@@ -11,7 +11,7 @@ import { supervisorView } from "./scheduler";
 import { attachSession, detachSession, getSession, listSessions } from "./sessions";
 import {
   addTask, approveTask, blockTask, claimNext, claimTask, getNotes, getTask,
-  listTasks, rejectTask, submitTask, taskCounts, addNote,
+  listTasks, rejectTask, submitTask, taskCounts, unblockTask, addNote,
 } from "./tasks";
 import {
   bindSession, findWorkerBySession, getWorker, listWorkers,
@@ -46,6 +46,7 @@ Usage:
   agentctl approve <task-id> [--worker <id>]
   agentctl reject <task-id> "reason" [--worker <id>]
   agentctl block <task-id> "reason" [--worker <id>] [--human]
+  agentctl unblock <task-id> [--worker <id>]
 
   agentctl send <worker-id> "message" [--task <tid>] [--kind <k>]
   agentctl inbox [--worker <id>] [--claim] [--ack <msg-id>]
@@ -300,6 +301,15 @@ async function main(): Promise<void> {
         if (!id || !reason) throw new Error('usage: agentctl block <task-id> "reason" [--human]');
         const workerId = resolveWorkerId(flag(argv, "--worker"));
         const t = blockTask(db, id, workerId, reason, hasFlag(argv, "--human"));
+        console.log(`${t.id} -> ${t.state}`);
+        break;
+      }
+
+      case "unblock": {
+        const id = argv[1];
+        if (!id) throw new Error("usage: agentctl unblock <task-id>");
+        const workerId = resolveWorkerId(flag(argv, "--worker"));
+        const t = unblockTask(db, id, workerId);
         console.log(`${t.id} -> ${t.state}`);
         break;
       }

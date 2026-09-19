@@ -208,7 +208,7 @@ export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<
     }
   }
 
-  if (needsPlanner(view)) {
+  if (needsPlanner(view, planners(db).length)) {
     for (const p of planners(db).filter((x) => x.state === "idle" || x.state === "starting")) {
       const full = getWorker(db, p.id)!;
       if (await tryWake(rt, db, full, PLANNER_NUDGE, "queue-low", at)) actions.push(`planner-woken:${p.id}`);

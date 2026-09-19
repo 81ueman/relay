@@ -79,8 +79,13 @@ export function needsWorkerWakeup(v: SupervisorView): boolean {
   return v.runnable > 0 && v.working === 0;
 }
 
-export function needsPlanner(v: SupervisorView): boolean {
-  return v.runnable < lowWaterMark() && v.unfinished > 0;
+export function needsPlanner(v: SupervisorView, plannerCount = 1): boolean {
+  if (plannerCount === 0) return false;
+  if (v.runnable < lowWaterMark() && v.unfinished > 0) return true;
+  // Queue fully drained (nothing runnable, nothing in review, nothing unfinished):
+  // wake the planner so a standing objective keeps producing work instead of
+  // the whole system going quiet. Cooldown in tryWake bounds the wake rate.
+  return v.runnable === 0 && v.review === 0 && v.unfinished === 0;
 }
 
 export function needsReviewer(v: SupervisorView): boolean {

@@ -171,6 +171,19 @@ export function addNote(db: Database, taskId: string, workerId: string, body: st
   logEvent(db, { source: "worker", workerId, taskId, type: "task.note", payload: { kind } });
 }
 
+/** Release a blocked task back to queued so someone (or the same worker) can take it. */
+export function unblockTask(db: Database, taskId: string, workerId: string): Task {
+  const task = getTask(db, taskId);
+  if (!task) throw new Error(`unknown task: ${taskId}`);
+  if (task.state !== "blocked_internal" && task.state !== "blocked_human") {
+    throw new Error(`cannot unblock task in state ${task.state}`);
+  }
+  const t = now();
+  db.query(`UPDATE tasks SET state = 'queued', updated_at = ? WHERE id = ?`).run(t, taskId);
+  logEvent(db, { source: "worker", workerId, taskId, type: "task.unblocked" });
+  return getTask(db, taskId)!;
+}
+
 export function getNotes(db: Database, taskId: string): { worker_id: string | null; kind: string; body: string; created_at: number }[] {
   return db.query(`SELECT worker_id, kind, body, created_at FROM task_notes WHERE task_id = ? ORDER BY id ASC`).all(taskId) as {
     worker_id: string | null; kind: string; body: string; created_at: number;
