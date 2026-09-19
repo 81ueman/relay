@@ -9,6 +9,7 @@ import { handleErrorSignal, handleIdleSignal, reconcile } from "./reconciler";
 import { buildRuntime, HerdrRuntime } from "./runtime/herdr";
 import { supervisorView } from "./scheduler";
 import { attachSession, detachSession, getSession, listSessions } from "./sessions";
+import { listRuntimes } from "./runtimes";
 import {
   addTask, approveTask, blockTask, claimNext, claimTask, getNotes, getTask,
   listTasks, rejectTask, submitTask, taskCounts, unblockTask, addNote,
@@ -35,6 +36,8 @@ Usage:
   agentctl session list
   agentctl session status --session <sid>
 
+  agentctl runtime list [--worker <id>] [--state <state>]
+
   agentctl task add "description" [--title T] [--acceptance A] [--priority N] [--role R] [--parent T1]
   agentctl task list [--state <state>]
   agentctl task show <id>
@@ -60,6 +63,8 @@ Usage:
 Worker identity: --worker flag, $AGENTCTL_WORKER, or .agentctl/worker-id
 DB: $AGENTCTL_DB or .agentctl/state.db (WAL mode)
 Env: AGENTCTL_LEASE_MS AGENTCTL_STALL_MS AGENTCTL_LOW_WATER AGENTCTL_AUTO_APPROVE AGENTCTL_INTERVAL_MS
+Spawn: AGENTCTL_HERDR_WORKSPACE (required to spawn; else $HERDR_WORKSPACE_ID)
+Runtime cleanup: AGENTCTL_RUNTIME_CLEANUP_GRACE_MS AGENTCTL_ATTACH_TIMEOUT_MS AGENTCTL_RESTART_COOLDOWN_MS
 `;
 }
 
@@ -137,7 +142,7 @@ async function main(): Promise<void> {
           console.log(`registered ${w.id} role=${w.role}`);
         } else if (sub === "list") {
           for (const w of listWorkers(db)) {
-            console.log(`${w.id}\t${w.role}\t${w.state}\t${w.current_task_id ?? "-"}\tsession=${w.opencode_session_id ?? "-"}`);
+            console.log(`${w.id}\t${w.role}\t${w.state}\tgen=${w.generation}\truntime=${w.runtime_id ?? "-"}\ttask=${w.current_task_id ?? "-"}\tsession=${w.opencode_session_id ?? "-"}`);
           }
         } else if (sub === "status") {
           const id = argv[2];
@@ -190,6 +195,23 @@ async function main(): Promise<void> {
           }
         } else {
           throw new Error(`unknown session subcommand: ${sub}`);
+        }
+        break;
+      }
+
+      case "runtime": {
+        const sub = argv[1];
+        if (sub !== "list") throw new Error("usage: agentctl runtime list [--worker <id>] [--state <state>]");
+        const rest = argv.slice(2);
+        const workerId = flag(rest, "--worker");
+        const state = flag(rest, "--state");
+        const rows = listRuntimes(db, { workerId, state: state as never });
+        if (rows.length === 0) console.log("(none)");
+        for (const r of rows) {
+          const age = fmtAge(now() - r.created_at);
+          console.log(
+            `${r.worker_id}\tg${r.generation}\t${r.state}\truntime=${r.runtime_id ?? "-"}\ttab=${r.tab_id ?? "-"}\tsession=${r.session_id ?? "-"}\tage=${age}\tcleanup_after=${r.cleanup_after ? new Date(r.cleanup_after).toISOString() : "-"}`
+          );
         }
         break;
       }

@@ -182,7 +182,7 @@ describe("F. runtime_id routing", () => {
     await rt.wake(w, "hi");
     await rt.interrupt(w);
     await rt.peek(w);
-    await rt.start({ ...w });
+    await rt.start(w, 1);
     for (const t of rt.targets) {
       expect(t.target).toBe("pane-special");
     }

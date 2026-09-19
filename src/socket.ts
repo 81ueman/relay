@@ -11,7 +11,8 @@ import { getWorker, setWorkerState, touchSeen } from "./workers";
 //   {"type":"session.idle","session_id":"ses_xxx","generation":2}
 //   {"type":"session.error",...,"payload":{...}}
 //   {"type":"permission.asked" | "permission.replied" | "tool.execute.after" | "session.status" | ..., ...}
-//   {"type":"session.attach","session_id":...,"role":...,"worker_id":...,"directory":...,"worktree":...}
+//   {"type":"session.attach","session_id":...,"role":...,"worker_id":...,"generation":N,...}
+//     (generation present = relay-spawned session; absent = manual attach)
 //   {"type":"session.detach","session_id":...}
 //   {"type":"ping"}
 // Response per line: {"ok":true,...} or {"ok":false,"reason":...}
@@ -48,9 +49,12 @@ export async function handleSocketMessage(msg: SocketMessage, ctx: SocketContext
     if (!msg.session_id) return { ok: false, reason: "no-session" };
     const s = attachSession(db, msg.session_id, {
       role: msg.role, workerId: msg.worker_id, directory: msg.directory, worktree: msg.worktree,
+      // Relay-spawned sessions send the authoritative generation from
+      // AGENTCTL_GENERATION; manual attaches omit it and get a bumped one.
+      generation: typeof msg.generation === "number" ? msg.generation : undefined,
     });
     ctx.wakeReconcile.value = true;
-    return { ok: true, worker_id: s.worker_id, generation: s.generation };
+    return { ok: true, worker_id: s.worker_id, generation: s.generation, managed: true };
   }
 
   if (type === "session.detach") {

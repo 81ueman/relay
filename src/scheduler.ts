@@ -41,11 +41,19 @@ export function productiveWorkers(db: Database): { id: string; state: string }[]
   return workingWorkers(db);
 }
 
-/** Idle (or newly starting / permission-waiting) managed workers: wake candidates. */
+/**
+ * Workers that can accept NEW work: state == idle AND holding no task.
+ * waiting_input is explicitly NOT here: such a worker still owns its current
+ * work and must never be told to `agentctl next`. starting/restarting workers
+ * are not ready yet either.
+ */
+export function idleWorkers(db: Database): { id: string; role: string; state: string }[] {
+  return listWorkers(db).filter((w) => w.state === "idle" && w.current_task_id === null);
+}
+
+/** @deprecated Use idleWorkers(). Kept as the NEXT_NUDGE candidate set. */
 export function wakeableWorkers(db: Database): { id: string; role: string; state: string }[] {
-  return listWorkers(db).filter(
-    (w) => w.state === "idle" || w.state === "starting" || w.state === "waiting_input"
-  );
+  return idleWorkers(db);
 }
 
 export function reviewers(db: Database): { id: string; state: string }[] {
@@ -81,11 +89,12 @@ export function needsWorkerWakeup(v: SupervisorView): boolean {
 
 export function needsPlanner(v: SupervisorView, plannerCount = 1): boolean {
   if (plannerCount === 0) return false;
-  if (v.runnable < lowWaterMark() && v.unfinished > 0) return true;
-  // Queue fully drained (nothing runnable, nothing in review, nothing unfinished):
-  // wake the planner so a standing objective keeps producing work instead of
-  // the whole system going quiet. Cooldown in tryWake bounds the wake rate.
-  return v.runnable === 0 && v.review === 0 && v.unfinished === 0;
+  // A planner must not invent work out of thin air. Only top up the queue while
+  // there is already work in flight, and never while the only thing left is a
+  // human decision.
+  if (v.status === "SYSTEM_WAITING_FOR_HUMAN") return false;
+  if (v.unfinished === 0) return false;
+  return v.runnable < lowWaterMark();
 }
 
 export function needsReviewer(v: SupervisorView): boolean {

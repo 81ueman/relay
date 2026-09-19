@@ -26,6 +26,11 @@ export type WorkerState = (typeof WORKER_STATES)[number];
 export const MESSAGE_STATES = ["queued", "delivered", "acked", "failed"] as const;
 export type MessageState = (typeof MESSAGE_STATES)[number];
 
+// Runtime generation lifecycle. A runtime is one Herdr tab + OpenCode session
+// generation. Sessions/runtimes are DISPOSABLE; tasks are durable.
+export const RUNTIME_STATES = ["starting", "active", "stale", "dead", "cleaned"] as const;
+export type RuntimeState = (typeof RUNTIME_STATES)[number];
+
 export interface Task {
   id: string;
   title: string;
@@ -57,6 +62,27 @@ export interface Worker {
   nudged_at: number | null; // [ext] single-nudge bookkeeping for stalled detection
   created_at: number;
   updated_at: number;
+}
+
+/**
+ * One spawned runtime generation (Herdr tab + OpenCode session). History /
+ * cleanup authority: workers.runtime_id / generation / opencode_session_id
+ * keep pointing at the ACTIVE generation only, while this table lets us find
+ * and safely clean up old generations later.
+ */
+export interface WorkerRuntime {
+  id: number;
+  worker_id: string;
+  generation: number;
+  runtime_id: string | null; // Herdr agent name
+  tab_id: string | null;
+  pane_id: string | null;
+  session_id: string | null; // OpenCode session bound on managed attach
+  state: RuntimeState;
+  created_at: number;
+  stale_at: number | null;
+  cleanup_after: number | null;
+  cleaned_at: number | null;
 }
 
 export interface Message {
@@ -172,4 +198,24 @@ CREATE TABLE IF NOT EXISTS task_notes (
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_task_notes_task ON task_notes(task_id);
+
+-- Runtime generation history. Sessions/runtimes are disposable; tasks durable.
+-- Old generations are marked stale/dead here, then cleaned up ONLY after a
+-- grace period and ONLY when they are no longer the worker's current runtime.
+CREATE TABLE IF NOT EXISTS worker_runtimes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  worker_id TEXT NOT NULL,
+  generation INTEGER NOT NULL,
+  runtime_id TEXT,
+  tab_id TEXT,
+  pane_id TEXT,
+  session_id TEXT,
+  state TEXT NOT NULL DEFAULT 'starting',
+  created_at INTEGER NOT NULL,
+  stale_at INTEGER,
+  cleanup_after INTEGER,
+  cleaned_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_worker_runtimes_worker ON worker_runtimes(worker_id, generation);
+CREATE INDEX IF NOT EXISTS idx_worker_runtimes_cleanup ON worker_runtimes(state, cleanup_after);
 `;

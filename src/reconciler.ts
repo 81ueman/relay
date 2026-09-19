@@ -3,15 +3,27 @@ import { now } from "./db";
 import { countIdleSinceProgress, logEvent } from "./events";
 import type { Runtime } from "./runtime/runtime";
 import {
+  cleanupCandidates,
+  getActiveRuntime,
+  getStartingRuntime,
+  listRuntimes,
+  markRuntimeActive,
+  markRuntimeCleaned,
+  markRuntimeDead,
+  markRuntimeStale,
+  recordRuntime,
+  runtimeCleanupGraceMs,
+} from "./runtimes";
+import {
+  idleWorkers,
   needsPlanner,
   needsReviewer,
   needsWorkerWakeup,
   planners,
-  reviewers,
   stallMs,
   supervisorView,
-  wakeableWorkers,
 } from "./scheduler";
+import type { Session } from "./sessions";
 import { approveTask, expireLeases, getTask, reviewTasks, runnableTasks } from "./tasks";
 import { getWorker, listWorkers, setWorkerState, touchSeen, type WorkerRow } from "./workers";
 
@@ -35,13 +47,28 @@ function wakeCooldownMs(): number {
   return Number.isFinite(v) && v >= 0 ? v : 30000;
 }
 
-function recentlyWoken(db: Database, workerId: string, at: number): boolean {
-  const cd = wakeCooldownMs();
-  if (cd === 0) return false;
+/** How long a fresh generation may wait for managed attach before we give up. */
+function attachTimeoutMs(): number {
+  const v = Number(process.env.AGENTCTL_ATTACH_TIMEOUT_MS ?? "30000");
+  return Number.isFinite(v) && v > 0 ? v : 30000;
+}
+
+/** Backoff between restart attempts for the same worker (avoids tab thrash). */
+function restartCooldownMs(): number {
+  const v = Number(process.env.AGENTCTL_RESTART_COOLDOWN_MS ?? "30000");
+  return Number.isFinite(v) && v >= 0 ? v : 30000;
+}
+
+function recentlyEvent(db: Database, workerId: string, type: string, at: number, windowMs: number): boolean {
+  if (windowMs === 0) return false;
   const r = db
-    .query(`SELECT COUNT(*) AS n FROM events WHERE worker_id = ? AND type = 'worker.woken' AND timestamp > ?`)
-    .get(workerId, at - cd) as { n: number };
+    .query(`SELECT COUNT(*) AS n FROM events WHERE worker_id = ? AND type = ? AND timestamp > ?`)
+    .get(workerId, type, at - windowMs) as { n: number };
   return r.n > 0;
+}
+
+function recentlyWoken(db: Database, workerId: string, at: number): boolean {
+  return recentlyEvent(db, workerId, "worker.woken", at, wakeCooldownMs());
 }
 
 async function tryWake(
@@ -72,21 +99,140 @@ function releaseTaskOfDeadWorker(db: Database, workerId: string, taskId: string 
   return null;
 }
 
-/** Restart a dead worker via a real fresh generation. Returns true when reachable again. */
+/**
+ * Restart = mark the current generation stale, then spawn a FRESH generation.
+ * The old tab is never destroyed here (cleanup is a separate pass). If the
+ * fresh spawn fails we keep the old runtime metadata: only runtimes that are
+ * explicitly stale/dead are ever cleanup-eligible.
+ */
 async function restartWorker(db: Database, rt: Runtime, w: WorkerRow, at: number): Promise<boolean> {
+  if (recentlyEvent(db, w.id, "worker.restarting", at, restartCooldownMs())) {
+    return false; // backoff: do not spawn a new tab every tick
+  }
+
+  const active = getActiveRuntime(db, w.id);
+  if (active) {
+    markRuntimeStale(db, active.id, at);
+  } else if (w.runtime_id || w.opencode_session_id) {
+    // Legacy/manual runtime without history: capture it as stale before replacing.
+    const known = listRuntimes(db, { workerId: w.id }).some(
+      (r) => r.state !== "cleaned" && (r.runtime_id === w.runtime_id || (r.runtime_id === null && r.generation === w.generation))
+    );
+    if (!known) {
+      recordRuntime(db, {
+        workerId: w.id,
+        generation: w.generation,
+        runtimeId: w.runtime_id,
+        sessionId: w.opencode_session_id,
+        state: "stale",
+        cleanupAfter: at + runtimeCleanupGraceMs(),
+      });
+    }
+  }
+
   setWorkerState(db, w.id, "restarting");
+  const generation = w.generation + 1;
   try {
-    const target = await rt.restart(w);
+    const started = await rt.restart(w, generation);
+    recordRuntime(db, {
+      workerId: w.id,
+      generation,
+      runtimeId: started.runtimeId,
+      tabId: started.tabId ?? null,
+      paneId: started.paneId ?? null,
+      state: "starting",
+    });
     db.query(
-      `UPDATE workers SET runtime_id = ?, generation = generation + 1, state = 'starting',
-        current_task_id = NULL, nudged_at = NULL, updated_at = ? WHERE id = ?`
-    ).run(target, at, w.id);
-    logEvent(db, { source: "supervisor", workerId: w.id, type: "worker.restarted", payload: { target } });
+      `UPDATE workers SET generation = ?, runtime_id = ?, opencode_session_id = NULL,
+         state = 'starting', current_task_id = NULL, nudged_at = NULL, updated_at = ? WHERE id = ?`
+    ).run(generation, started.runtimeId, at, w.id);
+    logEvent(db, {
+      source: "supervisor",
+      workerId: w.id,
+      type: "worker.restarting",
+      payload: { generation, runtimeId: started.runtimeId, tabId: started.tabId ?? null },
+    });
     return true;
   } catch (e) {
     setWorkerState(db, w.id, "dead");
-    logEvent(db, { source: "supervisor", workerId: w.id, type: "worker.restart_failed", payload: { error: String(e).slice(0, 200) } });
+    logEvent(db, {
+      source: "supervisor",
+      workerId: w.id,
+      type: "worker.restart_failed",
+      payload: { generation, error: String(e).slice(0, 200) },
+    });
     return false;
+  }
+}
+
+/**
+ * Promote freshly spawned generations to active once managed attach lands, and
+ * time out the ones that never attach. Keeps workers in starting/restarting
+ * until then: a tab existing is NOT restart success.
+ */
+async function activatePendingRuntimes(db: Database, actions: string[], at: number): Promise<void> {
+  for (const w of listWorkers(db)) {
+    if (w.state !== "starting" && w.state !== "restarting") continue;
+    const sr = getStartingRuntime(db, w.id, w.generation);
+    if (!sr) continue;
+
+    const sess = db
+      .query(`SELECT * FROM sessions WHERE worker_id = ? AND managed = 1 AND generation = ? LIMIT 1`)
+      .get(w.id, w.generation) as Session | null;
+
+    if (sess) {
+      markRuntimeActive(db, sr.id, sess.session_id, at);
+      db.query(
+        `UPDATE workers
+           SET state = CASE WHEN state IN ('starting','restarting') THEN 'idle' ELSE state END,
+               opencode_session_id = ?, updated_at = ?
+         WHERE id = ?`
+      ).run(sess.session_id, at, w.id);
+      logEvent(db, { source: "supervisor", workerId: w.id, type: "worker.active", payload: { generation: w.generation, sessionId: sess.session_id } });
+      actions.push(`active:${w.id}:g${w.generation}`);
+      continue;
+    }
+
+    if (at - sr.created_at > attachTimeoutMs()) {
+      markRuntimeDead(db, sr.id, at);
+      setWorkerState(db, w.id, "dead");
+      logEvent(db, { source: "supervisor", workerId: w.id, type: "worker.attach_timeout", payload: { generation: w.generation } });
+      actions.push(`attach-timeout:${w.id}`);
+    }
+  }
+}
+
+/**
+ * Reap old generations past their grace period. Hard safety gates: never the
+ * current generation, never the current runtime, only explicit stale/dead, and
+ * the adapter must prove relay tab ownership. A cleanup failure only logs and
+ * retries later; it must never affect task execution or fresh workers.
+ */
+async function cleanupOldRuntimes(db: Database, rt: Runtime, actions: string[], at: number): Promise<void> {
+  for (const c of cleanupCandidates(db, at)) {
+    if (c.state !== "stale" && c.state !== "dead") continue;
+    if (c.cleanup_after === null || c.cleanup_after > at) continue;
+
+    const w = getWorker(db, c.worker_id);
+    if (w) {
+      if (c.generation >= w.generation) continue; // never current/newer
+      if (c.runtime_id && w.runtime_id && c.runtime_id === w.runtime_id) continue; // never current runtime
+    }
+
+    try {
+      await rt.cleanup(c);
+      markRuntimeCleaned(db, c.id, at);
+      actions.push(`cleaned:${c.worker_id}:g${c.generation}`);
+    } catch (e) {
+      logEvent(db, {
+        source: "supervisor",
+        workerId: c.worker_id,
+        type: "runtime.cleanup_failed",
+        payload: { generation: c.generation, runtimeId: c.runtime_id, error: String(e).slice(0, 200) },
+      });
+      actions.push(`cleanup-failed:${c.worker_id}:g${c.generation}`);
+      // Leave it stale/dead so the next pass retries.
+    }
   }
 }
 
@@ -107,12 +253,17 @@ export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<
   const expired = expireLeases(db, at);
   for (const t of expired) actions.push(`lease-expired:${t.id}`);
 
-  // 2. Walk workers.
+  // 2. Promote fresh generations that have completed managed attach.
+  await activatePendingRuntimes(db, actions, at);
+
+  // 3. Walk workers (starting/restarting are owned by step 2).
   const stallTimeout = stallMs();
 
   for (const w of listWorkers(db)) {
-    const alive = await rt.isAlive(w).catch(() => false);
     const fresh = getWorker(db, w.id)!;
+    if (fresh.state === "starting" || fresh.state === "restarting") continue;
+
+    const alive = await rt.isAlive(fresh).catch(() => false);
 
     if (!alive) {
       if (fresh.state !== "dead") {
@@ -120,6 +271,8 @@ export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<
         logEvent(db, { source: "supervisor", workerId: w.id, type: "worker.dead" });
         actions.push(`dead:${w.id}`);
       }
+      // Transport is gone; restartWorker marks the old generation stale before
+      // spawning fresh (old metadata is never deleted here).
       const requeued = releaseTaskOfDeadWorker(db, w.id, fresh.current_task_id, at);
       if (requeued) actions.push(`requeued:${requeued}`);
       db.query(`UPDATE workers SET current_task_id = NULL, updated_at = ? WHERE id = ?`).run(at, w.id);
@@ -127,7 +280,7 @@ export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<
       if (await restartWorker(db, rt, { ...fresh, state: "dead" }, at)) {
         actions.push(`restarted:${w.id}`);
       } else {
-        actions.push(`restart-failed:${w.id}`);
+        actions.push(`restart-skipped:${w.id}`);
       }
       continue;
     }
@@ -165,13 +318,13 @@ export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<
     }
   }
 
-  // 3. Core invariant: runnable work + zero working workers => wake or start someone.
+  // 4. Core invariant: runnable work + zero working workers => wake or start someone.
   const view = supervisorView(db);
 
   if (needsWorkerWakeup(view)) {
-    const candidates = wakeableWorkers(db).sort((a, b) => a.id.localeCompare(b.id));
+    const idle = idleWorkers(db).sort((a, b) => a.id.localeCompare(b.id));
     let woken = false;
-    for (const c of candidates) {
+    for (const c of idle) {
       const full = getWorker(db, c.id)!;
       if (await tryWake(rt, db, full, NEXT_NUDGE, "no-working-worker", at)) {
         actions.push(`woken:${c.id}`);
@@ -180,16 +333,21 @@ export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<
       }
     }
     if (!woken) {
-      // Nobody wakeable (all dead/stalled): restart one so work can move.
+      // No idle worker can take it. Recover a fallen one, or wait for a fresh
+      // generation to finish attaching. Never nudge waiting_input workers.
       const fallen = listWorkers(db)
         .filter((x) => x.state === "dead" || x.state === "stalled" || x.state === "restarting")
         .sort((a, b) => a.id.localeCompare(b.id))[0];
       if (fallen) {
         if (await restartWorker(db, rt, fallen, at)) actions.push(`restarted:${fallen.id}`);
-        else actions.push(`restart-failed:${fallen.id}`);
+        else actions.push(`restart-skipped:${fallen.id}`);
+      } else if (idle.length > 0) {
+        actions.push("wake-suppressed");
+      } else if (listWorkers(db).some((x) => x.state === "starting")) {
+        actions.push("awaiting-start");
       } else {
-        logEvent(db, { source: "supervisor", type: "supervisor.no_workers", payload: { view } });
-        actions.push("no-workers");
+        logEvent(db, { source: "supervisor", type: "supervisor.no_idle_worker", payload: { view } });
+        actions.push("no-idle-worker");
       }
     }
   }
@@ -201,7 +359,7 @@ export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<
         actions.push(`auto-approved:${t.id}`);
       }
     } else {
-      for (const r of reviewers(db).filter((x) => x.state === "idle" || x.state === "starting")) {
+      for (const r of idleWorkers(db).filter((x) => x.role === "reviewer")) {
         const full = getWorker(db, r.id)!;
         if (await tryWake(rt, db, full, REVIEW_NUDGE, "review-pending", at)) actions.push(`reviewer-woken:${r.id}`);
       }
@@ -209,11 +367,14 @@ export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<
   }
 
   if (needsPlanner(view, planners(db).length)) {
-    for (const p of planners(db).filter((x) => x.state === "idle" || x.state === "starting")) {
+    for (const p of idleWorkers(db).filter((x) => x.role === "planner")) {
       const full = getWorker(db, p.id)!;
       if (await tryWake(rt, db, full, PLANNER_NUDGE, "queue-low", at)) actions.push(`planner-woken:${p.id}`);
     }
   }
+
+  // 5. Reap old generations, isolated from all of the above.
+  await cleanupOldRuntimes(db, rt, actions, at);
 
   return { view: supervisorView(db), actions };
 }
@@ -230,6 +391,9 @@ export async function handleIdleSignal(db: Database, rt: Runtime, workerId: stri
   }
   touchSeen(db, workerId, at);
   logEvent(db, { source: "opencode", workerId, type: "session.idle" });
+
+  // waiting_input still owns its current work: never tell it to take new work.
+  if (w.state === "waiting_input") return "waiting-input";
 
   if (!w.current_task_id) {
     // No task + runnable work -> wake to next.

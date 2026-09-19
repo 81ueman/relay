@@ -1,6 +1,7 @@
 import type { Database } from "bun:sqlite";
 import { now } from "./db";
 import { logEvent } from "./events";
+import { findRuntime, markRuntimeActive } from "./runtimes";
 import { getWorker, registerWorker } from "./workers";
 
 export interface Session {
@@ -14,6 +15,20 @@ export interface Session {
   attached_at: number | null;
   detached_at: number | null;
   updated_at: number;
+}
+
+export interface AttachOptions {
+  role?: string;
+  workerId?: string;
+  directory?: string;
+  worktree?: string;
+  /**
+   * Explicit generation. Relay-spawned sessions pass the generation from
+   * AGENTCTL_GENERATION (authoritative, must match the worker/runtime row).
+   * Manual mid-flight attaches omit it and get a fresh bumped generation,
+   * which is returned to the plugin and cached for fencing.
+   */
+  generation?: number;
 }
 
 export function getSession(db: Database, sessionId: string): Session | null {
@@ -36,22 +51,48 @@ function slugSession(sessionId: string): string {
 
 /**
  * Attach a live OpenCode session to relay management.
- * Bumps the generation so stale events from a previous epoch are ignored.
+ *
+ * - Relay-spawned (opts.generation set): the generation is authoritative and
+ *   the matching freshly spawned runtime row is promoted to active.
+ * - Manual attach (no generation): bump the generation and return it; the
+ *   plugin caches it so subsequent events fence correctly.
+ *
  * No process restart required. Returns the session row + bound worker id.
  */
-export function attachSession(
-  db: Database,
-  sessionId: string,
-  opts: { role?: string; workerId?: string; directory?: string; worktree?: string } = {}
-): Session {
+export function attachSession(db: Database, sessionId: string, opts: AttachOptions = {}): Session {
   const t = now();
-  const role = opts.role ?? "worker";
-  const workerId = opts.workerId ?? slugSession(sessionId);
-  const worker = getWorker(db, workerId) ?? registerWorker(db, workerId, { role });
-  db.query(`UPDATE workers SET opencode_session_id = ?, updated_at = ? WHERE id = ?`).run(sessionId, t, worker.id);
-
   const prev = getSession(db, sessionId);
-  const generation = (prev?.generation ?? 0) + 1;
+  const role = opts.role ?? prev?.role ?? "worker";
+  const workerId = opts.workerId ?? prev?.worker_id ?? slugSession(sessionId);
+  const worker = getWorker(db, workerId) ?? registerWorker(db, workerId, { role, sessionId });
+  const generation = opts.generation ?? (prev?.generation ?? 0) + 1;
+
+  db.query(`UPDATE workers SET opencode_session_id = ?, role = COALESCE(?, role), updated_at = ? WHERE id = ?`).run(
+    sessionId,
+    opts.role ?? null,
+    t,
+    worker.id
+  );
+
+  if (opts.generation !== undefined) {
+    // Relay-spawned: adopt the generation and leave 'starting/restarting' only
+    // now that managed attach has actually landed.
+    db.query(
+      `UPDATE workers
+         SET generation = ?,
+             state = CASE WHEN state IN ('starting','restarting') THEN 'idle' ELSE state END,
+             updated_at = ?
+       WHERE id = ?`
+    ).run(generation, t, worker.id);
+
+    // Promote the matching freshly spawned runtime row.
+    const rt = findRuntime(db, worker.id, generation);
+    if (rt && (rt.state === "starting" || rt.state === "active")) {
+      markRuntimeActive(db, rt.id, sessionId, t);
+      if (rt.runtime_id) db.query(`UPDATE workers SET runtime_id = ? WHERE id = ?`).run(rt.runtime_id, worker.id);
+    }
+  }
+
   db.query(
     `INSERT INTO sessions (session_id, managed, worker_id, role, generation, directory, worktree, attached_at, detached_at, updated_at)
      VALUES (?, 1, ?, ?, ?, ?, ?, ?, NULL, ?)
@@ -60,7 +101,12 @@ export function attachSession(
        generation = excluded.generation, directory = excluded.directory, worktree = excluded.worktree,
        attached_at = excluded.attached_at, detached_at = NULL, updated_at = excluded.updated_at`
   ).run(sessionId, worker.id, role, generation, opts.directory ?? null, opts.worktree ?? null, t, t);
-  logEvent(db, { source: "supervisor", workerId: worker.id, type: "session.attached", payload: { sessionId, generation, role } });
+  logEvent(db, {
+    source: "supervisor",
+    workerId: worker.id,
+    type: "session.attached",
+    payload: { sessionId, generation, role, spawned: opts.generation !== undefined },
+  });
   return getSession(db, sessionId)!;
 }
 
@@ -85,7 +131,8 @@ export function detachSession(db: Database, sessionId: string): Session | null {
 
 /**
  * Gate an inbound session event. Returns the managed session, or null when the
- * event must be ignored (unmanaged session or stale generation). Never writes.
+ * event must be ignored. Managed events MUST carry a generation: a missing or
+ * mismatched generation is ignored (zombie protection). Never writes.
  */
 export function gateEvent(
   db: Database,
@@ -95,9 +142,8 @@ export function gateEvent(
   if (!sessionId) return { ok: false, reason: "no-session" };
   const s = getSession(db, sessionId);
   if (!s || s.managed !== 1) return { ok: false, reason: "unmanaged" };
-  if (eventGeneration !== undefined && eventGeneration !== s.generation) {
-    return { ok: false, reason: "stale-generation" };
-  }
+  if (eventGeneration === undefined) return { ok: false, reason: "no-generation" };
+  if (eventGeneration !== s.generation) return { ok: false, reason: "stale-generation" };
   return { ok: true, session: s };
 }
 

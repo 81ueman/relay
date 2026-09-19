@@ -7,15 +7,33 @@ import type { Worker } from "../schema";
 // worker.runtime_id consistently. Callers must NEVER build Herdr
 // targets themselves.
 
+/** Result of spawning a fresh generation. Herdr metadata stays out of the workers row. */
+export interface StartedRuntime {
+  runtimeId: string; // Herdr agent name (unique per generation)
+  tabId?: string;
+  paneId?: string;
+}
+
+/** Minimal shape the cleanup path needs from worker_runtimes history. */
+export interface RuntimeRecord {
+  worker_id: string;
+  generation: number;
+  runtime_id: string | null;
+  tab_id: string | null;
+  pane_id: string | null;
+}
+
 export interface Runtime {
   readonly name: string;
   isAlive(worker: Worker): Promise<boolean>;
   wake(worker: Worker, text: string): Promise<void>;
   interrupt(worker: Worker): Promise<void>;
-  /** Spawn a brand-new agent generation for this worker (must work when nothing exists). Returns the new runtime target. */
-  start(worker: Worker): Promise<string>;
-  /** interrupt (best effort) + start a fresh generation. Returns the new runtime target. */
-  restart(worker: Worker): Promise<string>;
+  /** Spawn a brand-new generation in a fresh tab (must work when nothing exists). */
+  start(worker: Worker, generation: number): Promise<StartedRuntime>;
+  /** interrupt (best effort) + start a fresh generation. */
+  restart(worker: Worker, generation: number): Promise<StartedRuntime>;
+  /** Safely reap an old generation's tab. MUST refuse if it cannot prove relay ownership. */
+  cleanup(runtime: RuntimeRecord): Promise<void>;
   peek(worker: Worker): Promise<string>;
 }
 
@@ -28,8 +46,12 @@ export class MockRuntime implements Runtime {
   interrupts: string[] = [];
   starts: string[] = [];
   restarts: string[] = [];
+  /** runtime ids passed to cleanup(), in order. */
+  cleanups: string[] = [];
   failWake = new Set<string>();
   failStart = new Set<string>();
+  /** Runtime ids (or `${worker}:g${generation}`) whose cleanup should throw. */
+  failCleanup = new Set<string>();
   peekText = "";
 
   static targetOf(w: Pick<Worker, "id" | "runtime_id">): string {
@@ -59,20 +81,36 @@ export class MockRuntime implements Runtime {
     this.targets.push({ op: "interrupt", target });
     this.interrupts.push(target);
   }
-  async start(w: Worker): Promise<string> {
+  async start(w: Worker, generation: number): Promise<StartedRuntime> {
     const target = MockRuntime.targetOf(w);
     this.targets.push({ op: "start", target });
     if (this.failStart.has(this.key(w))) throw new Error("start failed (simulated)");
     this.starts.push(this.key(w));
     this.alive.set(this.key(w), true);
-    return target;
+    return {
+      runtimeId: `${target}#g${generation}`,
+      tabId: `tab-${w.id}-g${generation}`,
+      paneId: `pane-${w.id}-g${generation}`,
+    };
   }
-  async restart(w: Worker): Promise<string> {
+  async restart(w: Worker, generation: number): Promise<StartedRuntime> {
     const target = MockRuntime.targetOf(w);
     this.targets.push({ op: "restart", target });
     this.restarts.push(this.key(w));
     this.alive.set(this.key(w), true);
-    return target;
+    return {
+      runtimeId: `${target}#g${generation}`,
+      tabId: `tab-${w.id}-g${generation}`,
+      paneId: `pane-${w.id}-g${generation}`,
+    };
+  }
+  async cleanup(rec: RuntimeRecord): Promise<void> {
+    const runtimeId = rec.runtime_id ?? `${rec.worker_id}:g${rec.generation}`;
+    this.targets.push({ op: "cleanup", target: runtimeId });
+    if (this.failCleanup.has(runtimeId) || this.failCleanup.has(`${rec.worker_id}:g${rec.generation}`)) {
+      throw new Error("cleanup failed (simulated)");
+    }
+    this.cleanups.push(runtimeId);
   }
   async peek(w: Worker): Promise<string> {
     this.targets.push({ op: "peek", target: MockRuntime.targetOf(w) });

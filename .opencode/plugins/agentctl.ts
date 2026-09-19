@@ -28,6 +28,17 @@ const generationCache = new Map<string, number>();
 // Sessions detached via the in-process tool: skip even the socket write for pings.
 const detachedCache = new Set<string>();
 
+// Relay-spawned sessions are launched with AGENTCTL_MANAGED=1 and an explicit
+// worker + generation. They auto-attach on their first event; a plain
+// `opencode` launch has none of these and stays unmanaged.
+const MANAGED = process.env.AGENTCTL_MANAGED === "1";
+const ENV_WORKER = process.env.AGENTCTL_WORKER;
+const ENV_GENERATION = (() => {
+  const n = Number(process.env.AGENTCTL_GENERATION ?? "");
+  return Number.isFinite(n) && n > 0 ? n : undefined;
+})();
+const autoAttached = new Set<string>();
+
 function sockPath(explicitDir?: string): string {
   if (process.env.AGENTCTL_SOCK) return process.env.AGENTCTL_SOCK;
   const dir = explicitDir ?? process.cwd();
@@ -102,14 +113,58 @@ function sendRequest(msg: Record<string, unknown>, explicitDir?: string, timeout
   });
 }
 
+function generationFor(sessionID: string | undefined): number | undefined {
+  // Cached generation wins (it is set by auto-attach from env, or by a manual
+  // attach's response); otherwise fall back to the env generation.
+  if (sessionID) {
+    const cached = generationCache.get(sessionID);
+    if (cached !== undefined) return cached;
+  }
+  return ENV_GENERATION;
+}
+
 function withGeneration(sessionID: string | undefined, extra: Record<string, unknown> = {}): Record<string, unknown> {
   const out: Record<string, unknown> = { ...extra };
   if (sessionID) {
     out.session_id = sessionID;
-    const g = generationCache.get(sessionID);
+    const g = generationFor(sessionID);
     if (g !== undefined) out.generation = g;
   }
   return out;
+}
+
+/**
+ * Auto managed attach for relay-spawned sessions. The first event we see for a
+ * session launched with AGENTCTL_MANAGED=1 registers it as managed with the
+ * env generation. Fire-and-forget: the generation is already known locally.
+ */
+function maybeAutoAttach(sessionID: string | undefined, explicitDir?: string): void {
+  if (!MANAGED || !sessionID || autoAttached.has(sessionID)) return;
+  autoAttached.add(sessionID);
+  const directory = explicitDir ?? process.cwd();
+  if (ENV_GENERATION !== undefined) {
+    generationCache.set(sessionID, ENV_GENERATION);
+    sendEvent(
+      {
+        type: "session.attach",
+        session_id: sessionID,
+        worker_id: ENV_WORKER,
+        generation: ENV_GENERATION,
+        role: "worker",
+        directory,
+      },
+      explicitDir
+    );
+    return;
+  }
+  // Unexpected (managed spawn without a generation): ask the daemon and cache.
+  void sendRequest(
+    { type: "session.attach", session_id: sessionID, worker_id: ENV_WORKER, role: "worker", directory },
+    explicitDir
+  ).then((res) => {
+    if (res?.ok && typeof res.generation === "number") generationCache.set(sessionID, res.generation);
+    else autoAttached.delete(sessionID); // allow a retry on the next event
+  });
 }
 
 function sessionIDOf(data: any): string | undefined {
@@ -140,6 +195,7 @@ const LIVENESS_TYPES = new Set(["session.status", "session.created", "session.vi
 const TOOL_AFTER = "tool.execute.after";
 
 function forwardEvent(type: string, sessionID: string | undefined, data: any, explicitDir?: string): void {
+  if (sessionID) maybeAutoAttach(sessionID, explicitDir);
   if (IDLE_TYPES.has(type) || ERROR_TYPES.has(type)) {
     // Always forwarded; the daemon gates on managed + generation.
     const payload = ERROR_TYPES.has(type) ? { payload: { error: errorOf(data) } } : {};

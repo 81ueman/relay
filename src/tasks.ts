@@ -179,7 +179,8 @@ export function unblockTask(db: Database, taskId: string, workerId: string): Tas
     throw new Error(`cannot unblock task in state ${task.state}`);
   }
   const t = now();
-  db.query(`UPDATE tasks SET state = 'queued', updated_at = ? WHERE id = ?`).run(t, taskId);
+  // Fresh claim gets a new lease token; ensure no stale ownership lingers.
+  db.query(`UPDATE tasks SET state = 'queued', assignee = NULL, lease_until = NULL, updated_at = ? WHERE id = ?`).run(t, taskId);
   logEvent(db, { source: "worker", workerId, taskId, type: "task.unblocked" });
   return getTask(db, taskId)!;
 }
@@ -260,9 +261,14 @@ export function blockTask(db: Database, taskId: string, workerId: string, reason
     taskId, workerId, human ? "blocked_human" : "blocked_internal", reason, t
   );
   const state: TaskState = human ? "blocked_human" : "blocked_internal";
-  db.query(`UPDATE tasks SET state = ?, updated_at = ? WHERE id = ?`).run(state, t, taskId);
+  // Blocking releases ownership completely: no stale assignee/lease survives, so
+  // the task cannot be "submitted" later by a worker that no longer owns it.
+  db.query(
+    `UPDATE tasks SET state = ?, assignee = NULL, lease_until = NULL, lease_token = lease_token + 1, updated_at = ? WHERE id = ?`
+  ).run(state, t, taskId);
   // A blocked task never parks the worker: it must immediately take the next runnable task.
   if (task.assignee) clearCurrentTask(db, task.assignee);
+  db.query(`UPDATE workers SET current_task_id = NULL WHERE id = ? AND current_task_id = ?`).run(workerId, taskId);
   db.query(`UPDATE workers SET state = 'idle', updated_at = ? WHERE id = ? AND current_task_id IS NULL`).run(t, workerId);
   touchProgress(db, workerId, t);
   logEvent(db, { source: "worker", workerId, taskId, type: human ? "task.blocked_human" : "task.blocked_internal", payload: { reason } });
