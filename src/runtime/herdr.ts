@@ -111,6 +111,26 @@ function getTabLabel(tabId: string): string | null {
   return typeof label === "string" ? label : null;
 }
 
+/** Retry `agent start` a few times: a freshly created tab's shell may not be ready yet. */
+async function startAgentWithRetry(name: string, paneId: string): Promise<void> {
+  let lastErr = "";
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt > 0) await Bun.sleep(1500);
+    const r = runHerdr(["agent", "start", name, "--kind", "opencode", "--pane", paneId, "--timeout", "60000"], 75000);
+    if (r.ok || runHerdr(["agent", "get", name], 5000).ok) return;
+    lastErr = (r.stderr || r.stdout).trim().slice(0, 200);
+  }
+  throw new Error(`herdr agent start failed in ${paneId}: ${lastErr}`);
+}
+
+/** Best-effort rollback of a tab WE just created and failed to bring up. */
+function closeRelayTab(workerId: string, generation: number, tabId: string): void {
+  try {
+    if (getTabLabel(tabId) !== relayTabLabel(workerId, generation)) return; // not provably ours
+    runHerdr(["tab", "close", tabId], 10000);
+  } catch { /* best effort */ }
+}
+
 export const BOOTSTRAP_PROMPT = (workerId: string) =>
   `You are managed by the relay supervisor as worker ${workerId}. ` +
   `Load the agent-worker skill, then run \`agentctl next\` to claim work. ` +
@@ -171,21 +191,29 @@ export class HerdrRuntime implements Runtime {
     const parsed = tryParseJson(tab.stdout);
     const paneId = extractRootPaneId(parsed);
     const tabId = extractTabId(parsed);
-    if (!paneId) throw new Error(`herdr tab create returned no pane id: ${tab.stdout.slice(0, 200)}`);
+    if (!paneId) {
+      if (tabId) closeRelayTab(w.id, generation, tabId);
+      throw new Error(`herdr tab create returned no pane id: ${tab.stdout.slice(0, 200)}`);
+    }
 
-    const started = runHerdr(["agent", "start", name, "--kind", "opencode", "--pane", paneId, "--timeout", "60000"], 75000);
-    if (!started.ok) {
-      // Leave the tab in place (never destroy state synchronously); it becomes
-      // cleanup-eligible as a stale/dead runtime later.
-      throw new Error(`herdr agent start failed in ${paneId}: ${(started.stderr || started.stdout).trim().slice(0, 200)}`);
+    try {
+      await startAgentWithRetry(name, paneId);
+      // Best-effort bootstrap: a hiccup here must not abort an otherwise good spawn.
+      try {
+        await this.wake({ ...w, runtime_id: name }, BOOTSTRAP_PROMPT(w.id));
+      } catch { /* the daemon's wake loop will kick it once active */ }
+      if (!(await this.isAlive({ ...w, runtime_id: name }))) {
+        throw new Error(`started agent ${name} is not reachable`);
+      }
+      return { runtimeId: name, tabId: tabId ?? undefined, paneId };
+    } catch (e) {
+      // A brand-new tab that never produced a usable generation is rolled back
+      // synchronously so it cannot leak as an untracked duplicate. OLD
+      // generations are never closed here; they go through the async cleanup
+      // pass after their grace period.
+      if (tabId) closeRelayTab(w.id, generation, tabId);
+      throw e;
     }
-    // Ensure the fresh OpenCode session emits events so the plugin can
-    // auto-attach (AGENTCTL_MANAGED=1) and reachability can be confirmed.
-    await this.wake({ ...w, runtime_id: name }, BOOTSTRAP_PROMPT(w.id));
-    if (!(await this.isAlive({ ...w, runtime_id: name }))) {
-      throw new Error(`started agent ${name} is not reachable`);
-    }
-    return { runtimeId: name, tabId: tabId ?? undefined, paneId };
   }
 
   async restart(w: Worker, generation: number): Promise<StartedRuntime> {
