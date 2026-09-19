@@ -16,9 +16,11 @@ import {
 } from "./runtimes";
 import {
   idleWorkers,
+  isOperationalWorker,
   needsPlanner,
   needsReviewer,
   needsWorkerWakeup,
+  operationalWorkers,
   planners,
   stallMs,
   supervisorView,
@@ -204,6 +206,9 @@ async function restartWorker(db: Database, rt: Runtime, w: WorkerRow, at: number
 async function activatePendingRuntimes(db: Database, actions: string[], at: number): Promise<void> {
   for (const w of listWorkers(db)) {
     if (w.state !== "starting") continue;
+    // Only Relay-owned spawns are ours to promote/time out; a detached or plain
+    // registered worker is never supervised.
+    if (!isOperationalWorker(db, w)) continue;
     const sr = getStartingRuntime(db, w.id, w.generation);
     if (!sr) continue;
 
@@ -298,6 +303,9 @@ export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<
   for (const w of listWorkers(db)) {
     const fresh = getWorker(db, w.id)!;
     if (fresh.state === "starting") continue;
+    // Detached / never-attached workers are NOT supervised: skip liveness
+    // polling, dead detection, stall detection and restart entirely.
+    if (!isOperationalWorker(db, fresh)) continue;
 
     const alive = await rt.isAlive(fresh).catch(() => false);
 
@@ -371,7 +379,7 @@ export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<
     if (!woken) {
       // No idle worker can take it. Recover a fallen one, or wait for a fresh
       // generation to finish attaching. Never nudge waiting_input workers.
-      const fallen = listWorkers(db)
+      const fallen = operationalWorkers(db)
         .filter((x) => x.state === "dead" || x.state === "stalled")
         .sort((a, b) => a.id.localeCompare(b.id))[0];
       if (fallen) {
@@ -379,7 +387,7 @@ export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<
         else actions.push(`restart-skipped:${fallen.id}`);
       } else if (idle.length > 0) {
         actions.push("wake-suppressed");
-      } else if (listWorkers(db).some((x) => x.state === "starting")) {
+      } else if (operationalWorkers(db).some((x) => x.state === "starting")) {
         actions.push("awaiting-start");
       } else {
         logEvent(db, { source: "supervisor", type: "supervisor.no_idle_worker", payload: { view } });

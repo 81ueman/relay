@@ -1,7 +1,7 @@
 import type { Database } from "bun:sqlite";
 import { now } from "./db";
 import { logEvent } from "./events";
-import { clearCurrentTask, getWorker, touchProgress } from "./workers";
+import { clearCurrentTask, getWorker, normalizeWorkerAfterTaskRelease, touchProgress } from "./workers";
 import type { Task, TaskState } from "./schema";
 
 export const STALE_LEASE = "STALE_LEASE";
@@ -216,10 +216,7 @@ export function submitTask(
   db.query(`UPDATE tasks SET state = 'review', updated_at = ? WHERE id = ?`).run(t, taskId);
   clearCurrentTask(db, workerId);
   touchProgress(db, workerId, t);
-  const w = getWorker(db, workerId)!;
-  if (w.state === "working") {
-    db.query(`UPDATE workers SET state = 'idle', updated_at = ? WHERE id = ?`).run(t, workerId);
-  }
+  normalizeWorkerAfterTaskRelease(db, workerId, t);
   logEvent(db, { source: "worker", workerId, taskId, type: "task.submitted" });
   return getTask(db, taskId)!;
 }
@@ -232,7 +229,8 @@ export function approveTask(db: Database, taskId: string, workerId: string): Tas
   db.query(`UPDATE tasks SET state = 'done', updated_at = ? WHERE id = ?`).run(t, taskId);
   if (task.assignee === workerId) clearCurrentTask(db, workerId);
   else if (task.assignee) clearCurrentTask(db, task.assignee);
-  db.query(`UPDATE workers SET state = 'idle', updated_at = ? WHERE id = ? AND current_task_id IS NULL`).run(t, workerId);
+  normalizeWorkerAfterTaskRelease(db, workerId, t);
+  if (task.assignee && task.assignee !== workerId) normalizeWorkerAfterTaskRelease(db, task.assignee, t);
   touchProgress(db, workerId, t);
   logEvent(db, { source: "reviewer", workerId, taskId, type: "task.approved" });
   return getTask(db, taskId)!;
@@ -247,7 +245,11 @@ export function rejectTask(db: Database, taskId: string, workerId: string, reaso
   db.query(
     `UPDATE tasks SET state = 'queued', assignee = NULL, lease_token = lease_token + 1, lease_until = NULL, updated_at = ? WHERE id = ?`
   ).run(t, taskId);
-  if (task.assignee) clearCurrentTask(db, task.assignee);
+  if (task.assignee) {
+    clearCurrentTask(db, task.assignee);
+    normalizeWorkerAfterTaskRelease(db, task.assignee, t);
+  }
+  normalizeWorkerAfterTaskRelease(db, workerId, t);
   touchProgress(db, workerId, t);
   logEvent(db, { source: "reviewer", workerId, taskId, type: "task.rejected", payload: { reason } });
   return getTask(db, taskId)!;
@@ -267,9 +269,12 @@ export function blockTask(db: Database, taskId: string, workerId: string, reason
     `UPDATE tasks SET state = ?, assignee = NULL, lease_until = NULL, lease_token = lease_token + 1, updated_at = ? WHERE id = ?`
   ).run(state, t, taskId);
   // A blocked task never parks the worker: it must immediately take the next runnable task.
-  if (task.assignee) clearCurrentTask(db, task.assignee);
+  if (task.assignee) {
+    clearCurrentTask(db, task.assignee);
+    normalizeWorkerAfterTaskRelease(db, task.assignee, t);
+  }
   db.query(`UPDATE workers SET current_task_id = NULL WHERE id = ? AND current_task_id = ?`).run(workerId, taskId);
-  db.query(`UPDATE workers SET state = 'idle', updated_at = ? WHERE id = ? AND current_task_id IS NULL`).run(t, workerId);
+  normalizeWorkerAfterTaskRelease(db, workerId, t);
   touchProgress(db, workerId, t);
   logEvent(db, { source: "worker", workerId, taskId, type: human ? "task.blocked_human" : "task.blocked_internal", payload: { reason } });
   return getTask(db, taskId)!;
@@ -284,6 +289,7 @@ export function expireLeases(db: Database, at = now()): Task[] {
     ).run(at, task.id);
     if (task.assignee) {
       db.query(`UPDATE workers SET current_task_id = NULL, updated_at = ? WHERE id = ? AND current_task_id = ?`).run(at, task.assignee, task.id);
+      normalizeWorkerAfterTaskRelease(db, task.assignee, at);
     }
     logEvent(db, { source: "supervisor", workerId: task.assignee, taskId: task.id, type: "task.lease_expired" });
   }

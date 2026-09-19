@@ -7,8 +7,9 @@ import { openDb } from "../src/db";
 import { listEvents } from "../src/events";
 import { claimInbox, inboxFor, sendMessage } from "../src/messages";
 import { handleIdleSignal, reconcile } from "../src/reconciler";
-import { MockRuntime } from "../src/runtime/runtime";
+import { MockRuntime, type HerdrIdentity } from "../src/runtime/runtime";
 import { supervisorView, systemStatus } from "../src/scheduler";
+import { attachSession } from "../src/sessions";
 import { getWorker } from "../src/workers";
 import {
   addTask, approveTask, blockTask, claimNext, getTask,
@@ -36,10 +37,22 @@ afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-function worker(id: string, role = "worker"): void {
-  registerWorker(db, id, { role });
-  db.query(`UPDATE workers SET state = 'idle' WHERE id = ?`).run(id);
+function identityFor(id: string, runtimeId: string): HerdrIdentity {
+  return { agent: runtimeId, tabId: `tab-${id}`, paneId: `pane-${id}`, workspaceId: "w-test", agentKind: "opencode" };
+}
+
+/**
+ * Register a worker and attach a managed session. Only managed workers are
+ * schedulable: a plain registered worker is invisible to the supervisor.
+ */
+function managedWorker(id: string, role = "worker", runtimeId = `${id}-agent`): void {
+  registerWorker(db, id, { role, runtimeId });
+  attachSession(db, `ses_${id}`, { role, workerId: id, identity: identityFor(id, runtimeId) });
   rt.setAlive(id, true);
+}
+
+function worker(id: string, role = "worker"): void {
+  managedWorker(id, role);
 }
 
 describe("phase 1: tasks + workers", () => {
@@ -219,9 +232,7 @@ describe("failure test 5: lost wake", () => {
 
 describe("failure test 6: no productive worker", () => {
   test("queued task + all workers idle/dead => supervisor wakes or restarts one", async () => {
-    registerWorker(db, "w1", { role: "worker" });
-    db.query(`UPDATE workers SET state = 'idle' WHERE id = 'w1'`).run();
-    rt.setAlive("w1", true);
+    managedWorker("w1");
     addTask(db, { title: "orphaned work" });
     // Force zero productive workers: mark dead but transport can restart.
     db.query(`UPDATE workers SET state = 'dead' WHERE id = 'w1'`).run();
@@ -281,9 +292,7 @@ describe("stalled detection (multi-signal, never bare idle)", () => {
 describe("planner / reviewer automation", () => {
   test("reviewer woken when reviews pile up", async () => {
     worker("w1");
-    registerWorker(db, "rev", { role: "reviewer" });
-    db.query(`UPDATE workers SET state = 'idle' WHERE id = 'rev'`).run();
-    rt.setAlive("rev", true);
+    managedWorker("rev", "reviewer");
     const t = addTask(db, { title: "to review" });
     claimNext(db, "w1");
     submitTask(db, t.id, "w1", { evidence: "e" });
@@ -308,9 +317,7 @@ describe("planner / reviewer automation", () => {
 
   test("planner woken when queue runs low", async () => {
     process.env.AGENTCTL_LOW_WATER = "3";
-    registerWorker(db, "plan", { role: "planner" });
-    db.query(`UPDATE workers SET state = 'idle' WHERE id = 'plan'`).run();
-    rt.setAlive("plan", true);
+    managedWorker("plan", "planner");
     addTask(db, { title: "last one" });
     const { actions } = await reconcile(db, rt);
     expect(actions).toContain("planner-woken:plan");

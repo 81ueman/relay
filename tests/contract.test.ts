@@ -44,9 +44,18 @@ afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
+/**
+ * Register a worker and attach a managed session. Only managed workers are
+ * schedulable: `idleWorkers()` ignores a plain registered worker.
+ */
 function idleWorker(id: string, role = "worker", extra: Record<string, unknown> = {}): void {
-  registerWorker(db, id, { role, ...extra } as never);
-  db.query(`UPDATE workers SET state = 'idle' WHERE id = ?`).run(id);
+  const runtimeId = (extra.runtimeId as string | undefined) ?? `${id}-agent`;
+  registerWorker(db, id, { role, runtimeId });
+  attachSession(db, `ses_${id}`, {
+    role,
+    workerId: id,
+    identity: { agent: runtimeId, tabId: `tab-${id}`, paneId: `pane-${id}`, workspaceId: "w-ext", agentKind: "opencode" },
+  });
   rt.setAlive(id, true);
 }
 
@@ -179,9 +188,7 @@ describe("E. dead worker real restart", () => {
 
 describe("F. runtime_id routing", () => {
   test("every runtime call targets runtime_id, never the worker id", async () => {
-    registerWorker(db, "worker-1", { role: "worker", runtimeId: "pane-special" });
-    db.query(`UPDATE workers SET state = 'idle' WHERE id = 'worker-1'`).run();
-    rt.setAlive("worker-1", true);
+    idleWorker("worker-1", "worker", { runtimeId: "pane-special" });
     const w = getWorker(db, "worker-1")!;
     await rt.isAlive(w);
     await rt.wake(w, "hi");
@@ -208,8 +215,14 @@ describe("G. zombie session protection", () => {
   test("gen-1 event cannot touch a gen-2 worker", async () => {
     const s1 = attachSession(db, "ses-z", { role: "worker", identity: IDENTITY });
     expect(s1.generation).toBe(1);
-    // Re-attach (e.g. session resume / worker rebind) bumps the generation.
-    const s2 = attachSession(db, "ses-z", { role: "worker", workerId: s1.worker_id!, identity: IDENTITY });
+    // The Herdr pane moved (new tab/pane): a re-attach with a DIFFERENT verified
+    // identity is not the same binding, so it gets a fresh generation. (An
+    // identical binding is idempotent — see the manual-attach idempotency test.)
+    const s2 = attachSession(db, "ses-z", {
+      role: "worker",
+      workerId: s1.worker_id!,
+      identity: { ...IDENTITY, agent: "herdr-agent-2", tabId: "tab-ext-2", paneId: "pane-ext-2" },
+    });
     expect(s2.generation).toBe(2);
     const before = eventCount();
     const stale = await handleSocketMessage({ type: "session.idle", session_id: "ses-z", generation: 1 }, ctx);

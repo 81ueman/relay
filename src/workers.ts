@@ -74,3 +74,18 @@ export function bindSession(db: Database, id: string, sessionId: string): Worker
 export function clearCurrentTask(db: Database, id: string): void {
   db.query(`UPDATE workers SET current_task_id = NULL, updated_at = ? WHERE id = ?`).run(now(), id);
 }
+
+/**
+ * Normalize a worker that no longer holds a task. A worker with no
+ * current_task_id must never stay `working`/`waiting_input`: those states imply
+ * an owned task. starting/dead/stalled mean something else and are left alone.
+ *
+ * Called after every task-release path (submit/block/reject/approve/lease
+ * expiry) so no half-state survives into the next reconcile pass.
+ */
+export function normalizeWorkerAfterTaskRelease(db: Database, id: string, at = now()): void {
+  db.query(
+    `UPDATE workers SET state = 'idle', updated_at = ?
+      WHERE id = ? AND current_task_id IS NULL AND state IN ('working', 'waiting_input')`
+  ).run(at, id);
+}

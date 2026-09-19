@@ -4,6 +4,7 @@ import { logEvent } from "./events";
 import type { HerdrIdentity } from "./runtime/runtime";
 import {
   findRuntime,
+  getActiveRuntime,
   listRuntimes,
   markRuntimeActive,
   markRuntimeStale,
@@ -84,6 +85,7 @@ export function attachSession(db: Database, sessionId: string, opts: AttachOptio
   const role = opts.role ?? prev?.role ?? "worker";
   const workerId = opts.workerId ?? prev?.worker_id ?? slugSession(sessionId);
   const spawned = opts.generation !== undefined;
+  const generation = spawned ? opts.generation! : (prev?.generation ?? 0) + 1;
 
   // A managed session belongs to exactly one worker. Refuse a cross-worker
   // steal (e.g. a stale plugin on a shared server claiming another session).
@@ -91,26 +93,87 @@ export function attachSession(db: Database, sessionId: string, opts: AttachOptio
     throw new Error(`attach rejected: ${sessionId} is already managed by ${prev.worker_id}`);
   }
 
-  const runtimeRow = spawned ? findRuntime(db, workerId, opts.generation!) : null;
+  const worker0 = getWorker(db, workerId);
+  const runtimeRow = spawned ? findRuntime(db, workerId, generation) : null;
+
   if (spawned) {
     if (!runtimeRow) {
-      throw new Error(`attach rejected: no runtime row for ${workerId} g${opts.generation}`);
+      throw new Error(`attach rejected: no runtime row for ${workerId} g${generation}`);
     }
     if (runtimeRow.relay_owned !== 1) {
-      throw new Error(`attach rejected: runtime ${workerId} g${opts.generation} is not relay-owned`);
+      throw new Error(`attach rejected: runtime ${workerId} g${generation} is not relay-owned`);
     }
     if (runtimeRow.state !== "starting" && runtimeRow.state !== "active") {
-      throw new Error(`attach rejected: runtime ${workerId} g${opts.generation} is ${runtimeRow.state}`);
+      throw new Error(`attach rejected: runtime ${workerId} g${generation} is ${runtimeRow.state}`);
     }
-    if (runtimeRow.attach_token && opts.attachToken !== runtimeRow.attach_token) {
-      throw new Error(`attach rejected: bad token for ${workerId} g${opts.generation}`);
+    // Fail closed: a relay-spawned generation ALWAYS carries a non-null
+    // per-spawn token. A tokenless runtime row (legacy/corrupt) is NOT attachable,
+    // and a missing incoming token is always rejected.
+    if (!runtimeRow.attach_token) {
+      throw new Error(`attach rejected: runtime ${workerId} g${generation} has no attach token`);
     }
-  } else if (!opts.identity?.agent) {
-    throw new Error("attach failed: session is not running inside Herdr");
+    if (!opts.attachToken || opts.attachToken !== runtimeRow.attach_token) {
+      throw new Error(`attach rejected: bad token for ${workerId} g${generation}`);
+    }
+    // An ACTIVE generation already belongs to exactly one session. The token
+    // proves generation ownership, not permission for any session to bind.
+    if (runtimeRow.state === "active") {
+      const idempotent =
+        runtimeRow.session_id === sessionId &&
+        !!worker0 &&
+        worker0.opencode_session_id === sessionId &&
+        worker0.generation === generation &&
+        !!prev &&
+        prev.managed === 1 &&
+        prev.worker_id === workerId &&
+        prev.generation === generation;
+      if (idempotent) return prev!;
+      throw new Error(
+        `attach rejected: ${workerId} g${generation} is already active on ${runtimeRow.session_id ?? "another session"}`
+      );
+    }
+  } else {
+    if (!opts.identity?.agent) {
+      throw new Error("attach failed: session is not running inside Herdr");
+    }
+    // Never silently migrate a busy worker: an owned task must be
+    // submitted/blocked/requeued before its session is rebound.
+    if (worker0 && worker0.current_task_id) {
+      throw new Error(`attach rejected: worker ${workerId} is busy with task ${worker0.current_task_id}`);
+    }
+    // Do not steal another managed worker binding without an explicit detach.
+    if (worker0 && worker0.opencode_session_id && worker0.opencode_session_id !== sessionId) {
+      const bound = getSession(db, worker0.opencode_session_id);
+      if (bound && bound.managed === 1) {
+        throw new Error(
+          `attach rejected: worker ${workerId} is already managed by ${worker0.opencode_session_id}; detach it first`
+        );
+      }
+    }
+    // Idempotent re-attach: this session already owns this worker on the same
+    // Herdr runtime => return the existing binding unchanged (no new generation,
+    // no new runtime history row).
+    if (
+      prev &&
+      prev.managed === 1 &&
+      prev.worker_id === workerId &&
+      !!worker0 &&
+      worker0.opencode_session_id === sessionId
+    ) {
+      const active = getActiveRuntime(db, workerId);
+      if (
+        active &&
+        active.relay_owned === 0 &&
+        active.runtime_id === opts.identity!.agent &&
+        active.tab_id === opts.identity!.tabId &&
+        active.pane_id === opts.identity!.paneId
+      ) {
+        return prev;
+      }
+    }
   }
 
-  const generation = spawned ? opts.generation! : (prev?.generation ?? 0) + 1;
-  const worker = getWorker(db, workerId) ?? registerWorker(db, workerId, { role, sessionId });
+  const worker = worker0 ?? registerWorker(db, workerId, { role, sessionId });
 
   // Supersede the worker's previous session: events from the old generation's
   // session must no longer drive this worker (zombie protection on the way in).
@@ -171,19 +234,36 @@ export function attachSession(db: Database, sessionId: string, opts: AttachOptio
   return getSession(db, sessionId)!;
 }
 
-/** Detach: the session returns to a plain standalone OpenCode session. */
+/**
+ * Detach: the session returns to a plain standalone OpenCode session.
+ *
+ * Management off, NOT runtime destruction: runtime rows are kept, and an
+ * adopted runtime (relay_owned=false) is never closed. A worker that still owns
+ * a task is REJECTED — detaching it would leave a task owned by an unmanaged
+ * (unsupervised) session. Submit/block/requeue first.
+ */
 export function detachSession(db: Database, sessionId: string): Session | null {
   const t = now();
   const s = getSession(db, sessionId);
   if (!s) return null;
+
+  if (s.worker_id) {
+    const w = getWorker(db, s.worker_id);
+    if (w && w.opencode_session_id === sessionId && w.current_task_id) {
+      throw new Error(
+        `detach rejected: worker ${w.id} still owns task ${w.current_task_id}; submit/block/requeue it first`
+      );
+    }
+  }
+
   db.query(`UPDATE sessions SET managed = 0, detached_at = ?, updated_at = ? WHERE session_id = ?`).run(t, t, sessionId);
   if (s.worker_id) {
     const w = getWorker(db, s.worker_id);
-    // Release the session binding; a task-holding worker keeps its task (explicit CLI moves it).
-    if (w && w.opencode_session_id === sessionId && !w.current_task_id) {
-      db.query(`UPDATE workers SET opencode_session_id = NULL, state = 'idle', updated_at = ? WHERE id = ?`).run(t, w.id);
-    } else if (w && w.opencode_session_id === sessionId) {
-      db.query(`UPDATE workers SET opencode_session_id = NULL, updated_at = ? WHERE id = ?`).run(t, w.id);
+    if (w && w.opencode_session_id === sessionId) {
+      // No managed session => not operational: no wake, no poll, no restart.
+      db.query(
+        `UPDATE workers SET opencode_session_id = NULL, current_task_id = NULL, state = 'idle', nudged_at = NULL, updated_at = ? WHERE id = ?`
+      ).run(t, w.id);
     }
   }
   logEvent(db, { source: "supervisor", workerId: s.worker_id, type: "session.detached", payload: { sessionId } });

@@ -46,6 +46,11 @@ export interface SocketContext {
 
 const IDLE_TYPES = new Set(["session.idle"]);
 const ERROR_TYPES = new Set(["session.error", "session.execution.failed"]);
+// The plugin normalizes permission/form replies into `permission.replied`; accept
+// the raw OpenCode forms too in one place. A reply NEVER means the task is done —
+// task semantics stay explicit (`agentctl submit` / `agentctl block`).
+const PERMISSION_ASKED = new Set(["permission.asked", "form.created"]);
+const PERMISSION_REPLIED = new Set(["permission.replied", "form.replied", "form.cancelled"]);
 
 export async function handleSocketMessage(msg: SocketMessage, ctx: SocketContext): Promise<Record<string, unknown>> {
   const { db, runtime } = ctx;
@@ -102,8 +107,12 @@ export async function handleSocketMessage(msg: SocketMessage, ctx: SocketContext
 
   if (type === "session.detach") {
     if (!msg.session_id) return { ok: false, reason: "no-session" };
-    const s = detachSession(db, msg.session_id);
-    return { ok: true, managed: s ? s.managed === 1 : false };
+    try {
+      const s = detachSession(db, msg.session_id);
+      return { ok: true, managed: s ? s.managed === 1 : false };
+    } catch (e) {
+      return { ok: false, reason: String(e).slice(0, 200) };
+    }
   }
 
   // All other events are gated on managed sessions first (no writes when ignored).
@@ -131,10 +140,22 @@ export async function handleSocketMessage(msg: SocketMessage, ctx: SocketContext
     return { ok: true, reconciled: actions };
   }
 
-  if (type === "permission.asked") {
+  if (PERMISSION_ASKED.has(type)) {
     touchSeen(db, workerId);
     const w = getWorker(db, workerId)!;
     if (w.state === "working") setWorkerState(db, workerId, "waiting_input");
+    logEvent(db, { source: "opencode", workerId, type, payload: msg.payload ?? {} });
+    return { ok: true };
+  }
+
+  if (PERMISSION_REPLIED.has(type)) {
+    touchSeen(db, workerId);
+    const w = getWorker(db, workerId)!;
+    // The reply restores the state the permission interrupted. Never infer task
+    // completion from a form cancellation.
+    if (w.state === "waiting_input" || w.state === "working") {
+      setWorkerState(db, workerId, w.current_task_id ? "working" : "idle");
+    }
     logEvent(db, { source: "opencode", workerId, type, payload: msg.payload ?? {} });
     return { ok: true };
   }

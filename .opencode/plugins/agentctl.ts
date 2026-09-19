@@ -335,9 +335,13 @@ async function buildTools(): Promise<Record<string, any>> {
           { type: "session.detach", session_id: context.sessionID },
           context.directory
         );
+        if (!res?.ok) {
+          // Rejected (e.g. the worker still owns a task): stay managed. Do not
+          // poison the local caches — the session is NOT detached.
+          return `detach failed (${res?.reason ?? "unknown"}); session is still managed.`;
+        }
         detachedCache.add(context.sessionID);
         generationCache.delete(context.sessionID);
-        if (!res?.ok) return `detach failed (${res?.reason ?? "unknown"}); session treated as detached locally.`;
         return "detached. This session is now a normal standalone OpenCode session.";
       },
     }),

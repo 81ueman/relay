@@ -280,8 +280,10 @@ describe("J. old session/generation events are fenced out", () => {
     const s1 = attachSession(db, "ses_old", { role: "worker", identity: IDENTITY });
     const workerId = s1.worker_id!;
     // Fresh relay-owned generation supersedes the manual session.
-    recordRuntime(db, { workerId, generation: 2, runtimeId: "rt-g2", relayOwned: 1, state: "starting" });
-    attachSession(db, "ses_new", { workerId, generation: 2 });
+    recordRuntime(db, {
+      workerId, generation: 2, runtimeId: "rt-g2", relayOwned: 1, state: "starting", attachToken: "tok-g2",
+    });
+    attachSession(db, "ses_new", { workerId, generation: 2, attachToken: "tok-g2" });
 
     expect(getSession(db, "ses_old")!.managed).toBe(0); // superseded
     expect(getWorker(db, workerId)!.opencode_session_id).toBe("ses_new");

@@ -140,8 +140,16 @@ worker_runtime: state = active  relay_owned = false  tab_id/pane_id = existing
 ```
 
 Attach bumps a per-session `generation`; events carrying a stale generation are
-ignored (zombie-session protection). Detach returns the session to normal.
-**No process is restarted, and Relay never closes the adopted tab.**
+ignored (zombie-session protection). Re-attaching the **same** session to the
+same worker on the same Herdr agent/tab/pane is idempotent (no new generation,
+no new runtime row), and a worker that already owns a task — or a boundary that
+another managed session already holds — is rejected rather than silently
+rebound. Detach returns the session to normal: it clears `session.managed` and
+the worker's session binding, so a detached worker is never woken, polled,
+stalled or restarted again. A worker that still owns a task cannot be detached
+(`submit`/`block`/`requeue` first). **No process is restarted, detach is not a
+destroy, and Relay never closes the adopted tab (or any `relay_owned=false`
+runtime), even after cleanup grace.**
 
 ### B. Let Relay spawn a fresh Herdr runtime (relay_owned = true)
 
@@ -168,12 +176,17 @@ env-only path for dedicated one-server-per-worker deployments, but it is off by
 default because a shared server cannot identify a session from process env.)
 
 The `token` is the **per-spawn secret** (`worker_runtimes.attach_token`). A
-relay-generation attach is accepted only when the matching runtime row exists,
-is `relay_owned=true`, is `starting`/`active`, and the token matches exactly —
-so a stale plugin instance, another project's session, or an unrelated OpenCode
-session on the same shared server can never bind a session it does not own. A
-managed session also belongs to exactly one worker: a cross-worker attach is
-refused outright.
+relay-generation attach is **fail-closed**: it is accepted only when the
+matching runtime row exists, is `relay_owned=true`, is `starting`/`active`,
+**records a non-null token**, and the incoming token matches exactly. A tokenless
+runtime row (legacy/corrupt) or a missing token is rejected — so a stale plugin
+instance, another project's session, or an unrelated OpenCode session on the
+same shared server can never bind a session it does not own. A managed session
+also belongs to exactly one worker: a cross-worker attach is refused outright,
+and once a generation is `active` on one session it can never be taken by
+another session even with a valid token (the token proves generation ownership,
+not a licence to rebind). A retry of the identical attach is an idempotent
+success.
 
 ## Runtime generations (fresh start, stale old, later cleanup)
 

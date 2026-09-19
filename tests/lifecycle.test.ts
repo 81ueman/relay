@@ -51,11 +51,31 @@ function eventCount(): number {
   return listEvents(db, { limit: 10000 }).length;
 }
 
-function seedWorker(id: string, generation: number, runtimeId: string | null, state = "idle"): void {
-  registerWorker(db, id, { role: "worker" });
-  db.query(`UPDATE workers SET state = ?, generation = ?, runtime_id = ? WHERE id = ?`).run(
-    state,
+/**
+ * Register a worker and give it a MANAGED session + a relay-owned active runtime
+ * at `generation`. Only managed workers are schedulable/restartable, so every
+ * lifecycle fixture must go through the real attach path.
+ */
+function seedWorker(id: string, generation: number, runtimeId: string | null, state = "idle", role = "worker"): void {
+  registerWorker(db, id, { role });
+  const token = `seed-${id}-g${generation}`;
+  recordRuntime(db, {
+    workerId: id,
     generation,
+    runtimeId,
+    tabId: runtimeId ? `tab-${id}-g${generation}` : null,
+    state: "starting",
+    relayOwned: 1,
+    attachToken: token,
+  });
+  attachSession(db, `ses_${id}_g${generation}`, {
+    workerId: id,
+    role,
+    generation,
+    attachToken: token,
+  });
+  db.query(`UPDATE workers SET state = ?, runtime_id = COALESCE(?, runtime_id) WHERE id = ?`).run(
+    state,
     runtimeId,
     id
   );
@@ -182,10 +202,18 @@ describe("6. relay-spawned session auto attaches", () => {
   test("attach with worker + generation registers managed and activates the fresh runtime", async () => {
     registerWorker(db, "w1", { role: "worker" });
     db.query(`UPDATE workers SET state = 'starting', generation = 2, runtime_id = 'rt-w1-g2' WHERE id = 'w1'`).run();
-    recordRuntime(db, { workerId: "w1", generation: 2, runtimeId: "rt-w1-g2", tabId: "tab-w1-g2", state: "starting" });
+    recordRuntime(db, {
+      workerId: "w1",
+      generation: 2,
+      runtimeId: "rt-w1-g2",
+      tabId: "tab-w1-g2",
+      state: "starting",
+      relayOwned: 1,
+      attachToken: "tok-w1-g2",
+    });
 
     const res = await handleSocketMessage(
-      { type: "session.attach", session_id: "ses-spawn", worker_id: "w1", generation: 2, role: "worker" },
+      { type: "session.attach", session_id: "ses-spawn", worker_id: "w1", generation: 2, role: "worker", token: "tok-w1-g2" },
       ctx
     );
     expect(res.ok).toBe(true);
@@ -239,9 +267,7 @@ describe("8. permission wait is not wakeable", () => {
 describe("9. all work complete stays quiet", () => {
   test("no planner wake when queued/running/review/blocked are all zero", async () => {
     seedWorker("w1", 1, "rt-w1-g1");
-    registerWorker(db, "plan", { role: "planner" });
-    db.query(`UPDATE workers SET state = 'idle' WHERE id = 'plan'`).run();
-    rt.setAlive("plan", true);
+    seedWorker("plan", 1, "rt-plan-g1", "idle", "planner");
 
     const t = addTask(db, { title: "the only task" });
     claimNext(db, "w1");
@@ -274,13 +300,16 @@ describe("10. non-session ids are rejected", () => {
 describe("11. a fresh generation supersedes the old session", () => {
   test("attaching g2 detaches the worker's g1 session so its events stop counting", async () => {
     registerWorker(db, "w1", { role: "worker" });
-    db.query(`UPDATE workers SET state = 'idle', generation = 1, runtime_id = 'rt-w1-g1' WHERE id = 'w1'`).run();
-    recordRuntime(db, { workerId: "w1", generation: 1, runtimeId: "rt-w1-g1", state: "active" });
-    attachSession(db, "ses-w1-g1", { workerId: "w1", role: "worker", generation: 1 });
+    recordRuntime(db, {
+      workerId: "w1", generation: 1, runtimeId: "rt-w1-g1", state: "starting", relayOwned: 1, attachToken: "tok-g1",
+    });
+    attachSession(db, "ses-w1-g1", { workerId: "w1", role: "worker", generation: 1, attachToken: "tok-g1" });
     expect(getSession(db, "ses-w1-g1")!.managed).toBe(1);
 
-    recordRuntime(db, { workerId: "w1", generation: 2, runtimeId: "rt-w1-g2", state: "starting" });
-    attachSession(db, "ses-w1-g2", { workerId: "w1", role: "worker", generation: 2 });
+    recordRuntime(db, {
+      workerId: "w1", generation: 2, runtimeId: "rt-w1-g2", state: "starting", relayOwned: 1, attachToken: "tok-g2",
+    });
+    attachSession(db, "ses-w1-g2", { workerId: "w1", role: "worker", generation: 2, attachToken: "tok-g2" });
 
     expect(getSession(db, "ses-w1-g1")!.managed).toBe(0); // old session fenced out
     expect(getSession(db, "ses-w1-g2")!.managed).toBe(1);
