@@ -159,6 +159,9 @@ export class HerdrRuntime implements Runtime {
     ];
     if (process.env.AGENTCTL_DB) envArgs.push("--env", `AGENTCTL_DB=${process.env.AGENTCTL_DB}`);
     if (process.env.AGENTCTL_SOCK) envArgs.push("--env", `AGENTCTL_SOCK=${process.env.AGENTCTL_SOCK}`);
+    // The spawned agent must be able to resolve `agentctl`/`opencode` exactly
+    // like the daemon does; tab shells do not inherit the daemon's PATH.
+    if (process.env.PATH) envArgs.push("--env", `PATH=${process.env.PATH}`);
 
     const tab = runHerdr(
       ["tab", "create", "--workspace", workspace, "--cwd", cwd, "--no-focus", "--label", relayTabLabel(w.id, generation), ...envArgs],
