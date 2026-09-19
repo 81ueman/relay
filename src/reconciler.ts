@@ -6,30 +6,86 @@ import {
   needsPlanner,
   needsReviewer,
   needsWorkerWakeup,
+  planners,
+  reviewers,
   stallMs,
   supervisorView,
+  wakeableWorkers,
 } from "./scheduler";
 import { approveTask, expireLeases, getTask, reviewTasks, runnableTasks } from "./tasks";
-import { getWorker, listWorkers, setWorkerState, touchSeen } from "./workers";
+import { getWorker, listWorkers, setWorkerState, touchSeen, type WorkerRow } from "./workers";
 
 // Deterministic reconciler. No LLM: pure DB state + runtime transport.
+// Callers pass full Worker rows; only the Runtime adapter maps to targets.
 
-export const NEXT_NUDGE = "You have runnable work waiting. Run `agentctl next` now. Do not wait for instructions.";
+export const NEXT_NUDGE = "Run `agentctl next` now. Do not wait for instructions.";
 export const CONTINUE_NUDGE = (taskId: string) =>
-  `Your current task ${taskId} is still running. Check task state and continue the next concrete action. Do not start over; do not wait.`;
+  `Your task ${taskId} is still running. ` +
+  `Continue the next concrete action. ` +
+  `If blocked, explicitly block it. ` +
+  `Do not wait for instructions.`;
 export const STALL_NUDGE = (taskId: string) =>
   `No progress on ${taskId} for a while. If you can proceed, continue now. If you are stuck, run \`agentctl block ${taskId} "<reason>"\` (or --human only when a human is truly required), then run \`agentctl next\`.`;
 export const REVIEW_NUDGE = "There are tasks waiting for review. Run `agentctl next` to pick one up.";
 export const PLANNER_NUDGE =
   "Task queue is running low. Decompose the next objective into small tasks with acceptance criteria (agentctl task add), then go idle. Do not monitor other workers.";
 
-async function tryWake(rt: Runtime, db: Database, workerId: string, text: string, reason: string): Promise<boolean> {
+function wakeCooldownMs(): number {
+  const v = Number(process.env.AGENTCTL_WAKE_COOLDOWN_MS ?? "30000");
+  return Number.isFinite(v) && v >= 0 ? v : 30000;
+}
+
+function recentlyWoken(db: Database, workerId: string, at: number): boolean {
+  const cd = wakeCooldownMs();
+  if (cd === 0) return false;
+  const r = db
+    .query(`SELECT COUNT(*) AS n FROM events WHERE worker_id = ? AND type = 'worker.woken' AND timestamp > ?`)
+    .get(workerId, at - cd) as { n: number };
+  return r.n > 0;
+}
+
+async function tryWake(
+  rt: Runtime, db: Database, w: WorkerRow, text: string, reason: string, at = now()
+): Promise<boolean> {
+  if (recentlyWoken(db, w.id, at)) return false;
   try {
-    await rt.wake(workerId, text);
-    logEvent(db, { source: "supervisor", workerId, type: "worker.woken", payload: { reason } });
+    await rt.wake(w, text);
+    logEvent(db, { source: "supervisor", workerId: w.id, type: "worker.woken", payload: { reason } });
     return true;
   } catch (e) {
-    logEvent(db, { source: "supervisor", workerId, type: "worker.wake_failed", payload: { reason, error: String(e) } });
+    logEvent(db, { source: "supervisor", workerId: w.id, type: "worker.wake_failed", payload: { reason, error: String(e).slice(0, 200) } });
+    return false;
+  }
+}
+
+/** Mark a worker dead, release its task to queued with a bumped token. */
+function releaseTaskOfDeadWorker(db: Database, workerId: string, taskId: string | null, at: number): string | null {
+  if (!taskId) return null;
+  const task = getTask(db, taskId);
+  if (task && task.state === "running") {
+    db.query(
+      `UPDATE tasks SET state = 'queued', assignee = NULL, lease_token = lease_token + 1, lease_until = NULL, updated_at = ? WHERE id = ?`
+    ).run(at, task.id);
+    logEvent(db, { source: "supervisor", workerId, taskId: task.id, type: "task.requeued_dead_worker" });
+    return task.id;
+  }
+  return null;
+}
+
+/** Restart a dead worker via a real fresh generation. Returns true when reachable again. */
+async function restartWorker(db: Database, rt: Runtime, w: WorkerRow, at: number): Promise<boolean> {
+  setWorkerState(db, w.id, "restarting");
+  try {
+    const target = await rt.restart(w);
+    db.query(
+      `UPDATE workers SET runtime_id = ?, generation = generation + 1, state = 'starting',
+        current_task_id = NULL, nudged_at = NULL, updated_at = ? WHERE id = ?`
+    ).run(target, at, w.id);
+    logEvent(db, { source: "supervisor", workerId: w.id, type: "worker.restarted", payload: { target } });
+    return true;
+  } catch (e) {
+    setWorkerState(db, w.id, "dead");
+    logEvent(db, { source: "supervisor", workerId: w.id, type: "worker.restart_failed", payload: { error: String(e).slice(0, 200) } });
     return false;
   }
 }
@@ -52,43 +108,31 @@ export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<
   for (const t of expired) actions.push(`lease-expired:${t.id}`);
 
   // 2. Walk workers.
-  const workers = listWorkers(db);
   const stallTimeout = stallMs();
 
-  for (const w of workers) {
-    const alive = await rt.isAlive(w.id).catch(() => false);
+  for (const w of listWorkers(db)) {
+    const alive = await rt.isAlive(w).catch(() => false);
     const fresh = getWorker(db, w.id)!;
 
-    // Dead worker holding (or not holding) work -> mark dead, release task, restart.
     if (!alive) {
       if (fresh.state !== "dead") {
         setWorkerState(db, w.id, "dead");
         logEvent(db, { source: "supervisor", workerId: w.id, type: "worker.dead" });
         actions.push(`dead:${w.id}`);
       }
-      if (fresh.current_task_id) {
-        const task = getTask(db, fresh.current_task_id);
-        if (task && task.state === "running") {
-          db.query(
-            `UPDATE tasks SET state = 'queued', assignee = NULL, lease_token = lease_token + 1, lease_until = NULL, updated_at = ? WHERE id = ?`
-          ).run(at, task.id);
-          logEvent(db, { source: "supervisor", workerId: w.id, taskId: task.id, type: "task.requeued_dead_worker" });
-          actions.push(`requeued:${task.id}`);
-        }
-        db.query(`UPDATE workers SET current_task_id = NULL, updated_at = ? WHERE id = ?`).run(at, w.id);
-      }
-      // Restart so a replacement can pick work up; restart failure is recorded, task stays queued.
-      try {
-        await rt.restart(w.id);
-        setWorkerState(db, w.id, "restarting");
+      const requeued = releaseTaskOfDeadWorker(db, w.id, fresh.current_task_id, at);
+      if (requeued) actions.push(`requeued:${requeued}`);
+      db.query(`UPDATE workers SET current_task_id = NULL, updated_at = ? WHERE id = ?`).run(at, w.id);
+      // Real recovery: spawn a fresh generation so someone can pick work up.
+      if (await restartWorker(db, rt, { ...fresh, state: "dead" }, at)) {
         actions.push(`restarted:${w.id}`);
-      } catch (e) {
-        logEvent(db, { source: "supervisor", workerId: w.id, type: "worker.restart_failed", payload: { error: String(e) } });
+      } else {
+        actions.push(`restart-failed:${w.id}`);
       }
       continue;
     }
 
-    // Alive worker claiming work but lease-less task gone (e.g. DB moved on): resync to idle.
+    // Alive but DB moved on (task reassigned/completed elsewhere): resync to idle.
     if ((fresh.state === "working" || fresh.state === "waiting_input") && fresh.current_task_id) {
       const task = getTask(db, fresh.current_task_id);
       if (!task || (task.state !== "running" && task.state !== "review") || task.assignee !== w.id) {
@@ -97,51 +141,56 @@ export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<
         actions.push(`resynced:${w.id}`);
         continue;
       }
-      // Stalled detection: running + valid lease + no progress + process alive.
+      // Stalled: running + valid lease + stale progress + process alive.
       if (task.state === "running" && (task.lease_until ?? 0) >= at && at - fresh.last_progress_at > stallTimeout) {
         if (!fresh.nudged_at) {
-          await tryWake(rt, db, w.id, STALL_NUDGE(task.id), "stall-nudge");
+          await tryWake(rt, db, fresh, STALL_NUDGE(task.id), "stall-nudge", at);
           db.query(`UPDATE workers SET nudged_at = ?, updated_at = ? WHERE id = ?`).run(at, at, w.id);
           actions.push(`nudge:${w.id}`);
         } else if (at - fresh.nudged_at > stallTimeout) {
           setWorkerState(db, w.id, "stalled");
           logEvent(db, { source: "supervisor", workerId: w.id, taskId: task.id, type: "worker.stalled" });
-          try { await rt.interrupt(w.id); } catch { /* best effort */ }
+          try { await rt.interrupt(fresh); } catch { /* best effort */ }
           db.query(
             `UPDATE tasks SET state = 'queued', assignee = NULL, lease_token = lease_token + 1, lease_until = NULL, updated_at = ? WHERE id = ?`
           ).run(at, task.id);
           db.query(`UPDATE workers SET current_task_id = NULL, nudged_at = NULL, updated_at = ? WHERE id = ?`).run(at, w.id);
-          try { await rt.restart(w.id); } catch { /* best effort */ }
-          actions.push(`stalled:${w.id}`);
+          if (await restartWorker(db, rt, { ...fresh, state: "stalled" }, at)) {
+            actions.push(`stalled-restarted:${w.id}`);
+          } else {
+            actions.push(`stalled:${w.id}`);
+          }
         }
       }
     }
   }
 
-  // 3. Invariants.
+  // 3. Core invariant: runnable work + zero working workers => wake or start someone.
   const view = supervisorView(db);
 
   if (needsWorkerWakeup(view)) {
-    // Wake (or restart) one worker so at least one agent moves forward.
-    const candidates = listWorkers(db).sort((a, b) => a.id.localeCompare(b.id));
-    const target = candidates.find((c) => c.state === "idle" || c.state === "starting" || c.state === "waiting_input")
-      ?? candidates.find((c) => c.state === "stalled" || c.state === "dead" || c.state === "restarting")
-      ?? candidates[0];
-    if (target) {
-      if (target.state === "dead" || target.state === "stalled" || target.state === "restarting") {
-        try {
-          await rt.restart(target.id);
-          setWorkerState(db, target.id, "restarting");
-          actions.push(`restarted:${target.id}`);
-        } catch {
-          actions.push(`restart-failed:${target.id}`);
-        }
-      } else {
-        if (await tryWake(rt, db, target.id, NEXT_NUDGE, "no-productive-worker")) actions.push(`woken:${target.id}`);
+    const candidates = wakeableWorkers(db).sort((a, b) => a.id.localeCompare(b.id));
+    let woken = false;
+    for (const c of candidates) {
+      const full = getWorker(db, c.id)!;
+      if (await tryWake(rt, db, full, NEXT_NUDGE, "no-working-worker", at)) {
+        actions.push(`woken:${c.id}`);
+        woken = true;
+        break; // one wake per pass; the loop repeats, with cooldown rotation.
       }
-    } else {
-      logEvent(db, { source: "supervisor", type: "supervisor.no_workers", payload: { view } });
-      actions.push("no-workers");
+    }
+    if (!woken) {
+      // Nobody wakeable (all dead/stalled): restart one so work can move.
+      const fallen = listWorkers(db)
+        .filter((x) => x.state === "dead" || x.state === "stalled" || x.state === "restarting")
+        .sort((a, b) => a.id.localeCompare(b.id))[0];
+      if (fallen) {
+        if (await restartWorker(db, rt, fallen, at)) actions.push(`restarted:${fallen.id}`);
+        else actions.push(`restart-failed:${fallen.id}`);
+      } else {
+        logEvent(db, { source: "supervisor", type: "supervisor.no_workers", payload: { view } });
+        actions.push("no-workers");
+      }
     }
   }
 
@@ -152,17 +201,17 @@ export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<
         actions.push(`auto-approved:${t.id}`);
       }
     } else {
-      const reviewers = listWorkers(db).filter((w) => w.role === "reviewer" && (w.state === "idle" || w.state === "starting"));
-      for (const r of reviewers) {
-        if (await tryWake(rt, db, r.id, REVIEW_NUDGE, "review-pending")) actions.push(`reviewer-woken:${r.id}`);
+      for (const r of reviewers(db).filter((x) => x.state === "idle" || x.state === "starting")) {
+        const full = getWorker(db, r.id)!;
+        if (await tryWake(rt, db, full, REVIEW_NUDGE, "review-pending", at)) actions.push(`reviewer-woken:${r.id}`);
       }
     }
   }
 
   if (needsPlanner(view)) {
-    const planners = listWorkers(db).filter((w) => w.role === "planner" && (w.state === "idle" || w.state === "starting"));
-    for (const p of planners) {
-      if (await tryWake(rt, db, p.id, PLANNER_NUDGE, "queue-low")) actions.push(`planner-woken:${p.id}`);
+    for (const p of planners(db).filter((x) => x.state === "idle" || x.state === "starting")) {
+      const full = getWorker(db, p.id)!;
+      if (await tryWake(rt, db, full, PLANNER_NUDGE, "queue-low", at)) actions.push(`planner-woken:${p.id}`);
     }
   }
 
@@ -170,8 +219,8 @@ export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<
 }
 
 /**
- * Handle a session.idle signal. Idle is NEVER task completion: inspect the DB
- * and nudge accordingly. Returns a short description of what was done.
+ * Handle a session.idle signal from a MANAGED session.
+ * Idle is NEVER task completion: inspect the DB and nudge via the real runtime.
  */
 export async function handleIdleSignal(db: Database, rt: Runtime, workerId: string, at = now()): Promise<string> {
   const w = getWorker(db, workerId);
@@ -183,13 +232,13 @@ export async function handleIdleSignal(db: Database, rt: Runtime, workerId: stri
   logEvent(db, { source: "opencode", workerId, type: "session.idle" });
 
   if (!w.current_task_id) {
-    // Case 1: no task + runnable work -> wake to next.
+    // No task + runnable work -> wake to next.
     if (runnableTasks(db).length > 0) {
-      await tryWake(rt, db, workerId, NEXT_NUDGE, "idle-no-task");
+      await tryWake(rt, db, w, NEXT_NUDGE, "idle-no-task", at);
       return "woke-next";
     }
-    if ((reviewTasks(db).length > 0) && w.role === "reviewer") {
-      await tryWake(rt, db, workerId, REVIEW_NUDGE, "idle-no-task-review");
+    if (reviewTasks(db).length > 0 && w.role === "reviewer") {
+      await tryWake(rt, db, w, REVIEW_NUDGE, "idle-no-task-review", at);
       return "woke-review";
     }
     return "idle-no-work";
@@ -199,39 +248,42 @@ export async function handleIdleSignal(db: Database, rt: Runtime, workerId: stri
   if (!task) {
     db.query(`UPDATE workers SET current_task_id = NULL, state = 'idle', updated_at = ? WHERE id = ?`).run(at, workerId);
     if (runnableTasks(db).length > 0) {
-      await tryWake(rt, db, workerId, NEXT_NUDGE, "idle-task-gone");
+      const fresh = getWorker(db, workerId)!;
+      await tryWake(rt, db, fresh, NEXT_NUDGE, "idle-task-gone", at);
       return "woke-next";
     }
     return "task-gone";
   }
 
-  // Case 3: review -> worker must move on.
-  if (task.state === "review") {
-    await tryWake(rt, db, workerId, NEXT_NUDGE, "idle-in-review");
+  if (task.state === "review" || task.state === "done") {
+    const fresh0 = getWorker(db, workerId)!;
+    await tryWake(rt, db, fresh0, NEXT_NUDGE, "idle-in-review", at);
     return "woke-next";
   }
-  // Case 4: blocked_human -> never park the worker.
-  if (task.state === "blocked_human" || task.state === "blocked_internal" || task.state === "done") {
+  if (task.state === "blocked_human" || task.state === "blocked_internal") {
+    // A human-blocked task never parks the worker: release + move on.
     db.query(`UPDATE workers SET current_task_id = NULL, state = 'idle', updated_at = ? WHERE id = ?`).run(at, workerId);
+    const fresh = getWorker(db, workerId)!;
     if (runnableTasks(db).length > 0 || (reviewTasks(db).length > 0 && w.role === "reviewer")) {
-      await tryWake(rt, db, workerId, NEXT_NUDGE, "idle-terminal-task");
+      await tryWake(rt, db, fresh, NEXT_NUDGE, "idle-terminal-task", at);
       return "woke-next";
     }
     return "moved-on";
   }
-  // Case 2: still running -> premature stop. Nudge to continue, unless
-  // repeated idles with no progress indicate a stall.
   if (task.state === "running") {
+    // Premature stop until proven otherwise: continue-nudge first.
+    // Stalled verdicts need process-alive + stale progress + repeated idle
+    // (handled by the reconciler pass, never by idle alone).
     const idleCount = countIdleSinceProgress(db, workerId);
     if (idleCount >= 3 && at - w.last_progress_at > stallMs()) {
       if (!w.nudged_at) {
-        await tryWake(rt, db, workerId, STALL_NUDGE(task.id), "idle-stall-nudge");
+        await tryWake(rt, db, w, STALL_NUDGE(task.id), "idle-stall-nudge", at);
         db.query(`UPDATE workers SET nudged_at = ?, updated_at = ? WHERE id = ?`).run(at, at, workerId);
         return "stall-nudged";
       }
       return "stall-suspect";
     }
-    await tryWake(rt, db, workerId, CONTINUE_NUDGE(task.id), "idle-premature");
+    await tryWake(rt, db, w, CONTINUE_NUDGE(task.id), "idle-premature", at);
     return "nudged-continue";
   }
   return "noop";

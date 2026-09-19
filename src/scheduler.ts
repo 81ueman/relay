@@ -27,16 +27,40 @@ export function systemStatus(db: Database): SystemStatus {
   return "RUNNING";
 }
 
-/** Workers currently able to make progress (not dead/stalled/waiting). */
+/**
+ * Workers actually moving work: state == working AND holding a task.
+ * Idle is NOT productive: an idle worker with runnable tasks around
+ * must be woken, never counted as "someone is on it".
+ */
+export function workingWorkers(db: Database): { id: string; state: string }[] {
+  return listWorkers(db).filter((w) => w.state === "working" && w.current_task_id !== null);
+}
+
+/** @deprecated Use workingWorkers(). Idle does not count as productive. */
 export function productiveWorkers(db: Database): { id: string; state: string }[] {
-  return listWorkers(db).filter((w) => w.state === "working" || w.state === "idle" || w.state === "starting");
+  return workingWorkers(db);
+}
+
+/** Idle (or newly starting / permission-waiting) managed workers: wake candidates. */
+export function wakeableWorkers(db: Database): { id: string; role: string; state: string }[] {
+  return listWorkers(db).filter(
+    (w) => w.state === "idle" || w.state === "starting" || w.state === "waiting_input"
+  );
+}
+
+export function reviewers(db: Database): { id: string; state: string }[] {
+  return listWorkers(db).filter((w) => w.role === "reviewer");
+}
+
+export function planners(db: Database): { id: string; state: string }[] {
+  return listWorkers(db).filter((w) => w.role === "planner");
 }
 
 export interface SupervisorView {
   runnable: number;
   review: number;
   unfinished: number;
-  productive: number;
+  working: number;
   status: SystemStatus;
 }
 
@@ -45,13 +69,14 @@ export function supervisorView(db: Database): SupervisorView {
     runnable: runnableTasks(db).length,
     review: reviewTasks(db).length,
     unfinished: unfinishedCount(db),
-    productive: productiveWorkers(db).length,
+    working: workingWorkers(db).length,
     status: systemStatus(db),
   };
 }
 
+/** Core invariant: runnable work with zero working workers => wake or start someone. */
 export function needsWorkerWakeup(v: SupervisorView): boolean {
-  return v.runnable > 0 && v.productive === 0;
+  return v.runnable > 0 && v.working === 0;
 }
 
 export function needsPlanner(v: SupervisorView): boolean {

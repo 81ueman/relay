@@ -69,19 +69,11 @@ export function taskCounts(db: Database): Record<string, number> {
   return out;
 }
 
-function roleMatches(taskRole: string | null, workerRole: string): boolean {
-  if (taskRole === null || taskRole === "") return true;
-  if (taskRole === workerRole) return true;
-  // Generic workers may also take explicitly worker-tagged tasks.
-  if (workerRole !== "reviewer" && workerRole !== "planner" && taskRole === "worker") return true;
-  if (workerRole === "planner" && taskRole === "worker") return true;
-  return false;
-}
-
 /**
  * Atomically claim the highest-priority runnable task for a worker.
  * Uses BEGIN IMMEDIATE so double-claim across processes is impossible.
- * Reviewers are routed to review tasks (no state change, assignment only).
+ * Peer model: task `role` is an informational capability tag, not a gate.
+ * Any worker may claim any queued task; reviewers check review first.
  */
 export function claimNext(db: Database, workerId: string): Task | null {
   const worker = getWorker(db, workerId);
@@ -90,29 +82,25 @@ export function claimNext(db: Database, workerId: string): Task | null {
 
   db.run("BEGIN IMMEDIATE");
   try {
-    let task: Task | null = null;
-
     if (worker.role === "reviewer") {
-      task = (db
+      const review = (db
         .query(`SELECT * FROM tasks WHERE state = 'review' ORDER BY priority DESC, created_at ASC LIMIT 1`)
         .get() as Task | null) ?? null;
-      if (task) {
-        db.query(`UPDATE tasks SET assignee = ?, updated_at = ? WHERE id = ?`).run(workerId, t, task.id);
+      if (review) {
+        db.query(`UPDATE tasks SET assignee = ?, updated_at = ? WHERE id = ?`).run(workerId, t, review.id);
         db.query(
           `UPDATE workers SET current_task_id = ?, state = 'working', last_seen_at = ?, last_progress_at = ?, updated_at = ? WHERE id = ?`
-        ).run(task.id, t, t, t, workerId);
-        logEvent(db, { source: "scheduler", workerId, taskId: task.id, type: "task.review_assigned" });
+        ).run(review.id, t, t, t, workerId);
+        logEvent(db, { source: "scheduler", workerId, taskId: review.id, type: "task.review_assigned" });
         db.run("COMMIT");
-        return getTask(db, task.id)!;
+        return getTask(db, review.id)!;
       }
-      db.run("COMMIT");
-      return null;
+      // No reviews pending: fall through to queued work (peer, no hierarchy).
     }
 
-    const queued = db
-      .query(`SELECT * FROM tasks WHERE state = 'queued' ORDER BY priority DESC, created_at ASC`)
-      .all() as Task[];
-    task = queued.find((x) => roleMatches(x.role, worker.role)) ?? null;
+    const task = (db
+      .query(`SELECT * FROM tasks WHERE state = 'queued' ORDER BY priority DESC, created_at ASC LIMIT 1`)
+      .get() as Task | null) ?? null;
 
     if (!task) {
       db.query(`UPDATE workers SET state = CASE WHEN current_task_id IS NULL THEN 'idle' ELSE state END, updated_at = ? WHERE id = ?`).run(t, workerId);
@@ -141,7 +129,7 @@ export function claimNext(db: Database, workerId: string): Task | null {
   }
 }
 
-/** Atomically claim one specific task (queued -> running). */
+/** Atomically claim one specific task (queued -> running). Peer model: any role may claim. */
 export function claimTask(db: Database, taskId: string, workerId: string): Task {
   const worker = getWorker(db, workerId);
   if (!worker) throw new Error(`unknown worker: ${workerId}. Register first: agentctl worker register ${workerId}`);
@@ -152,9 +140,6 @@ export function claimTask(db: Database, taskId: string, workerId: string): Task 
     const task = getTask(db, taskId);
     if (!task) throw new Error(`unknown task: ${taskId}`);
     if (task.state !== "queued") throw new Error(`cannot claim task in state ${task.state}`);
-    if (!roleMatches(task.role, worker.role)) {
-      throw new Error(`task role ${task.role ?? "-"} does not match worker role ${worker.role}`);
-    }
     db.query(
       `UPDATE tasks SET state = 'running', assignee = ?, lease_token = lease_token + 1,
         lease_until = ?, updated_at = ? WHERE id = ? AND state = 'queued'`

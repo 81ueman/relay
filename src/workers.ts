@@ -3,25 +3,34 @@ import { now } from "./db";
 import { logEvent } from "./events";
 import type { Worker, WorkerState } from "./schema";
 
+export type WorkerRow = Worker;
+
 export function registerWorker(
   db: Database,
   id: string,
-  opts: { role?: string; runtimeId?: string; sessionId?: string } = {}
+  opts: { role?: string; runtimeId?: string; sessionId?: string; cwd?: string; command?: string } = {}
 ): Worker {
   const t = now();
   const existing = db.query(`SELECT * FROM workers WHERE id = ?`).get(id) as Worker | null;
   if (existing) {
     db.query(
       `UPDATE workers SET role = COALESCE(?, role), runtime_id = COALESCE(?, runtime_id),
-        opencode_session_id = COALESCE(?, opencode_session_id), updated_at = ? WHERE id = ?`
-    ).run(opts.role ?? null, opts.runtimeId ?? null, opts.sessionId ?? null, t, id);
+        opencode_session_id = COALESCE(?, opencode_session_id),
+        cwd = COALESCE(?, cwd), command = COALESCE(?, command), updated_at = ? WHERE id = ?`
+    ).run(
+      opts.role ?? null, opts.runtimeId ?? null, opts.sessionId ?? null,
+      opts.cwd ?? null, opts.command ?? null, t, id
+    );
     return getWorker(db, id)!;
   }
   db.query(
-    `INSERT INTO workers (id, role, runtime_id, opencode_session_id, state, current_task_id,
+    `INSERT INTO workers (id, role, runtime_id, cwd, command, opencode_session_id, state, current_task_id,
       generation, last_seen_at, last_progress_at, nudged_at, created_at, updated_at)
-     VALUES (?, ?, ?, ?, 'starting', NULL, 0, ?, ?, NULL, ?, ?)`
-  ).run(id, opts.role ?? "worker", opts.runtimeId ?? null, opts.sessionId ?? null, t, t, t, t);
+     VALUES (?, ?, ?, ?, ?, ?, 'starting', NULL, 0, ?, ?, NULL, ?, ?)`
+  ).run(
+    id, opts.role ?? "worker", opts.runtimeId ?? null, opts.cwd ?? null, opts.command ?? null,
+    opts.sessionId ?? null, t, t, t, t
+  );
   logEvent(db, { source: "cli", workerId: id, type: "worker.registered", payload: { role: opts.role ?? "worker" } });
   return getWorker(db, id)!;
 }

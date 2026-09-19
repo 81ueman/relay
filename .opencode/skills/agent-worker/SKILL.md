@@ -7,6 +7,10 @@ description: Durable-task worker for the relay supervisor. Start with `agentctl 
 
 You are a worker under the `agentctl` supervisor. SQLite is the source of truth — not your pane state, not Herdr idle, not your own claim of "done".
 
+If this session is not yet managed, run the `agent_attach` tool first (or ask for
+`agentctl session attach --session <id>`). Detaching (`agent_detach`) returns you
+to a normal standalone session.
+
 ## The loop (no waiting)
 
 ```text

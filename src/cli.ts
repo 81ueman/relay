@@ -3,12 +3,12 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { defaultDbPath, initControlPlane, now, openDb } from "./db";
 import { formatEvent, listEvents, logEvent } from "./events";
-import { claimInbox, inboxFor, sendMessage } from "./messages";
+import { ackMessage, claimInbox, deliverMessage, getMessage, inboxFor, sendMessage } from "./messages";
 import { runDaemon } from "./daemon";
 import { handleErrorSignal, handleIdleSignal, reconcile } from "./reconciler";
-import { HerdrRuntime } from "./runtime/herdr";
-import { MockRuntime } from "./runtime/runtime";
+import { buildRuntime, HerdrRuntime } from "./runtime/herdr";
 import { supervisorView } from "./scheduler";
+import { attachSession, detachSession, getSession, listSessions } from "./sessions";
 import {
   addTask, approveTask, blockTask, claimNext, claimTask, getNotes, getTask,
   listTasks, rejectTask, submitTask, taskCounts, addNote,
@@ -25,10 +25,15 @@ Usage:
   agentctl init
   agentctl daemon [--once] [--interval <ms>]
 
-  agentctl worker register <id> --role worker [--runtime <herdr-target>] [--session <sid>]
+  agentctl worker register <id> --role worker [--runtime <herdr-target>] [--session <sid>] [--cwd <dir>] [--command <cmd>]
   agentctl worker list
   agentctl worker status <id>
   agentctl worker bind <id> --session <sid>
+
+  agentctl session attach --session <sid> [--role worker] [--worker <id>] [--dir <d>] [--worktree <w>]
+  agentctl session detach --session <sid>
+  agentctl session list
+  agentctl session status --session <sid>
 
   agentctl task add "description" [--title T] [--acceptance A] [--priority N] [--role R] [--parent T1]
   agentctl task list [--state <state>]
@@ -43,12 +48,12 @@ Usage:
   agentctl block <task-id> "reason" [--worker <id>] [--human]
 
   agentctl send <worker-id> "message" [--task <tid>] [--kind <k>]
-  agentctl inbox [--worker <id>] [--claim]
+  agentctl inbox [--worker <id>] [--claim] [--ack <msg-id>]
 
   agentctl status
   agentctl events [--follow] [--limit N]
 
-  # OpenCode plugin entrypoint (records an event; daemon reconciles within ~1-2s)
+  # Debug entrypoint (the OpenCode plugin normally talks to the daemon socket)
   agentctl event record --type <t> [--session <sid>] [--worker <id>] [--task <tid>] [--payload <json>]
 
 Worker identity: --worker flag, $AGENTCTL_WORKER, or .agentctl/worker-id
@@ -118,7 +123,13 @@ async function main(): Promise<void> {
           const role = flag(argv.slice(2), "--role") ?? "worker";
           const runtimeId = flag(argv.slice(2), "--runtime");
           const sessionId = flag(argv.slice(2), "--session");
-          const w = registerWorker(db, id, { role, runtimeId: runtimeId ?? undefined, sessionId: sessionId ?? undefined });
+          const w = registerWorker(db, id, {
+            role,
+            runtimeId: runtimeId ?? undefined,
+            sessionId: sessionId ?? undefined,
+            cwd: flag(argv.slice(2), "--cwd") ?? undefined,
+            command: flag(argv.slice(2), "--command") ?? undefined,
+          });
           setWorkerState(db, id, "idle");
           // Remember a default worker identity for this checkout.
           try { writeFileSync(join(process.cwd(), ".agentctl", "worker-id"), id); } catch { /* ignore */ }
@@ -141,6 +152,43 @@ async function main(): Promise<void> {
           console.log(`bound ${w.id} session=${w.opencode_session_id}`);
         } else {
           throw new Error(`unknown worker subcommand: ${sub}`);
+        }
+        break;
+      }
+
+      case "session": {
+        const sub = argv[1];
+        const rest = argv.slice(2);
+        if (sub === "attach") {
+          const sessionId = flag(rest, "--session");
+          if (!sessionId) throw new Error("usage: agentctl session attach --session <sid> [--role R] [--worker W]");
+          const s = attachSession(db, sessionId, {
+            role: flag(rest, "--role") ?? undefined,
+            workerId: flag(rest, "--worker") ?? undefined,
+            directory: flag(rest, "--dir") ?? undefined,
+            worktree: flag(rest, "--worktree") ?? undefined,
+          });
+          console.log(`attached ${s.session_id} worker=${s.worker_id} generation=${s.generation}`);
+        } else if (sub === "detach") {
+          const sessionId = flag(rest, "--session");
+          if (!sessionId) throw new Error("usage: agentctl session detach --session <sid>");
+          const s = detachSession(db, sessionId);
+          console.log(s ? `detached ${s.session_id}` : "no such session (already unmanaged)");
+        } else if (sub === "list") {
+          for (const s of listSessions(db)) {
+            console.log(`${s.session_id}\t${s.managed === 1 ? "managed" : "unmanaged"}\tworker=${s.worker_id ?? "-"}\tgen=${s.generation}`);
+          }
+        } else if (sub === "status") {
+          const sessionId = flag(rest, "--session");
+          if (!sessionId) throw new Error("usage: agentctl session status --session <sid>");
+          const s = getSession(db, sessionId);
+          if (!s) {
+            console.log("unmanaged (unknown session)");
+          } else {
+            console.log(JSON.stringify(s, null, 2));
+          }
+        } else {
+          throw new Error(`unknown session subcommand: ${sub}`);
         }
         break;
       }
@@ -266,11 +314,17 @@ async function main(): Promise<void> {
           kind: flag(argv, "--kind") ?? undefined,
         });
         // Best-effort wake AFTER durable commit. Failure keeps the message queued.
-        const target = getWorker(db, recipient);
-        const herdrTarget = target?.runtime_id ?? recipient;
+        // Routing lives in the adapter (worker.runtime_id); callers pass Worker rows.
+        const existing = getWorker(db, recipient);
+        const targetRow = existing ?? {
+          id: recipient, role: "worker", runtime_id: null, cwd: null, command: null,
+          opencode_session_id: null, state: "idle" as const, current_task_id: null,
+          generation: 0, last_seen_at: 0, last_progress_at: 0, nudged_at: null,
+          created_at: 0, updated_at: 0,
+        };
         try {
           const rt = new HerdrRuntime();
-          await rt.wake(herdrTarget, `You have a new durable message (id ${id}). Run \`agentctl inbox --claim\` to receive it.`);
+          await rt.wake(targetRow, `You have a new durable message (id ${id}). Run \`agentctl inbox --claim\` to receive it.`);
           console.log(`sent msg=${id} (wake delivered)`);
         } catch (e) {
           console.log(`sent msg=${id} (wake failed, message remains queued: ${String(e).slice(0, 120)})`);
@@ -280,7 +334,11 @@ async function main(): Promise<void> {
 
       case "inbox": {
         const workerId = resolveWorkerId(flag(argv, "--worker"));
-        if (hasFlag(argv, "--claim")) {
+        const ackId = flag(argv, "--ack");
+        if (ackId !== undefined) {
+          const m = ackMessage(db, Number(ackId), workerId);
+          console.log(`acked #${m.id} (state=${m.state})`);
+        } else if (hasFlag(argv, "--claim")) {
           const items = inboxFor(db, workerId);
           for (const m of items) {
             console.log(`#${m.id} from=${m.sender} kind=${m.kind} task=${m.task_id ?? "-"}: ${m.payload}`);
@@ -312,7 +370,7 @@ async function main(): Promise<void> {
         console.log("");
         console.log("Tasks");
         console.log("-----");
-        for (const s of ["queued", "claimed", "running", "review", "blocked_internal", "blocked_human", "done", "failed"]) {
+        for (const s of ["queued", "running", "review", "blocked_internal", "blocked_human", "done", "failed"]) {
           console.log(`${s.padEnd(16)} ${counts[s] ?? 0}`);
         }
         console.log("");
@@ -362,9 +420,9 @@ async function main(): Promise<void> {
         if (!workerId && sessionId) {
           workerId = findWorkerBySession(db, sessionId)?.id;
         }
-        // session.idle is a trigger only: record + run the idle state machine inline
-        // so single-shot environments get correct behavior even without a daemon.
-        const rt = new MockRuntime(); // event path never blocks on transport
+        // Debug path: same idle state machine the daemon runs, but with the
+        // REAL runtime so wakes actually reach Herdr agents.
+        const rt = buildRuntime();
         if (type === "session.idle" && workerId) {
           const outcome = await handleIdleSignal(db, rt, workerId);
           console.log(`idle:${outcome}`);

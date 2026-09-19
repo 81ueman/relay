@@ -3,7 +3,6 @@
 
 export const TASK_STATES = [
   "queued",
-  "claimed",
   "running",
   "review",
   "done",
@@ -47,6 +46,8 @@ export interface Worker {
   id: string;
   role: string;
   runtime_id: string | null;
+  cwd: string | null; // [ext] spawn metadata for start()
+  command: string | null; // [ext] spawn metadata for start()
   opencode_session_id: string | null;
   state: WorkerState;
   current_task_id: string | null;
@@ -118,6 +119,23 @@ CREATE TABLE IF NOT EXISTS workers (
 );
 CREATE INDEX IF NOT EXISTS idx_workers_session ON workers(opencode_session_id);
 CREATE INDEX IF NOT EXISTS idx_workers_state ON workers(state);
+
+-- OpenCode sessions: managed/unmanaged gating + zombie protection.
+-- A plain opencode launch is UNMANAGED (managed=0): the plugin may load
+-- but the daemon ignores its events. agent_attach flips to MANAGED.
+CREATE TABLE IF NOT EXISTS sessions (
+  session_id TEXT PRIMARY KEY,
+  managed INTEGER NOT NULL DEFAULT 0,
+  worker_id TEXT,
+  role TEXT,
+  generation INTEGER NOT NULL DEFAULT 0,
+  directory TEXT,
+  worktree TEXT,
+  attached_at INTEGER,
+  detached_at INTEGER,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_worker ON sessions(worker_id);
 
 CREATE TABLE IF NOT EXISTS messages (
   id INTEGER PRIMARY KEY AUTOINCREMENT,

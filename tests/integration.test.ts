@@ -9,6 +9,7 @@ import { claimInbox, inboxFor, sendMessage } from "../src/messages";
 import { handleIdleSignal, reconcile } from "../src/reconciler";
 import { MockRuntime } from "../src/runtime/runtime";
 import { supervisorView, systemStatus } from "../src/scheduler";
+import { getWorker } from "../src/workers";
 import {
   addTask, approveTask, blockTask, claimNext, getTask,
   rejectTask, submitTask, addNote, expireLeases,
@@ -24,6 +25,7 @@ beforeEach(() => {
   process.env.AGENTCTL_DB = join(dir, "state.db");
   process.env.AGENTCTL_LEASE_MS = "120000";
   process.env.AGENTCTL_STALL_MS = "60000";
+  process.env.AGENTCTL_WAKE_COOLDOWN_MS = "0";
   delete process.env.AGENTCTL_AUTO_APPROVE;
   db = openDb(process.env.AGENTCTL_DB);
   rt = new MockRuntime();
@@ -197,7 +199,7 @@ describe("failure test 5: lost wake", () => {
     rt.failWake.add("w2");
     let wakeFailed = false;
     try {
-      await rt.wake("w2", "nudge");
+      await rt.wake(getWorker(db, "w2")!, "nudge");
     } catch {
       wakeFailed = true;
     }
@@ -228,14 +230,16 @@ describe("failure test 6: no productive worker", () => {
     expect(actions.some((a) => a === "restarted:w1" || a.startsWith("woken:w1"))).toBe(true);
   });
 
-  test("idle worker woken when work waits and nobody works", async () => {
+  test("idle workers are NOT productive: queued task forces a wake", async () => {
     worker("w1"); // idle
+    worker("w2"); // idle
     addTask(db, { title: "waiting" });
     const { view, actions } = await reconcile(db, rt);
-    // w1 is productive (idle counts), so no forced wake; but work is claimable.
-    expect(view.productive).toBe(1);
-    expect(claimNext(db, "w1")).not.toBeNull();
-    expect(actions).not.toContain("no-workers");
+    // Idle does not count: the invariant fires and someone gets NEXT_NUDGE.
+    expect(view.working).toBe(0);
+    expect(actions.some((a) => a.startsWith("woken:"))).toBe(true);
+    expect(rt.wakes.length).toBe(1);
+    expect(rt.wakes[0].text).toMatch(/agentctl next/);
   });
 });
 
@@ -255,7 +259,7 @@ describe("stalled detection (multi-signal, never bare idle)", () => {
     db.query(`UPDATE workers SET last_progress_at = ?, nudged_at = ? WHERE id = 'w1'`).run(Date.now() - 10000, Date.now() - 10000);
     db.query(`UPDATE tasks SET lease_until = ? WHERE id = ?`).run(Date.now() + 60000, t.id);
     r = await reconcile(db, rt);
-    expect(r.actions).toContain("stalled:w1");
+    expect(r.actions).toContain("stalled-restarted:w1");
     const after = getTask(db, t.id)!;
     expect(after.state).toBe("queued");
     expect(after.lease_token).toBeGreaterThan(1);

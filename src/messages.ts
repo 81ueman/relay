@@ -50,7 +50,38 @@ export function inboxFor(db: Database, workerId: string, onlyPending = false): I
   return rows;
 }
 
-/** Acknowledge (consume) all pending inbox messages. Returns count acked. */
+export function getMessage(db: Database, id: number): InboxItem | null {
+  return (
+    (db
+      .query(`SELECT id, sender, recipient, task_id, kind, payload, state, created_at FROM messages WHERE id = ?`)
+      .get(id) as InboxItem | null) ?? null
+  );
+}
+
+/** Mark one message delivered (it reached the recipient's inbox view). */
+export function deliverMessage(db: Database, id: number): InboxItem {
+  const m = getMessage(db, id);
+  if (!m) throw new Error(`unknown message: ${id}`);
+  if (m.state === "queued") {
+    db.query(`UPDATE messages SET state = 'delivered', delivered_at = ? WHERE id = ?`).run(now(), id);
+  }
+  return getMessage(db, id)!;
+}
+
+/** Mark one message acked (recipient consumed it). */
+export function ackMessage(db: Database, id: number, workerId: string): InboxItem {
+  const m = getMessage(db, id);
+  if (!m) throw new Error(`unknown message: ${id}`);
+  if (m.recipient !== workerId) throw new Error(`message ${id} belongs to ${m.recipient}, not ${workerId}`);
+  const t = now();
+  db.query(
+    `UPDATE messages SET state = 'acked', delivered_at = COALESCE(delivered_at, ?), acked_at = ? WHERE id = ?`
+  ).run(t, t, id);
+  logEvent(db, { source: "worker", workerId, type: "message.acked", payload: { id } });
+  return getMessage(db, id)!;
+}
+
+/** Acknowledge (consume) all pending inbox messages. Returns count acked. Kept for CLI compat. */
 export function claimInbox(db: Database, workerId: string): number {
   const t = now();
   const pending = db

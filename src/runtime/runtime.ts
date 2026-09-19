@@ -1,48 +1,81 @@
+import type { Worker } from "../schema";
+
 // Transport interface. Herdr is a process/session transport only:
 // durable state always lives in SQLite first; wake() is just a nudge.
+//
+// All methods take the full Worker row so adapters can route via
+// worker.runtime_id consistently. Callers must NEVER build Herdr
+// targets themselves.
 
 export interface Runtime {
   readonly name: string;
-  isAlive(workerId: string): Promise<boolean>;
-  wake(workerId: string, text: string): Promise<void>;
-  interrupt(workerId: string): Promise<void>;
-  restart(workerId: string): Promise<void>;
-  peek(workerId: string): Promise<string>;
-}
-
-/** Resolve the Herdr target (agent name or pane id) for a worker. */
-export function targetFor(worker: { id: string; runtime_id: string | null }): string {
-  return worker.runtime_id ?? worker.id;
+  isAlive(worker: Worker): Promise<boolean>;
+  wake(worker: Worker, text: string): Promise<void>;
+  interrupt(worker: Worker): Promise<void>;
+  /** Spawn a brand-new agent generation for this worker (must work when nothing exists). Returns the new runtime target. */
+  start(worker: Worker): Promise<string>;
+  /** interrupt (best effort) + start a fresh generation. Returns the new runtime target. */
+  restart(worker: Worker): Promise<string>;
+  peek(worker: Worker): Promise<string>;
 }
 
 export class MockRuntime implements Runtime {
   readonly name = "mock";
   alive = new Map<string, boolean>();
-  wakes: { workerId: string; text: string }[] = [];
+  /** Every transport target actually used, in call order (for routing tests). */
+  targets: { op: string; target: string }[] = [];
+  wakes: { workerId: string; target: string; text: string }[] = [];
   interrupts: string[] = [];
+  starts: string[] = [];
   restarts: string[] = [];
   failWake = new Set<string>();
+  failStart = new Set<string>();
   peekText = "";
+
+  static targetOf(w: Pick<Worker, "id" | "runtime_id">): string {
+    return w.runtime_id ?? w.id;
+  }
+
+  private key(w: Pick<Worker, "id" | "runtime_id">): string {
+    return w.id;
+  }
 
   setAlive(id: string, v: boolean): void {
     this.alive.set(id, v);
   }
 
-  async isAlive(workerId: string): Promise<boolean> {
-    return this.alive.get(workerId) ?? true;
+  async isAlive(w: Worker): Promise<boolean> {
+    this.targets.push({ op: "isAlive", target: MockRuntime.targetOf(w) });
+    return this.alive.get(this.key(w)) ?? true;
   }
-  async wake(workerId: string, text: string): Promise<void> {
-    if (this.failWake.has(workerId)) throw new Error("wake delivery failed (simulated)");
-    this.wakes.push({ workerId, text });
+  async wake(w: Worker, text: string): Promise<void> {
+    const target = MockRuntime.targetOf(w);
+    this.targets.push({ op: "wake", target });
+    if (this.failWake.has(this.key(w))) throw new Error("wake delivery failed (simulated)");
+    this.wakes.push({ workerId: w.id, target, text });
   }
-  async interrupt(workerId: string): Promise<void> {
-    this.interrupts.push(workerId);
+  async interrupt(w: Worker): Promise<void> {
+    const target = MockRuntime.targetOf(w);
+    this.targets.push({ op: "interrupt", target });
+    this.interrupts.push(target);
   }
-  async restart(workerId: string): Promise<void> {
-    this.restarts.push(workerId);
-    this.alive.set(workerId, true);
+  async start(w: Worker): Promise<string> {
+    const target = MockRuntime.targetOf(w);
+    this.targets.push({ op: "start", target });
+    if (this.failStart.has(this.key(w))) throw new Error("start failed (simulated)");
+    this.starts.push(this.key(w));
+    this.alive.set(this.key(w), true);
+    return target;
   }
-  async peek(_workerId: string): Promise<string> {
+  async restart(w: Worker): Promise<string> {
+    const target = MockRuntime.targetOf(w);
+    this.targets.push({ op: "restart", target });
+    this.restarts.push(this.key(w));
+    this.alive.set(this.key(w), true);
+    return target;
+  }
+  async peek(w: Worker): Promise<string> {
+    this.targets.push({ op: "peek", target: MockRuntime.targetOf(w) });
     return this.peekText;
   }
 }
