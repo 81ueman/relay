@@ -31,7 +31,7 @@ Usage:
   agentctl worker status <id>
   agentctl worker bind <id> --session <sid>
 
-  agentctl session attach --session <sid> [--role worker] [--worker <id>] [--dir <d>] [--worktree <w>]
+  agentctl session attach --session <sid> [--role worker] [--worker <id>] [--dir <d>] [--worktree <w>] [--pane <p>] [--tab <t>]
   agentctl session detach --session <sid>
   agentctl session list
   agentctl session status --session <sid>
@@ -64,7 +64,9 @@ Worker identity: --worker flag, $AGENTCTL_WORKER, or .agentctl/worker-id
 DB: $AGENTCTL_DB or .agentctl/state.db (WAL mode)
 Env: AGENTCTL_LEASE_MS AGENTCTL_STALL_MS AGENTCTL_LOW_WATER AGENTCTL_AUTO_APPROVE AGENTCTL_INTERVAL_MS
 Spawn: AGENTCTL_HERDR_WORKSPACE (required to spawn; else $HERDR_WORKSPACE_ID)
+Manual attach: requires a live Herdr agent (use --pane/--tab or $HERDR_PANE_ID/$HERDR_TAB_ID)
 Runtime cleanup: AGENTCTL_RUNTIME_CLEANUP_GRACE_MS AGENTCTL_ATTACH_TIMEOUT_MS AGENTCTL_RESTART_COOLDOWN_MS
+Herdr is required. AGENTCTL_RUNTIME=mock is test-only.
 `;
 }
 
@@ -167,14 +169,29 @@ async function main(): Promise<void> {
         const rest = argv.slice(2);
         if (sub === "attach") {
           const sessionId = flag(rest, "--session");
-          if (!sessionId) throw new Error("usage: agentctl session attach --session <sid> [--role R] [--worker W]");
+          if (!sessionId) throw new Error("usage: agentctl session attach --session <sid> [--role R] [--worker W] [--pane P] [--tab T]");
+          // Manual attach: the session must provably live inside a Herdr agent.
+          // Resolve + verify BEFORE touching the DB; unverifiable => fail closed.
+          const rt = buildRuntime();
+          const identity = await rt.resolveIdentity({
+            sessionId,
+            hint: {
+              paneId: flag(rest, "--pane") ?? process.env.HERDR_PANE_ID,
+              tabId: flag(rest, "--tab") ?? process.env.HERDR_TAB_ID,
+              workspaceId: flag(rest, "--workspace") ?? process.env.HERDR_WORKSPACE_ID,
+              directory: flag(rest, "--dir") ?? undefined,
+            },
+          });
           const s = attachSession(db, sessionId, {
             role: flag(rest, "--role") ?? undefined,
             workerId: flag(rest, "--worker") ?? undefined,
             directory: flag(rest, "--dir") ?? undefined,
             worktree: flag(rest, "--worktree") ?? undefined,
+            identity,
           });
-          console.log(`attached ${s.session_id} worker=${s.worker_id} generation=${s.generation}`);
+          console.log(
+            `attached ${s.session_id} worker=${s.worker_id} generation=${s.generation} agent=${identity.agent} tab=${identity.tabId} relay_owned=false`
+          );
         } else if (sub === "detach") {
           const sessionId = flag(rest, "--session");
           if (!sessionId) throw new Error("usage: agentctl session detach --session <sid>");
@@ -210,7 +227,7 @@ async function main(): Promise<void> {
         for (const r of rows) {
           const age = fmtAge(now() - r.created_at);
           console.log(
-            `${r.worker_id}\tg${r.generation}\t${r.state}\truntime=${r.runtime_id ?? "-"}\ttab=${r.tab_id ?? "-"}\tsession=${r.session_id ?? "-"}\tage=${age}\tcleanup_after=${r.cleanup_after ? new Date(r.cleanup_after).toISOString() : "-"}`
+            `${r.worker_id}\tg${r.generation}\t${r.state}\towned=${r.relay_owned === 1 ? "relay" : "external"}\truntime=${r.runtime_id ?? "-"}\ttab=${r.tab_id ?? "-"}\tws=${r.workspace_id ?? "-"}\tsession=${r.session_id ?? "-"}\tage=${age}\tcleanup_after=${r.cleanup_after ? new Date(r.cleanup_after).toISOString() : "-"}`
           );
         }
         break;

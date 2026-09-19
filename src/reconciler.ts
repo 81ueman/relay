@@ -106,10 +106,12 @@ function releaseTaskOfDeadWorker(db: Database, workerId: string, taskId: string 
 }
 
 /**
- * Restart = mark the current generation stale, then spawn a FRESH generation.
- * The old tab is never destroyed here (cleanup is a separate pass). If the
- * fresh spawn fails we keep the old runtime metadata: only runtimes that are
- * explicitly stale/dead are ever cleanup-eligible.
+ * Restart = CONTROL-PLANE policy, built from transport primitives:
+ *   1. mark the current generation stale (history kept; tab NOT closed here)
+ *   2. best-effort interrupt the old generation
+ *   3. start a FRESH relay-owned generation (rt.start)
+ * If the fresh spawn fails we keep the old runtime metadata: only runtimes that
+ * are explicitly stale/dead are ever cleanup-eligible.
  */
 async function restartWorker(db: Database, rt: Runtime, w: WorkerRow, at: number): Promise<boolean> {
   const cooldown = restartCooldownMs();
@@ -123,11 +125,13 @@ async function restartWorker(db: Database, rt: Runtime, w: WorkerRow, at: number
     return false; // backoff: do not spawn a new tab every tick
   }
 
+  // 1. Old generation -> stale. The tab is never closed in the restart path.
   const active = getActiveRuntime(db, w.id);
   if (active) {
     markRuntimeStale(db, active.id, at);
   } else if (w.runtime_id || w.opencode_session_id) {
-    // Legacy/manual runtime without history: capture it as stale before replacing.
+    // Legacy/manual runtime without history: capture it as stale. We cannot
+    // prove we created it, so relay_owned=false => it is NEVER cleaned.
     const known = listRuntimes(db, { workerId: w.id }).some(
       (r) => r.state !== "cleaned" && (r.runtime_id === w.runtime_id || (r.runtime_id === null && r.generation === w.generation))
     );
@@ -137,23 +141,36 @@ async function restartWorker(db: Database, rt: Runtime, w: WorkerRow, at: number
         generation: w.generation,
         runtimeId: w.runtime_id,
         sessionId: w.opencode_session_id,
+        relayOwned: 0,
         state: "stale",
         cleanupAfter: at + runtimeCleanupGraceMs(),
       });
     }
   }
 
-  setWorkerState(db, w.id, "restarting");
+  // 2. Best-effort interrupt of the OLD generation (targets the old runtime_id,
+  //    not the worker id). A gone runtime simply ignores it.
+  const oldTarget = active?.runtime_id ?? w.runtime_id;
+  if (oldTarget) {
+    try {
+      await rt.interrupt({ ...w, runtime_id: oldTarget });
+    } catch { /* already dead or unreachable */ }
+  }
+
+  // 3. Fresh generation: a transport primitive, not a runtime "restart".
+  setWorkerState(db, w.id, "starting");
   const generation = w.generation + 1;
   try {
-    const started = await rt.restart(w, generation);
+    const started = await rt.start(w, generation);
     recordRuntime(db, {
       workerId: w.id,
       generation,
       runtimeId: started.runtimeId,
       tabId: started.tabId ?? null,
       paneId: started.paneId ?? null,
+      workspaceId: started.workspaceId ?? null,
       attachToken: started.attachToken ?? null,
+      relayOwned: 1,
       state: "starting",
     });
     db.query(
@@ -181,12 +198,12 @@ async function restartWorker(db: Database, rt: Runtime, w: WorkerRow, at: number
 
 /**
  * Promote freshly spawned generations to active once managed attach lands, and
- * time out the ones that never attach. Keeps workers in starting/restarting
- * until then: a tab existing is NOT restart success.
+ * time out the ones that never attach. Keeps workers starting until then: a tab
+ * existing is NOT restart success.
  */
 async function activatePendingRuntimes(db: Database, actions: string[], at: number): Promise<void> {
   for (const w of listWorkers(db)) {
-    if (w.state !== "starting" && w.state !== "restarting") continue;
+    if (w.state !== "starting") continue;
     const sr = getStartingRuntime(db, w.id, w.generation);
     if (!sr) continue;
 
@@ -198,8 +215,7 @@ async function activatePendingRuntimes(db: Database, actions: string[], at: numb
       markRuntimeActive(db, sr.id, sess.session_id, at);
       db.query(
         `UPDATE workers
-           SET state = CASE WHEN state IN ('starting','restarting') THEN 'idle' ELSE state END,
-               opencode_session_id = ?, updated_at = ?
+           SET state = 'idle', opencode_session_id = ?, updated_at = ?
          WHERE id = ?`
       ).run(sess.session_id, at, w.id);
       logEvent(db, { source: "supervisor", workerId: w.id, type: "worker.active", payload: { generation: w.generation, sessionId: sess.session_id } });
@@ -225,6 +241,7 @@ async function activatePendingRuntimes(db: Database, actions: string[], at: numb
 async function cleanupOldRuntimes(db: Database, rt: Runtime, actions: string[], at: number): Promise<void> {
   for (const c of cleanupCandidates(db, at)) {
     if (c.state !== "stale" && c.state !== "dead") continue;
+    if (c.relay_owned !== 1) continue; // adopted/external runtimes are never closed
     if (c.cleanup_after === null || c.cleanup_after > at) continue;
 
     const w = getWorker(db, c.worker_id);
@@ -275,12 +292,12 @@ export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<
   // 2. Promote fresh generations that have completed managed attach.
   await activatePendingRuntimes(db, actions, at);
 
-  // 3. Walk workers (starting/restarting are owned by step 2).
+  // 3. Walk workers (starting is owned by step 2).
   const stallTimeout = stallMs();
 
   for (const w of listWorkers(db)) {
     const fresh = getWorker(db, w.id)!;
-    if (fresh.state === "starting" || fresh.state === "restarting") continue;
+    if (fresh.state === "starting") continue;
 
     const alive = await rt.isAlive(fresh).catch(() => false);
 
@@ -355,7 +372,7 @@ export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<
       // No idle worker can take it. Recover a fallen one, or wait for a fresh
       // generation to finish attaching. Never nudge waiting_input workers.
       const fallen = listWorkers(db)
-        .filter((x) => x.state === "dead" || x.state === "stalled" || x.state === "restarting")
+        .filter((x) => x.state === "dead" || x.state === "stalled")
         .sort((a, b) => a.id.localeCompare(b.id))[0];
       if (fallen) {
         if (await restartWorker(db, rt, fallen, at)) actions.push(`restarted:${fallen.id}`);

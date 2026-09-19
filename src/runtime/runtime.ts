@@ -1,17 +1,23 @@
 import type { Worker } from "../schema";
 
-// Transport interface. Herdr is a process/session transport only:
-// durable state always lives in SQLite first; wake() is just a nudge.
+// Transport interface. Relay is a Herdr-only control plane: Herdr is the ONLY
+// process/session transport. durable state always lives in SQLite first; wake()
+// is just a nudge, and Herdr idleness is NEVER a source of truth.
 //
-// All methods take the full Worker row so adapters can route via
-// worker.runtime_id consistently. Callers must NEVER build Herdr
-// targets themselves.
+// There is deliberately no capability model and no tmux/other backend: the
+// production implementation is HerdrRuntime, and MockRuntime exists solely for
+// unit/integration tests (injected via DaemonOptions.runtime).
+//
+// Restart is a CONTROL-PLANE policy, not a transport primitive: the supervisor
+// marks the old generation stale, best-effort interrupts it, then calls start()
+// for a fresh generation. The adapter therefore has no restart().
 
 /** Result of spawning a fresh generation. Herdr metadata stays out of the workers row. */
 export interface StartedRuntime {
-  runtimeId: string; // Herdr agent name (unique per generation)
+  runtimeId: string; // Herdr agent name (or pane id when the agent is unnamed)
   tabId?: string;
   paneId?: string;
+  workspaceId?: string;
   /**
    * Secret baked into the bootstrap prompt. The daemon requires it on the
    * managed attach so a stale/foreign plugin (or another project's session on a
@@ -27,6 +33,32 @@ export interface RuntimeRecord {
   runtime_id: string | null;
   tab_id: string | null;
   pane_id: string | null;
+  /** 1 = relay-created tab; 0 = adopted (never closed). */
+  relay_owned?: number;
+}
+
+/**
+ * Resolved Herdr identity of a live OpenCode session. Every managed session
+ * must have one: Relay refuses to manage a session it cannot prove is running
+ * inside a Herdr agent (fail closed, never guess).
+ */
+export interface HerdrIdentity {
+  /** Herdr agent name, or the pane id for an unnamed agent (both are valid targets). */
+  agent: string;
+  tabId: string;
+  paneId: string;
+  workspaceId: string | null;
+  /** Herdr agent kind, e.g. "opencode". */
+  agentKind: string;
+}
+
+/** Caller-provided hints (from the plugin's pane environment). Verified, never trusted blindly. */
+export interface HerdrIdentityHint {
+  paneId?: string;
+  tabId?: string;
+  workspaceId?: string;
+  /** OpenCode session working directory, cross-checked against the pane cwd. */
+  directory?: string;
 }
 
 export interface Runtime {
@@ -36,11 +68,18 @@ export interface Runtime {
   interrupt(worker: Worker): Promise<void>;
   /** Spawn a brand-new generation in a fresh tab (must work when nothing exists). */
   start(worker: Worker, generation: number): Promise<StartedRuntime>;
-  /** interrupt (best effort) + start a fresh generation. */
-  restart(worker: Worker, generation: number): Promise<StartedRuntime>;
-  /** Safely reap an old generation's tab. MUST refuse if it cannot prove relay ownership. */
+  /**
+   * Safely reap an old generation's tab. MUST refuse if it cannot prove relay
+   * ownership, and MUST refuse outright when relay_owned is not true.
+   */
   cleanup(runtime: RuntimeRecord): Promise<void>;
   peek(worker: Worker): Promise<string>;
+  /**
+   * Resolve the Herdr identity of the runtime hosting `sessionId` (manual
+   * attach). MUST throw when the identity cannot be proven exactly: missing or
+   * ambiguous mappings are rejected, never guessed.
+   */
+  resolveIdentity(input: { sessionId: string; hint?: HerdrIdentityHint }): Promise<HerdrIdentity>;
 }
 
 export class MockRuntime implements Runtime {
@@ -51,15 +90,18 @@ export class MockRuntime implements Runtime {
   wakes: { workerId: string; target: string; text: string }[] = [];
   interrupts: string[] = [];
   starts: string[] = [];
-  restarts: string[] = [];
   /** runtime ids passed to cleanup(), in order. */
   cleanups: string[] = [];
   failWake = new Set<string>();
   failStart = new Set<string>();
-  /** Workers whose restart() should throw. */
-  failRestart = new Set<string>();
   /** Runtime ids (or `${worker}:g${generation}`) whose cleanup should throw. */
   failCleanup = new Set<string>();
+  /** sessionId -> resolved Herdr identity (manual attach). Missing => reject. */
+  identities = new Map<string, HerdrIdentity>();
+  /** Every resolveIdentity call (for hint/verification assertions). */
+  resolves: { sessionId: string; hint?: HerdrIdentityHint }[] = [];
+  /** When set, resolveIdentity throws this (simulated ambiguity/unverifiable). */
+  resolveError?: string;
   peekText = "";
 
   static targetOf(w: Pick<Worker, "id" | "runtime_id">): string {
@@ -72,6 +114,10 @@ export class MockRuntime implements Runtime {
 
   setAlive(id: string, v: boolean): void {
     this.alive.set(id, v);
+  }
+
+  setIdentity(sessionId: string, identity: HerdrIdentity): void {
+    this.identities.set(sessionId, identity);
   }
 
   async isAlive(w: Worker): Promise<boolean> {
@@ -102,22 +148,13 @@ export class MockRuntime implements Runtime {
       attachToken: `mock-token-${w.id}-g${generation}`,
     };
   }
-  async restart(w: Worker, generation: number): Promise<StartedRuntime> {
-    const target = MockRuntime.targetOf(w);
-    this.targets.push({ op: "restart", target });
-    if (this.failRestart.has(this.key(w))) throw new Error("restart failed (simulated)");
-    this.restarts.push(this.key(w));
-    this.alive.set(this.key(w), true);
-    return {
-      runtimeId: `${target}#g${generation}`,
-      tabId: `tab-${w.id}-g${generation}`,
-      paneId: `pane-${w.id}-g${generation}`,
-      attachToken: `mock-token-${w.id}-g${generation}`,
-    };
-  }
   async cleanup(rec: RuntimeRecord): Promise<void> {
     const runtimeId = rec.runtime_id ?? `${rec.worker_id}:g${rec.generation}`;
     this.targets.push({ op: "cleanup", target: runtimeId });
+    // Ownership is absolute: an adopted (relay_owned=false) runtime is never closed.
+    if (rec.relay_owned !== undefined && rec.relay_owned === 0) {
+      throw new Error("refusing to clean a non-relay-owned runtime (simulated)");
+    }
     if (this.failCleanup.has(runtimeId) || this.failCleanup.has(`${rec.worker_id}:g${rec.generation}`)) {
       throw new Error("cleanup failed (simulated)");
     }
@@ -126,5 +163,13 @@ export class MockRuntime implements Runtime {
   async peek(w: Worker): Promise<string> {
     this.targets.push({ op: "peek", target: MockRuntime.targetOf(w) });
     return this.peekText;
+  }
+  async resolveIdentity(input: { sessionId: string; hint?: HerdrIdentityHint }): Promise<HerdrIdentity> {
+    this.targets.push({ op: "resolveIdentity", target: input.sessionId });
+    this.resolves.push({ sessionId: input.sessionId, hint: input.hint });
+    if (this.resolveError) throw new Error(this.resolveError);
+    const id = this.identities.get(input.sessionId);
+    if (!id) throw new Error("session is not running inside Herdr (simulated)");
+    return id;
   }
 }

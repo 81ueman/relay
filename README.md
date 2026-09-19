@@ -1,16 +1,27 @@
-# relay — `agentctl`: a lightweight supervisor for Herdr + OpenCode agents
+# relay — `agentctl`: a Herdr-only supervisor for OpenCode agents
 
 Goal: **as long as unblocked work exists, at least one agent keeps moving.**
+
+> **Relay is a Herdr-only supervisor for OpenCode agents.**
+> It does not support managing OpenCode outside Herdr. Every Relay-managed
+> OpenCode session must be running inside a Herdr agent.
 
 `agentctl` is a small deterministic control plane (Bun + TypeScript + SQLite).
 It is not an orchestration framework and has no parent-child model: agents are
 peers (`communication = many-to-many`, `task ownership = single writer`).
 
+```text
+Herdr   = process/session transport
+SQLite  = durable truth
+OpenCode = coding agent
+Relay   = deterministic supervisor
+```
+
 - durable task queue (SQLite is the **only** source of truth, WAL mode)
 - worker state, durable inbox, append-only event log, managed-session table
 - OpenCode event hooks (triggers only — `session.idle` is never completion)
-- Herdr session/pane adapter (transport only, never truth)
-- stalled/dead worker recovery with real process regeneration
+- Herdr agent/tab adapter (the only transport; never truth)
+- stalled/dead worker recovery with fresh-generation regeneration
 - planner/worker/reviewer auto wake-up, OpenCode Skill (`agent-worker`)
 
 Failure philosophy: `process alive ≠ progressing`, `session idle ≠ done`,
@@ -39,6 +50,10 @@ bun link   # global `agentctl`; or export AGENTCTL_BIN="bun $PWD/src/cli.ts"
 ```
 
 Requires: Bun ≥ 1.1, `herdr` on PATH, OpenCode v2.
+**Herdr is mandatory**: the daemon fails to start when the herdr CLI/socket is
+unavailable (`relay requires Herdr; ...`). There is no mock fallback, no tmux
+backend and no capability negotiation — `MockRuntime` exists only so tests can
+inject a transport.
 Plugin shape verified against the bundled `herdr-agent-state` integration
 (default export `{ id, setup }`) and `@opencode-ai/plugin` types (custom tools).
 
@@ -75,10 +90,23 @@ is how agents once landed in an unrelated workspace).
 
 ## Managed sessions: plain `opencode` stays untouched
 
-The plugin loads everywhere but does nothing by itself. A session that just
-runs `opencode` is **unmanaged**: no DB writes, no subprocess, no Herdr calls,
-no reaction to idle, no auto prompt, no task claim. The daemon ignores its
-events (verified by contract test B).
+Herdr-runtime is mandatory; Relay *management* is optional. Running OpenCode
+inside Herdr is **not** the same as being Relay-managed. The plugin loads
+everywhere but does nothing by itself: a session that just runs `opencode` is
+**unmanaged** — no DB writes, no subprocess, no Herdr calls, no reaction to
+idle, no auto prompt, no task claim. The daemon ignores its events (verified by
+contract test B).
+
+```text
+Herdr session + unmanaged
+        │ agent_attach
+        ▼
+Herdr session + managed
+```
+
+There are exactly two ways a session becomes managed.
+
+### A. Attach an existing Herdr session (relay_owned = false)
 
 Attach a live session without restarting it (custom tool or CLI):
 
@@ -88,18 +116,45 @@ agent_detach()
 ```
 
 ```bash
-agentctl session attach --session ses_xxx --role worker
+agentctl session attach --session ses_xxx --role worker   # uses $HERDR_PANE_ID/$HERDR_TAB_ID
 agentctl session detach --session ses_xxx
 agentctl session list
 ```
 
-Attach bumps a per-session `generation`; events carrying a stale generation
-are ignored (zombie-session protection). Detach returns the session to normal.
+The daemon **resolves the session's Herdr identity before any DB write**
+(agent, tab id, pane id, workspace id). The plugin sends its pane env
+(`HERDR_PANE_ID`/`HERDR_TAB_ID`/`HERDR_WORKSPACE_ID`); the daemon verifies the
+pane exists, runs an `opencode` agent, and is consistent with the hint. If Herdr
+itself reports a session id for a pane, that mapping is authoritative. If the
+identity cannot be proven — missing, ambiguous, or a mismatch — the attach is
+**rejected** (`attach failed: session is not running inside Herdr`): Relay never
+guesses and never creates a half-managed state (`managed=true`, `runtime_id=null`).
 
-Sessions spawned by relay itself (via `Runtime.start`) are **automatically
-managed**. Identity cannot come from process env: a single OpenCode server
-(`opencode serve --service`) can host many sessions and its env names at most
-one worker. So the relay bootstrap prompt carries a per-spawn marker
+On success the existing runtime is registered as the worker's current runtime:
+
+```text
+worker.state = idle            worker.runtime_id = <herdr agent>
+worker.opencode_session_id = <session>   worker.generation = N
+session.managed = true         session.generation = N
+worker_runtime: state = active  relay_owned = false  tab_id/pane_id = existing
+```
+
+Attach bumps a per-session `generation`; events carrying a stale generation are
+ignored (zombie-session protection). Detach returns the session to normal.
+**No process is restarted, and Relay never closes the adopted tab.**
+
+### B. Let Relay spawn a fresh Herdr runtime (relay_owned = true)
+
+```text
+Relay → herdr tab create --workspace <ws> --no-focus --label relay:<worker>:g<N>
+      → herdr agent start --kind opencode --pane <pane>
+      → fresh OpenCode session → agent_attach (auto) → managed
+```
+
+Sessions spawned by relay itself are **automatically managed**. Identity cannot
+come from process env alone: a single OpenCode server (`opencode serve
+--service`) can host many sessions and its env names at most one worker. So the
+relay bootstrap prompt carries a per-spawn marker
 
 ```text
 RELAY-ATTACH worker=<worker-id> gen=<generation> token=<spawn-token>
@@ -112,57 +167,75 @@ still exported into the spawned tab; `AGENTCTL_AUTO_ATTACH=1` enables the
 env-only path for dedicated one-server-per-worker deployments, but it is off by
 default because a shared server cannot identify a session from process env.)
 
-The `token` is the **per-spawn secret** (`worker_runtimes.attach_token`). The
-daemon accepts a relay-generation attach only when the token matches, so a
-stale plugin instance, another project's session, or an unrelated OpenCode
+The `token` is the **per-spawn secret** (`worker_runtimes.attach_token`). A
+relay-generation attach is accepted only when the matching runtime row exists,
+is `relay_owned=true`, is `starting`/`active`, and the token matches exactly —
+so a stale plugin instance, another project's session, or an unrelated OpenCode
 session on the same shared server can never bind a session it does not own. A
 managed session also belongs to exactly one worker: a cross-worker attach is
 refused outright.
 
-## Runtime generations (fresh tab, stale old, later cleanup)
+## Runtime generations (fresh start, stale old, later cleanup)
 
 `worker_runtimes` is the history/cleanup authority; the `workers` row only
 points at the **active** generation (`runtime_id`, `generation`,
 `opencode_session_id`). Runtime states: `starting → active → stale/dead →
-cleaned`.
+cleaned`. Each row also records **ownership**:
+
+```text
+relay_owned = true   Relay created this tab     → eligible for later cleanup
+relay_owned = false  adopted via manual attach  → NEVER closed by Relay
+```
+
+Restart is **control-plane policy**, not a transport primitive: the Herdr
+adapter has no `restart()`, only `wake`/`interrupt`/`start`/`cleanup`/`isAlive`/
+`peek`. The supervisor composes a restart from those primitives:
 
 ```text
 generation N (active)
-      │ problem
+      │ problem: task ownership released/requeued
       ▼
  mark stale (cleanup_after = now + grace)      # old tab NOT closed here
       │
       ▼
- fresh tab spawn: herdr tab create --workspace <ws> --no-focus \
+ best-effort interrupt of generation N's runtime
+      │
+      ▼
+ start() fresh generation N+1: herdr tab create --workspace <ws> --no-focus \
    --label relay:<worker>:g<N+1> --env AGENTCTL_MANAGED=1 --env AGENTCTL_GENERATION=<N+1>
       │
       ▼
- OpenCode session.created -> plugin session.attach(worker, generation=N+1)
+ OpenCode session.created -> plugin session.attach(worker, generation=N+1, token)
       │
       ▼
  worker active (state idle, generation N+1)
       │
-      └─ old generation N: stale → grace period → safe cleanup → cleaned
+      └─ old generation N: stale → grace → safe cleanup (relay_owned only) → cleaned
 ```
+
+A dead/stalled **manual** runtime follows the same path: g1 (`relay_owned=false`)
+goes stale but is never closed, and Relay spawns a fresh relay-owned g2.
 
 Restart success is **not** "a tab exists": the worker stays `starting` until a
 matching managed attach lands (or times out). Cleanup is a separate maintenance
 pass and deletes a tab only when all of these hold:
 
 ```text
-runtime.worker_id == worker            runtime.generation  < workers.generation
-runtime.runtime_id != workers.runtime_id   state ∈ {stale, dead}
-cleanup_after <= now                   tab label == relay:<worker>:g<generation>
+runtime.relay_owned == true            runtime.worker_id == worker
+runtime.generation  < workers.generation   runtime.runtime_id != workers.runtime_id
+state ∈ {stale, dead}   cleanup_after <= now
+tab label == relay:<worker>:g<generation>
 ```
 
-Cleanup failures are logged as `runtime.cleanup_failed` and retried later; a
-leftover old tab is acceptable, a stopped fresh worker is not. Repeated
-failures are recorded at most once per `AGENTCTL_CLEANUP_LOG_WINDOW_MS`
-(default 60000) so a stuck cleanup cannot flood the event log. If the recorded
-tab is already gone there is nothing to reap, so the runtime is marked
-`cleaned` instead of retrying forever; an unreadable label on a tab that still
-exists is refused. `waiting_input` workers are never wake candidates for
-`agentctl next`.
+A `relay_owned=false` runtime is never a cleanup candidate, whatever its state,
+and the adapter refuses such a cleanup outright. Cleanup failures are logged as
+`runtime.cleanup_failed` and retried later; a leftover old tab is acceptable, a
+stopped fresh worker is not. Repeated failures are recorded at most once per
+`AGENTCTL_CLEANUP_LOG_WINDOW_MS` (default 60000) so a stuck cleanup cannot
+flood the event log. If the recorded tab is already gone there is nothing to
+reap, so the runtime is marked `cleaned` instead of retrying forever; an
+unreadable label on a tab that still exists is refused. `waiting_input` workers
+are never wake candidates for `agentctl next`.
 
 Restart attempts are throttled by `AGENTCTL_RESTART_COOLDOWN_MS` (default
 30000), applied after **failures** too, so a spawn that cannot come up is
@@ -242,16 +315,17 @@ Claims carry fencing leases; `note` heartbeats + renews; a stale worker's late
 ## Recovery (all deterministic, no LLM)
 
 - **Dead worker** (transport reports gone): task requeued with bumped token,
-  then `restart()` marks the old generation **stale** and spawns a **fresh
-  generation** — new tab in the explicit workspace (`herdr tab create
-  --workspace <ws> --no-focus --label relay:<worker>:g<N>`), `herdr agent start
-  --kind opencode`, managed auto-attach, activation. Old tabs are never closed
-  in the restart path.
-- **Old generation cleanup**: a separate pass reaps stale/dead runtimes past
-  their grace period, only when provably relay-owned (label check) and never
-  the current generation/runtime (`agentctl runtime list` to inspect).
+  then the supervisor marks the old generation **stale**, best-effort
+  interrupts it, and `start()`s a **fresh generation** — new tab in the explicit
+  workspace (`herdr tab create --workspace <ws> --no-focus --label
+  relay:<worker>:g<N>`), `herdr agent start --kind opencode`, managed
+  auto-attach, activation. Old tabs are never closed in the restart path.
+- **Old generation cleanup**: a separate pass reaps `relay_owned` stale/dead
+  runtimes past their grace period, only when provably relay-owned (label check)
+  and never the current generation/runtime (`agentctl runtime list` to inspect).
+  Adopted (`relay_owned=false`) tabs are never closed.
 - **Stalled** (running + valid lease + alive + stale progress + repeated idle):
-  nudge once → still nothing → interrupt, requeue, restart fresh generation.
+  nudge once → still nothing → interrupt, requeue, fresh generation.
 - **Crash between heartbeats**: lease expiry returns the task to queued.
 - **All work done**: the system goes quiet. The planner is not woken to invent
   new work unless unfinished work still exists and the queue is below low-water.
@@ -260,15 +334,16 @@ Claims carry fencing leases; `note` heartbeats + renews; a stale worker's late
 
 ```text
 Task:    queued running review done blocked_human blocked_internal (+ failed)
-Worker:  idle working stalled dead (+ starting/waiting_input/restarting transient)
+Worker:  idle working waiting_input stalled dead (+ starting transient)
 Session: managed | unmanaged
+Runtime: starting active stale dead cleaned, each relay_owned = true | false
 Message: queued delivered acked (+ failed)
 ```
 
 ## Tests
 
 ```bash
-bun test            # 38 tests: 19 integration + 10 contract (A–H) + 9 runtime lifecycle
+bun test            # 53 tests across integration / contract / lifecycle / herdr
 bunx tsc --noEmit
 ```
 
@@ -283,6 +358,13 @@ generation is never cleaned · cleanup failure retries without breaking work ·
 relay-spawned sessions auto-attach · plain sessions stay unmanaged ·
 `waiting_input` is not wakeable · all-done stays quiet.
 
+Herdr-only: manual attach registers the existing runtime `relay_owned=false` ·
+non-Herdr / ambiguous attach is rejected with no half-state · an adopted runtime
+is never cleaned · a dead manual runtime is replaced by a fresh relay-owned
+generation · the current generation is never cleaned · missing Herdr fails
+daemon startup (no mock fallback) · relay-generation attach requires a matching
+relay-owned runtime row + token · old session/generation events are fenced out.
+
 ## Layout
 
 ```text
@@ -290,5 +372,5 @@ src/cli.ts  daemon.ts  db.ts  schema.ts  scheduler.ts  reconciler.ts
     sessions.ts  socket.ts  messages.ts  tasks.ts  workers.ts  events.ts
     runtimes.ts  runtime/{runtime,herdr}.ts
 .opencode/plugins/agentctl.ts  .opencode/skills/agent-worker/SKILL.md
-tests/{integration,contract,lifecycle}.test.ts
+tests/{integration,contract,lifecycle,herdr}.test.ts
 ```

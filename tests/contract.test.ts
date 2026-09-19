@@ -14,6 +14,10 @@ import { getWorker, registerWorker } from "../src/workers";
 
 // Correctness contract for the relay control plane (spec section 11).
 
+// Minimal verified Herdr identity for manual-attach tests (production resolves
+// this from Herdr directly; tests inject it).
+const IDENTITY = { agent: "herdr-agent", tabId: "tab-ext", paneId: "pane-ext", workspaceId: "w-ext", agentKind: "opencode" };
+
 let dir = "";
 let db: Database;
 let rt: MockRuntime;
@@ -90,7 +94,6 @@ describe("B. standalone OpenCode (unmanaged)", () => {
     expect(rt.wakes).toHaveLength(0);
     expect(rt.targets).toHaveLength(0); // no Herdr call whatsoever
     expect(rt.starts).toHaveLength(0);
-    expect(rt.restarts).toHaveLength(0);
     expect(getTask(db, t.id)!.state).toBe("running");
   });
 });
@@ -101,7 +104,9 @@ describe("C. dynamic attach/detach", () => {
     let res = await handleSocketMessage({ type: "session.idle", session_id: "ses-live" }, ctx);
     expect(res).toMatchObject({ ignored: "unmanaged" });
 
-    // Attach mid-session (no restart): returns worker + generation.
+    // Attach mid-session (no restart): returns worker + generation. Manual
+    // attach requires a verified Herdr identity (injected here).
+    rt.setIdentity("ses-live", IDENTITY);
     res = await handleSocketMessage(
       { type: "session.attach", session_id: "ses-live", role: "worker", directory: "/tmp", worktree: "/tmp" },
       ctx
@@ -131,7 +136,7 @@ describe("C. dynamic attach/detach", () => {
 
 describe("D. idle uses the injected (real) runtime", () => {
   test("managed worker with running task + idle => runtime.wake called, task untouched", async () => {
-    const s = attachSession(db, "ses-d", { role: "worker" });
+    const s = attachSession(db, "ses-d", { role: "worker", identity: IDENTITY });
     const workerId = s.worker_id!;
     rt.setAlive(workerId, true);
     db.query(`UPDATE workers SET state = 'idle' WHERE id = ?`).run(workerId);
@@ -158,7 +163,7 @@ describe("E. dead worker real restart", () => {
     const { actions } = await reconcile(db, rt);
     expect(actions).toContain("dead:w1");
     expect(actions).toContain(`requeued:${t.id}`);
-    expect(rt.restarts).toContain("w1"); // real restart, not just ctrl+c
+    expect(rt.starts).toContain("w1"); // real restart, not just ctrl+c
     const after = getTask(db, t.id)!;
     expect(after.state).toBe("queued");
     expect(after.assignee).toBeNull();
@@ -201,10 +206,10 @@ describe("F. runtime_id routing", () => {
 
 describe("G. zombie session protection", () => {
   test("gen-1 event cannot touch a gen-2 worker", async () => {
-    const s1 = attachSession(db, "ses-z", { role: "worker" });
+    const s1 = attachSession(db, "ses-z", { role: "worker", identity: IDENTITY });
     expect(s1.generation).toBe(1);
     // Re-attach (e.g. session resume / worker rebind) bumps the generation.
-    const s2 = attachSession(db, "ses-z", { role: "worker", workerId: s1.worker_id! });
+    const s2 = attachSession(db, "ses-z", { role: "worker", workerId: s1.worker_id!, identity: IDENTITY });
     expect(s2.generation).toBe(2);
     const before = eventCount();
     const stale = await handleSocketMessage({ type: "session.idle", session_id: "ses-z", generation: 1 }, ctx);

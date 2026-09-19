@@ -19,7 +19,6 @@ export const WORKER_STATES = [
   "waiting_input",
   "stalled",
   "dead",
-  "restarting",
 ] as const;
 export type WorkerState = (typeof WORKER_STATES)[number];
 
@@ -74,11 +73,18 @@ export interface WorkerRuntime {
   id: number;
   worker_id: string;
   generation: number;
-  runtime_id: string | null; // Herdr agent name
+  runtime_id: string | null; // Herdr agent name (or pane id when the agent is unnamed)
   tab_id: string | null;
   pane_id: string | null;
+  workspace_id: string | null;
   session_id: string | null; // OpenCode session bound on managed attach
   attach_token: string | null; // per-spawn secret that legitimises a managed attach
+  /**
+   * Ownership. 1 = Relay created this Herdr tab (relay_owned=true), so it may
+   * later be reaped. 0 = an existing Herdr runtime adopted via manual attach
+   * (relay_owned=false): Relay NEVER closes such a tab, ever.
+   */
+  relay_owned: number;
   state: RuntimeState;
   created_at: number;
   stale_at: number | null;
@@ -210,8 +216,10 @@ CREATE TABLE IF NOT EXISTS worker_runtimes (
   runtime_id TEXT,
   tab_id TEXT,
   pane_id TEXT,
+  workspace_id TEXT,
   session_id TEXT,
   attach_token TEXT,
+  relay_owned INTEGER NOT NULL DEFAULT 1,
   state TEXT NOT NULL DEFAULT 'starting',
   created_at INTEGER NOT NULL,
   stale_at INTEGER,

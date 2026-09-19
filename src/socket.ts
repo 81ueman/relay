@@ -3,8 +3,8 @@ import { unlinkSync } from "node:fs";
 import { defaultSockPath } from "./db";
 import { logEvent } from "./events";
 import { handleErrorSignal, handleIdleSignal, reconcile } from "./reconciler";
-import type { Runtime } from "./runtime/runtime";
-import { attachSession, detachSession, gateEvent, workerForSession } from "./sessions";
+import type { HerdrIdentity, Runtime } from "./runtime/runtime";
+import { attachSession, detachSession, gateEvent, managedWorkerForSession } from "./sessions";
 import { getWorker, setWorkerState, touchSeen } from "./workers";
 
 // JSON Lines over a Unix domain socket. Small protocol:
@@ -12,7 +12,9 @@ import { getWorker, setWorkerState, touchSeen } from "./workers";
 //   {"type":"session.error",...,"payload":{...}}
 //   {"type":"permission.asked" | "permission.replied" | "tool.execute.after" | "session.status" | ..., ...}
 //   {"type":"session.attach","session_id":...,"role":...,"worker_id":...,"generation":N,...}
-//     (generation present = relay-spawned session; absent = manual attach)
+//     (generation present = relay-spawned session; absent = manual attach and
+//      then Herdr identity hints (pane_id/tab_id/workspace_id) are REQUIRED,
+//      verified daemon-side; unverifiable => rejected, never guessed)
 //   {"type":"session.detach","session_id":...}
 //   {"type":"ping"}
 // Response per line: {"ok":true,...} or {"ok":false,"reason":...}
@@ -29,6 +31,10 @@ export interface SocketMessage {
   worktree?: string;
   /** Per-spawn attach secret (relay-spawned generations only). */
   token?: string;
+  /** Herdr identity hints from the plugin's pane env (manual attach). */
+  pane_id?: string;
+  tab_id?: string;
+  workspace_id?: string;
 }
 
 export interface SocketContext {
@@ -53,14 +59,39 @@ export async function handleSocketMessage(msg: SocketMessage, ctx: SocketContext
     // (`ses...`). Shell/command ids (`sh_...`) and other host ids must never
     // become managed sessions, whatever a plugin version sends.
     if (!/^ses/.test(msg.session_id)) return { ok: false, reason: "not-a-session-id" };
+
+    // Manual attach (no generation): the session must PROVABLY be running inside
+    // a Herdr agent. Resolve + verify BEFORE any DB write so a rejected attach
+    // leaves zero half-managed state.
+    let identity: HerdrIdentity | undefined;
+    if (typeof msg.generation !== "number") {
+      try {
+        identity = await runtime.resolveIdentity({
+          sessionId: msg.session_id,
+          hint: {
+            paneId: msg.pane_id,
+            tabId: msg.tab_id,
+            workspaceId: msg.workspace_id,
+            directory: msg.directory,
+          },
+        });
+      } catch (e) {
+        return { ok: false, reason: String(e).slice(0, 200) };
+      }
+    }
+
     let s;
     try {
       s = attachSession(db, msg.session_id, {
-        role: msg.role, workerId: msg.worker_id, directory: msg.directory, worktree: msg.worktree,
-        // Relay-spawned sessions send the authoritative generation from
-        // AGENTCTL_GENERATION; manual attaches omit it and get a bumped one.
+        role: msg.role,
+        workerId: msg.worker_id,
+        directory: msg.directory,
+        worktree: msg.worktree,
+        // Relay-spawned sessions send the authoritative generation; manual
+        // attaches omit it and get a bumped one plus the resolved identity.
         generation: typeof msg.generation === "number" ? msg.generation : undefined,
         attachToken: msg.token,
+        identity,
       });
     } catch (e) {
       return { ok: false, reason: String(e).slice(0, 200) };
@@ -79,17 +110,18 @@ export async function handleSocketMessage(msg: SocketMessage, ctx: SocketContext
   const gate = gateEvent(db, msg.session_id, msg.generation);
   if (!gate.ok) return { ok: true, ignored: gate.reason };
   const session = gate.session;
-  const workerId = workerForSession(db, session);
+  // Strict fencing: the session, its generation and the worker binding must all
+  // agree, or the event belongs to a superseded/foreign session.
+  const workerId = managedWorkerForSession(db, session);
+  if (!workerId) return { ok: true, ignored: "fenced-out" };
 
   if (IDLE_TYPES.has(type)) {
-    if (!workerId) return { ok: true, ignored: "no-worker" };
     const outcome = await handleIdleSignal(db, runtime, workerId);
     ctx.wakeReconcile.value = true;
     return { ok: true, outcome };
   }
 
   if (ERROR_TYPES.has(type)) {
-    if (!workerId) return { ok: true, ignored: "no-worker" };
     const err = typeof msg.payload === "string" ? msg.payload : JSON.stringify(msg.payload ?? {});
     const outcome = handleErrorSignal(db, workerId, err.slice(0, 500));
     ctx.wakeReconcile.value = true; // suspect/dead candidate: reconcile now
@@ -100,20 +132,16 @@ export async function handleSocketMessage(msg: SocketMessage, ctx: SocketContext
   }
 
   if (type === "permission.asked") {
-    if (workerId) {
-      touchSeen(db, workerId);
-      const w = getWorker(db, workerId)!;
-      if (w.state === "working") setWorkerState(db, workerId, "waiting_input");
-      logEvent(db, { source: "opencode", workerId, type, payload: msg.payload ?? {} });
-    }
+    touchSeen(db, workerId);
+    const w = getWorker(db, workerId)!;
+    if (w.state === "working") setWorkerState(db, workerId, "waiting_input");
+    logEvent(db, { source: "opencode", workerId, type, payload: msg.payload ?? {} });
     return { ok: true };
   }
 
   // Liveness only. Explicit `agentctl note` remains the strongest progress signal.
-  if (workerId) {
-    touchSeen(db, workerId);
-    logEvent(db, { source: "opencode", workerId, type, payload: msg.payload ?? {} });
-  }
+  touchSeen(db, workerId);
+  logEvent(db, { source: "opencode", workerId, type, payload: msg.payload ?? {} });
   return { ok: true };
 }
 

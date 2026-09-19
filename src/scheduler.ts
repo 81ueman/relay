@@ -44,7 +44,7 @@ export function productiveWorkers(db: Database): { id: string; state: string }[]
 /**
  * Workers that can accept NEW work: state == idle AND holding no task.
  * waiting_input is explicitly NOT here: such a worker still owns its current
- * work and must never be told to `agentctl next`. starting/restarting workers
+ * work and must never be told to `agentctl next`. starting workers
  * are not ready yet either.
  */
 export function idleWorkers(db: Database): { id: string; role: string; state: string }[] {

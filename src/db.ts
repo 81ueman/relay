@@ -37,6 +37,13 @@ function migrate(db: Database): void {
   if (columnExists(db, "worker_runtimes", "id") && !columnExists(db, "worker_runtimes", "attach_token")) {
     db.exec("ALTER TABLE worker_runtimes ADD COLUMN attach_token TEXT;");
   }
+  // Ownership: rows predating manual attach were all relay-spawned tabs.
+  if (columnExists(db, "worker_runtimes", "id") && !columnExists(db, "worker_runtimes", "relay_owned")) {
+    db.exec("ALTER TABLE worker_runtimes ADD COLUMN relay_owned INTEGER NOT NULL DEFAULT 1;");
+  }
+  if (columnExists(db, "worker_runtimes", "id") && !columnExists(db, "worker_runtimes", "workspace_id")) {
+    db.exec("ALTER TABLE worker_runtimes ADD COLUMN workspace_id TEXT;");
+  }
 }
 
 export function openDb(path?: string): Database {

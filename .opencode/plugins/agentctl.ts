@@ -44,6 +44,21 @@ const ENV_GENERATION = (() => {
 const AUTO_ATTACH_FROM_ENV = process.env.AGENTCTL_AUTO_ATTACH === "1";
 const autoAttached = new Set<string>();
 
+// Herdr sets these on every pane process. For a manual attach the daemon
+// verifies them against live Herdr state (never trusts them blindly): the pane
+// must exist, run an opencode agent, and be consistent with the hint.
+const HERDR_PANE_ID = process.env.HERDR_ENV === "1" ? process.env.HERDR_PANE_ID : undefined;
+const HERDR_TAB_ID = process.env.HERDR_ENV === "1" ? process.env.HERDR_TAB_ID : undefined;
+const HERDR_WORKSPACE_ID = process.env.HERDR_ENV === "1" ? process.env.HERDR_WORKSPACE_ID : undefined;
+
+function herdrIdentityFields(): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  if (HERDR_PANE_ID) out.pane_id = HERDR_PANE_ID;
+  if (HERDR_TAB_ID) out.tab_id = HERDR_TAB_ID;
+  if (HERDR_WORKSPACE_ID) out.workspace_id = HERDR_WORKSPACE_ID;
+  return out;
+}
+
 // Per-spawn marker carried in the relay bootstrap prompt. It travels with the
 // session's own prompt text, so this plugin can bind the RIGHT session to the
 // intended worker/generation even when many sessions share one server (whose
@@ -177,6 +192,7 @@ function autoAttach(
       token,
       role: "worker",
       directory,
+      ...herdrIdentityFields(),
     },
     directory
   );
@@ -298,6 +314,7 @@ async function buildTools(): Promise<Record<string, any>> {
             token: args.token,
             directory: context.directory,
             worktree: context.worktree,
+            ...herdrIdentityFields(),
           },
           context.directory
         );

@@ -19,9 +19,12 @@ export interface RecordRuntimeInput {
   runtimeId?: string | null;
   tabId?: string | null;
   paneId?: string | null;
+  workspaceId?: string | null;
   sessionId?: string | null;
   /** Per-spawn secret required to accept a relay-generation managed attach. */
   attachToken?: string | null;
+  /** 1 (default) = relay created this tab; 0 = adopted existing runtime (never closed). */
+  relayOwned?: 0 | 1;
   state?: RuntimeState;
   /** Absolute time after which a stale/dead runtime may be cleaned. */
   cleanupAfter?: number | null;
@@ -40,8 +43,8 @@ export function recordRuntime(db: Database, input: RecordRuntimeInput): WorkerRu
   const info = db
     .query(
       `INSERT INTO worker_runtimes
-        (worker_id, generation, runtime_id, tab_id, pane_id, session_id, attach_token, state, created_at, stale_at, cleanup_after, cleaned_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
+        (worker_id, generation, runtime_id, tab_id, pane_id, workspace_id, session_id, attach_token, relay_owned, state, created_at, stale_at, cleanup_after, cleaned_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
     )
     .run(
       input.workerId,
@@ -49,8 +52,10 @@ export function recordRuntime(db: Database, input: RecordRuntimeInput): WorkerRu
       input.runtimeId ?? null,
       input.tabId ?? null,
       input.paneId ?? null,
+      input.workspaceId ?? null,
       input.sessionId ?? null,
       input.attachToken ?? null,
+      input.relayOwned ?? 1,
       state,
       t,
       state === "stale" || state === "dead" ? t : null,
@@ -61,7 +66,12 @@ export function recordRuntime(db: Database, input: RecordRuntimeInput): WorkerRu
     source: "supervisor",
     workerId: input.workerId,
     type: "runtime.recorded",
-    payload: { generation: input.generation, runtimeId: input.runtimeId ?? null, state },
+    payload: {
+      generation: input.generation,
+      runtimeId: input.runtimeId ?? null,
+      state,
+      relayOwned: (input.relayOwned ?? 1) === 1,
+    },
   });
   return getRuntime(db, id)!;
 }
@@ -172,14 +182,16 @@ export function markRuntimeCleaned(db: Database, id: number, at = now()): Worker
 }
 
 /**
- * Runtimes eligible for cleanup: explicitly stale/dead AND past their grace
- * period. Generation/ownership safety is enforced by the caller (reconciler).
+ * Runtimes eligible for cleanup: relay-owned only, explicitly stale/dead, and
+ * past their grace period. Manual (relay_owned=false) runtimes are NEVER
+ * candidates. Generation/ownership safety beyond this is enforced by the caller
+ * (reconciler: never the current generation/runtime).
  */
 export function cleanupCandidates(db: Database, at = now()): WorkerRuntime[] {
   return db
     .query(
       `SELECT * FROM worker_runtimes
-        WHERE state IN ('stale', 'dead') AND cleanup_after IS NOT NULL AND cleanup_after <= ?
+        WHERE relay_owned = 1 AND state IN ('stale', 'dead') AND cleanup_after IS NOT NULL AND cleanup_after <= ?
         ORDER BY generation ASC, id ASC`
     )
     .all(at) as WorkerRuntime[];

@@ -343,7 +343,7 @@ describe("14. a failed restart backs off instead of retrying every tick", () => 
     seedWorker("w1", 1, "rt-w1-g1");
     recordRuntime(db, { workerId: "w1", generation: 1, runtimeId: "rt-w1-g1", state: "active" });
     rt.setAlive("w1", false);
-    rt.failRestart.add("w1");
+    rt.failStart.add("w1");
 
     await reconcile(db, rt);
     await reconcile(db, rt);
