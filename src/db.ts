@@ -33,6 +33,10 @@ function migrate(db: Database): void {
   try {
     db.exec("UPDATE tasks SET state = 'queued' WHERE state = 'claimed';");
   } catch { /* tasks table may not exist yet on first init */ }
+  // Per-spawn attach token (generation fencing for managed attaches).
+  if (columnExists(db, "worker_runtimes", "id") && !columnExists(db, "worker_runtimes", "attach_token")) {
+    db.exec("ALTER TABLE worker_runtimes ADD COLUMN attach_token TEXT;");
+  }
 }
 
 export function openDb(path?: string): Database {

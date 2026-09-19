@@ -29,6 +29,12 @@ export interface AttachOptions {
    * which is returned to the plugin and cached for fencing.
    */
   generation?: number;
+  /**
+   * Per-spawn secret from the bootstrap marker. Required for relay-spawned
+   * attaches once the runtime recorded a token; without it a stale/foreign
+   * plugin (or another project's session on a shared server) cannot bind.
+   */
+  attachToken?: string;
 }
 
 export function getSession(db: Database, sessionId: string): Session | null {
@@ -64,8 +70,37 @@ export function attachSession(db: Database, sessionId: string, opts: AttachOptio
   const prev = getSession(db, sessionId);
   const role = opts.role ?? prev?.role ?? "worker";
   const workerId = opts.workerId ?? prev?.worker_id ?? slugSession(sessionId);
-  const worker = getWorker(db, workerId) ?? registerWorker(db, workerId, { role, sessionId });
   const generation = opts.generation ?? (prev?.generation ?? 0) + 1;
+
+  // A managed session belongs to exactly one worker. Refuse a cross-worker
+  // steal (e.g. a stale plugin on a shared server claiming another session).
+  if (prev && prev.managed === 1 && prev.worker_id && prev.worker_id !== workerId) {
+    throw new Error(`attach rejected: ${sessionId} is already managed by ${prev.worker_id}`);
+  }
+
+  // Relay-spawned attaches must prove the per-spawn token the daemon recorded.
+  // Runtimes without a token are legacy/manual and stay attachable.
+  if (opts.generation !== undefined) {
+    const expected = findRuntime(db, workerId, opts.generation);
+    if (expected?.attach_token && opts.attachToken !== expected.attach_token) {
+      throw new Error(`attach rejected: bad token for ${workerId} g${opts.generation}`);
+    }
+  }
+
+  const worker = getWorker(db, workerId) ?? registerWorker(db, workerId, { role, sessionId });
+
+  // Relay-spawned attach supersedes the worker's previous session: events from
+  // the old generation's session must no longer drive this worker (zombie
+  // protection on the way in). Manual attaches leave other sessions alone.
+  const prevBound = worker.opencode_session_id;
+  if (opts.generation !== undefined && prevBound && prevBound !== sessionId) {
+    db.query(`UPDATE sessions SET managed = 0, detached_at = ?, updated_at = ? WHERE session_id = ? AND worker_id = ?`).run(
+      t,
+      t,
+      prevBound,
+      worker.id
+    );
+  }
 
   db.query(`UPDATE workers SET opencode_session_id = ?, role = COALESCE(?, role), updated_at = ? WHERE id = ?`).run(
     sessionId,

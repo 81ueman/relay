@@ -20,6 +20,8 @@ export interface RecordRuntimeInput {
   tabId?: string | null;
   paneId?: string | null;
   sessionId?: string | null;
+  /** Per-spawn secret required to accept a relay-generation managed attach. */
+  attachToken?: string | null;
   state?: RuntimeState;
   /** Absolute time after which a stale/dead runtime may be cleaned. */
   cleanupAfter?: number | null;
@@ -38,8 +40,8 @@ export function recordRuntime(db: Database, input: RecordRuntimeInput): WorkerRu
   const info = db
     .query(
       `INSERT INTO worker_runtimes
-        (worker_id, generation, runtime_id, tab_id, pane_id, session_id, state, created_at, stale_at, cleanup_after, cleaned_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
+        (worker_id, generation, runtime_id, tab_id, pane_id, session_id, attach_token, state, created_at, stale_at, cleanup_after, cleaned_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
     )
     .run(
       input.workerId,
@@ -48,6 +50,7 @@ export function recordRuntime(db: Database, input: RecordRuntimeInput): WorkerRu
       input.tabId ?? null,
       input.paneId ?? null,
       input.sessionId ?? null,
+      input.attachToken ?? null,
       state,
       t,
       state === "stale" || state === "dead" ? t : null,

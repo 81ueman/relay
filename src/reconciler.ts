@@ -59,6 +59,12 @@ function restartCooldownMs(): number {
   return Number.isFinite(v) && v >= 0 ? v : 30000;
 }
 
+/** At most one `runtime.cleanup_failed` event per worker per window. */
+function cleanupFailureLogWindowMs(): number {
+  const v = Number(process.env.AGENTCTL_CLEANUP_LOG_WINDOW_MS ?? "60000");
+  return Number.isFinite(v) && v >= 0 ? v : 60000;
+}
+
 function recentlyEvent(db: Database, workerId: string, type: string, at: number, windowMs: number): boolean {
   if (windowMs === 0) return false;
   const r = db
@@ -106,7 +112,14 @@ function releaseTaskOfDeadWorker(db: Database, workerId: string, taskId: string 
  * explicitly stale/dead are ever cleanup-eligible.
  */
 async function restartWorker(db: Database, rt: Runtime, w: WorkerRow, at: number): Promise<boolean> {
-  if (recentlyEvent(db, w.id, "worker.restarting", at, restartCooldownMs())) {
+  const cooldown = restartCooldownMs();
+  // Back off both after a successful spawn and after a failure: otherwise a
+  // failing spawn (e.g. a stale leftover agent name) retries every tick and
+  // floods worker.restart_failed.
+  if (
+    recentlyEvent(db, w.id, "worker.restarting", at, cooldown) ||
+    recentlyEvent(db, w.id, "worker.restart_failed", at, cooldown)
+  ) {
     return false; // backoff: do not spawn a new tab every tick
   }
 
@@ -140,6 +153,7 @@ async function restartWorker(db: Database, rt: Runtime, w: WorkerRow, at: number
       runtimeId: started.runtimeId,
       tabId: started.tabId ?? null,
       paneId: started.paneId ?? null,
+      attachToken: started.attachToken ?? null,
       state: "starting",
     });
     db.query(
@@ -224,12 +238,17 @@ async function cleanupOldRuntimes(db: Database, rt: Runtime, actions: string[], 
       markRuntimeCleaned(db, c.id, at);
       actions.push(`cleaned:${c.worker_id}:g${c.generation}`);
     } catch (e) {
-      logEvent(db, {
-        source: "supervisor",
-        workerId: c.worker_id,
-        type: "runtime.cleanup_failed",
-        payload: { generation: c.generation, runtimeId: c.runtime_id, error: String(e).slice(0, 200) },
-      });
+      // A repeatedly failing cleanup must not flood the event log: record the
+      // failure at most once per window, but always keep the row stale so the
+      // next pass retries.
+      if (!recentlyEvent(db, c.worker_id, "runtime.cleanup_failed", at, cleanupFailureLogWindowMs())) {
+        logEvent(db, {
+          source: "supervisor",
+          workerId: c.worker_id,
+          type: "runtime.cleanup_failed",
+          payload: { generation: c.generation, runtimeId: c.runtime_id, error: String(e).slice(0, 200) },
+        });
+      }
       actions.push(`cleanup-failed:${c.worker_id}:g${c.generation}`);
       // Leave it stale/dead so the next pass retries.
     }

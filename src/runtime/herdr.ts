@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import type { Worker } from "../schema";
 import { MockRuntime, type Runtime, type RuntimeRecord, type StartedRuntime } from "./runtime";
 
@@ -99,7 +100,9 @@ function findTabIdByAgent(agentName: string): string | null {
   if (!r.ok) return null;
   const parsed = tryParseJson(r.stdout);
   const agents: any[] = parsed?.result?.agents ?? [];
-  const hit = agents.find((a) => a?.agent === agentName);
+  // `agent list` entries carry the agent NAME in `name`; `agent` is the kind
+  // (e.g. "opencode"). Match on the name.
+  const hit = agents.find((a) => a?.name === agentName);
   return typeof hit?.tab_id === "string" ? hit.tab_id : null;
 }
 
@@ -109,6 +112,15 @@ function getTabLabel(tabId: string): string | null {
   const parsed = tryParseJson(r.stdout);
   const label = parsed?.result?.tab?.label;
   return typeof label === "string" ? label : null;
+}
+
+/** True if the tab still exists. On an unreadable list we answer true (stay safe). */
+function tabExists(tabId: string): boolean {
+  const r = runHerdr(["tab", "list"], 8000);
+  if (!r.ok) return true;
+  const parsed = tryParseJson(r.stdout);
+  const tabs: any[] = parsed?.result?.tabs ?? [];
+  return tabs.some((t) => t?.tab_id === tabId);
 }
 
 /** Retry `agent start` a few times: a freshly created tab's shell may not be ready yet. */
@@ -131,8 +143,15 @@ function closeRelayTab(workerId: string, generation: number, tabId: string): voi
   } catch { /* best effort */ }
 }
 
-export const BOOTSTRAP_PROMPT = (workerId: string) =>
-  `You are managed by the relay supervisor as worker ${workerId}. ` +
+export const BOOTSTRAP_PROMPT = (workerId: string, generation: number, attachToken?: string) =>
+  // The first line is a machine-readable marker the relay plugin reads out of
+  // this session's own prompt text to auto-attach the RIGHT session. A shared
+  // OpenCode server has no per-session env, and may host sessions from several
+  // projects at once, so identity travels with the prompt. The attach token is
+  // the per-spawn secret the daemon demands before it accepts the attach, which
+  // stops a stale or foreign plugin from binding a session it does not own.
+  `RELAY-ATTACH worker=${workerId} gen=${generation}${attachToken ? ` token=${attachToken}` : ""}\n` +
+  `You are managed by the relay supervisor as worker ${workerId} (generation ${generation}). ` +
   `Load the agent-worker skill, then run \`agentctl next\` to claim work. ` +
   `Never wait for instructions; after each submit/block run \`agentctl next\` again.`;
 
@@ -168,8 +187,21 @@ export class HerdrRuntime implements Runtime {
     }
     const cwd = w.cwd ?? process.cwd();
     const name = agentNameFor(w.id, generation);
+    const attachToken = randomUUID();
     if (runHerdr(["agent", "get", name], 5000).ok) {
-      throw new Error(`agent ${name} already exists`);
+      // The target name already exists. If its tab is provably a relay tab for
+      // THIS worker+generation it is a leftover from an earlier attempt or run
+      // (e.g. the daemon crashed after create but before recording), so reap it
+      // and spawn clean rather than failing forever. Anything else is not ours:
+      // refuse instead of clobbering an unrelated agent.
+      const staleTab = findTabIdByAgent(name);
+      const expected = relayTabLabel(w.id, generation);
+      if (staleTab && getTabLabel(staleTab) === expected) {
+        runHerdr(["tab", "close", staleTab], 10000);
+        for (let i = 0; i < 8 && runHerdr(["agent", "get", name], 3000).ok; i++) await Bun.sleep(500);
+      } else {
+        throw new Error(`agent ${name} already exists and is not a relay tab for ${expected}`);
+      }
     }
 
     const envArgs: string[] = [
@@ -200,12 +232,12 @@ export class HerdrRuntime implements Runtime {
       await startAgentWithRetry(name, paneId);
       // Best-effort bootstrap: a hiccup here must not abort an otherwise good spawn.
       try {
-        await this.wake({ ...w, runtime_id: name }, BOOTSTRAP_PROMPT(w.id));
+        await this.wake({ ...w, runtime_id: name }, BOOTSTRAP_PROMPT(w.id, generation, attachToken));
       } catch { /* the daemon's wake loop will kick it once active */ }
       if (!(await this.isAlive({ ...w, runtime_id: name }))) {
         throw new Error(`started agent ${name} is not reachable`);
       }
-      return { runtimeId: name, tabId: tabId ?? undefined, paneId };
+      return { runtimeId: name, tabId: tabId ?? undefined, paneId, attachToken };
     } catch (e) {
       // A brand-new tab that never produced a usable generation is rolled back
       // synchronously so it cannot leak as an untracked duplicate. OLD
@@ -238,7 +270,13 @@ export class HerdrRuntime implements Runtime {
     }
     const expected = relayTabLabel(rec.worker_id, rec.generation);
     const label = getTabLabel(tabId);
-    if (label === null) throw new Error(`cannot read label for tab ${tabId}; refusing cleanup`);
+    if (label === null) {
+      // The tab is already gone: there is nothing left to reap, and recording
+      // it as cleaned stops a pointless retry loop. If the tab still exists but
+      // its label is unreadable we refuse (never close something unverified).
+      if (!tabExists(tabId)) return;
+      throw new Error(`cannot read label for tab ${tabId}; refusing cleanup`);
+    }
     if (label !== expected) throw new Error(`tab ${tabId} label "${label}" != "${expected}"; refusing cleanup`);
     const close = runHerdr(["tab", "close", tabId], 10000);
     if (!close.ok) throw new Error(`herdr tab close ${tabId} failed: ${(close.stderr || close.stdout).trim().slice(0, 200)}`);

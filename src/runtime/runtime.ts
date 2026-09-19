@@ -12,6 +12,12 @@ export interface StartedRuntime {
   runtimeId: string; // Herdr agent name (unique per generation)
   tabId?: string;
   paneId?: string;
+  /**
+   * Secret baked into the bootstrap prompt. The daemon requires it on the
+   * managed attach so a stale/foreign plugin (or another project's session on a
+   * shared OpenCode server) cannot bind a session it does not own.
+   */
+  attachToken?: string;
 }
 
 /** Minimal shape the cleanup path needs from worker_runtimes history. */
@@ -50,6 +56,8 @@ export class MockRuntime implements Runtime {
   cleanups: string[] = [];
   failWake = new Set<string>();
   failStart = new Set<string>();
+  /** Workers whose restart() should throw. */
+  failRestart = new Set<string>();
   /** Runtime ids (or `${worker}:g${generation}`) whose cleanup should throw. */
   failCleanup = new Set<string>();
   peekText = "";
@@ -91,17 +99,20 @@ export class MockRuntime implements Runtime {
       runtimeId: `${target}#g${generation}`,
       tabId: `tab-${w.id}-g${generation}`,
       paneId: `pane-${w.id}-g${generation}`,
+      attachToken: `mock-token-${w.id}-g${generation}`,
     };
   }
   async restart(w: Worker, generation: number): Promise<StartedRuntime> {
     const target = MockRuntime.targetOf(w);
     this.targets.push({ op: "restart", target });
+    if (this.failRestart.has(this.key(w))) throw new Error("restart failed (simulated)");
     this.restarts.push(this.key(w));
     this.alive.set(this.key(w), true);
     return {
       runtimeId: `${target}#g${generation}`,
       tabId: `tab-${w.id}-g${generation}`,
       paneId: `pane-${w.id}-g${generation}`,
+      attachToken: `mock-token-${w.id}-g${generation}`,
     };
   }
   async cleanup(rec: RuntimeRecord): Promise<void> {

@@ -78,6 +78,7 @@ export interface WorkerRuntime {
   tab_id: string | null;
   pane_id: string | null;
   session_id: string | null; // OpenCode session bound on managed attach
+  attach_token: string | null; // per-spawn secret that legitimises a managed attach
   state: RuntimeState;
   created_at: number;
   stale_at: number | null;
@@ -210,6 +211,7 @@ CREATE TABLE IF NOT EXISTS worker_runtimes (
   tab_id TEXT,
   pane_id TEXT,
   session_id TEXT,
+  attach_token TEXT,
   state TEXT NOT NULL DEFAULT 'starting',
   created_at INTEGER NOT NULL,
   stale_at INTEGER,

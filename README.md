@@ -65,7 +65,7 @@ AGENTCTL_LEASE_MS=120000 AGENTCTL_STALL_MS=60000 AGENTCTL_LOW_WATER=3
 AGENTCTL_WAKE_COOLDOWN_MS=30000 AGENTCTL_AUTO_APPROVE AGENTCTL_INTERVAL_MS=1500
 AGENTCTL_HERDR_WORKSPACE=<ws>   # REQUIRED to spawn (falls back to $HERDR_WORKSPACE_ID)
 AGENTCTL_RUNTIME_CLEANUP_GRACE_MS=300000 AGENTCTL_ATTACH_TIMEOUT_MS=30000
-AGENTCTL_RESTART_COOLDOWN_MS=30000
+AGENTCTL_RESTART_COOLDOWN_MS=30000 AGENTCTL_CLEANUP_LOG_WINDOW_MS=60000
 ```
 
 Spawning **requires** an explicit Herdr workspace. `herdr tab create` is
@@ -97,11 +97,27 @@ Attach bumps a per-session `generation`; events carrying a stale generation
 are ignored (zombie-session protection). Detach returns the session to normal.
 
 Sessions spawned by relay itself (via `Runtime.start`) are **automatically
-managed**: the fresh tab/agent is launched with `AGENTCTL_MANAGED=1`,
-`AGENTCTL_WORKER`, `AGENTCTL_GENERATION`, `AGENTCTL_DB`, `AGENTCTL_SOCK`, and
-the plugin auto-attaches on the session's first event using that generation.
-No manual `agent_attach` is needed. Plain `opencode` has none of these env
-vars and remains unmanaged.
+managed**. Identity cannot come from process env: a single OpenCode server
+(`opencode serve --service`) can host many sessions and its env names at most
+one worker. So the relay bootstrap prompt carries a per-spawn marker
+
+```text
+RELAY-ATTACH worker=<worker-id> gen=<generation> token=<spawn-token>
+```
+
+and the plugin reads it out of that session's own prompt text, then attaches
+**that** session with the intended worker/generation. Plain `opencode` has no
+marker and stays unmanaged. (`AGENTCTL_MANAGED/WORKER/GENERATION/DB/SOCK` are
+still exported into the spawned tab; `AGENTCTL_AUTO_ATTACH=1` enables the
+env-only path for dedicated one-server-per-worker deployments, but it is off by
+default because a shared server cannot identify a session from process env.)
+
+The `token` is the **per-spawn secret** (`worker_runtimes.attach_token`). The
+daemon accepts a relay-generation attach only when the token matches, so a
+stale plugin instance, another project's session, or an unrelated OpenCode
+session on the same shared server can never bind a session it does not own. A
+managed session also belongs to exactly one worker: a cross-worker attach is
+refused outright.
 
 ## Runtime generations (fresh tab, stale old, later cleanup)
 
@@ -140,8 +156,21 @@ cleanup_after <= now                   tab label == relay:<worker>:g<generation>
 ```
 
 Cleanup failures are logged as `runtime.cleanup_failed` and retried later; a
-leftover old tab is acceptable, a stopped fresh worker is not. `waiting_input`
-workers are never wake candidates for `agentctl next`.
+leftover old tab is acceptable, a stopped fresh worker is not. Repeated
+failures are recorded at most once per `AGENTCTL_CLEANUP_LOG_WINDOW_MS`
+(default 60000) so a stuck cleanup cannot flood the event log. If the recorded
+tab is already gone there is nothing to reap, so the runtime is marked
+`cleaned` instead of retrying forever; an unreadable label on a tab that still
+exists is refused. `waiting_input` workers are never wake candidates for
+`agentctl next`.
+
+Restart attempts are throttled by `AGENTCTL_RESTART_COOLDOWN_MS` (default
+30000), applied after **failures** too, so a spawn that cannot come up is
+retried on a slow cadence and `worker.restart_failed` cannot flood the log. If
+the target agent name already exists, `start()` reaps it only when its tab
+label proves relay ownership of the same `<worker>:g<generation>` (a leftover
+from an earlier attempt or run) and otherwise refuses — it never closes an
+agent it cannot prove it owns.
 
 
 ## Plugin → daemon: Unix socket, not subprocess

@@ -77,8 +77,9 @@ describe("1. fresh restart creates a new generation", () => {
     expect(g1.runtime_id).not.toBe(g2.runtime_id);
     expect(getWorker(db, "w1")!.generation).toBe(2);
 
-    // Managed attach lands for the fresh generation (relay-spawned env).
-    attachSession(db, "ses-w1-g2", { workerId: "w1", role: "worker", generation: 2 });
+    // Managed attach lands for the fresh generation (relay-spawned env), with
+    // the per-spawn token the runtime recorded.
+    attachSession(db, "ses-w1-g2", { workerId: "w1", role: "worker", generation: 2, attachToken: "mock-token-w1-g2" });
     await reconcile(db, rt);
 
     expect(findRuntime(db, "w1", 2)!.state).toBe("active");
@@ -253,5 +254,103 @@ describe("9. all work complete stays quiet", () => {
     expect(actions).not.toContain("planner-woken:plan");
     expect(rt.wakes).toHaveLength(0);
     expect(listWorkers(db).length).toBeGreaterThan(0); // planner exists but stays quiet
+  });
+});
+
+describe("10. non-session ids are rejected", () => {
+  test("a shell/command id never becomes a managed session", async () => {
+    const before = eventCount();
+    const res = await handleSocketMessage(
+      { type: "session.attach", session_id: "sh_0ba8abc", worker_id: "w1", generation: 1 },
+      ctx
+    );
+    expect(res).toMatchObject({ ok: false, reason: "not-a-session-id" });
+    expect(getSession(db, "sh_0ba8abc")).toBeNull();
+    expect(listWorkers(db)).toHaveLength(0);
+    expect(eventCount()).toBe(before);
+  });
+});
+
+describe("11. a fresh generation supersedes the old session", () => {
+  test("attaching g2 detaches the worker's g1 session so its events stop counting", async () => {
+    registerWorker(db, "w1", { role: "worker" });
+    db.query(`UPDATE workers SET state = 'idle', generation = 1, runtime_id = 'rt-w1-g1' WHERE id = 'w1'`).run();
+    recordRuntime(db, { workerId: "w1", generation: 1, runtimeId: "rt-w1-g1", state: "active" });
+    attachSession(db, "ses-w1-g1", { workerId: "w1", role: "worker", generation: 1 });
+    expect(getSession(db, "ses-w1-g1")!.managed).toBe(1);
+
+    recordRuntime(db, { workerId: "w1", generation: 2, runtimeId: "rt-w1-g2", state: "starting" });
+    attachSession(db, "ses-w1-g2", { workerId: "w1", role: "worker", generation: 2 });
+
+    expect(getSession(db, "ses-w1-g1")!.managed).toBe(0); // old session fenced out
+    expect(getSession(db, "ses-w1-g2")!.managed).toBe(1);
+    expect(getWorker(db, "w1")!.opencode_session_id).toBe("ses-w1-g2");
+    expect(findRuntime(db, "w1", 2)!.state).toBe("active");
+  });
+});
+
+describe("12. relay generations require the per-spawn attach token", () => {
+  test("an attach without the recorded token is rejected; the legit token succeeds", async () => {
+    seedWorker("w1", 1, "rt-w1-g1");
+    recordRuntime(db, { workerId: "w1", generation: 1, runtimeId: "rt-w1-g1", state: "active" });
+    rt.setAlive("w1", false);
+    await reconcile(db, rt);
+    expect(findRuntime(db, "w1", 2)!.attach_token).toBe("mock-token-w1-g2");
+
+    // A stale/foreign plugin (no token) must not be able to bind this generation.
+    const bad = await handleSocketMessage(
+      { type: "session.attach", session_id: "ses-intruder", worker_id: "w1", generation: 2 },
+      ctx
+    );
+    expect(bad).toMatchObject({ ok: false });
+    expect(getSession(db, "ses-intruder")).toBeNull();
+
+    const good = await handleSocketMessage(
+      { type: "session.attach", session_id: "ses-w1-g2", worker_id: "w1", generation: 2, token: "mock-token-w1-g2" },
+      ctx
+    );
+    expect(good).toMatchObject({ ok: true, worker_id: "w1" });
+    expect(getSession(db, "ses-w1-g2")!.managed).toBe(1);
+  });
+});
+
+describe("13. repeated cleanup failures are log-deduped", () => {
+  test("a failing cleanup logs once per window but keeps retrying", async () => {
+    seedWorker("w1", 2, "rt-w1-g2");
+    recordRuntime(db, {
+      workerId: "w1",
+      generation: 1,
+      runtimeId: "rt-w1-g1",
+      tabId: "tab-w1-g1",
+      state: "stale",
+      cleanupAfter: Date.now() - 1000,
+    });
+    rt.failCleanup.add("rt-w1-g1");
+
+    await reconcile(db, rt);
+    await reconcile(db, rt);
+    await reconcile(db, rt);
+
+    const failures = listEvents(db, { limit: 1000 }).filter((e) => e.type === "runtime.cleanup_failed");
+    expect(failures).toHaveLength(1); // one log line, not one per tick
+    expect(findRuntime(db, "w1", 1)!.state).toBe("stale"); // still retryable
+  });
+});
+
+describe("14. a failed restart backs off instead of retrying every tick", () => {
+  test("a spawn that keeps failing logs worker.restart_failed once per cooldown window", async () => {
+    process.env.AGENTCTL_RESTART_COOLDOWN_MS = "60000";
+    seedWorker("w1", 1, "rt-w1-g1");
+    recordRuntime(db, { workerId: "w1", generation: 1, runtimeId: "rt-w1-g1", state: "active" });
+    rt.setAlive("w1", false);
+    rt.failRestart.add("w1");
+
+    await reconcile(db, rt);
+    await reconcile(db, rt);
+    await reconcile(db, rt);
+
+    const failures = listEvents(db, { limit: 1000 }).filter((e) => e.type === "worker.restart_failed");
+    expect(failures).toHaveLength(1); // one log line, not one per tick
+    expect(getWorker(db, "w1")!.state).toBe("dead");
   });
 });

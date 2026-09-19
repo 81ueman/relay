@@ -27,6 +27,8 @@ export interface SocketMessage {
   worker_id?: string;
   directory?: string;
   worktree?: string;
+  /** Per-spawn attach secret (relay-spawned generations only). */
+  token?: string;
 }
 
 export interface SocketContext {
@@ -47,12 +49,22 @@ export async function handleSocketMessage(msg: SocketMessage, ctx: SocketContext
 
   if (type === "session.attach") {
     if (!msg.session_id) return { ok: false, reason: "no-session" };
-    const s = attachSession(db, msg.session_id, {
-      role: msg.role, workerId: msg.worker_id, directory: msg.directory, worktree: msg.worktree,
-      // Relay-spawned sessions send the authoritative generation from
-      // AGENTCTL_GENERATION; manual attaches omit it and get a bumped one.
-      generation: typeof msg.generation === "number" ? msg.generation : undefined,
-    });
+    // Defense in depth: a session id must look like an OpenCode session
+    // (`ses...`). Shell/command ids (`sh_...`) and other host ids must never
+    // become managed sessions, whatever a plugin version sends.
+    if (!/^ses/.test(msg.session_id)) return { ok: false, reason: "not-a-session-id" };
+    let s;
+    try {
+      s = attachSession(db, msg.session_id, {
+        role: msg.role, workerId: msg.worker_id, directory: msg.directory, worktree: msg.worktree,
+        // Relay-spawned sessions send the authoritative generation from
+        // AGENTCTL_GENERATION; manual attaches omit it and get a bumped one.
+        generation: typeof msg.generation === "number" ? msg.generation : undefined,
+        attachToken: msg.token,
+      });
+    } catch (e) {
+      return { ok: false, reason: String(e).slice(0, 200) };
+    }
     ctx.wakeReconcile.value = true;
     return { ok: true, worker_id: s.worker_id, generation: s.generation, managed: true };
   }

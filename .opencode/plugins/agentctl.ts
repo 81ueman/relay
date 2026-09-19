@@ -29,15 +29,36 @@ const generationCache = new Map<string, number>();
 const detachedCache = new Set<string>();
 
 // Relay-spawned sessions are launched with AGENTCTL_MANAGED=1 and an explicit
-// worker + generation. They auto-attach on their first event; a plain
-// `opencode` launch has none of these and stays unmanaged.
+// worker + generation. A plain `opencode` launch has none of these and stays
+// unmanaged.
 const MANAGED = process.env.AGENTCTL_MANAGED === "1";
 const ENV_WORKER = process.env.AGENTCTL_WORKER;
 const ENV_GENERATION = (() => {
   const n = Number(process.env.AGENTCTL_GENERATION ?? "");
   return Number.isFinite(n) && n > 0 ? n : undefined;
 })();
+// Env-only auto attach is OFF by default. A single OpenCode server can host
+// many sessions (`opencode serve --service`) and its process env names only one
+// worker, so env cannot identify a session. It is opt-in for dedicated
+// one-server-per-worker deployments.
+const AUTO_ATTACH_FROM_ENV = process.env.AGENTCTL_AUTO_ATTACH === "1";
 const autoAttached = new Set<string>();
+
+// Per-spawn marker carried in the relay bootstrap prompt. It travels with the
+// session's own prompt text, so this plugin can bind the RIGHT session to the
+// intended worker/generation even when many sessions share one server (whose
+// process env identifies nobody).
+const ATTACH_MARKER = /RELAY-ATTACH\s+worker=([A-Za-z0-9._-]+)\s+gen=(\d+)(?:\s+token=([A-Za-z0-9._-]+))?/;
+// Only these carry prompt text; scanning the high-frequency stream for a marker
+// would be pointless (and there is nothing to find once attached).
+const ATTACH_HINT_TYPES = new Set([
+  "session.inbox.enqueued",
+  "session.renamed",
+  "session.created",
+  "session.idle",
+  "session.status",
+  "session.viewed",
+]);
 
 function sockPath(explicitDir?: string): string {
   if (process.env.AGENTCTL_SOCK) return process.env.AGENTCTL_SOCK;
@@ -134,37 +155,54 @@ function withGeneration(sessionID: string | undefined, extra: Record<string, unk
 }
 
 /**
- * Auto managed attach for relay-spawned sessions. The first event we see for a
- * session launched with AGENTCTL_MANAGED=1 registers it as managed with the
- * env generation. Fire-and-forget: the generation is already known locally.
+ * Bind a session to a worker/generation and tell the daemon. Fire-and-forget:
+ * the generation is cached locally so later events fence correctly.
  */
-function maybeAutoAttach(sessionID: string | undefined, explicitDir?: string): void {
-  if (!MANAGED || !sessionID || autoAttached.has(sessionID)) return;
+function autoAttach(
+  sessionID: string,
+  workerId: string | undefined,
+  generation: number,
+  directory?: string,
+  token?: string
+): void {
+  if (autoAttached.has(sessionID)) return;
   autoAttached.add(sessionID);
-  const directory = explicitDir ?? process.cwd();
-  if (ENV_GENERATION !== undefined) {
-    generationCache.set(sessionID, ENV_GENERATION);
-    sendEvent(
-      {
-        type: "session.attach",
-        session_id: sessionID,
-        worker_id: ENV_WORKER,
-        generation: ENV_GENERATION,
-        role: "worker",
-        directory,
-      },
-      explicitDir
-    );
+  generationCache.set(sessionID, generation);
+  sendEvent(
+    {
+      type: "session.attach",
+      session_id: sessionID,
+      worker_id: workerId,
+      generation,
+      token,
+      role: "worker",
+      directory,
+    },
+    directory
+  );
+}
+
+/** Per-session identity from the relay bootstrap prompt marker. */
+function maybeAttachFromMarker(sessionID: string | undefined, data: any, directory?: string): void {
+  if (!sessionID || autoAttached.has(sessionID) || !sessionID.startsWith("ses_")) return;
+  let text = "";
+  try {
+    text = [data?.item?.payload?.text, data?.text, data?.title, data?.input?.prompt, data?.prompt]
+      .filter((x) => typeof x === "string")
+      .join("\n");
+    if (!text) text = JSON.stringify(data ?? {});
+  } catch {
     return;
   }
-  // Unexpected (managed spawn without a generation): ask the daemon and cache.
-  void sendRequest(
-    { type: "session.attach", session_id: sessionID, worker_id: ENV_WORKER, role: "worker", directory },
-    explicitDir
-  ).then((res) => {
-    if (res?.ok && typeof res.generation === "number") generationCache.set(sessionID, res.generation);
-    else autoAttached.delete(sessionID); // allow a retry on the next event
-  });
+  const m = ATTACH_MARKER.exec(text);
+  if (m) autoAttach(sessionID, m[1], Number(m[2]), directory, m[3]);
+}
+
+/** Opt-in env auto attach (only safe when one server serves exactly one worker). */
+function maybeAttachFromEnv(sessionID: string | undefined, directory?: string): void {
+  if (!AUTO_ATTACH_FROM_ENV || !MANAGED || !sessionID || !sessionID.startsWith("ses_")) return;
+  if (ENV_GENERATION === undefined) return;
+  autoAttach(sessionID, ENV_WORKER, ENV_GENERATION, directory);
 }
 
 function sessionIDOf(data: any): string | undefined {
@@ -195,7 +233,10 @@ const LIVENESS_TYPES = new Set(["session.status", "session.created", "session.vi
 const TOOL_AFTER = "tool.execute.after";
 
 function forwardEvent(type: string, sessionID: string | undefined, data: any, explicitDir?: string): void {
-  if (sessionID) maybeAutoAttach(sessionID, explicitDir);
+  // Attach THIS session only when the event proves its per-session identity:
+  // either the relay bootstrap marker in its own prompt text, or (opt-in) env.
+  if (ATTACH_HINT_TYPES.has(type)) maybeAttachFromMarker(sessionID, data, explicitDir);
+  maybeAttachFromEnv(sessionID, explicitDir);
   if (IDLE_TYPES.has(type) || ERROR_TYPES.has(type)) {
     // Always forwarded; the daemon gates on managed + generation.
     const payload = ERROR_TYPES.has(type) ? { payload: { error: errorOf(data) } } : {};
@@ -243,14 +284,18 @@ async function buildTools(): Promise<Record<string, any>> {
       args: {
         role: tool.schema.string().optional().describe("worker (default), planner, reviewer, coordinator"),
         worker_id: tool.schema.string().optional().describe("Existing worker id to bind, else auto-derived"),
+        generation: tool.schema.number().optional().describe("Relay generation to bind (relay-spawned sessions); omit for a manual attach"),
+        token: tool.schema.string().optional().describe("Per-spawn attach token (relay-spawned sessions)"),
       },
-      async execute(args: { role?: string; worker_id?: string }, context: any): Promise<string> {
+      async execute(args: { role?: string; worker_id?: string; generation?: number; token?: string }, context: any): Promise<string> {
         const res = await sendRequest(
           {
             type: "session.attach",
             session_id: context.sessionID,
             role: args.role ?? "worker",
             worker_id: args.worker_id,
+            generation: args.generation,
+            token: args.token,
             directory: context.directory,
             worktree: context.worktree,
           },
