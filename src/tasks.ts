@@ -9,6 +9,7 @@ import {
   touchProgress,
 } from "./workers";
 import type { Task, TaskState } from "./schema";
+import { notifyTaskDone } from "./notify";
 
 export const STALE_LEASE = "STALE_LEASE";
 
@@ -391,7 +392,10 @@ export function approveTask(db: Database, taskId: string, workerId: string): Tas
   if (task.assignee && task.assignee !== workerId) normalizeWorkerAfterTaskRelease(db, task.assignee, t);
   touchProgress(db, workerId, t);
   logEvent(db, { source: "reviewer", workerId, taskId, type: "task.approved" });
-  return getTask(db, taskId)!;
+  const done = getTask(db, taskId)!;
+  // Durable completion notice to the operator (opt-in; no-op without one).
+  notifyTaskDone(db, done, workerId);
+  return done;
 }
 
 export function rejectTask(db: Database, taskId: string, workerId: string, reason: string): Task {

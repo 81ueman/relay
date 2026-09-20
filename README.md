@@ -571,6 +571,14 @@ min), so a missed send-time wake cannot leave a backlog invisible; reading the
 inbox marks messages delivered and stops the nudge. `relay status` reports
 unread counts per recipient.
 
+**Completion notices.** The operator is also told when work finishes, so it does
+not have to poll: `RELAY_NOTIFY_ON=off|task|drain|both` (env, or a one-line
+`.relay/notify` file; default `off`). `task` sends a durable message at each
+approval (`T67 done (approved by reviewer)`); `drain` sends ONE message when the
+whole grid drains (no queued/running/review/blocked), debounced durably so it
+never repeats while empty and re-arms when new work appears. Relay-generated
+notices skip the mail-nudge delay and are woken on the next tick.
+
 `relay task show <id>` keeps stdout a single parseable JSON document (notes go
 to stderr); `relay task show <id> --json` emits ONE document with the task and
 its notes.

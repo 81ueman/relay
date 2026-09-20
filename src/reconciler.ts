@@ -44,6 +44,7 @@ import {
 } from "./tasks";
 import { getWorker, listWorkers, setWorkerState, touchSeen, type WorkerRow } from "./workers";
 import { HUMAN_RECIPIENT, operatorId } from "./messages";
+import { notifyGridDrained } from "./notify";
 
 // Deterministic reconciler. No LLM: pure DB state + runtime transport.
 // Callers pass full Worker rows; only the Runtime adapter maps to targets.
@@ -533,15 +534,18 @@ async function nudgeUnreadMail(
   const window = mailNudgeMs();
   const rows = db
     .query(
-      `SELECT recipient, COUNT(*) AS n, MIN(created_at) AS oldest
+      `SELECT recipient, COUNT(*) AS n, MIN(created_at) AS oldest,
+              SUM(CASE WHEN kind = 'notify' THEN 1 ELSE 0 END) AS notifies
          FROM messages WHERE state = 'queued'
         GROUP BY recipient`
     )
-    .all() as { recipient: string; n: number; oldest: number }[];
+    .all() as { recipient: string; n: number; oldest: number; notifies: number }[];
   if (rows.length === 0) return;
   const operator = operatorId();
-  for (const { recipient, n, oldest } of rows) {
-    if (at - oldest < window) continue; // let the send-time wake land first
+  for (const { recipient, n, oldest, notifies } of rows) {
+    // Relay-generated notices never had a send-time wake, so they skip the
+    // "let the wake land first" delay and are nudged on the next tick.
+    if (notifies === 0 && at - oldest < window) continue;
     const target = recipient === HUMAN_RECIPIENT ? operator : recipient;
     if (!target) continue;
     const w = getWorker(db, target);
@@ -765,11 +769,29 @@ export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<
     }
   }
 
-  // 5. Nudge recipients with undelivered mail (a durable safety net for a missed
+  // 5. Tell the operator when the WHOLE grid drains (no unfinished work). The
+  //    integrator holds no task, so no other nudge ever reaches it; without this
+  //    it can only poll. Debounced durably by notifyGridDrained (one notice per
+  //    drain), and woken immediately rather than waiting for the mail window.
+  if (view.unfinished === 0) {
+    const noticeId = notifyGridDrained(db);
+    if (noticeId !== null) {
+      const op = operatorId();
+      const w = op ? getWorker(db, op) : null;
+      if (w && w.retired_at === null) {
+        try {
+          await rt.wake(w, "all tasks done; nothing queued/running/review/blocked.");
+        } catch { /* best effort; the durable message remains */ }
+      }
+      actions.push("grid-drained-notified");
+    }
+  }
+
+  // 6. Nudge recipients with undelivered mail (a durable safety net for a missed
   //    send-time wake, and the only path that can reach `human`).
   await nudgeUnreadMail(db, rt, actions, at);
 
-  // 6. Reap old generations, isolated from all of the above.
+  // 7. Reap old generations, isolated from all of the above.
   await cleanupOldRuntimes(db, rt, actions, at);
 
   return { view: supervisorView(db), actions };

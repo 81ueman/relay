@@ -76,6 +76,7 @@ Usage:
 
 Worker identity: --worker flag, $RELAY_WORKER, your Herdr pane, or .relay/worker-id
 Operator: 'human' mail is routed to RELAY_OPERATOR=<worker-id> (or .relay/operator)
+Notify: RELAY_NOTIFY_ON=off|task|drain|both (operator notice on task done / grid drained)
 DB: $RELAY_DB or the nearest .relay/state.db (searched upward from cwd; WAL mode)
 Env: RELAY_LEASE_MS RELAY_LEASE_LIVENESS_GRACE_MS RELAY_STALL_MS RELAY_LOW_WATER
      RELAY_AUTO_APPROVE RELAY_INTERVAL_MS RELAY_ROLE_STRICT (default true)
