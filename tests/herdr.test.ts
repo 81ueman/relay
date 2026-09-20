@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Database } from "bun:sqlite";
 import { openDb } from "../src/db";
-import { listEvents } from "../src/events";
+import { listEvents, logEvent } from "../src/events";
 import { handleSocketMessage, type SocketContext } from "../src/socket";
 import { MockRuntime, type HerdrIdentity } from "../src/runtime/runtime";
 import { buildRuntime, pickIdentityByDirectory, resolveHerdrTarget, type HerdrAgentEntry } from "../src/runtime/herdr";
@@ -118,8 +118,8 @@ describe("B. non-Herdr attach is rejected", () => {
   });
 });
 
-describe("C+D. an adopted runtime is replaced but never cleaned", () => {
-  test("manual g1 -> stale (never closed) while a fresh relay-owned g2 spawns", async () => {
+describe("C+D. an adopted runtime is never auto-replaced", () => {
+  test("manual g1 is left as-is and the refusal is recorded (no competing agent)", async () => {
     rt.setIdentity("ses_man", IDENTITY);
     const res = await handleSocketMessage(
       { type: "session.attach", session_id: "ses_man", role: "worker", pane_id: IDENTITY.paneId },
@@ -128,24 +128,25 @@ describe("C+D. an adopted runtime is replaced but never cleaned", () => {
     const workerId = String(res.worker_id);
 
     rt.setAlive(workerId, false);
-    await reconcile(db, rt);
-
-    const g1 = findRuntime(db, workerId, 1)!;
-    const g2 = findRuntime(db, workerId, 2)!;
-    expect(g1.state).toBe("stale");
-    expect(g1.relay_owned).toBe(0);
-    expect(g2.state).toBe("starting");
-    expect(g2.relay_owned).toBe(1);
-    expect(getWorker(db, workerId)!.runtime_id).toBe(g2.runtime_id);
-    expect(getWorker(db, workerId)!.generation).toBe(2);
-
-    // Pretend g1's grace period elapsed: it is still NOT a cleanup candidate.
-    db.query(`UPDATE worker_runtimes SET cleanup_after = ? WHERE id = ?`).run(Date.now() - 1000, g1.id);
     const { actions } = await reconcile(db, rt);
+
+    // The transport-dead worker is marked dead and its task requeued...
+    expect(actions).toContain(`dead:${workerId}`);
+    // ...but NO fresh generation is spawned: relay cannot close the adopted tab,
+    // so replacing it would leave TWO live agents editing the same files.
+    expect(findRuntime(db, workerId, 2)).toBeNull();
+    expect(getWorker(db, workerId)!.generation).toBe(1);
+    expect(listEvents(db, { limit: 50 }).some((e) => e.type === "worker.restart_refused")).toBe(true);
+
+    // The adopted runtime remains and is NEVER a cleanup candidate.
+    const g1 = findRuntime(db, workerId, 1)!;
+    expect(g1.relay_owned).toBe(0);
+    expect(g1.state).toBe("active");
+    db.query(`UPDATE worker_runtimes SET cleanup_after = ? WHERE id = ?`).run(Date.now() - 1000, g1.id);
+    const { actions: a2 } = await reconcile(db, rt);
     expect(cleanupCandidates(db, Date.now()).some((c) => c.id === g1.id)).toBe(false);
     expect(rt.cleanups).toHaveLength(0);
-    expect(findRuntime(db, workerId, 1)!.state).toBe("stale"); // tab remains
-    expect(actions.some((a) => a.startsWith("cleaned:"))).toBe(false);
+    expect(a2.some((a) => a.startsWith("cleaned:"))).toBe(false);
 
     // Defense in depth: the adapter refuses to clean it outright.
     await expect(
@@ -158,17 +159,6 @@ describe("C+D. an adopted runtime is replaced but never cleaned", () => {
         relay_owned: 0,
       })
     ).rejects.toThrow();
-
-    // The fresh relay-owned generation completes attach and becomes active.
-    const fresh = await handleSocketMessage(
-      { type: "session.attach", session_id: "ses_man2", worker_id: workerId, generation: 2, token: g2.attach_token! },
-      ctx
-    );
-    expect(fresh.ok).toBe(true);
-    await reconcile(db, rt);
-    expect(findRuntime(db, workerId, 2)!.state).toBe("active");
-    expect(getWorker(db, workerId)!.opencode_session_id).toBe("ses_man2");
-    expect(findRuntime(db, workerId, 1)!.relay_owned).toBe(0);
   });
 });
 
@@ -409,6 +399,29 @@ describe("L. wake target resolution", () => {
   test("no live match falls back to the recorded target (honest error)", () => {
     expect(resolveHerdrTarget({ id: "ghost", runtime_id: null }, [])).toBe("ghost");
     expect(resolveHerdrTarget({ id: "ghost", runtime_id: "stale-runtime" }, [])).toBe("stale-runtime");
+  });
+});
+
+describe("N. restart cap", () => {
+  test("a worker at the cap is not spawned again", async () => {
+    rt.setIdentity("ses_cap", IDENTITY);
+    const res = await handleSocketMessage(
+      { type: "session.attach", session_id: "ses_cap", role: "worker", pane_id: IDENTITY.paneId },
+      ctx
+    );
+    const workerId = String(res.worker_id);
+    // Relay-owned so the ownership guard passes; the CAP must still stop it.
+    db.query(`UPDATE worker_runtimes SET relay_owned = 1 WHERE worker_id = ?`).run(workerId);
+    // Transport-gone: this is the path that actually spawns, so the cap applies.
+    db.query(`UPDATE workers SET state = 'dead' WHERE id = ?`).run(workerId);
+    rt.setAlive(workerId, false);
+    for (let i = 1; i <= 3; i++) {
+      logEvent(db, { source: "supervisor", workerId, type: "worker.restarting", payload: { generation: i } });
+    }
+    const { actions } = await reconcile(db, rt);
+    expect(actions).not.toContain(`restarted:${workerId}`);
+    expect(actions).not.toContain(`stalled-restarted:${workerId}`);
+    expect(listEvents(db, { limit: 50 }).some((e) => e.type === "worker.restart_capped")).toBe(true);
   });
 });
 

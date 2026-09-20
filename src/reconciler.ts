@@ -80,6 +80,19 @@ function attachTimeoutMs(): number {
   return Number.isFinite(v) && v > 0 ? v : 30000;
 }
 
+/**
+ * Runaway-spawn guard: at most this many fresh generations per worker inside
+ * the cap window. A generation that keeps stalling must not spawn forever.
+ */
+function restartCap(): number {
+  const v = Number(process.env.RELAY_RESTART_CAP ?? "3");
+  return Number.isFinite(v) && v > 0 ? v : 3;
+}
+function restartCapWindowMs(): number {
+  const v = Number(process.env.RELAY_RESTART_CAP_WINDOW_MS ?? "1800000");
+  return Number.isFinite(v) && v > 0 ? v : 1800000;
+}
+
 /** Backoff between restart attempts for the same worker (avoids tab thrash). */
 function restartCooldownMs(): number {
   const v = Number(process.env.RELAY_RESTART_COOLDOWN_MS ?? "30000");
@@ -181,9 +194,26 @@ async function restartWorker(db: Database, rt: Runtime, w: WorkerRow, at: number
   // floods worker.restart_failed.
   if (
     recentlyEvent(db, w.id, "worker.restarting", at, cooldown) ||
-    recentlyEvent(db, w.id, "worker.restart_failed", at, cooldown)
+    recentlyEvent(db, w.id, "worker.restart_failed", at, cooldown) ||
+    // A refused restart (adopted generation relay cannot retire) must also back
+    // off, or the walk retries it every tick and floods the event log.
+    recentlyEvent(db, w.id, "worker.restart_refused", at, cooldown)
   ) {
     return false; // backoff: do not spawn a new tab every tick
+  }
+  // Runaway guard: cap the number of fresh generations inside a window, so a
+  // generation that keeps stalling cannot spawn without bound.
+  const spawns = db
+    .query(`SELECT COUNT(*) AS n FROM events WHERE worker_id = ? AND type = 'worker.restarting' AND timestamp > ?`)
+    .get(w.id, at - restartCapWindowMs()) as { n: number };
+  if (spawns.n >= restartCap()) {
+    logEvent(db, {
+      source: "supervisor",
+      workerId: w.id,
+      type: "worker.restart_capped",
+      payload: { spawns: spawns.n, windowMs: restartCapWindowMs() },
+    });
+    return false;
   }
   restartingWorkers.add(w.id);
   try {
@@ -195,6 +225,26 @@ async function restartWorker(db: Database, rt: Runtime, w: WorkerRow, at: number
 
 /** The generation-allocating body of `restartWorker`; callers must hold its guard. */
 async function spawnFreshGeneration(db: Database, rt: Runtime, w: WorkerRow, at: number): Promise<boolean> {
+  // 0. Only a relay-OWNED current generation may be replaced. An adopted
+  //    (manual, relay_owned=0) runtime can never be closed by relay, so spawning
+  //    a replacement would leave TWO live agents on the same task — the old one
+  //    still editing the same files. Refuse and surface it instead of silently
+  //    creating a competing agent.
+  const currentRuntime = findRuntime(db, w.id, w.generation) ?? getActiveRuntime(db, w.id);
+  if (!currentRuntime || currentRuntime.relay_owned !== 1) {
+    logEvent(db, {
+      source: "supervisor",
+      workerId: w.id,
+      type: "worker.restart_refused",
+      payload: {
+        generation: w.generation,
+        relayOwned: currentRuntime?.relay_owned ?? null,
+        reason: "current generation is not relay-owned (adopted); relay cannot retire it",
+      },
+    });
+    return false;
+  }
+
   // 1. Old generation -> stale. The tab is never closed in the restart path.
   const active = getActiveRuntime(db, w.id);
   if (active) {
@@ -262,6 +312,13 @@ async function spawnFreshGeneration(db: Database, rt: Runtime, w: WorkerRow, at:
       relayOwned: 1,
       state: "starting",
     });
+    // Supersede the worker's previous session explicitly: its pointer is about to
+    // be nulled, so a later attach could no longer fence the old session.
+    if (w.opencode_session_id) {
+      db.query(
+        `UPDATE sessions SET managed = 0, detached_at = ?, updated_at = ? WHERE session_id = ? AND worker_id = ?`
+      ).run(at, at, w.opencode_session_id, w.id);
+    }
     db.query(
       `UPDATE workers SET generation = ?, runtime_id = ?, opencode_session_id = NULL,
          state = 'starting', current_task_id = NULL, nudged_at = NULL, updated_at = ? WHERE id = ?`
@@ -538,10 +595,24 @@ export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<
       const requeued = releaseTaskOfDeadWorker(db, w.id, fresh.current_task_id, at);
       if (requeued) actions.push(`requeued:${requeued}`);
       db.query(`UPDATE workers SET current_task_id = NULL, updated_at = ? WHERE id = ?`).run(at, w.id);
-      if (await restartWorker(db, rt, fresh, at)) {
-        actions.push(fresh.state === "stalled" ? `stalled-restarted:${w.id}` : `restarted:${w.id}`);
+
+      // Spawning a fresh generation is only safe when the OLD agent is gone.
+      // A "stalled" worker is alive by definition (the verdict needs a live
+      // process); spawning then leaves TWO agents on the same task, which is how
+      // a stall produced duplicate, competing agents. So: dead => replace;
+      // stalled-but-alive => interrupt and hand the task back, never duplicate.
+      const gone = fresh.state === "dead" ? true : !(await rt.isAlive(fresh).catch(() => false));
+      if (gone) {
+        if (await restartWorker(db, rt, fresh, at)) {
+          actions.push(fresh.state === "stalled" ? `stalled-restarted:${w.id}` : `restarted:${w.id}`);
+        } else {
+          actions.push(fresh.state === "stalled" ? `stalled:${w.id}` : `restart-skipped:${w.id}`);
+        }
       } else {
-        actions.push(fresh.state === "stalled" ? `stalled:${w.id}` : `restart-skipped:${w.id}`);
+        try { await rt.interrupt(fresh); } catch { /* best effort */ }
+        setWorkerState(db, w.id, "idle");
+        logEvent(db, { source: "supervisor", workerId: w.id, type: "worker.stall_released" });
+        actions.push(`stall-released:${w.id}`);
       }
       continue;
     }
@@ -600,10 +671,19 @@ export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<
             `UPDATE tasks SET state = 'queued', assignee = NULL, lease_token = lease_token + 1, lease_until = NULL, updated_at = ? WHERE id = ?`
           ).run(at, task.id);
           db.query(`UPDATE workers SET current_task_id = NULL, nudged_at = NULL, updated_at = ? WHERE id = ?`).run(at, w.id);
-          if (await restartWorker(db, rt, { ...fresh, state: "stalled" }, at)) {
-            actions.push(`stalled-restarted:${w.id}`);
+          // Only a GONE agent may be replaced. Spawning while the old one is
+          // still alive is what produced duplicate, competing agents.
+          const gone = !(await rt.isAlive(fresh).catch(() => false));
+          if (gone) {
+            if (await restartWorker(db, rt, { ...fresh, state: "stalled" }, at)) {
+              actions.push(`stalled-restarted:${w.id}`);
+            } else {
+              actions.push(`stalled:${w.id}`);
+            }
           } else {
-            actions.push(`stalled:${w.id}`);
+            setWorkerState(db, w.id, "idle");
+            logEvent(db, { source: "supervisor", workerId: w.id, type: "worker.stall_released" });
+            actions.push(`stall-released:${w.id}`);
           }
         }
       }

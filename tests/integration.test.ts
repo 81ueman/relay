@@ -237,6 +237,8 @@ describe("failure test 5: lost wake", () => {
 describe("failure test 6: no productive worker", () => {
   test("queued task + all workers idle/dead => supervisor wakes or restarts one", async () => {
     managedWorker("w1");
+    // Replaceable only if relay owns the current generation.
+    db.query(`UPDATE worker_runtimes SET relay_owned = 1 WHERE worker_id = 'w1'`).run();
     addTask(db, { title: "orphaned work" });
     // Force zero productive workers: mark dead but transport can restart.
     db.query(`UPDATE workers SET state = 'dead' WHERE id = 'w1'`).run();
@@ -262,6 +264,8 @@ describe("stalled detection (multi-signal, never bare idle)", () => {
   test("no progress + alive + valid lease => nudge once, then stalled", async () => {
     process.env.RELAY_STALL_MS = "100";
     worker("w1");
+    // The stall verdict restarts only a relay-OWNED generation.
+    db.query(`UPDATE worker_runtimes SET relay_owned = 1 WHERE worker_id = 'w1'`).run();
     const t = addTask(db, { title: "stuck" });
     claimNext(db, "w1");
     // Age the progress timestamp so the stall timeout trips.
@@ -274,10 +278,13 @@ describe("stalled detection (multi-signal, never bare idle)", () => {
     db.query(`UPDATE workers SET last_progress_at = ?, nudged_at = ? WHERE id = 'w1'`).run(Date.now() - 10000, Date.now() - 10000);
     db.query(`UPDATE tasks SET lease_until = ? WHERE id = ?`).run(Date.now() + 60000, t.id);
     r = await reconcile(db, rt);
-    expect(r.actions).toContain("stalled-restarted:w1");
+    // Alive but stalled: the task is handed back and the agent interrupted, but
+    // NO competing generation is spawned.
+    expect(r.actions).toContain("stall-released:w1");
     const after = getTask(db, t.id)!;
     expect(after.state).toBe("queued");
     expect(after.lease_token).toBeGreaterThan(1);
+    expect(rt.starts).not.toContain("w1");
   });
 
   test("fresh progress prevents stall verdict", async () => {

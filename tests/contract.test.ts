@@ -188,6 +188,9 @@ describe("D. idle uses the injected (real) runtime", () => {
 describe("E. dead worker real restart", () => {
   test("missing process/session => task requeued, token bumped, start/restart called, recoverable", async () => {
     idleWorker("w1");
+    // Only relay-OWNED generations are replaceable; an adopted (manual) one is
+    // never auto-replaced (relay cannot retire it). Make this one relay-owned.
+    db.query(`UPDATE worker_runtimes SET relay_owned = 1 WHERE worker_id = 'w1'`).run();
     const t = addTask(db, { title: "doomed" });
     claimNext(db, "w1");
     const tokenBefore = getTask(db, t.id)!.lease_token;

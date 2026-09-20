@@ -83,6 +83,7 @@ Env: RELAY_LEASE_MS RELAY_LEASE_LIVENESS_GRACE_MS RELAY_STALL_MS RELAY_LOW_WATER
 Spawn: RELAY_HERDR_WORKSPACE (required to spawn; else $HERDR_WORKSPACE_ID)
 Manual attach: requires a live Herdr agent (use --pane/--tab or $HERDR_PANE_ID/$HERDR_TAB_ID)
 Runtime cleanup: RELAY_RUNTIME_CLEANUP_GRACE_MS RELAY_ATTACH_TIMEOUT_MS RELAY_RESTART_COOLDOWN_MS
+Restart cap: RELAY_RESTART_CAP (default 3) RELAY_RESTART_CAP_WINDOW_MS (default 1800000)
 Herdr is required. RELAY_RUNTIME=mock is test-only.
 Help: relay <command> [subcommand] --help
 `;

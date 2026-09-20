@@ -604,8 +604,18 @@ worker, and borrowing a file default that lives in another live pane is
   runtimes past their grace period, only when provably relay-owned (label check)
   and never the current generation/runtime (`relay runtime list` to inspect).
   Adopted (`relay_owned=false`) tabs are never closed.
-- **Stalled** (running + valid lease + alive + stale progress + repeated idle):
-  nudge once → still nothing → interrupt, requeue, fresh generation.
+- **Stalled** (running + alive + stale progress, after a nudge): interrupt,
+  requeue the task, and **never spawn a replacement while the agent is alive** —
+  a fresh generation is only started once the transport reports the agent GONE.
+  Spawning a second agent on the same task is what produced duplicate, competing
+  agents editing the same files. A live-but-stalled worker is released to `idle`
+  (`worker.stall_released`) so the task can be re-claimed.
+- **Only relay-owned generations are replaceable**: a worker whose CURRENT
+  runtime is adopted (`relay_owned=0`) is never auto-replaced, because relay
+  cannot close that tab — replacing it would leave the old agent running
+  (`worker.restart_refused`). Restarts are additionally capped per worker per
+  window (`RELAY_RESTART_CAP`, default 3; `RELAY_RESTART_CAP_WINDOW_MS`, default
+  30 min) so a repeatedly-failing generation cannot spawn without bound.
 - **Crash between heartbeats**: a **liveness-aware** lease expiry returns the
   task to queued — but only when the assignee is **missing or dead/stalled**
   (or has gone silent past `RELAY_LEASE_LIVENESS_GRACE_MS`, default 300000). A
