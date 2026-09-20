@@ -47,6 +47,48 @@ export function herdrTarget(w: Pick<Worker, "id" | "runtime_id">): string {
 }
 
 /**
+ * Resolve a worker to a target Herdr will actually accept, using the live agent
+ * list. Herdr addresses an agent by name or by pane id, but a stored
+ * `runtime_id` is not always a live target: a worker that was registered but
+ * never completed a managed attach has `runtime_id = null`, while its agent is
+ * running under the sanitized name (`u2-corpus` -> `u2_corpus`). Addressing it
+ * by the bare worker id then fails with agent_not_found and the wake is lost.
+ *
+ * Preference order: the recorded runtime, the worker id, then the sanitized id;
+ * each is accepted as a live agent name, or resolved to its pane. Falls back to
+ * the recorded/id target so the caller still gets an honest error when nothing
+ * matches.
+ */
+export function resolveHerdrTarget(
+  w: Pick<Worker, "id" | "runtime_id">,
+  agents: HerdrAgentEntry[]
+): string {
+  const candidates: string[] = [];
+  if (w.runtime_id) candidates.push(w.runtime_id);
+  candidates.push(w.id);
+  const sanitized = w.id.replace(/-/g, "_");
+  if (sanitized !== w.id) candidates.push(sanitized);
+  const uniq = [...new Set(candidates)];
+  const panes = new Set<string>();
+  const paneByName = new Map<string, string>();
+  for (const a of agents) {
+    const pane = typeof a?.pane_id === "string" ? a.pane_id : "";
+    if (pane) panes.add(pane);
+    const name = typeof a?.name === "string" ? a.name : "";
+    if (name && pane) paneByName.set(name, pane);
+  }
+  for (const c of uniq) {
+    // A name resolves to its pane (always a valid target); a bare pane id is
+    // used as-is. The recorded target is never returned unverified if a live
+    // match exists.
+    const pane = paneByName.get(c);
+    if (pane) return pane;
+    if (panes.has(c)) return c;
+  }
+  return uniq[0];
+}
+
+/**
  * Workspace the relay is allowed to spawn into. Explicit only: we NEVER let
  * `tab create` fall back to the focused workspace (that is how agents ended up
  * in an unrelated workspace). Fail closed when unset.
@@ -269,19 +311,33 @@ function identityFromAgent(a: HerdrAgentEntry): HerdrIdentity {
 export class HerdrRuntime implements Runtime {
   readonly name = "herdr";
 
+  /**
+   * Live Herdr target for a worker: the stored runtime when it still resolves,
+   * otherwise the sanitized agent name. See resolveHerdrTarget.
+   */
+  private target(w: Worker): string {
+    try {
+      return resolveHerdrTarget(w, listAgents());
+    } catch {
+      return herdrTarget(w); // Herdr unreachable: keep the recorded target
+    }
+  }
+
   async isAlive(w: Worker): Promise<boolean> {
-    return runHerdr(["agent", "get", herdrTarget(w)], 5000).ok;
+    return runHerdr(["agent", "get", this.target(w)], 5000).ok;
   }
 
   async wake(w: Worker, text: string): Promise<void> {
     // No --wait: the daemon must never block on an agent turn.
-    const r = runHerdr(["agent", "prompt", herdrTarget(w), text], 10000);
-    if (!r.ok) throw new Error(`herdr wake failed for ${herdrTarget(w)}: ${(r.stderr || r.stdout).trim().slice(0, 200)}`);
+    const target = this.target(w);
+    const r = runHerdr(["agent", "prompt", target, text], 10000);
+    if (!r.ok) throw new Error(`herdr wake failed for ${target}: ${(r.stderr || r.stdout).trim().slice(0, 200)}`);
   }
 
   async interrupt(w: Worker): Promise<void> {
-    const r = runHerdr(["agent", "send-keys", herdrTarget(w), "esc"], 5000);
-    if (!r.ok) throw new Error(`herdr interrupt failed for ${herdrTarget(w)}`);
+    const target = this.target(w);
+    const r = runHerdr(["agent", "send-keys", target, "esc"], 5000);
+    if (!r.ok) throw new Error(`herdr interrupt failed for ${target}`);
   }
 
   /**

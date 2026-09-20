@@ -7,7 +7,7 @@ import { openDb } from "../src/db";
 import { listEvents } from "../src/events";
 import { handleSocketMessage, type SocketContext } from "../src/socket";
 import { MockRuntime, type HerdrIdentity } from "../src/runtime/runtime";
-import { buildRuntime, pickIdentityByDirectory, type HerdrAgentEntry } from "../src/runtime/herdr";
+import { buildRuntime, pickIdentityByDirectory, resolveHerdrTarget, type HerdrAgentEntry } from "../src/runtime/herdr";
 import { reconcile } from "../src/reconciler";
 import { attachSession, getSession } from "../src/sessions";
 import {
@@ -365,5 +365,44 @@ describe("K. directory identification for a shared OpenCode server", () => {
     // No pane hints were sent: the daemon must have resolved from the directory.
     expect(rt.resolves[0]?.hint).toMatchObject({ directory: "/proj/one", paneId: undefined });
     expect(getWorker(db, String(res.worker_id))!.runtime_id).toBe("dir-agent");
+  });
+});
+
+// ---------------------------------------------------------------------------
+describe("L. wake target resolution", () => {
+  const live = (pane_id: string, name?: string): HerdrAgentEntry => ({
+    pane_id,
+    name: name ?? null,
+    tab_id: "w1:t1",
+    agent: "opencode",
+  });
+
+  test("a recorded runtime that is a live pane is used as-is", () => {
+    expect(resolveHerdrTarget({ id: "frontend-eos", runtime_id: "w67:p4" }, [live("w67:p4", "u2_frontend_eos")]))
+      .toBe("w67:p4");
+  });
+
+  test("a null runtime_id falls back to the sanitized agent name, not the bare id", () => {
+    // Worker ids use '-', Herdr agent names use '_': addressing by the id would
+    // be agent_not_found, so the live pane must win.
+    expect(resolveHerdrTarget({ id: "u2-corpus", runtime_id: null }, [live("w66:p6", "u2_corpus")]))
+      .toBe("w66:p6");
+  });
+
+  test("a recorded runtime that is an agent NAME resolves to its pane", () => {
+    expect(resolveHerdrTarget(
+      { id: "control-ospf-research", runtime_id: "u2_ospf_research" },
+      [live("w66:p4", "u2_ospf_research")]
+    )).toBe("w66:p4");
+  });
+
+  test("an exact worker-id match resolves too", () => {
+    expect(resolveHerdrTarget({ id: "worker-1", runtime_id: null }, [live("w50:p9", "worker-1")]))
+      .toBe("w50:p9");
+  });
+
+  test("no live match falls back to the recorded target (honest error)", () => {
+    expect(resolveHerdrTarget({ id: "ghost", runtime_id: null }, [])).toBe("ghost");
+    expect(resolveHerdrTarget({ id: "ghost", runtime_id: "stale-runtime" }, [])).toBe("stale-runtime");
   });
 });

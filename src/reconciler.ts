@@ -425,6 +425,34 @@ export interface ReconcileResult {
   actions: string[];
 }
 
+/**
+ * Assignees whose running task's lease has lapsed but whose Herdr agent is
+ * still present. Lease expiry is CRASH recovery, but "no relay command for a
+ * while" also describes a healthy worker inside one long tool call (a cargo/go
+ * build can outlast the liveness grace window), and churning its task back to
+ * queued mid-build loses work. The live agent is the ground truth for "not a
+ * crash"; stall detection still owns "alive but stopped progressing".
+ *
+ * Only at-risk assignees (lease already lapsed) are probed, so this costs a few
+ * Herdr queries at most, and only when something is actually about to expire.
+ */
+async function transportAliveAssignees(
+  db: Database, rt: Runtime, at: number
+): Promise<Set<string>> {
+  const atRisk = db
+    .query(`SELECT DISTINCT assignee FROM tasks
+             WHERE state = 'running' AND lease_until IS NOT NULL AND lease_until < ?
+               AND assignee IS NOT NULL`)
+    .all(at) as { assignee: string }[];
+  const alive = new Set<string>();
+  for (const { assignee } of atRisk) {
+    const w = getWorker(db, assignee);
+    if (!w) continue;
+    if (await rt.isAlive(w).catch(() => false)) alive.add(assignee);
+  }
+  return alive;
+}
+
 /** One deterministic reconcile pass. Safe to run every 1-2s. */
 export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<ReconcileResult> {
   const actions: string[] = [];
@@ -433,7 +461,11 @@ export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<
   //    not-alive assignee is requeued; a live-but-slow worker keeps its lease.
   //    The transport-dead path in step 3 still requeues a crashed worker whose
   //    DB liveness still looks fresh.
-  const expired = expireLeases(db, at, defaultLeaseAlive(db, at));
+  //    A worker whose Herdr agent is still present is alive even without a
+  //    recent relay command (long build), so its lapsed lease is held, not churned.
+  const transportAlive = await transportAliveAssignees(db, rt, at);
+  const dbAlive = defaultLeaseAlive(db, at);
+  const expired = expireLeases(db, at, (wid) => (!!wid && transportAlive.has(wid)) || dbAlive(wid));
   for (const t of expired) actions.push(`lease-expired:${t.id}`);
 
   // 2. Promote fresh generations that have completed managed attach.

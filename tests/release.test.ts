@@ -253,4 +253,35 @@ describe("C. liveness-aware lease expiry — crash recovery only", () => {
     expect(actions).toContain(`requeued:${t.id}`);
     expect(getTask(db, t.id)!.state).toBe("queued");
   });
+
+  test("reconcile holds a lapsed lease while the Herdr agent is still alive", async () => {
+    managedWorker("w1", "worker");
+    const t = addTask(db, { title: "long build" });
+    claimNext(db, "w1");
+    const leaseUntil = getTask(db, t.id)!.lease_until!;
+    // The worker has run no relay command for a long time (one long tool call),
+    // so its DB liveness looks stale and the lease has lapsed...
+    db.query(`UPDATE workers SET last_seen_at = 0, last_progress_at = 0 WHERE id = 'w1'`).run();
+    // ...but its Herdr agent is still there, so this is NOT a crash.
+    rt.setAlive("w1", true);
+
+    const { actions } = await reconcile(db, rt, leaseUntil + 1);
+    expect(actions).not.toContain(`lease-expired:${t.id}`);
+    const after = getTask(db, t.id)!;
+    expect(after.state).toBe("running");
+    expect(after.assignee).toBe("w1");
+  });
+
+  test("reconcile still expires a lapsed lease once the Herdr agent is gone", async () => {
+    managedWorker("w1", "worker");
+    const t = addTask(db, { title: "vanished" });
+    claimNext(db, "w1");
+    const leaseUntil = getTask(db, t.id)!.lease_until!;
+    db.query(`UPDATE workers SET last_seen_at = 0, last_progress_at = 0 WHERE id = 'w1'`).run();
+    rt.setAlive("w1", false);
+
+    const { actions } = await reconcile(db, rt, leaseUntil + 1);
+    expect(actions).toContain(`lease-expired:${t.id}`);
+    expect(getTask(db, t.id)!.state).toBe("queued");
+  });
 });

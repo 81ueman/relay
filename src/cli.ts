@@ -52,7 +52,7 @@ Usage:
   relay task link <task-id> <plan-id>
   relay task unlink <task-id>
   relay task list [--state <state>]
-  relay task show <id>
+  relay task show <id> [--json]
 
   relay next [--worker <id>] [--role <r>] [--any-role]
   relay claim <task-id> [--worker <id>] [--role <r>] [--any-role]
@@ -144,7 +144,7 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
     usage: [
       'relay task add "description" [--title T] [--acceptance A] [--priority N] [--role R] [--parent T1] [--plan <plan-id>]',
       "relay task list [--state <state>]",
-      "relay task show <id>",
+      "relay task show <id> [--json]",
       "relay task link <id> <plan-id>",
       "relay task unlink <id>",
     ],
@@ -154,7 +154,7 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
     usage: ['relay task add "description" [--title T] [--acceptance A] [--priority N] [--role R] [--parent T1] [--plan <plan-id>]'],
   },
   "task list": { about: "List tasks (id, state, priority, role, assignee, plan, title).", usage: ["relay task list [--state <state>]"] },
-  "task show": { about: "Print one task as JSON, plus its notes.", usage: ["relay task show <id>"] },
+  "task show": { about: "Print one task as JSON. Notes go to stderr so stdout stays parseable; --json emits ONE document with the task and its notes.", usage: ["relay task show <id> [--json]"] },
   "task link": { about: "Link a task to a plan.json item (agent-status shows the plan status from relay).", usage: ["relay task link <task-id> <plan-id>"] },
   "task unlink": { about: "Remove a task's plan linkage.", usage: ["relay task unlink <task-id>"] },
   next: {
@@ -281,6 +281,7 @@ async function main(): Promise<void> {
           const role = flag(argv.slice(2), "--role") ?? "worker";
           const runtimeId = flag(argv.slice(2), "--runtime");
           const sessionId = flag(argv.slice(2), "--session");
+          const existing = getWorker(db, id);
           const w = registerWorker(db, id, {
             role,
             runtimeId: runtimeId ?? undefined,
@@ -288,7 +289,10 @@ async function main(): Promise<void> {
             cwd: flag(argv.slice(2), "--cwd") ?? undefined,
             command: flag(argv.slice(2), "--command") ?? undefined,
           });
-          setWorkerState(db, id, "idle");
+          // Never flip an EXISTING worker to idle: it may be mid-task, and a
+          // registration is not evidence its work stopped. Only a fresh
+          // registration (state 'starting') is normalized to idle.
+          if (!existing) setWorkerState(db, id, "idle");
           // Remember a default worker identity for this checkout.
           try { writeFileSync(join(process.cwd(), STATE_DIR, "worker-id"), id); } catch { /* ignore */ }
           console.log(`registered ${w.id} role=${w.role}`);
@@ -440,12 +444,20 @@ async function main(): Promise<void> {
           console.log(`${t.id} plan=-`);
         } else if (sub === "show") {
           const id = argv[2];
-          if (!id) throw new Error("usage: relay task show <id>");
+          if (!id) throw new Error("usage: relay task show <id> [--json]");
           const t = getTask(db, id);
           if (!t) throw new Error(`unknown task: ${id}`);
-          console.log(JSON.stringify(t, null, 2));
-          for (const n of getNotes(db, id)) {
-            console.log(`  [${n.kind}] ${n.worker_id ?? "?"}: ${n.body}`);
+          const notes = getNotes(db, id);
+          if (hasFlag(argv.slice(2), "--json")) {
+            // One self-contained JSON document (task + notes) for agents.
+            console.log(JSON.stringify({ ...t, notes }, null, 2));
+          } else {
+            // stdout stays a single parseable JSON document; the human-readable
+            // notes go to stderr so `relay task show <id> | jq` keeps working.
+            console.log(JSON.stringify(t, null, 2));
+            for (const n of notes) {
+              console.error(`  [${n.kind}] ${n.worker_id ?? "?"}: ${n.body}`);
+            }
           }
         } else {
           throw new Error(`unknown task subcommand: ${sub}`);

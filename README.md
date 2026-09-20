@@ -547,6 +547,15 @@ RELAY_WORKER=worker-2 relay inbox --claim   # bulk (compat)
 RELAY_WORKER=worker-2 relay inbox --ack 7   # per-ID ack
 ```
 
+The wake target is resolved against live Herdr state — the worker's recorded
+runtime, its id, or the sanitized agent name (`u2-corpus` → `u2_corpus`) — so a
+worker registered before its pane was recorded is still woken instead of
+failing with `agent_not_found` (the message stays queued either way).
+
+`relay task show <id>` keeps stdout a single parseable JSON document (notes go
+to stderr); `relay task show <id> --json` emits ONE document with the task and
+its notes.
+
 Observe: `relay status`, `relay events --follow`.
 
 ## Worker protocol (also in the Skill)
