@@ -259,7 +259,12 @@ attach, fresh spawn and restart computes
 `nextGeneration = max(workers.generation, session.generation, MAX(worker_runtimes.generation)) + 1`.
 A new manual attach on a worker at generation 4 is therefore >= 5, and a legacy
 `worker.generation=2` with runtime history at 5 yields 6. Re-binding the exact
-same session/worker/Herdr runtime is idempotent and does not bump it.
+same session/worker/Herdr runtime is idempotent and does not bump it. Allocation
+is **single-writer per worker**: a fresh spawn is guarded so overlapping
+reconcile passes (the daemon loop and the immediate reconcile on a session error)
+can never mint the same number twice and leave two runtime rows for one
+generation; the commit transaction re-checks the number so a generation taken by
+another daemon is never duplicated.
 
 A dead/stalled **manual** runtime follows the same path: g1 (`relay_owned=false`)
 goes stale but is never closed, and Relay spawns a fresh relay-owned g2.

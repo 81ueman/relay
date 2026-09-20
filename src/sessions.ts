@@ -83,10 +83,17 @@ function slugSession(sessionId: string): string {
 export function attachSession(db: Database, sessionId: string, opts: AttachOptions = {}): Session {
   const t = now();
   const prev = getSession(db, sessionId);
-  const role = opts.role ?? prev?.role ?? "worker";
   const workerId = opts.workerId ?? prev?.worker_id ?? slugSession(sessionId);
   const spawned = opts.generation !== undefined;
   const worker0 = getWorker(db, workerId);
+  // The WORKER row is the authority for a worker's role. A relay-spawned attach
+  // carries identity (worker/generation/token) from the bootstrap marker, NOT a
+  // role: it may never change the worker's registered role, so a plugin that
+  // still sends role:"worker" cannot demote a pre-registered reviewer/planner and
+  // leave the review queue without a reviewer. A manual attach may set the role
+  // explicitly; otherwise the existing worker/session role is preserved.
+  const explicitRole = spawned ? undefined : opts.role;
+  const role = explicitRole ?? worker0?.role ?? prev?.role ?? "worker";
 
   // A managed session belongs to exactly one worker. Refuse a cross-worker
   // steal (e.g. a stale plugin on a shared server claiming another session).
@@ -208,7 +215,7 @@ export function attachSession(db: Database, sessionId: string, opts: AttachOptio
        SET opencode_session_id = ?, role = COALESCE(?, role), runtime_id = COALESCE(?, runtime_id),
            state = 'idle', generation = ?, nudged_at = NULL, updated_at = ?
      WHERE id = ?`
-  ).run(sessionId, opts.role ?? null, runtimeId ?? null, generation, t, worker.id);
+  ).run(sessionId, explicitRole ?? null, runtimeId ?? null, generation, t, worker.id);
 
   if (spawned) {
     // Promote the matching freshly spawned runtime row.

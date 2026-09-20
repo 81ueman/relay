@@ -4,6 +4,7 @@ import { countIdleSinceProgress, logEvent } from "./events";
 import type { Runtime, StartedRuntime } from "./runtime/runtime";
 import {
   cleanupCandidates,
+  findRuntime,
   getActiveRuntime,
   getStartingRuntime,
   listRuntimes,
@@ -126,6 +127,17 @@ function releaseTaskOfDeadWorker(db: Database, workerId: string, taskId: string 
 }
 
 /**
+ * Workers with a fresh-generation spawn currently in flight. `restartWorker`
+ * awaits the transport (`rt.start`), so a second reconcile pass (the daemon loop
+ * and the immediate reconcile on `session.error`/`session.execution.failed` can
+ * overlap) would otherwise read the same `MAX(generation)` and spawn a second
+ * tab for the SAME generation. A per-worker in-flight guard keeps generation
+ * allocation single-writer; the commit-time re-check below covers the
+ * cross-process case.
+ */
+const restartingWorkers = new Set<string>();
+
+/**
  * Restart = CONTROL-PLANE policy, built from transport primitives:
  *   1. mark the current generation stale (history kept; tab NOT closed here)
  *   2. best-effort interrupt the old generation
@@ -137,8 +149,14 @@ function releaseTaskOfDeadWorker(db: Database, workerId: string, taskId: string 
  * delivery fails, the generation is KEPT (runtime still `starting`, worker
  * still supervised) and retried after a cooldown — a generation is never
  * discarded because a prompt could not be delivered.
+ *
+ * Generation is a per-worker fencing number. Exactly one fresh generation may be
+ * allocated per worker at a time: concurrent passes must not each mint the same
+ * number and leave two runtime rows for it (a plugin holding the losing token
+ * could then never attach). A re-entrant pass is a no-op.
  */
 async function restartWorker(db: Database, rt: Runtime, w: WorkerRow, at: number): Promise<boolean> {
+  if (restartingWorkers.has(w.id)) return false;
   const cooldown = restartCooldownMs();
   // Back off both after a successful spawn and after a failure: otherwise a
   // failing spawn (e.g. a stale leftover agent name) retries every tick and
@@ -149,7 +167,16 @@ async function restartWorker(db: Database, rt: Runtime, w: WorkerRow, at: number
   ) {
     return false; // backoff: do not spawn a new tab every tick
   }
+  restartingWorkers.add(w.id);
+  try {
+    return await spawnFreshGeneration(db, rt, w, at);
+  } finally {
+    restartingWorkers.delete(w.id);
+  }
+}
 
+/** The generation-allocating body of `restartWorker`; callers must hold its guard. */
+async function spawnFreshGeneration(db: Database, rt: Runtime, w: WorkerRow, at: number): Promise<boolean> {
   // 1. Old generation -> stale. The tab is never closed in the restart path.
   const active = getActiveRuntime(db, w.id);
   if (active) {
@@ -201,7 +228,11 @@ async function restartWorker(db: Database, rt: Runtime, w: WorkerRow, at: number
   // 4. Durable control-plane commit BEFORE any wake/prompt. The runtime row and
   //    the worker pointer move together (one transaction), so an attach racing
   //    the bootstrap ALWAYS finds a matching relay-owned/attach_token/starting row.
+  //    The transaction also RE-CHECKS the generation: `nextGeneration` was read
+  //    before the awaited `rt.start`, so another writer (a second daemon) may have
+  //    taken this number. If so we refuse to create a duplicate runtime row.
   const runtimeRow = db.transaction(() => {
+    if (findRuntime(db, w.id, generation)) return null;
     const rr = recordRuntime(db, {
       workerId: w.id,
       generation,
@@ -225,6 +256,29 @@ async function restartWorker(db: Database, rt: Runtime, w: WorkerRow, at: number
     });
     return rr;
   })();
+
+  if (!runtimeRow) {
+    // The generation was taken while we were starting the transport. Abandon our
+    // duplicate (never record a second row for the same generation) and reap the
+    // tab we just created; the next pass mints a strictly higher number.
+    logEvent(db, {
+      source: "supervisor",
+      workerId: w.id,
+      type: "worker.restart_failed",
+      payload: { generation, error: "generation already allocated" },
+    });
+    try {
+      await rt.cleanup({
+        worker_id: w.id,
+        generation,
+        runtime_id: started.runtimeId,
+        tab_id: started.tabId ?? null,
+        pane_id: started.paneId ?? null,
+        relay_owned: 1,
+      });
+    } catch { /* orphan reap in start() is the fallback */ }
+    return false;
+  }
 
   // 5. Bootstrap AFTER the commit. A delivery failure must not abandon the
   //    generation; activatePendingRuntimes retries it after a cooldown.

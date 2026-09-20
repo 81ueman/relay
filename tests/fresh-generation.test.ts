@@ -246,3 +246,118 @@ describe("generation monotonicity", () => {
     expect(findRuntime(db, "w1", 6)!.state).toBe("starting");
   });
 });
+
+describe("attach never clobbers the worker's role", () => {
+  test("a relay-spawned attach keeps the registered role even if the plugin sends role=worker", () => {
+    registerWorker(db, "rev1", { role: "reviewer" });
+    const token = "tok-rev1";
+    recordRuntime(db, {
+      workerId: "rev1",
+      generation: 1,
+      runtimeId: "rt-rev1-g1",
+      state: "starting",
+      relayOwned: 1,
+      attachToken: token,
+    });
+    // A legacy plugin still hard-codes role:"worker" on the relay-spawned attach.
+    const s = attachSession(db, "ses_rev1", {
+      workerId: "rev1",
+      role: "worker",
+      generation: 1,
+      attachToken: token,
+    });
+    expect(getWorker(db, "rev1")!.role).toBe("reviewer");
+    expect(s.role).toBe("reviewer");
+    // ...so the review queue still has a reviewer to wake.
+    expect(listRuntimes(db, { workerId: "rev1", state: "active" })).toHaveLength(1);
+  });
+
+  test("a manual attach without an explicit role preserves the registered role", () => {
+    registerWorker(db, "rev2", { role: "reviewer" });
+    rt.setIdentity("ses_manual", IDENTITY);
+    const s = attachSession(db, "ses_manual", { workerId: "rev2", identity: IDENTITY });
+    expect(getWorker(db, "rev2")!.role).toBe("reviewer");
+    expect(s.role).toBe("reviewer");
+  });
+
+  test("a manual attach WITH an explicit role may still set it", () => {
+    registerWorker(db, "w9", { role: "worker" });
+    rt.setIdentity("ses_promote", IDENTITY);
+    const s = attachSession(db, "ses_promote", { workerId: "w9", role: "reviewer", identity: IDENTITY });
+    expect(getWorker(db, "w9")!.role).toBe("reviewer");
+    expect(s.role).toBe("reviewer");
+  });
+});
+
+describe("generation allocation is single-writer", () => {
+  // `restartWorker` awaits `rt.start` between reading MAX(generation) and
+  // committing, and the daemon loop can overlap with the immediate reconcile on
+  // session.error / session.execution.failed. Two passes must never mint the same
+  // generation (a plugin holding the losing token could never attach).
+  test("concurrent reconcile never allocates the same generation twice", async () => {
+    seedSpawned("w1", 1);
+    rt.setAlive("w1", false);
+
+    // Hold the first start so a second reconcile can interleave.
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let starts = 0;
+    rt.start = async (w: any, generation: number) => {
+      starts++;
+      await gate;
+      return {
+        runtimeId: `rt-${w.id}-g${generation}`,
+        tabId: `tab-${w.id}-g${generation}`,
+        paneId: `pane-${w.id}-g${generation}`,
+        attachToken: `tok-${w.id}-g${generation}`,
+      };
+    };
+
+    const p1 = reconcile(db, rt);
+    await Bun.sleep(5);
+    const p2 = reconcile(db, rt);
+    await Bun.sleep(5);
+    release();
+    await Promise.all([p1, p2]);
+
+    expect(starts).toBe(1);
+    const g2 = listRuntimes(db, { workerId: "w1" }).filter((r) => r.generation === 2);
+    expect(g2).toHaveLength(1);
+    expect(getWorker(db, "w1")!.generation).toBe(2);
+  });
+
+  test("a generation taken by a concurrent writer is never re-created", async () => {
+    seedSpawned("w1", 1);
+    rt.setAlive("w1", false);
+
+    rt.start = async (w: any, generation: number) => {
+      // Simulate a second daemon committing this generation while we start.
+      recordRuntime(db, {
+        workerId: w.id,
+        generation,
+        runtimeId: `other-${generation}`,
+        relayOwned: 1,
+        state: "starting",
+        attachToken: `other-tok-${generation}`,
+      });
+      db.query(
+        `UPDATE workers SET generation = ?, runtime_id = ?, opencode_session_id = NULL, state = 'starting' WHERE id = ?`
+      ).run(generation, `other-${generation}`, w.id);
+      return {
+        runtimeId: `rt-${w.id}-g${generation}`,
+        tabId: `tab-${w.id}-g${generation}`,
+        attachToken: `tok-${w.id}-g${generation}`,
+      };
+    };
+
+    await reconcile(db, rt);
+
+    const g2 = listRuntimes(db, { workerId: "w1" }).filter((r) => r.generation === 2);
+    expect(g2).toHaveLength(1);
+    expect(g2[0].runtime_id).toBe("other-2");
+    // The duplicate transport this daemon started is reaped, not left untracked.
+    expect(rt.cleanups).toContain("rt-w1-g2");
+    expect(getWorker(db, "w1")!.generation).toBe(2);
+    expect(getWorker(db, "w1")!.runtime_id).toBe("other-2");
+  });
+});

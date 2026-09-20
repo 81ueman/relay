@@ -352,7 +352,6 @@ async function autoAttach(
       worker_id: workerId,
       generation,
       token,
-      role: "worker",
       directory,
     },
     directory
@@ -520,7 +519,7 @@ async function registerTools(ctx: any): Promise<void> {
           {
             type: "session.attach",
             session_id: sessionID,
-            role: args.role ?? "worker",
+            role: args.role,
             worker_id: args.worker_id,
             generation: args.generation,
             token: args.token,
