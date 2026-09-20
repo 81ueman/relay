@@ -17,7 +17,7 @@ import {
 } from "./tasks";
 import {
   bindSession, findWorkerBySession, getWorker, listWorkers,
-  registerWorker, setWorkerState, touchSeen,
+  registerWorker, retireWorker, setWorkerState, touchSeen, unretireWorker,
 } from "./workers";
 
 // A role is "known" if it matches a registered worker or a built-in special role.
@@ -35,9 +35,11 @@ Usage:
   relay daemon [--once] [--interval <ms>]
 
   relay worker register <id> --role worker [--runtime <herdr-target>] [--session <sid>] [--cwd <dir>] [--command <cmd>]
-  relay worker list
+  relay worker list [--all]
   relay worker status <id>
   relay worker bind <id> --session <sid>
+  relay worker retire <id> [--reason <text>]
+  relay worker unretire <id>
 
   relay session attach --session <sid> [--role worker] [--worker <id>] [--dir <d>] [--worktree <w>] [--pane <p>] [--tab <t>]
   relay session detach --session <sid>
@@ -98,18 +100,25 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
     about: "Manage worker identities (the assignees in the durable task ledger).",
     usage: [
       "relay worker register <id> [--role worker] [--runtime <herdr-target>] [--session <sid>] [--cwd <dir>] [--command <cmd>]",
-      "relay worker list",
+      "relay worker list [--all]",
       "relay worker status <id>",
       "relay worker bind <id> --session <sid>",
+      "relay worker retire <id> [--reason <text>]",
+      "relay worker unretire <id>",
     ],
   },
   "worker register": {
     about: "Register a worker and remember it as this checkout's default identity (.relay/worker-id).",
     usage: ['relay worker register <id> [--role worker] [--runtime <herdr-target>] [--session <sid>] [--cwd <dir>] [--command <cmd>]'],
   },
-  "worker list": { about: "List workers.", usage: ["relay worker list"] },
+  "worker list": { about: "List workers ({id,role,state,gen,runtime,task,session}). Retired workers are hidden unless --all.", usage: ["relay worker list [--all]"] },
   "worker status": { about: "Print one worker as JSON.", usage: ["relay worker status <id>"] },
   "worker bind": { about: "Bind a worker to an OpenCode session id.", usage: ["relay worker bind <id> --session <sid>"] },
+  "worker retire": {
+    about: "Retire a worker (history only): hidden from list/status and excluded from scheduling, stalling and role discovery. The row and its events survive. Refused while the worker still owns a task.",
+    usage: ['relay worker retire <id> [--reason <text>]'],
+  },
+  "worker unretire": { about: "Reverse a retirement so the worker becomes schedulable again.", usage: ["relay worker unretire <id>"] },
   session: {
     about: "Manage OpenCode sessions attached to Herdr agents.",
     usage: [
@@ -284,9 +293,21 @@ async function main(): Promise<void> {
           try { writeFileSync(join(process.cwd(), STATE_DIR, "worker-id"), id); } catch { /* ignore */ }
           console.log(`registered ${w.id} role=${w.role}`);
         } else if (sub === "list") {
-          for (const w of listWorkers(db)) {
-            console.log(`${w.id}\t${w.role}\t${w.state}\tgen=${w.generation}\truntime=${w.runtime_id ?? "-"}\ttask=${w.current_task_id ?? "-"}\tsession=${w.opencode_session_id ?? "-"}`);
+          const all = hasFlag(argv.slice(2), "--all");
+          for (const w of listWorkers(db, { includeRetired: all })) {
+            const retired = w.retired_at ? `\tRETIRED(${w.retired_reason ?? "-"})` : "";
+            console.log(`${w.id}\t${w.role}\t${w.state}\tgen=${w.generation}\truntime=${w.runtime_id ?? "-"}\ttask=${w.current_task_id ?? "-"}\tsession=${w.opencode_session_id ?? "-"}${retired}`);
           }
+        } else if (sub === "retire") {
+          const id = argv[2];
+          if (!id) throw new Error("usage: relay worker retire <id> [--reason <text>]");
+          const w = retireWorker(db, id, flag(argv.slice(2), "--reason") ?? undefined);
+          console.log(`retired ${w.id} role=${w.role}${w.retired_reason ? ` reason=${w.retired_reason}` : ""}`);
+        } else if (sub === "unretire") {
+          const id = argv[2];
+          if (!id) throw new Error("usage: relay worker unretire <id>");
+          const w = unretireWorker(db, id);
+          console.log(`unretired ${w.id} role=${w.role} state=${w.state}`);
         } else if (sub === "status") {
           const id = argv[2];
           if (!id) throw new Error("usage: relay worker status <id>");
@@ -548,6 +569,7 @@ async function main(): Promise<void> {
           id: recipient, role: "worker", runtime_id: null, cwd: null, command: null,
           opencode_session_id: null, state: "idle" as const, current_task_id: null,
           generation: 0, last_seen_at: 0, last_progress_at: 0, nudged_at: null,
+          retired_at: null, retired_reason: null,
           created_at: 0, updated_at: 0,
         };
         try {

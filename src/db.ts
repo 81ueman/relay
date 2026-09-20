@@ -30,6 +30,15 @@ function migrate(db: Database): void {
     if (!columnExists(db, "workers", "command")) {
       db.exec("ALTER TABLE workers ADD COLUMN command TEXT;");
     }
+    // Retirement tombstone: see Worker.retired_at. The index is created here (not
+    // in SCHEMA) because SCHEMA runs first on DBs that predate the column.
+    if (!columnExists(db, "workers", "retired_at")) {
+      db.exec("ALTER TABLE workers ADD COLUMN retired_at INTEGER;");
+    }
+    if (!columnExists(db, "workers", "retired_reason")) {
+      db.exec("ALTER TABLE workers ADD COLUMN retired_reason TEXT;");
+    }
+    db.exec("CREATE INDEX IF NOT EXISTS idx_workers_retired ON workers(retired_at);");
   }
   // `claimed` task state was removed: anything left there is runnable work.
   try {

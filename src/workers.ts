@@ -13,6 +13,12 @@ export function registerWorker(
   const t = now();
   const existing = db.query(`SELECT * FROM workers WHERE id = ?`).get(id) as Worker | null;
   if (existing) {
+    // Re-registering a retired id revives it explicitly: bring it back into the
+    // schedulable set rather than silently keeping a tombstone around.
+    if (existing.retired_at !== null) {
+      db.query(`UPDATE workers SET retired_at = NULL, retired_reason = NULL WHERE id = ?`).run(id);
+      logEvent(db, { source: "cli", workerId: id, type: "worker.unretired", payload: { reason: "re-registered" } });
+    }
     db.query(
       `UPDATE workers SET role = COALESCE(?, role), runtime_id = COALESCE(?, runtime_id),
         opencode_session_id = COALESCE(?, opencode_session_id),
@@ -39,14 +45,60 @@ export function getWorker(db: Database, id: string): Worker | null {
   return (db.query(`SELECT * FROM workers WHERE id = ?`).get(id) as Worker | null) ?? null;
 }
 
+/** A retired worker is history only: never scheduled, listed or woken again. */
+export function isRetired(w: Worker | null | undefined): boolean {
+  return !!w && w.retired_at !== null;
+}
+
+/**
+ * Retire a worker without deleting it. The row stays so historical events and
+ * task references remain resolvable, but every operational surface excludes it.
+ *
+ * Refuses to retire a worker that still owns a task: retiring is a deliberate,
+ * manual act, and silently taking a worker out from under durable work would
+ * strand it. Release/submit the task first, then retire.
+ */
+export function retireWorker(db: Database, id: string, reason?: string): Worker {
+  const w = getWorker(db, id);
+  if (!w) throw new Error(`unknown worker: ${id}`);
+  if (w.retired_at !== null) return w; // idempotent
+  if (w.current_task_id) {
+    throw new Error(`retire rejected: ${id} still owns ${w.current_task_id}; release/submit it first`);
+  }
+  const t = now();
+  db.query(`UPDATE workers SET retired_at = ?, retired_reason = ?, updated_at = ? WHERE id = ?`).run(
+    t, reason ?? null, t, id
+  );
+  logEvent(db, {
+    source: "cli",
+    workerId: id,
+    type: "worker.retired",
+    payload: { reason: reason ?? null, generation: w.generation, sessionId: w.opencode_session_id },
+  });
+  return getWorker(db, id)!;
+}
+
+/** Reverse a retirement (an un-retired worker becomes schedulable again). */
+export function unretireWorker(db: Database, id: string): Worker {
+  const w = getWorker(db, id);
+  if (!w) throw new Error(`unknown worker: ${id}`);
+  if (w.retired_at === null) return w; // idempotent
+  db.query(`UPDATE workers SET retired_at = NULL, retired_reason = NULL, updated_at = ? WHERE id = ?`).run(now(), id);
+  logEvent(db, { source: "cli", workerId: id, type: "worker.unretired", payload: {} });
+  return getWorker(db, id)!;
+}
+
 export function findWorkerBySession(db: Database, sessionId: string): Worker | null {
   return (
     (db.query(`SELECT * FROM workers WHERE opencode_session_id = ?`).get(sessionId) as Worker | null) ?? null
   );
 }
 
-export function listWorkers(db: Database): Worker[] {
-  return db.query(`SELECT * FROM workers ORDER BY id ASC`).all() as Worker[];
+export function listWorkers(db: Database, opts: { includeRetired?: boolean } = {}): Worker[] {
+  const sql = opts.includeRetired
+    ? `SELECT * FROM workers ORDER BY id ASC`
+    : `SELECT * FROM workers WHERE retired_at IS NULL ORDER BY id ASC`;
+  return db.query(sql).all() as Worker[];
 }
 
 export function setWorkerState(db: Database, id: string, state: WorkerState): void {

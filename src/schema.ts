@@ -60,6 +60,15 @@ export interface Worker {
   last_seen_at: number;
   last_progress_at: number;
   nudged_at: number | null; // [ext] single-nudge bookkeeping for stalled detection
+  /**
+   * [ext] Retirement tombstone. A retired worker is history only: it is excluded
+   * from the operational/supervised sets, from role discovery and from all
+   * listings, but its row (and events) survive so earlier references stay
+   * resolvable. Used to clean up duplicate registrations (e.g. a worker
+   * registered twice under an old and a new id for the same session).
+   */
+  retired_at: number | null;
+  retired_reason: string | null;
   created_at: number;
   updated_at: number;
 }
@@ -151,6 +160,8 @@ CREATE TABLE IF NOT EXISTS workers (
   last_seen_at INTEGER NOT NULL DEFAULT 0,
   last_progress_at INTEGER NOT NULL DEFAULT 0,
   nudged_at INTEGER,
+  retired_at INTEGER,
+  retired_reason TEXT,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );

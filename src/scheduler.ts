@@ -42,6 +42,7 @@ export function systemStatus(db: Database): SystemStatus {
  * workers.opencode_session_id — no duplicate `workers.managed` flag.
  */
 export function isOperationalWorker(db: Database, w: WorkerRow): boolean {
+  if (w.retired_at !== null) return false; // retired = history only, never supervised
   if (w.opencode_session_id) {
     const s = getSession(db, w.opencode_session_id);
     if (s && s.managed === 1 && s.worker_id === w.id) return true;
