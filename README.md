@@ -78,6 +78,13 @@ bun install
 bun link   # global `relay`; or export RELAY_BIN="bun $PWD/src/cli.ts"
 ```
 
+No build step: the `bin` is `src/cli.ts`, which Bun executes directly — so
+`bun run build` is optional (bundling only). Install straight from git with:
+
+```bash
+bun install -g github:81ueman/relay
+```
+
 Requires: Bun ≥ 1.1, `herdr` on PATH, OpenCode v2.
 **Herdr is mandatory**: the daemon fails to start when the herdr CLI/socket is
 unavailable (`relay requires Herdr; ...`). There is no mock fallback, no tmux

@@ -4,7 +4,7 @@
   "description": "Lightweight deterministic supervisor that keeps Herdr + OpenCode agents moving while SQLite stays the source of truth.",
   "type": "module",
   "bin": {
-    "relay": "./dist/cli.js"
+    "relay": "./src/cli.ts"
   },
   "scripts": {
     "build": "bun build src/cli.ts --outdir dist --target bun",
