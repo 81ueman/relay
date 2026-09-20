@@ -47,17 +47,27 @@ worker immediately to take other runnable work.
 ```text
 Relay is a single-supervisor control plane.
 
-One SQLite control-plane DB must have exactly one active Relay daemon.
-Running multiple Relay daemons against the same DB is unsupported and rejected.
+One physical (canonical) SQLite control-plane DB must have exactly one active
+Relay daemon. Running multiple Relay daemons against the same DB is unsupported
+and rejected.
 ```
 
 The daemon owns generation allocation, liveness reconciliation, restart
 decisions, and the project Unix socket, so two daemons on one DB would race on
-all of them. The boundary is enforced at startup, locally (no distributed lock,
-no leader election):
+all of them. Singleton ownership belongs to the **physical SQLite file**, not to
+a path spelling and not to a socket path: the DB is canonicalized with
+`realpath`, symlink aliases converge on one lock, and a different `$RELAY_SOCK`
+cannot smuggle a second supervisor onto the same state. The boundary is enforced
+at startup, locally (no distributed lock, no leader election):
 
-- a control-plane lock next to the DB (`.relay/relay.lock`) makes a second
-  supervisor fail fast, even if `$RELAY_SOCK` points somewhere else;
+- a lock keyed to the canonical DB (`<canonical-db>.relay.lock`, e.g.
+  `.relay/state.db.relay.lock`) makes a second supervisor fail fast, even if
+  `$RELAY_SOCK` points somewhere else. The lock carries a pid **and** a
+  per-acquisition random token, and is only unlinked by its exact owner: a valid
+  live-pid lock is rejected, a dead-pid lock is reclaimed;
+- a lock file that is still empty/partial is **never** reclaimed immediately —
+  another process may be initializing it. A fresh malformed lock is protected for
+  a short grace window; only a sufficiently old corrupt lock is reclaimed;
 - the daemon probes `.relay/relay.sock` before binding: a **live** listener is
   never unlinked (a second daemon is rejected), only a **stale** one (file
   exists, nobody answers) is reclaimed; a non-socket file at the path fails

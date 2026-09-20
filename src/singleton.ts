@@ -2,24 +2,44 @@
 //
 // Relay's production invariant is:
 //
-//     one control-plane DB  =  one active relay supervisor daemon
+//     one physical control-plane SQLite DB  =  one active relay supervisor
 //
-// A second daemon reconciling the same SQLite DB would break generation
-// allocation and cleanup (each daemon owns a per-worker fencing number and the
-// Herdr workspace). Relay does NOT implement distributed locking / leader
-// election: the control plane is local, and the boundary is enforced at startup
-// with two small, local mechanisms, in priority order:
+// A second daemon reconciling the same physical SQLite file would break
+// generation allocation and cleanup (each daemon owns a per-worker fencing
+// number and the Herdr workspace). Relay does NOT implement distributed locking
+// / leader election: the control plane is local, and the boundary is enforced at
+// startup with two small, local mechanisms, in priority order:
 //
-//   1. a control-plane lock, keyed to the DB path (so a *different* RELAY_SOCK
-//      cannot smuggle a second supervisor onto the same state);
+//   1. a control-plane lock keyed to the CANONICAL physical DB path (`realpath`),
+//      so a symlink alias or a *different* RELAY_SOCK cannot smuggle a second
+//      supervisor onto the same state;
 //   2. a unix-socket ownership probe: a live listener is never unlinked; only a
 //      provably stale socket (file exists, nobody answers) is reclaimed.
 //
-// Both are best-effort for locality only; neither is a distributed protocol.
+// Ownership is proven by pid AND a per-acquisition random token, so PID reuse or
+// a replacement lock can never be deleted by a late release. A lock is published
+// ATOMICALLY: metadata is fully written to a private temp file and hard-linked
+// into place, so the lock path is never observable empty/partial from our writer
+// (there is no `create`-then-`write` window). A lock file that is nonetheless
+// found empty/partial (a foreign/legacy writer) is NEVER reclaimed immediately:
+// it is protected for LOCK_INIT_GRACE_MS and only reclaimed once it is old
+// enough to be a crashed startup.
+//
+// Both mechanisms are best-effort for locality only; neither is a distributed
+// protocol.
 
-import { closeSync, existsSync, openSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import {
+  existsSync,
+  linkSync,
+  readFileSync,
+  realpathSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { connect } from "node:net";
-import { dirname, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 
 /** Daemon identity echoed by the socket `ping` reply (DB/socket ownership proof). */
 export interface DaemonIdentity {
@@ -33,14 +53,93 @@ export function daemonIdentity(dbPath: string, sockPath: string, runtime: string
   return { pid: process.pid, db_path: dbPath, runtime, sock_path: sockPath };
 }
 
-/** The control-plane lock lives next to the DB it protects. */
-export function defaultLockPath(dbPath: string): string {
-  return join(dirname(dbPath), "relay.lock");
+/** How long a malformed, newly-created lock is treated as "still initializing". */
+export const LOCK_INIT_GRACE_MS = 2000;
+/** Retry cadence while a fresh malformed lock is protected. */
+const LOCK_RETRY_MS = 50;
+/** Extra budget beyond the grace before a fresh malformed lock fails the startup. */
+const LOCK_BUDGET_MARGIN_MS = 500;
+
+/**
+ * Resolve the physical identity of the control-plane SQLite file.
+ *
+ * Two spellings of the same file (symlink aliases, `/var` vs `/private/var`,
+ * copied-but-linked dirs) must converge on ONE supervisor, so ownership is keyed
+ * to the realpath, never the requested path. The daemon checks DB existence
+ * first, so `realpathSync` succeeds in production; the fallback keeps lock-path
+ * derivation usable for a not-yet-created file.
+ */
+export function canonicalizeDbPath(dbPath: string): string {
+  try {
+    return realpathSync(dbPath);
+  } catch {
+    try {
+      // Canonicalize the containing directory so directory aliases converge too.
+      return join(realpathSync(dirname(dbPath)), basename(dbPath));
+    } catch {
+      return resolve(dbPath);
+    }
+  }
+}
+
+/**
+ * DB-specific lock path. The lock belongs to the physical SQLite FILE, not to a
+ * directory: `/tmp/control/a.db` and `/tmp/control/b.db` are different control
+ * planes and must not collide.
+ */
+export function lockPathFor(canonicalDbPath: string): string {
+  return `${canonicalDbPath}.relay.lock`;
 }
 
 export interface LockHandle {
   path: string;
+  /** Per-acquisition ownership proof; release requires an exact match. */
+  token: string;
   release(): void;
+}
+
+interface LockMetadata {
+  pid: number;
+  token: string;
+  db_path: string;
+  created_at: number;
+}
+
+type LockRead = { ok: true; meta: LockMetadata } | { ok: false };
+
+/**
+ * Read lock metadata. Anything that is not a complete
+ * `{ pid, token, ... }` record (empty, partial JSON, invalid JSON, missing pid,
+ * missing token) is reported as unreadable — the caller MUST NOT treat that as
+ * proof of staleness on its own.
+ */
+function readLockMetadata(path: string): LockRead {
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf-8");
+  } catch {
+    return { ok: false };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return { ok: false };
+  }
+  if (!parsed || typeof parsed !== "object") return { ok: false };
+  const m = parsed as Record<string, unknown>;
+  const pid = Number(m.pid);
+  if (!Number.isInteger(pid) || pid <= 0) return { ok: false };
+  if (typeof m.token !== "string" || m.token.length === 0) return { ok: false };
+  return {
+    ok: true,
+    meta: {
+      pid,
+      token: m.token,
+      db_path: typeof m.db_path === "string" ? m.db_path : "",
+      created_at: Number(m.created_at) || 0,
+    },
+  };
 }
 
 function pidAlive(pid: number): boolean {
@@ -54,55 +153,130 @@ function pidAlive(pid: number): boolean {
   }
 }
 
-function readLockPid(path: string): number {
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function reclaim(path: string): void {
   try {
-    const raw = JSON.parse(readFileSync(path, "utf-8")) as { pid?: unknown };
-    return Number(raw?.pid) || 0;
+    unlinkSync(path);
   } catch {
-    return 0;
+    /* already gone / raced with another starter */
   }
 }
 
-function releaseLock(path: string): void {
+/**
+ * Release only while the lock is still THIS exact incarnation: pid AND token
+ * must match. A same-pid/different-token lock (PID reuse, or a lock replaced by
+ * another acquisition) is not ours to remove.
+ */
+function releaseLock(path: string, token: string): void {
+  const read = readLockMetadata(path);
+  if (!read.ok) return;
+  if (read.meta.pid !== process.pid || read.meta.token !== token) return;
   try {
-    // Only remove the lock if it is still OURS: a stale-holder reclaim by another
-    // process must never be deleted by our late shutdown.
-    if (readLockPid(path) !== process.pid) return;
     unlinkSync(path);
   } catch {
     /* already gone */
   }
 }
 
+export interface AcquireLockOptions {
+  /** Canonical physical DB path recorded in the lock + used in error messages. */
+  dbPath?: string;
+  /** Override the fresh-malformed grace (tests use a short value). */
+  initGraceMs?: number;
+}
+
 /**
- * Acquire the exclusive control-plane lock. `wx` (exclusive create) is the
- * atomic primitive: only one process can create the file. A pre-existing lock is
- * either held by a live process (reject) or stale (holder crashed → reclaim).
+ * Acquire the exclusive control-plane lock for one physical SQLite DB.
+ *
+ * An atomic hard-link of a fully-written metadata file is the only way to win.
+ * A pre-existing lock is:
+ *
+ *   valid + live pid   -> reject (second supervisor)
+ *   valid + dead pid   -> reclaim and retry
+ *   malformed + fresh  -> PROTECT (another process may be initializing); retry
+ *   malformed + old    -> reclaim and retry (crashed startup)
+ *
+ * Atomic publish removes the create-before-metadata window for our own writer;
+ * the fresh-malformed rule additionally protects against a foreign/legacy
+ * partial lock that must never be reclaimed while it may still be initializing.
  */
-export function acquireLock(path: string): LockHandle {
-  for (let attempt = 0; attempt < 3; attempt++) {
+export async function acquireLock(
+  path: string,
+  opts: AcquireLockOptions = {}
+): Promise<LockHandle> {
+  const token = randomUUID();
+  const dbPath = opts.dbPath ?? "";
+  const graceMs = opts.initGraceMs ?? LOCK_INIT_GRACE_MS;
+  const deadline = Date.now() + graceMs + LOCK_BUDGET_MARGIN_MS;
+
+  for (;;) {
+    // 1) Atomic exclusive create. Metadata is written to a unique temp file and
+    //    hard-linked into place: `link` fails with EEXIST when the lock is held
+    //    and exposes only a fully-written record otherwise.
+    const meta: LockMetadata = {
+      pid: process.pid,
+      token,
+      db_path: dbPath,
+      created_at: Date.now(),
+    };
+    const tmp = `${path}.${token}.tmp`;
+    let created = false;
     try {
-      const fd = openSync(path, "wx");
-      writeFileSync(fd, JSON.stringify({ pid: process.pid, at: Date.now() }));
-      closeSync(fd);
-      return { path, release: () => releaseLock(path) };
-    } catch (e) {
-      if ((e as NodeJS.ErrnoException)?.code !== "EEXIST") throw e;
-      const pid = readLockPid(path);
-      if (pidAlive(pid)) {
-        throw new Error(
-          `relay control plane already has an active daemon (pid ${pid}); refusing a second supervisor`
-        );
-      }
-      // Stale lock (holder is gone): reclaim it and retry.
+      writeFileSync(tmp, JSON.stringify(meta), { flag: "wx" });
       try {
-        unlinkSync(path);
+        linkSync(tmp, path);
+        created = true;
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException)?.code !== "EEXIST") throw e;
+      }
+    } finally {
+      try {
+        unlinkSync(tmp);
       } catch {
-        /* raced with another starter */
+        /* already gone */
       }
     }
+    if (created) return { path, token, release: () => releaseLock(path, token) };
+
+    // 2) Someone else created the file: classify it.
+    const read = readLockMetadata(path);
+    if (read.ok) {
+      if (pidAlive(read.meta.pid)) {
+        throw new Error(
+          `relay control plane already has an active supervisor for ${
+            dbPath || path
+          } (pid ${read.meta.pid}); refusing a second supervisor`
+        );
+      }
+      // Dead holder: a stale lock from a crashed process -> reclaim.
+      reclaim(path);
+      continue;
+    }
+
+    // Malformed/empty/partial (a foreign/legacy writer mid-publish, or a crash
+    // artifact): only age can justify a destructive reclaim.
+    let ageMs: number;
+    try {
+      ageMs = Date.now() - statSync(path).mtimeMs;
+    } catch {
+      ageMs = Number.POSITIVE_INFINITY; // vanished: another starter moved on
+    }
+    if (ageMs < graceMs) {
+      if (Date.now() >= deadline) {
+        throw new Error(
+          `relay control-plane lock ${path} is being initialized by another process; ` +
+            `refusing to reclaim a fresh lock for ${dbPath || path}`
+        );
+      }
+      await sleep(LOCK_RETRY_MS);
+      continue;
+    }
+    // Old corrupt lock from a crashed/incomplete startup: reclaim and retry.
+    reclaim(path);
   }
-  throw new Error(`could not acquire relay control-plane lock at ${path}`);
 }
 
 /** Best-effort: does the daemon at this socket path still answer? */
@@ -197,8 +371,9 @@ export async function probeSocket(path: string, timeoutMs = 800): Promise<Socket
  *   stale      -> reclaim (unlink) and continue
  *   live       -> fail closed; never unlink a live daemon's socket
  *
- * A live daemon serving a DIFFERENT control-plane DB on the same socket path is a
- * configuration error and is rejected too (the singleton must be DB-identified).
+ * A live daemon serving a DIFFERENT canonical control-plane DB on the same socket
+ * path is a configuration error and is rejected too (the singleton is DB-identity
+ * based, not socket based).
  */
 export async function assertSocketFree(sockPath: string, dbPath: string): Promise<void> {
   const probe = await probeSocket(sockPath);
@@ -224,8 +399,8 @@ export async function assertSocketFree(sockPath: string, dbPath: string): Promis
     );
   }
   throw new Error(
-    `relay daemon already running for this control plane${
-      id ? ` (pid ${id.pid}, db ${id.db_path})` : ""
+    `relay control plane already has an active supervisor for ${dbPath}${
+      id ? ` (pid ${id.pid})` : ""
     }; refusing a second supervisor`
   );
 }

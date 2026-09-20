@@ -19,14 +19,16 @@ event-ordering and recovery bugs that Relay has historically had (see
 
 ```text
 Implementation boundary assumption:
-exactly one Relay supervisor process owns a control-plane DB at a time.
+exactly one Relay supervisor process owns a physical/canonical SQLite
+control-plane DB at a time.
 ```
 
 The TLA+ model does not model two concurrent supervisor processes racing through
 the same SQLite DB / Herdr workspace. The implementation enforces the
-single-supervisor assumption at daemon startup (`.relay/relay.lock` plus a
-non-destructive `.relay/relay.sock` ownership probe; see the top-level
-`README.md` §"Single-supervisor invariant"). Because the boundary excludes
+single-supervisor assumption at daemon startup (a lock keyed to the canonical
+`realpath` DB, `<canonical-db>.relay.lock`, plus a non-destructive
+`.relay/relay.sock` ownership probe; see the top-level `README.md`
+§"Single-supervisor invariant"). Because the boundary excludes
 concurrent daemons, generation allocation in the implementation stays
 process-local (`restartingWorkers` + a commit-time generation re-check); the model
 needs **no** generation reservation table, distributed lock, or leader election,

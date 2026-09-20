@@ -9,8 +9,9 @@ import { startSocketServer, type SocketContext, type SocketHandle } from "./sock
 import {
   acquireLock,
   assertSocketFree,
+  canonicalizeDbPath,
   daemonIdentity,
-  defaultLockPath,
+  lockPathFor,
   type LockHandle,
 } from "./singleton";
 
@@ -34,18 +35,22 @@ export interface DaemonOptions {
  * intervalMs (default 1500ms) or immediately when woken by socket events.
  * The Unix socket also serves idle/error signals with the REAL runtime.
  *
- * Single-supervisor boundary (see `src/singleton.ts`): one control-plane DB has
- * at most one active daemon. Startup acquires a DB-keyed lock and probes the
- * socket; a live daemon is rejected, a stale socket is reclaimed, and a bind
- * failure is fatal. `--once` runs the SAME acquisition (it executes a supervisor
- * pass) but does not bind, since it never serves.
+ * Single-supervisor boundary (see `src/singleton.ts`): one physical
+ * (canonical) control-plane DB has at most one active daemon. Startup
+ * canonicalizes the DB, acquires the DB-specific lock and probes the socket; a
+ * live daemon is rejected, a stale socket is reclaimed, and a bind failure is
+ * fatal. `--once` runs the SAME acquisition (it executes a supervisor pass) but
+ * does not bind, since it never serves.
  */
 export async function runDaemon(opts: DaemonOptions = {}): Promise<void> {
-  const dbPath = opts.dbPath ?? defaultDbPath();
-  if (!existsSync(dbPath)) {
-    console.error(`[relay] DB not found at ${dbPath}. Run \`relay init\` first.`);
+  const requestedDbPath = opts.dbPath ?? defaultDbPath();
+  if (!existsSync(requestedDbPath)) {
+    console.error(`[relay] DB not found at ${requestedDbPath}. Run \`relay init\` first.`);
     process.exit(1);
   }
+  // Singleton ownership belongs to the physical SQLite file, not to a path
+  // spelling: symlink aliases must converge on one canonical DB identity.
+  const dbPath = canonicalizeDbPath(requestedDbPath);
   const intervalMs = opts.intervalMs ?? Number(process.env.RELAY_INTERVAL_MS ?? "1500");
   const rt = opts.runtime ?? buildRuntime();
   const sockPath = opts.sockPath ?? defaultSockPath();
@@ -62,10 +67,10 @@ export async function runDaemon(opts: DaemonOptions = {}): Promise<void> {
   try {
     if (guard) {
       // Fail fast BEFORE any DB/runtime work: a second supervisor must never
-      // reconcile. Acquire the DB-keyed lock first, then prove the socket is
-      // either absent, stale (reclaimable), or ours to bind — never a live
-      // daemon's (that socket is never unlinked).
-      lock = acquireLock(opts.lockPath ?? defaultLockPath(dbPath));
+      // reconcile. Acquire the canonical-DB-specific lock first, then prove the
+      // socket is either absent, stale (reclaimable), or ours to bind — never a
+      // live daemon's (that socket is never unlinked).
+      lock = await acquireLock(opts.lockPath ?? lockPathFor(dbPath), { dbPath });
       await assertSocketFree(sockPath, dbPath);
     }
 

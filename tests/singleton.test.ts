@@ -1,5 +1,14 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,13 +19,17 @@ import { startSocketServer, type SocketContext } from "../src/socket";
 import {
   acquireLock,
   assertSocketFree,
+  canonicalizeDbPath,
   daemonIdentity,
+  lockPathFor,
   probeSocket,
 } from "../src/singleton";
 
-// Single-supervisor boundary: one control-plane DB == one active relay daemon.
-// The guard is (1) a DB-keyed lock and (2) a socket ownership probe that never
-// unlinks a live listener and reclaims only a provably stale one.
+// Single-supervisor boundary: one PHYSICAL control-plane SQLite DB == one active
+// relay daemon. The guard is (1) a DB-specific lock keyed to the canonical
+// (realpath) DB and released only with the exact (pid, token) and (2) a socket
+// ownership probe that never unlinks a live listener and reclaims only a
+// provably stale one.
 
 const REPO = join(import.meta.dir, "..");
 const dirs: string[] = [];
@@ -45,6 +58,14 @@ async function makeStaleSocket(path: string): Promise<void> {
   const server = createServer(() => {});
   await new Promise<void>((resolve) => server.listen(path, resolve));
   await new Promise<void>((resolve) => server.close(() => resolve()));
+}
+
+function deadPid(): number {
+  return Bun.spawnSync({ cmd: ["true"] }).pid;
+}
+
+function readLock(path: string): Record<string, unknown> {
+  return JSON.parse(readFileSync(path, "utf-8")) as Record<string, unknown>;
 }
 
 describe("socket ownership probe", () => {
@@ -79,7 +100,7 @@ describe("socket ownership probe", () => {
       }
 
       await expect(assertSocketFree(sockPath, dbPath)).rejects.toThrow(
-        /already running|second supervisor/
+        /already has an active supervisor|second supervisor/
       );
 
       // A second starter must NOT have stolen the pathname: still reachable.
@@ -129,37 +150,131 @@ describe("socket ownership probe", () => {
   });
 });
 
+describe("canonical DB identity", () => {
+  test("a physical DB yields a DB-specific lock path (not a directory-wide one)", () => {
+    const dir = tempDir();
+    const a = lockPathFor(canonicalizeDbPath(join(dir, "a.db")));
+    const b = lockPathFor(canonicalizeDbPath(join(dir, "b.db")));
+    expect(a).not.toBe(b);
+    expect(a.endsWith("a.db.relay.lock")).toBe(true);
+    expect(b.endsWith("b.db.relay.lock")).toBe(true);
+  });
+
+  test("symlink aliases converge on one canonical DB and one lock", () => {
+    const realDir = tempDir();
+    const aliasDir = tempDir();
+    const realDb = join(realDir, "state.db");
+    openDb(realDb).close();
+    const aliasDb = join(aliasDir, "state.db");
+    symlinkSync(realDb, aliasDb);
+
+    expect(canonicalizeDbPath(aliasDb)).toBe(canonicalizeDbPath(realDb));
+    expect(lockPathFor(canonicalizeDbPath(aliasDb))).toBe(lockPathFor(canonicalizeDbPath(realDb)));
+  });
+});
+
 describe("control-plane lock", () => {
-  test("a live holder rejects a second acquisition", () => {
-    const lock = join(tempDir(), "relay.lock");
-    const held = acquireLock(lock);
+  test("a live holder rejects a second acquisition", async () => {
+    const dir = tempDir();
+    const dbPath = join(dir, "state.db");
+    openDb(dbPath).close();
+    const lock = lockPathFor(canonicalizeDbPath(dbPath));
+    const held = await acquireLock(lock, { dbPath: canonicalizeDbPath(dbPath) });
     try {
-      expect(() => acquireLock(lock)).toThrow(/active daemon|second supervisor/);
+      await expect(
+        acquireLock(lock, { dbPath: canonicalizeDbPath(dbPath) })
+      ).rejects.toThrow(/active supervisor|second supervisor/);
     } finally {
       held.release();
     }
     expect(existsSync(lock)).toBe(false);
   });
 
-  test("a lock left by a dead process is reclaimed", () => {
+  test("a valid lock left by a dead process is reclaimed", async () => {
     const dir = tempDir();
-    const lock = join(dir, "relay.lock");
-    const dead = Bun.spawnSync({ cmd: ["true"] });
-    writeFileSync(lock, JSON.stringify({ pid: dead.pid, at: Date.now() }));
+    const dbPath = join(dir, "state.db");
+    openDb(dbPath).close();
+    const canonical = canonicalizeDbPath(dbPath);
+    const lock = lockPathFor(canonical);
+    writeFileSync(
+      lock,
+      JSON.stringify({ pid: deadPid(), token: "dead-token", db_path: canonical, created_at: Date.now() })
+    );
 
-    const held = acquireLock(lock);
+    const held = await acquireLock(lock, { dbPath: canonical });
+    expect(readLock(lock).token).toBe(held.token);
     held.release();
     expect(existsSync(lock)).toBe(false);
   });
 
-  test("release never deletes a lock that is no longer ours", () => {
+  test("release requires the exact ownership token (same pid, different token stays)", async () => {
     const dir = tempDir();
-    const lock = join(dir, "relay.lock");
-    const held = acquireLock(lock);
-    // Simulate another process having reclaimed/overwritten the lock.
-    writeFileSync(lock, JSON.stringify({ pid: process.pid + 1, at: Date.now() }));
+    const dbPath = join(dir, "state.db");
+    openDb(dbPath).close();
+    const canonical = canonicalizeDbPath(dbPath);
+    const lock = lockPathFor(canonical);
+    const held = await acquireLock(lock, { dbPath: canonical });
+
+    // A replacement lock with the same PID but a different incarnation.
+    writeFileSync(
+      lock,
+      JSON.stringify({ pid: process.pid, token: "someone-else", db_path: canonical, created_at: Date.now() })
+    );
     held.release();
     expect(existsSync(lock)).toBe(true);
+    expect(readLock(lock).token).toBe("someone-else");
+  });
+
+  test("a fresh empty lock is never reclaimed immediately", async () => {
+    const dir = tempDir();
+    const dbPath = join(dir, "state.db");
+    openDb(dbPath).close();
+    const canonical = canonicalizeDbPath(dbPath);
+    const lock = lockPathFor(canonical);
+    writeFileSync(lock, "");
+
+    const pending = acquireLock(lock, { dbPath: canonical, initGraceMs: 250 });
+    await Bun.sleep(80);
+    // Still protected while fresh: not unlinked.
+    expect(existsSync(lock)).toBe(true);
+    expect(readFileSync(lock, "utf-8")).toBe("");
+
+    const held = await pending; // reclaimed only once it aged past the grace
+    expect(readLock(lock).token).toBe(held.token);
+    held.release();
+  });
+
+  test("a fresh partial-JSON lock is never reclaimed immediately", async () => {
+    const dir = tempDir();
+    const dbPath = join(dir, "state.db");
+    openDb(dbPath).close();
+    const canonical = canonicalizeDbPath(dbPath);
+    const lock = lockPathFor(canonical);
+    writeFileSync(lock, `{"pid":`);
+
+    const pending = acquireLock(lock, { dbPath: canonical, initGraceMs: 250 });
+    await Bun.sleep(80);
+    expect(readFileSync(lock, "utf-8")).toBe(`{"pid":`);
+
+    const held = await pending;
+    expect(readLock(lock).token).toBe(held.token);
+    held.release();
+  });
+
+  test("an old corrupt lock is reclaimed", async () => {
+    const dir = tempDir();
+    const dbPath = join(dir, "state.db");
+    openDb(dbPath).close();
+    const canonical = canonicalizeDbPath(dbPath);
+    const lock = lockPathFor(canonical);
+    writeFileSync(lock, `{"pid":`);
+    const old = new Date(Date.now() - 10_000);
+    utimesSync(lock, old, old);
+
+    const held = await acquireLock(lock, { dbPath: canonical });
+    expect(readLock(lock).token).toBe(held.token);
+    held.release();
+    expect(existsSync(lock)).toBe(false);
   });
 });
 
@@ -173,6 +288,18 @@ function spawnDaemon(env: Record<string, string | undefined>, extra: string[] = 
     cwd: REPO,
     env,
     stdout: "ignore",
+    stderr: "pipe",
+  });
+  procs.push(p);
+  return p;
+}
+
+function spawnFixture(file: string, env: Record<string, string | undefined>): Bun.Subprocess {
+  const p = Bun.spawn({
+    cmd: ["bun", `tests/fixtures/${file}`],
+    cwd: REPO,
+    env,
+    stdout: "pipe",
     stderr: "pipe",
   });
   procs.push(p);
@@ -208,8 +335,8 @@ async function exitWithin(p: Bun.Subprocess, ms = 8000): Promise<number> {
   return code as number;
 }
 
-async function stderrOf(p: Bun.Subprocess): Promise<string> {
-  return new Response(p.stderr as ReadableStream).text();
+async function streamOf(s: ReadableStream | number | undefined): Promise<string> {
+  return new Response(s as ReadableStream).text();
 }
 
 function daemonEnv(dbPath: string, sockPath: string): Record<string, string | undefined> {
@@ -236,9 +363,9 @@ describe("daemon single-supervisor enforcement (subprocess)", () => {
 
     const second = spawnDaemon(env);
     const code = await exitWithin(second);
-    const err = await stderrOf(second);
+    const err = await streamOf(second.stderr);
     expect(code).not.toBe(0);
-    expect(err).toMatch(/already running|second supervisor|active daemon/);
+    expect(err).toMatch(/active supervisor|second supervisor|active daemon/);
 
     // Daemon A is untouched: its socket is still reachable.
     expect((await probeSocket(sockPath)).status).toBe("live");
@@ -282,7 +409,7 @@ describe("daemon single-supervisor enforcement (subprocess)", () => {
 
     const proc = spawnDaemon(env);
     const code = await exitWithin(proc);
-    const err = await stderrOf(proc);
+    const err = await streamOf(proc.stderr);
     expect(code).not.toBe(0);
     expect(err).not.toMatch(/socket listening/);
   }, 20000);
@@ -299,19 +426,143 @@ describe("daemon single-supervisor enforcement (subprocess)", () => {
 
     const once = spawnDaemon(env, ["--once"]);
     const code = await exitWithin(once);
-    const err = await stderrOf(once);
+    const err = await streamOf(once.stderr);
     expect(code).not.toBe(0);
-    expect(err).toMatch(/already running|second supervisor|active daemon/);
+    expect(err).toMatch(/active supervisor|second supervisor|active daemon/);
   }, 20000);
 
   test("F: MockRuntime + noSocket bypasses the singleton for tests", async () => {
     const dir = tempDir();
     const dbPath = join(dir, "state.db");
     openDb(dbPath).close();
+    const canonical = canonicalizeDbPath(dbPath);
 
     await runDaemon({ once: true, noSocket: true, runtime: new MockRuntime(), dbPath, intervalMs: 0 });
 
-    expect(existsSync(join(dir, "relay.lock"))).toBe(false);
+    expect(existsSync(lockPathFor(canonical))).toBe(false);
     expect(existsSync(join(dir, "relay.sock"))).toBe(false);
+  }, 20000);
+
+  test("G: simultaneous lock acquisitions have exactly one winner", async () => {
+    const dir = tempDir();
+    const dbPath = join(dir, "state.db");
+    openDb(dbPath).close();
+    const canonical = canonicalizeDbPath(dbPath);
+    const lock = lockPathFor(canonical);
+    const startAt = Date.now() + 1200;
+
+    const env = (): Record<string, string | undefined> => ({
+      ...process.env,
+      LOCK_PATH: lock,
+      LOCK_DB: canonical,
+      START_AT: String(startAt),
+      HOLD_MS: "1000",
+    });
+    const a = spawnFixture("lock-acquire.ts", env());
+    const b = spawnFixture("lock-acquire.ts", env());
+    await Promise.all([a.exited, b.exited]);
+    const [outA, outB] = await Promise.all([streamOf(a.stdout), streamOf(b.stdout)]);
+
+    const outputs = [outA, outB];
+    expect(outputs.filter((o) => o.includes("ACQUIRED")).length).toBe(1);
+    expect(outputs.filter((o) => o.includes("REJECTED")).length).toBe(1);
+  }, 20000);
+
+  test("H: simultaneous `daemon --once` runs exactly one supervisor pass", async () => {
+    const dir = tempDir();
+    const dbPath = join(dir, "state.db");
+    const sockPath = join(dir, "relay.sock");
+    openDb(dbPath).close();
+    const startAt = Date.now() + 1200;
+
+    const env = (): Record<string, string | undefined> => ({
+      ...daemonEnv(dbPath, sockPath),
+      START_AT: String(startAt),
+    });
+    const a = spawnFixture("daemon-once.ts", env());
+    const b = spawnFixture("daemon-once.ts", env());
+    const [codeA, codeB] = await Promise.all([a.exited, b.exited]);
+    const [errA, errB] = await Promise.all([streamOf(a.stderr), streamOf(b.stderr)]);
+
+    expect([codeA, codeB].filter((c) => c === 0).length).toBe(1);
+    // Only one process ever reached the post-acquisition startup line.
+    expect((errA + errB).match(/daemon starting/g)?.length ?? 0).toBe(1);
+  }, 20000);
+
+  test("I: different DBs in the same directory run concurrently", async () => {
+    const dir = tempDir();
+    const dbA = join(dir, "a.db");
+    const dbB = join(dir, "b.db");
+    openDb(dbA).close();
+    openDb(dbB).close();
+    const sockA = join(dir, "a.sock");
+    const sockB = join(dir, "b.sock");
+
+    spawnDaemon(daemonEnv(dbA, sockA));
+    spawnDaemon(daemonEnv(dbB, sockB));
+    await waitFor(async () => (await probeSocket(sockA, 200)).status === "live");
+    await waitFor(async () => (await probeSocket(sockB, 200)).status === "live");
+
+    expect((await probeSocket(sockA)).status).toBe("live");
+    expect((await probeSocket(sockB)).status).toBe("live");
+  }, 20000);
+
+  test("J: a symlink alias of the same DB is rejected (different socket)", async () => {
+    const realDir = tempDir();
+    const aliasDir = tempDir();
+    const realDb = join(realDir, "state.db");
+    openDb(realDb).close();
+    const aliasDb = join(aliasDir, "state.db");
+    symlinkSync(realDb, aliasDb);
+    const realSock = join(realDir, "relay.sock");
+    const aliasSock = join(aliasDir, "relay.sock");
+
+    spawnDaemon(daemonEnv(realDb, realSock));
+    await waitFor(async () => (await probeSocket(realSock, 200)).status === "live");
+
+    const second = spawnDaemon(daemonEnv(aliasDb, aliasSock));
+    const code = await exitWithin(second);
+    const err = await streamOf(second.stderr);
+    expect(code).not.toBe(0);
+    expect(err).toMatch(/active supervisor|second supervisor/);
+    expect((await probeSocket(realSock)).status).toBe("live");
+  }, 20000);
+
+  test("K: a different RELAY_SOCK cannot bypass the same-DB singleton", async () => {
+    const dir = tempDir();
+    const dbPath = join(dir, "state.db");
+    openDb(dbPath).close();
+    const sockA = join(dir, "a.sock");
+    const sockB = join(dir, "b.sock");
+
+    spawnDaemon(daemonEnv(dbPath, sockA));
+    await waitFor(async () => (await probeSocket(sockA, 200)).status === "live");
+
+    const second = spawnDaemon(daemonEnv(dbPath, sockB));
+    const code = await exitWithin(second);
+    const err = await streamOf(second.stderr);
+    expect(code).not.toBe(0);
+    expect(err).toMatch(/active supervisor|second supervisor/);
+    expect((await probeSocket(sockA)).status).toBe("live");
+  }, 20000);
+
+  test("L: ping reports the canonical physical DB path", async () => {
+    const realDir = tempDir();
+    const aliasDir = tempDir();
+    const realDb = join(realDir, "state.db");
+    openDb(realDb).close();
+    const aliasDb = join(aliasDir, "state.db");
+    symlinkSync(realDb, aliasDb);
+    const sock = join(aliasDir, "relay.sock");
+
+    spawnDaemon(daemonEnv(aliasDb, sock));
+    await waitFor(async () => (await probeSocket(sock, 200)).status === "live");
+
+    const probe = await probeSocket(sock);
+    expect(probe.status).toBe("live");
+    if (probe.status === "live") {
+      expect(probe.identity?.db_path).toBe(canonicalizeDbPath(realDb));
+      expect(probe.identity?.db_path).not.toBe(aliasDb);
+    }
   }, 20000);
 });
