@@ -19,6 +19,7 @@ import {
   bindSession, findWorkerBySession, getWorker, listWorkers,
   registerWorker, retireWorker, setWorkerState, touchSeen, unretireWorker,
 } from "./workers";
+import { resolveWorkerIdentity } from "./identity";
 
 // A role is "known" if it matches a registered worker or a built-in special role.
 // Used for a non-fatal warning on `task add --role`, never a rejection.
@@ -73,7 +74,7 @@ Usage:
   # Debug entrypoint (the OpenCode plugin normally talks to the daemon socket)
   relay event record --type <t> [--session <sid>] [--worker <id>] [--task <tid>] [--payload <json>]
 
-Worker identity: --worker flag, $RELAY_WORKER, or .relay/worker-id
+Worker identity: --worker flag, $RELAY_WORKER, your Herdr pane, or .relay/worker-id
 DB: $RELAY_DB or .relay/state.db (WAL mode)
 Env: RELAY_LEASE_MS RELAY_LEASE_LIVENESS_GRACE_MS RELAY_STALL_MS RELAY_LOW_WATER
      RELAY_AUTO_APPROVE RELAY_INTERVAL_MS RELAY_ROLE_STRICT (default true)
@@ -108,7 +109,7 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
     ],
   },
   "worker register": {
-    about: "Register a worker and remember it as this checkout's default identity (.relay/worker-id).",
+    about: "Register a worker. Also writes .relay/worker-id, a SHARED-checkout default used only when --worker/$RELAY_WORKER/the caller's pane cannot name a worker.",
     usage: ['relay worker register <id> [--role worker] [--runtime <herdr-target>] [--session <sid>] [--cwd <dir>] [--command <cmd>]'],
   },
   "worker list": { about: "List workers ({id,role,state,gen,runtime,task,session}). Retired workers are hidden unless --all.", usage: ["relay worker list [--all]"] },
@@ -229,16 +230,20 @@ function hasFlag(args: string[], name: string): boolean {
   return args.includes(name);
 }
 
-function resolveWorkerId(explicit?: string): string {
-  if (explicit) return explicit;
-  const envWorker = process.env.RELAY_WORKER;
-  if (envWorker) return envWorker;
+function resolveWorkerId(db: ReturnType<typeof openDb>, explicit?: string): string {
   const f = join(process.cwd(), STATE_DIR, "worker-id");
+  let fileDefault: string | undefined;
   if (existsSync(f)) {
     const v = readFileSync(f, "utf-8").trim();
-    if (v) return v;
+    if (v) fileDefault = v;
   }
-  throw new Error("no worker identity: pass --worker <id>, set $RELAY_WORKER, or run `relay worker register`");
+  return resolveWorkerIdentity({
+    db,
+    explicit,
+    envWorker: process.env.RELAY_WORKER,
+    paneId: process.env.HERDR_PANE_ID,
+    fileDefault,
+  });
 }
 
 function fmtAge(ms: number): string {
@@ -466,7 +471,7 @@ async function main(): Promise<void> {
       }
 
       case "next": {
-        const workerId = resolveWorkerId(flag(argv, "--worker"));
+        const workerId = resolveWorkerId(db, flag(argv, "--worker"));
         const t = claimNext(db, workerId, {
           role: flag(argv, "--role") ?? undefined,
           strictRole: hasFlag(argv, "--any-role") ? false : undefined,
@@ -485,7 +490,7 @@ async function main(): Promise<void> {
       case "claim": {
         const id = argv[1];
         if (!id) throw new Error("usage: relay claim <task-id>");
-        const workerId = resolveWorkerId(flag(argv, "--worker"));
+        const workerId = resolveWorkerId(db, flag(argv, "--worker"));
         const claimed = claimTask(db, id, workerId, {
           role: flag(argv, "--role") ?? undefined,
           strictRole: hasFlag(argv, "--any-role") ? false : undefined,
@@ -498,7 +503,7 @@ async function main(): Promise<void> {
         const id = argv[1];
         const body = argv[2];
         if (!id || !body) throw new Error('usage: relay note <task-id> "progress"');
-        const workerId = resolveWorkerId(flag(argv, "--worker"));
+        const workerId = resolveWorkerId(db, flag(argv, "--worker"));
         addNote(db, id, workerId, body);
         console.log("noted");
         break;
@@ -507,7 +512,7 @@ async function main(): Promise<void> {
       case "submit": {
         const id = argv[1];
         if (!id) throw new Error("usage: relay submit <task-id> --evidence ...");
-        const workerId = resolveWorkerId(flag(argv, "--worker"));
+        const workerId = resolveWorkerId(db, flag(argv, "--worker"));
         const evidence = flag(argv, "--evidence") ?? "";
         const leaseRaw = flag(argv, "--lease");
         const t = submitTask(db, id, workerId, {
@@ -521,7 +526,7 @@ async function main(): Promise<void> {
       case "approve": {
         const id = argv[1];
         if (!id) throw new Error("usage: relay approve <task-id>");
-        const workerId = resolveWorkerId(flag(argv, "--worker"));
+        const workerId = resolveWorkerId(db, flag(argv, "--worker"));
         const t = approveTask(db, id, workerId);
         console.log(`${t.id} -> done`);
         break;
@@ -531,7 +536,7 @@ async function main(): Promise<void> {
         const id = argv[1];
         const reason = argv[2];
         if (!id || !reason) throw new Error('usage: relay reject <task-id> "reason"');
-        const workerId = resolveWorkerId(flag(argv, "--worker"));
+        const workerId = resolveWorkerId(db, flag(argv, "--worker"));
         const t = rejectTask(db, id, workerId, reason);
         console.log(`${t.id} -> queued`);
         break;
@@ -541,7 +546,7 @@ async function main(): Promise<void> {
         const id = argv[1];
         const reason = argv[2];
         if (!id || !reason) throw new Error('usage: relay block <task-id> "reason" [--human]');
-        const workerId = resolveWorkerId(flag(argv, "--worker"));
+        const workerId = resolveWorkerId(db, flag(argv, "--worker"));
         const t = blockTask(db, id, workerId, reason, hasFlag(argv, "--human"));
         console.log(`${t.id} -> ${t.state}`);
         break;
@@ -550,7 +555,7 @@ async function main(): Promise<void> {
       case "unblock": {
         const id = argv[1];
         if (!id) throw new Error("usage: relay unblock <task-id>");
-        const workerId = resolveWorkerId(flag(argv, "--worker"));
+        const workerId = resolveWorkerId(db, flag(argv, "--worker"));
         const t = unblockTask(db, id, workerId);
         console.log(`${t.id} -> ${t.state}`);
         break;
@@ -559,7 +564,7 @@ async function main(): Promise<void> {
       case "release": {
         const id = argv[1];
         if (!id) throw new Error("usage: relay release <task-id> [--worker <id>]");
-        const workerId = resolveWorkerId(flag(argv, "--worker"));
+        const workerId = resolveWorkerId(db, flag(argv, "--worker"));
         const t = releaseTask(db, id, workerId);
         console.log(`${t.id} -> ${t.state} lease=${t.lease_token}`);
         break;
@@ -595,7 +600,7 @@ async function main(): Promise<void> {
       }
 
       case "inbox": {
-        const workerId = resolveWorkerId(flag(argv, "--worker"));
+        const workerId = resolveWorkerId(db, flag(argv, "--worker"));
         const ackId = flag(argv, "--ack");
         if (ackId !== undefined) {
           const m = ackMessage(db, Number(ackId), workerId);

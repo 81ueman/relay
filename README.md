@@ -567,6 +567,12 @@ Observe: `relay status`, `relay events --follow`.
 leases; `note` heartbeats + renews; a stale worker's late `submit` is rejected
 with `STALE_LEASE`. Pane/Herdr `idle` is never completion.
 
+Identity follows `--worker` → `$RELAY_WORKER` → the caller's Herdr pane → the
+shared `.relay/worker-id`. In a multi-agent checkout that file is merely the
+LAST registration, so a caller whose pane names a live worker always uses that
+worker, and borrowing a file default that lives in another live pane is
+**refused** (it would misattribute notes and break `submit`'s assignee fence).
+
 ## Recovery (all deterministic, no LLM)
 
 - **Dead worker** (transport reports gone): task requeued with bumped token,
