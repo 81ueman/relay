@@ -33,7 +33,15 @@ import {
 import { BOOTSTRAP_PROMPT } from "./runtime/herdr";
 import type { Session } from "./sessions";
 import type { WorkerRuntime } from "./schema";
-import { approveTask, expireLeases, getTask, reviewTasks, runnableTasks } from "./tasks";
+import {
+  approveTask,
+  claimableRunnableTasks,
+  defaultLeaseAlive,
+  expireLeases,
+  getTask,
+  reviewTasks,
+  unclaimableRunnableTasks,
+} from "./tasks";
 import { getWorker, listWorkers, setWorkerState, touchSeen, type WorkerRow } from "./workers";
 
 // Deterministic reconciler. No LLM: pure DB state + runtime transport.
@@ -421,8 +429,11 @@ export interface ReconcileResult {
 export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<ReconcileResult> {
   const actions: string[] = [];
 
-  // 1. Expire stale leases first (worker crash recovery).
-  const expired = expireLeases(db, at);
+  // 1. Expire lapsed leases first (worker crash recovery). Only a missing or
+  //    not-alive assignee is requeued; a live-but-slow worker keeps its lease.
+  //    The transport-dead path in step 3 still requeues a crashed worker whose
+  //    DB liveness still looks fresh.
+  const expired = expireLeases(db, at, defaultLeaseAlive(db, at));
   for (const t of expired) actions.push(`lease-expired:${t.id}`);
 
   // 2. Promote fresh generations that have completed managed attach.
@@ -512,7 +523,12 @@ export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<
   const view = supervisorView(db);
 
   if (needsWorkerWakeup(view)) {
-    const idle = idleWorkers(db).sort((a, b) => a.id.localeCompare(b.id));
+    // Only wake an idle worker for runnable work it can actually claim under the
+    // active role policy: never tell a role=worker pane to take a queue that is
+    // entirely role=dataplane-rust. Waiting_input workers are never candidates.
+    const idle = idleWorkers(db)
+      .filter((c) => claimableRunnableTasks(db, c.id).length > 0)
+      .sort((a, b) => a.id.localeCompare(b.id));
     let woken = false;
     for (const c of idle) {
       const full = getWorker(db, c.id)!;
@@ -523,11 +539,13 @@ export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<
       }
     }
     if (!woken) {
-      // No idle worker can take it. Recover a fallen one, or wait for a fresh
-      // generation to finish attaching. Never nudge waiting_input workers.
+      // No idle worker can take it. Recover a fallen one that could, or wait for
+      // a fresh generation to finish attaching.
       const fallen = supervisedWorkers(db)
         .filter((x) => x.state === "dead" || x.state === "stalled")
+        .filter((x) => claimableRunnableTasks(db, x.id).length > 0)
         .sort((a, b) => a.id.localeCompare(b.id))[0];
+      const stranded = unclaimableRunnableTasks(db);
       if (fallen) {
         if (await restartWorker(db, rt, fallen, at)) actions.push(`restarted:${fallen.id}`);
         else actions.push(`restart-skipped:${fallen.id}`);
@@ -535,6 +553,15 @@ export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<
         actions.push("wake-suppressed");
       } else if (operationalWorkers(db).some((x) => x.state === "starting")) {
         actions.push("awaiting-start");
+      } else if (stranded.length > 0) {
+        // Runnable work exists but no registered worker role can claim it: make
+        // the stranded task visible instead of looping on a wake that cannot help.
+        logEvent(db, {
+          source: "supervisor",
+          type: "supervisor.unclaimable_work",
+          payload: { tasks: stranded.map((t) => ({ id: t.id, role: t.role })) },
+        });
+        actions.push(`unclaimable:${stranded.map((t) => t.id).join(",")}`);
       } else {
         logEvent(db, { source: "supervisor", type: "supervisor.no_idle_worker", payload: { view } });
         actions.push("no-idle-worker");
@@ -586,8 +613,8 @@ export async function handleIdleSignal(db: Database, rt: Runtime, workerId: stri
   if (w.state === "waiting_input") return "waiting-input";
 
   if (!w.current_task_id) {
-    // No task + runnable work -> wake to next.
-    if (runnableTasks(db).length > 0) {
+    // No task + runnable work this worker can actually claim -> wake to next.
+    if (claimableRunnableTasks(db, workerId).length > 0) {
       await tryWake(rt, db, w, NEXT_NUDGE, "idle-no-task", at);
       return "woke-next";
     }
@@ -601,7 +628,7 @@ export async function handleIdleSignal(db: Database, rt: Runtime, workerId: stri
   const task = getTask(db, w.current_task_id);
   if (!task) {
     db.query(`UPDATE workers SET current_task_id = NULL, state = 'idle', updated_at = ? WHERE id = ?`).run(at, workerId);
-    if (runnableTasks(db).length > 0) {
+    if (claimableRunnableTasks(db, workerId).length > 0) {
       const fresh = getWorker(db, workerId)!;
       await tryWake(rt, db, fresh, NEXT_NUDGE, "idle-task-gone", at);
       return "woke-next";
@@ -618,7 +645,7 @@ export async function handleIdleSignal(db: Database, rt: Runtime, workerId: stri
     // A human-blocked task never parks the worker: release + move on.
     db.query(`UPDATE workers SET current_task_id = NULL, state = 'idle', updated_at = ? WHERE id = ?`).run(at, workerId);
     const fresh = getWorker(db, workerId)!;
-    if (runnableTasks(db).length > 0 || (reviewTasks(db).length > 0 && w.role === "reviewer")) {
+    if (claimableRunnableTasks(db, workerId).length > 0 || (reviewTasks(db).length > 0 && w.role === "reviewer")) {
       await tryWake(rt, db, fresh, NEXT_NUDGE, "idle-terminal-task", at);
       return "woke-next";
     }

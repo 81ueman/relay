@@ -1,7 +1,7 @@
 import type { Database } from "bun:sqlite";
 import { findRuntime, getStartingRuntime } from "./runtimes";
 import { getSession } from "./sessions";
-import { reviewTasks, runnableTasks, taskCounts, unfinishedCount } from "./tasks";
+import { reviewTasks, runnableTasks, taskCounts, unclaimableRunnableTasks, unfinishedCount } from "./tasks";
 import { listWorkers, type WorkerRow } from "./workers";
 
 export function stallMs(): number {
@@ -138,6 +138,8 @@ export interface SupervisorView {
   unfinished: number;
   working: number;
   status: SystemStatus;
+  /** Runnable tasks whose non-null role matches no registered worker (strict only). */
+  unclaimable: number;
 }
 
 export function supervisorView(db: Database): SupervisorView {
@@ -147,6 +149,7 @@ export function supervisorView(db: Database): SupervisorView {
     unfinished: unfinishedCount(db),
     working: workingWorkers(db).length,
     status: systemStatus(db),
+    unclaimable: unclaimableRunnableTasks(db).length,
   };
 }
 

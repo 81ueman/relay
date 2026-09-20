@@ -12,12 +12,20 @@ import { attachSession, detachSession, getSession, listSessions } from "./sessio
 import { listRuntimes } from "./runtimes";
 import {
   addTask, approveTask, blockTask, claimNext, claimTask, getNotes, getTask,
-  listTasks, rejectTask, submitTask, taskCounts, unblockTask, addNote, setTaskPlan,
+  listTasks, rejectTask, releaseTask, submitTask, taskCounts, unblockTask,
+  unclaimableRunnableTasks, addNote, setTaskPlan,
 } from "./tasks";
 import {
   bindSession, findWorkerBySession, getWorker, listWorkers,
   registerWorker, setWorkerState, touchSeen,
 } from "./workers";
+
+// A role is "known" if it matches a registered worker or a built-in special role.
+// Used for a non-fatal warning on `task add --role`, never a rejection.
+function knownRole(db: ReturnType<typeof openDb>, role: string): boolean {
+  if (role === "worker" || role === "planner" || role === "reviewer") return true;
+  return listWorkers(db).some((w) => w.role === role);
+}
 
 function usage(): string {
   return `relay — lightweight supervisor for Herdr + OpenCode agents (SQLite is the source of truth)
@@ -44,14 +52,15 @@ Usage:
   relay task list [--state <state>]
   relay task show <id>
 
-  relay next [--worker <id>]
-  relay claim <task-id> [--worker <id>]
+  relay next [--worker <id>] [--role <r>] [--any-role]
+  relay claim <task-id> [--worker <id>] [--role <r>] [--any-role]
   relay note <task-id> "progress" [--worker <id>]
   relay submit <task-id> --evidence "..." [--worker <id>] [--lease <token>]
   relay approve <task-id> [--worker <id>]
   relay reject <task-id> "reason" [--worker <id>]
   relay block <task-id> "reason" [--worker <id>] [--human]
   relay unblock <task-id> [--worker <id>]
+  relay release <task-id> [--worker <id>]
 
   relay send <worker-id> "message" [--task <tid>] [--kind <k>]
   relay inbox [--worker <id>] [--claim] [--ack <msg-id>]
@@ -64,7 +73,8 @@ Usage:
 
 Worker identity: --worker flag, $RELAY_WORKER, or .relay/worker-id
 DB: $RELAY_DB or .relay/state.db (WAL mode)
-Env: RELAY_LEASE_MS RELAY_STALL_MS RELAY_LOW_WATER RELAY_AUTO_APPROVE RELAY_INTERVAL_MS
+Env: RELAY_LEASE_MS RELAY_LEASE_LIVENESS_GRACE_MS RELAY_STALL_MS RELAY_LOW_WATER
+     RELAY_AUTO_APPROVE RELAY_INTERVAL_MS RELAY_ROLE_STRICT (default true)
 Spawn: RELAY_HERDR_WORKSPACE (required to spawn; else $HERDR_WORKSPACE_ID)
 Manual attach: requires a live Herdr agent (use --pane/--tab or $HERDR_PANE_ID/$HERDR_TAB_ID)
 Runtime cleanup: RELAY_RUNTIME_CLEANUP_GRACE_MS RELAY_ATTACH_TIMEOUT_MS RELAY_RESTART_COOLDOWN_MS
@@ -131,7 +141,7 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
     ],
   },
   "task add": {
-    about: "Queue a new task. --parent nests it under T1 (the tree is display-side). --plan <plan-id> records which agent-status plan.json item this task belongs to.",
+    about: "Queue a new task. --parent nests it under T1 (the tree is display-side). A --role makes the task claimable only by a worker of that role by default; an unknown role warns (non-fatal). --plan <plan-id> records which agent-status plan.json item this task belongs to.",
     usage: ['relay task add "description" [--title T] [--acceptance A] [--priority N] [--role R] [--parent T1] [--plan <plan-id>]'],
   },
   "task list": { about: "List tasks (id, state, priority, role, assignee, plan, title).", usage: ["relay task list [--state <state>]"] },
@@ -139,16 +149,30 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
   "task link": { about: "Link a task to a plan.json item (agent-status shows the plan status from relay).", usage: ["relay task link <task-id> <plan-id>"] },
   "task unlink": { about: "Remove a task's plan linkage.", usage: ["relay task unlink <task-id>"] },
   next: {
-    about: "Claim the next queued task for the worker (prints NO_TASK if none).",
-    usage: ["relay next [--worker <id>]"],
+    about: "Claim the next queued task the worker's role may take (prints NO_TASK if none). Role matching is STRICT by default: a role-tagged task is only claimable by a worker registered with that role; role-less tasks by anyone.",
+    usage: [
+      "relay next [--worker <id>] [--role <r>] [--any-role]",
+      "  --role <r>   match this role instead of the worker's registered role",
+      "  --any-role   recovery override: ignore task roles (old any-worker behavior)",
+    ],
   },
-  claim: { about: "Claim a specific task.", usage: ["relay claim <task-id> [--worker <id>]"] },
+  claim: {
+    about: "Claim a specific task. Role matching is STRICT by default (see `relay next --help`).",
+    usage: [
+      "relay claim <task-id> [--worker <id>] [--role <r>] [--any-role]",
+      "  --any-role   recovery override: ignore the task's role",
+    ],
+  },
   note: { about: "Record a progress note (the strongest liveness signal).", usage: ['relay note <task-id> "progress" [--worker <id>]'] },
   submit: { about: "Submit work for review (task -> review).", usage: ['relay submit <task-id> --evidence "..." [--worker <id>] [--lease <token>]'] },
   approve: { about: "Approve a reviewed task (task -> done).", usage: ["relay approve <task-id> [--worker <id>]"] },
   reject: { about: "Reject a reviewed task (task -> queued).", usage: ['relay reject <task-id> "reason" [--worker <id>]'] },
   block: { about: "Block a task. --human marks it blocked_human (needs a person).", usage: ['relay block <task-id> "reason" [--worker <id>] [--human]'] },
   unblock: { about: "Unblock a task.", usage: ["relay unblock <task-id> [--worker <id>]"] },
+  release: {
+    about: "Hand a RUNNING task back to the queue cleanly (no block/reject note): clears assignee + lease, bumps the fencing token. The current assignee or any human/worker may release.",
+    usage: ["relay release <task-id> [--worker <id>]"],
+  },
   send: { about: "Send a durable message; the best-effort wake is delivered after the commit.", usage: ['relay send <worker-id> "message" [--task <tid>] [--kind <k>]'] },
   inbox: { about: "Read (and optionally claim/ack) the worker's inbox.", usage: ["relay inbox [--worker <id>] [--claim] [--ack <msg-id>]"] },
   status: { about: "Print workers, task counts, and the supervisor view.", usage: ["relay status"] },
@@ -361,12 +385,19 @@ async function main(): Promise<void> {
           const desc = argv[2];
           if (!desc) throw new Error('usage: relay task add "description" [...]');
           const rest = argv.slice(2);
+          const role = flag(rest, "--role") ?? undefined;
+          if (role && !knownRole(db, role)) {
+            console.error(
+              `relay: warning: task role '${role}' matches no registered worker and is not a known special role ` +
+                `(worker/planner/reviewer); the task may be unclaimable until a matching worker is registered.`
+            );
+          }
           const t = addTask(db, {
             title: flag(rest, "--title") ?? desc.slice(0, 80),
             description: desc,
             acceptance: flag(rest, "--acceptance") ?? "",
             priority: flag(rest, "--priority") ? Number(flag(rest, "--priority")) : 0,
-            role: flag(rest, "--role") ?? undefined,
+            role,
             parentTaskId: flag(rest, "--parent") ?? undefined,
             planId: flag(rest, "--plan") ?? undefined,
           });
@@ -403,7 +434,10 @@ async function main(): Promise<void> {
 
       case "next": {
         const workerId = resolveWorkerId(flag(argv, "--worker"));
-        const t = claimNext(db, workerId);
+        const t = claimNext(db, workerId, {
+          role: flag(argv, "--role") ?? undefined,
+          strictRole: hasFlag(argv, "--any-role") ? false : undefined,
+        });
         if (!t) {
           console.log("NO_TASK");
         } else {
@@ -419,7 +453,10 @@ async function main(): Promise<void> {
         const id = argv[1];
         if (!id) throw new Error("usage: relay claim <task-id>");
         const workerId = resolveWorkerId(flag(argv, "--worker"));
-        const claimed = claimTask(db, id, workerId);
+        const claimed = claimTask(db, id, workerId, {
+          role: flag(argv, "--role") ?? undefined,
+          strictRole: hasFlag(argv, "--any-role") ? false : undefined,
+        });
         console.log(`${claimed.id} lease=${claimed.lease_token}`);
         break;
       }
@@ -483,6 +520,15 @@ async function main(): Promise<void> {
         const workerId = resolveWorkerId(flag(argv, "--worker"));
         const t = unblockTask(db, id, workerId);
         console.log(`${t.id} -> ${t.state}`);
+        break;
+      }
+
+      case "release": {
+        const id = argv[1];
+        if (!id) throw new Error("usage: relay release <task-id> [--worker <id>]");
+        const workerId = resolveWorkerId(flag(argv, "--worker"));
+        const t = releaseTask(db, id, workerId);
+        console.log(`${t.id} -> ${t.state} lease=${t.lease_token}`);
         break;
       }
 
@@ -555,6 +601,12 @@ async function main(): Promise<void> {
         for (const s of ["queued", "running", "review", "blocked_internal", "blocked_human", "done", "failed"]) {
           console.log(`${s.padEnd(16)} ${counts[s] ?? 0}`);
         }
+        const stranded = unclaimableRunnableTasks(db);
+        console.log("");
+        console.log("Unclaimable");
+        console.log("-----------");
+        if (stranded.length === 0) console.log("(none)");
+        for (const t of stranded) console.log(`${t.id}  role=${t.role}  ${t.title}`);
         console.log("");
         console.log("System");
         console.log("------");

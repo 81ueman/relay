@@ -22,11 +22,16 @@ Never wait for instructions or for another agent to finish. If your task is gone
 ## Rules
 
 - Start work with `relay next`. Never start a task you have not claimed.
+- **Roles are strict by default**: `relay next` only offers tasks whose `role`
+  is null or matches your registered role. `NO_TASK` means no *eligible* work,
+  not no work — do not reach for another worker's role-tagged task. (Operators
+  use `--any-role` / `RELAY_ROLE_STRICT=false` only for recovery.)
 - Record real progress with `relay note <id> "..."` (strongest progress signal; also renews your lease).
 - Finish with `relay submit <id> --evidence "..."` — this moves the task to `review`, not `done`.
+- Claimed the wrong task? Hand it back cleanly with `relay release <id>` (no fake block/reject note), then `relay next`.
 - Stuck but retryable: `relay block <id> "<reason>"`.
 - Human truly required: `relay block <id> --human "<reason>"` — then immediately `relay next`, never park yourself.
-- After every `submit`/`block`, immediately run `relay next`. No exceptions.
+- After every `submit`/`block`/`release`, immediately run `relay next`. No exceptions.
 - Never busy-wait on another agent. Send a durable message instead: `relay send <worker-id> "..."`.
 - Check `relay inbox --claim` when woken for messages.
 - Terminal/pane idle is NOT task done. Task DB is the source of truth.
@@ -36,9 +41,10 @@ Never wait for instructions or for another agent to finish. If your task is gone
 ```bash
 export RELAY_WORKER=worker-1   # or pass --worker worker-1 every time
 
-relay next                                  # atomic claim of top-priority runnable task
+relay next                                  # atomic claim of top-priority task your role may take
 relay note T12 "implemented retry, tests green"
 relay submit T12 --evidence "tests: bun test auth (12 pass)"
+relay release T12                           # wrong task? hand it back cleanly, then `relay next`
 relay block T12 "flaky dep, retry after T11" 
 relay block T12 --human "need prod DB credentials"
 relay send worker-2 "T12 ready for review" --task T12

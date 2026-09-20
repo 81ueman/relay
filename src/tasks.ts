@@ -1,7 +1,13 @@
 import type { Database } from "bun:sqlite";
 import { now } from "./db";
 import { logEvent } from "./events";
-import { clearCurrentTask, getWorker, normalizeWorkerAfterTaskRelease, touchProgress } from "./workers";
+import {
+  clearCurrentTask,
+  getWorker,
+  listWorkers,
+  normalizeWorkerAfterTaskRelease,
+  touchProgress,
+} from "./workers";
 import type { Task, TaskState } from "./schema";
 
 export const STALE_LEASE = "STALE_LEASE";
@@ -9,6 +15,71 @@ export const STALE_LEASE = "STALE_LEASE";
 export function leaseMs(): number {
   const v = Number(process.env.RELAY_LEASE_MS ?? "120000");
   return Number.isFinite(v) && v > 0 ? v : 120000;
+}
+
+/**
+ * How long a worker may go without a liveness signal before its running task's
+ * lease is revoked (crash recovery). Deliberately generous vs. RELAY_LEASE_MS:
+ * the lease is a *heartbeat* window, the grace window is the *crash* window.
+ */
+export function leaseLivenessGraceMs(): number {
+  const v = Number(process.env.RELAY_LEASE_LIVENESS_GRACE_MS ?? "300000");
+  return Number.isFinite(v) && v > 0 ? v : 300000;
+}
+
+// ---------------------------------------------------------------------------
+// Role-aware claiming policy
+//
+// A task's `role` is a real claim gate by default (strict). A task with a
+// non-null role is claimable only by a worker whose role equals it; `role IS
+// NULL` tasks stay claimable by anyone. Strict is the default; set
+// RELAY_ROLE_STRICT=false (or pass --any-role) to restore the legacy
+// any-worker behavior for recovery.
+// ---------------------------------------------------------------------------
+
+/** Strict role matching is the default; RELAY_ROLE_STRICT=false opts out. */
+export function roleStrictDefault(): boolean {
+  const v = process.env.RELAY_ROLE_STRICT;
+  if (v === undefined || v === "") return true;
+  return !/^(false|0|no|off)$/i.test(v);
+}
+
+export interface ClaimOptions {
+  /** Explicit override role for this call (`relay next --role R`). */
+  role?: string;
+  /** false = escape hatch (--any-role); defaults to `roleStrictDefault()`. */
+  strictRole?: boolean;
+}
+
+/** True when `matchRole` may claim a task tagged `taskRole` under the policy. */
+export function roleMatches(taskRole: string | null, matchRole: string, strict: boolean): boolean {
+  if (!strict) return true;
+  if (taskRole === null) return true;
+  return taskRole === matchRole;
+}
+
+/** Resolve the effective (matchRole, strict) for a worker + per-call options. */
+function claimPolicy(workerRole: string, opts: ClaimOptions): { matchRole: string; strict: boolean } {
+  return { matchRole: opts.role ?? workerRole, strict: opts.strictRole ?? roleStrictDefault() };
+}
+
+/** Queued tasks this worker could claim right now under the active policy. */
+export function claimableRunnableTasks(db: Database, workerId: string, opts: ClaimOptions = {}): Task[] {
+  const worker = getWorker(db, workerId);
+  if (!worker) return [];
+  const { matchRole, strict } = claimPolicy(worker.role, opts);
+  return runnableTasks(db).filter((t) => roleMatches(t.role, matchRole, strict));
+}
+
+/**
+ * Runnable tasks no registered worker role can claim (only meaningful under
+ * strict). Surfaced in `relay status` / the supervisor view so a stranded task
+ * is visible instead of silently unclaimable.
+ */
+export function unclaimableRunnableTasks(db: Database): Task[] {
+  if (!roleStrictDefault()) return [];
+  const roles = new Set(listWorkers(db).map((w) => w.role));
+  return runnableTasks(db).filter((t) => t.role !== null && !roles.has(t.role));
 }
 
 function nextTaskId(db: Database): string {
@@ -96,13 +167,20 @@ export function taskCounts(db: Database): Record<string, number> {
 /**
  * Atomically claim the highest-priority runnable task for a worker.
  * Uses BEGIN IMMEDIATE so double-claim across processes is impossible.
- * Peer model: task `role` is an informational capability tag, not a gate.
- * Any worker may claim any queued task; reviewers check review first.
+ * Peer ownership model: a task's `role` is a real claim gate by default. A
+ * task tagged with a role is claimable only by a worker of that role;
+ * `role IS NULL` tasks stay claimable by anyone. Reviewers still check the
+ * review queue first (review tasks are only claimable by reviewers).
+ *
+ * `opts.role` overrides the match role for this call (`relay next --role R`);
+ * `opts.strictRole: false` (or RELAY_ROLE_STRICT=false / --any-role) restores
+ * the legacy any-worker behavior for recovery.
  */
-export function claimNext(db: Database, workerId: string): Task | null {
+export function claimNext(db: Database, workerId: string, opts: ClaimOptions = {}): Task | null {
   const worker = getWorker(db, workerId);
   if (!worker) throw new Error(`unknown worker: ${workerId}. Register first: relay worker register ${workerId}`);
   const t = now();
+  const { matchRole, strict } = claimPolicy(worker.role, opts);
 
   db.run("BEGIN IMMEDIATE");
   try {
@@ -119,12 +197,16 @@ export function claimNext(db: Database, workerId: string): Task | null {
         db.run("COMMIT");
         return getTask(db, review.id)!;
       }
-      // No reviews pending: fall through to queued work (peer, no hierarchy).
+      // No reviews pending: fall through to queued work (role-gated below; a
+      // reviewer also claims `role='reviewer'` queued tasks).
     }
 
-    const task = (db
-      .query(`SELECT * FROM tasks WHERE state = 'queued' ORDER BY priority DESC, created_at ASC LIMIT 1`)
-      .get() as Task | null) ?? null;
+    // Apply the role gate in SQL so selection stays atomic. Under strict, only
+    // role IS NULL or role = matchRole qualify.
+    const queuedSql = strict
+      ? `SELECT * FROM tasks WHERE state = 'queued' AND (role IS NULL OR role = ?) ORDER BY priority DESC, created_at ASC LIMIT 1`
+      : `SELECT * FROM tasks WHERE state = 'queued' ORDER BY priority DESC, created_at ASC LIMIT 1`;
+    const task = (strict ? db.query(queuedSql).get(matchRole) : db.query(queuedSql).get()) as Task | null;
 
     if (!task) {
       db.query(`UPDATE workers SET state = CASE WHEN current_task_id IS NULL THEN 'idle' ELSE state END, updated_at = ? WHERE id = ?`).run(t, workerId);
@@ -153,8 +235,13 @@ export function claimNext(db: Database, workerId: string): Task | null {
   }
 }
 
-/** Atomically claim one specific task (queued -> running). Peer model: any role may claim. */
-export function claimTask(db: Database, taskId: string, workerId: string): Task {
+/**
+ * Atomically claim one specific task (queued -> running). Peer ownership model,
+ * role-gated by default: a task tagged with a role may only be claimed by a
+ * worker of that role. `opts.role` overrides the match role; `opts.strictRole:
+ * false` (or RELAY_ROLE_STRICT=false / --any-role) restores any-worker claiming.
+ */
+export function claimTask(db: Database, taskId: string, workerId: string, opts: ClaimOptions = {}): Task {
   const worker = getWorker(db, workerId);
   if (!worker) throw new Error(`unknown worker: ${workerId}. Register first: relay worker register ${workerId}`);
   if (worker.role === "reviewer") throw new Error(`reviewers take review tasks via \`relay next\`, not claim`);
@@ -164,6 +251,12 @@ export function claimTask(db: Database, taskId: string, workerId: string): Task 
     const task = getTask(db, taskId);
     if (!task) throw new Error(`unknown task: ${taskId}`);
     if (task.state !== "queued") throw new Error(`cannot claim task in state ${task.state}`);
+    const { matchRole, strict } = claimPolicy(worker.role, opts);
+    if (!roleMatches(task.role, matchRole, strict)) {
+      throw new Error(
+        `cannot claim task ${taskId}: role '${task.role}' does not match worker role '${matchRole}' (use --any-role to override)`
+      );
+    }
     db.query(
       `UPDATE tasks SET state = 'running', assignee = ?, lease_token = lease_token + 1,
         lease_until = ?, updated_at = ? WHERE id = ? AND state = 'queued'`
@@ -206,6 +299,47 @@ export function unblockTask(db: Database, taskId: string, workerId: string): Tas
   // Fresh claim gets a new lease token; ensure no stale ownership lingers.
   db.query(`UPDATE tasks SET state = 'queued', assignee = NULL, lease_until = NULL, updated_at = ? WHERE id = ?`).run(t, taskId);
   logEvent(db, { source: "worker", workerId, taskId, type: "task.unblocked" });
+  return getTask(db, taskId)!;
+}
+
+/**
+ * Clean hand-back of a RUNNING task (mis-claimed ownership) without fabricating
+ * a block/reject note. The task returns to `queued` with a bumped fencing token
+ * and no assignee/lease; the previous owner's `current_task_id` is cleared.
+ *
+ * Ownership rule (deliberate): the current assignee may release, and a human /
+ * any other worker may also release — this is the recovery path used when the
+ * owner is gone or has claimed the wrong role. There is intentionally no hard
+ * fencing requirement here (that would defeat the recovery purpose); the task's
+ * bumped lease_token still fences the old owner's later submit.
+ */
+export function releaseTask(db: Database, taskId: string, workerId: string, reason = ""): Task {
+  const task = getTask(db, taskId);
+  if (!task) throw new Error(`unknown task: ${taskId}`);
+  if (task.state !== "running") throw new Error(`cannot release task in state ${task.state}`);
+  const t = now();
+  const body = reason.trim() || `released by ${workerId}`;
+  db.query(`INSERT INTO task_notes (task_id, worker_id, kind, body, created_at) VALUES (?, ?, 'release', ?, ?)`).run(
+    taskId,
+    workerId,
+    body,
+    t
+  );
+  db.query(
+    `UPDATE tasks SET state = 'queued', assignee = NULL, lease_until = NULL,
+       lease_token = lease_token + 1, updated_at = ? WHERE id = ?`
+  ).run(t, taskId);
+  if (task.assignee) {
+    clearCurrentTask(db, task.assignee);
+    normalizeWorkerAfterTaskRelease(db, task.assignee, t);
+  }
+  // A releasing non-owner (human/recovery) must not keep a stale pointer either.
+  if (workerId !== task.assignee) {
+    db.query(`UPDATE workers SET current_task_id = NULL WHERE id = ? AND current_task_id = ?`).run(workerId, taskId);
+    normalizeWorkerAfterTaskRelease(db, workerId, t);
+  }
+  touchProgress(db, workerId, t);
+  logEvent(db, { source: "worker", workerId, taskId, type: "task.released", payload: { reason: body } });
   return getTask(db, taskId)!;
 }
 
@@ -304,10 +438,45 @@ export function blockTask(db: Database, taskId: string, workerId: string, reason
   return getTask(db, taskId)!;
 }
 
-/** Revoke expired leases: running tasks whose lease lapsed return to queued with a bumped token. */
-export function expireLeases(db: Database, at = now()): Task[] {
-  const expired = db.query(`SELECT * FROM tasks WHERE state = 'running' AND lease_until IS NOT NULL AND lease_until < ?`).all(at) as Task[];
-  for (const task of expired) {
+/**
+ * Default liveness predicate for lease expiry. A worker counts as ALIVE (so its
+ * running task's lapse is NOT treated as a crash) when its row exists, its state
+ * is not `dead`/`stalled`, and it has been seen/progressed within the grace
+ * window. A missing row or a dead/stalled worker is NOT alive, so a genuine
+ * crash still requeues.
+ */
+export function defaultLeaseAlive(db: Database, at: number): (workerId: string | null) => boolean {
+  const grace = leaseLivenessGraceMs();
+  return (workerId) => {
+    if (!workerId) return false;
+    const w = getWorker(db, workerId);
+    if (!w) return false;
+    if (w.state === "dead" || w.state === "stalled") return false;
+    const last = Math.max(w.last_seen_at ?? 0, w.last_progress_at ?? 0);
+    return last >= at - grace;
+  };
+}
+
+/**
+ * Revoke lapsed leases: running tasks whose lease lapsed return to queued with a
+ * bumped token — but ONLY when the assignee is missing or not alive. A live but
+ * slow worker keeps its lease (it renews on `note`; the stall detector, not
+ * lease expiry, handles a live worker that has stopped progressing). Pass
+ * `isAlive` to customize; by default the DB liveness rule above is used.
+ */
+export function expireLeases(
+  db: Database,
+  at = now(),
+  isAlive?: (workerId: string | null) => boolean
+): Task[] {
+  const alive = isAlive ?? defaultLeaseAlive(db, at);
+  const due = db
+    .query(`SELECT * FROM tasks WHERE state = 'running' AND lease_until IS NOT NULL AND lease_until < ?`)
+    .all(at) as Task[];
+  const expired: Task[] = [];
+  for (const task of due) {
+    // Worker alive but slow: keep its lease; crash recovery is transport/DB driven.
+    if (alive(task.assignee)) continue;
     db.query(
       `UPDATE tasks SET state = 'queued', assignee = NULL, lease_token = lease_token + 1, lease_until = NULL, updated_at = ? WHERE id = ?`
     ).run(at, task.id);
@@ -316,6 +485,7 @@ export function expireLeases(db: Database, at = now()): Task[] {
       normalizeWorkerAfterTaskRelease(db, task.assignee, at);
     }
     logEvent(db, { source: "supervisor", workerId: task.assignee, taskId: task.id, type: "task.lease_expired" });
+    expired.push(task);
   }
   return expired;
 }
