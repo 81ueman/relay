@@ -67,7 +67,117 @@ Spawn: RELAY_HERDR_WORKSPACE (required to spawn; else $HERDR_WORKSPACE_ID)
 Manual attach: requires a live Herdr agent (use --pane/--tab or $HERDR_PANE_ID/$HERDR_TAB_ID)
 Runtime cleanup: RELAY_RUNTIME_CLEANUP_GRACE_MS RELAY_ATTACH_TIMEOUT_MS RELAY_RESTART_COOLDOWN_MS
 Herdr is required. RELAY_RUNTIME=mock is test-only.
+Help: relay <command> [subcommand] --help
 `;
+}
+
+// Per-command help. Keys are the command path ("task", "task add", ...).
+// Longer (more specific) keys win; a group help covers its subcommands.
+const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
+  init: {
+    about: "Create .relay/state.db (WAL) and the control-plane schema in the current directory.",
+    usage: ["relay init"],
+  },
+  daemon: {
+    about: "Run the supervisor loop (reconcile + lease/stall handling).",
+    usage: ["relay daemon [--once] [--interval <ms>]", "  --once            run a single pass, then exit", "  --interval <ms>   loop interval (default $RELAY_INTERVAL_MS)"],
+  },
+  worker: {
+    about: "Manage worker identities (the assignees in the durable task ledger).",
+    usage: [
+      "relay worker register <id> [--role worker] [--runtime <herdr-target>] [--session <sid>] [--cwd <dir>] [--command <cmd>]",
+      "relay worker list",
+      "relay worker status <id>",
+      "relay worker bind <id> --session <sid>",
+    ],
+  },
+  "worker register": {
+    about: "Register a worker and remember it as this checkout's default identity (.relay/worker-id).",
+    usage: ['relay worker register <id> [--role worker] [--runtime <herdr-target>] [--session <sid>] [--cwd <dir>] [--command <cmd>]'],
+  },
+  "worker list": { about: "List workers.", usage: ["relay worker list"] },
+  "worker status": { about: "Print one worker as JSON.", usage: ["relay worker status <id>"] },
+  "worker bind": { about: "Bind a worker to an OpenCode session id.", usage: ["relay worker bind <id> --session <sid>"] },
+  session: {
+    about: "Manage OpenCode sessions attached to Herdr agents.",
+    usage: [
+      "relay session attach --session <sid> [--role R] [--worker W] [--dir D] [--worktree W] [--pane P] [--tab T]",
+      "relay session detach --session <sid>",
+      "relay session list",
+      "relay session status --session <sid>",
+    ],
+  },
+  "session attach": {
+    about: "Attach a session. The Herdr agent is resolved and verified BEFORE touching the DB (fail-closed).",
+    usage: ["relay session attach --session <sid> [--role R] [--worker W] [--dir D] [--worktree W] [--pane P] [--tab T]"],
+  },
+  "session detach": { about: "Detach a managed session.", usage: ["relay session detach --session <sid>"] },
+  "session list": { about: "List sessions.", usage: ["relay session list"] },
+  "session status": { about: "Print one session as JSON (or 'unmanaged').", usage: ["relay session status --session <sid>"] },
+  runtime: {
+    about: "List runtime rows (external vs relay-owned) and their cleanup deadlines.",
+    usage: ["relay runtime list [--worker <id>] [--state <state>]"],
+  },
+  task: {
+    about: "Manage tasks in the durable ledger.",
+    usage: [
+      'relay task add "description" [--title T] [--acceptance A] [--priority N] [--role R] [--parent T1]',
+      "relay task list [--state <state>]",
+      "relay task show <id>",
+    ],
+  },
+  "task add": {
+    about: "Queue a new task. --parent nests it under T1 (the tree is display-side).",
+    usage: ['relay task add "description" [--title T] [--acceptance A] [--priority N] [--role R] [--parent T1]'],
+  },
+  "task list": { about: "List tasks (id, state, priority, role, assignee, title).", usage: ["relay task list [--state <state>]"] },
+  "task show": { about: "Print one task as JSON, plus its notes.", usage: ["relay task show <id>"] },
+  next: {
+    about: "Claim the next queued task for the worker (prints NO_TASK if none).",
+    usage: ["relay next [--worker <id>]"],
+  },
+  claim: { about: "Claim a specific task.", usage: ["relay claim <task-id> [--worker <id>]"] },
+  note: { about: "Record a progress note (the strongest liveness signal).", usage: ['relay note <task-id> "progress" [--worker <id>]'] },
+  submit: { about: "Submit work for review (task -> review).", usage: ['relay submit <task-id> --evidence "..." [--worker <id>] [--lease <token>]'] },
+  approve: { about: "Approve a reviewed task (task -> done).", usage: ["relay approve <task-id> [--worker <id>]"] },
+  reject: { about: "Reject a reviewed task (task -> queued).", usage: ['relay reject <task-id> "reason" [--worker <id>]'] },
+  block: { about: "Block a task. --human marks it blocked_human (needs a person).", usage: ['relay block <task-id> "reason" [--worker <id>] [--human]'] },
+  unblock: { about: "Unblock a task.", usage: ["relay unblock <task-id> [--worker <id>]"] },
+  send: { about: "Send a durable message; the best-effort wake is delivered after the commit.", usage: ['relay send <worker-id> "message" [--task <tid>] [--kind <k>]'] },
+  inbox: { about: "Read (and optionally claim/ack) the worker's inbox.", usage: ["relay inbox [--worker <id>] [--claim] [--ack <msg-id>]"] },
+  status: { about: "Print workers, task counts, and the supervisor view.", usage: ["relay status"] },
+  events: { about: "Print recent events, or follow them (Ctrl-C to stop).", usage: ["relay events [--follow] [--limit N]"] },
+  event: {
+    about: "Debug entrypoint: record an event. session.idle/error drive the same state machine as the daemon.",
+    usage: ["relay event record --type <t> [--session <sid>] [--worker <id>] [--task <tid>] [--payload <json>]"],
+  },
+};
+
+const GROUP_COMMANDS = new Set(["worker", "session", "task", "event"]);
+
+function commandUsage(path: string[]): string {
+  for (let n = path.length; n >= 1; n--) {
+    const key = path.slice(0, n).join(" ");
+    const h = COMMAND_HELP[key];
+    if (!h) continue;
+    const lines = [
+      `relay ${key}`,
+      "",
+      `  ${h.about}`,
+      "",
+      "Usage:",
+      ...h.usage.map((u) => `  ${u}`),
+      "",
+      "Options:",
+      "  -h, --help   show this help",
+    ];
+    if (GROUP_COMMANDS.has(key)) {
+      lines.push("", `  Run \`relay ${key} <subcommand> --help\` for details.`);
+    }
+    lines.push("");
+    return lines.join("\n");
+  }
+  return usage();
 }
 
 function flag(args: string[], name: string): string | undefined {
@@ -102,11 +212,12 @@ function fmtAge(ms: number): string {
 
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
-  const cmd = argv[0];
-  if (!cmd || cmd === "--help" || cmd === "-h" || cmd === "help") {
-    console.log(usage());
+  if (argv.length === 0 || argv[0] === "help" || argv.some((a) => a === "--help" || a === "-h")) {
+    const path = argv.filter((a) => a !== "help" && a !== "--help" && a !== "-h");
+    console.log(commandUsage(path));
     return;
   }
+  const cmd = argv[0];
 
   if (cmd === "init") {
     console.log(initControlPlane(process.cwd()));

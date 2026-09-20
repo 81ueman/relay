@@ -86,6 +86,16 @@ inject a transport.
 Plugin shape verified against the bundled `herdr-agent-state` integration
 (default export `{ id, setup }`) and `@opencode-ai/plugin` types (custom tools).
 
+## CLI help
+
+```bash
+relay --help              # full command list
+relay task --help         # help for a command
+relay task add --help     # help for a subcommand (also: `relay help task add`)
+```
+
+Every command and subcommand accepts `-h` / `--help`.
+
 ## Setup
 
 ```bash
