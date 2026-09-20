@@ -15,6 +15,29 @@ event-ordering and recovery bugs that Relay has historically had (see
 
 ---
 
+## Implementation boundary (single supervisor)
+
+```text
+Implementation boundary assumption:
+exactly one Relay supervisor process owns a control-plane DB at a time.
+```
+
+The TLA+ model does not model two concurrent supervisor processes racing through
+the same SQLite DB / Herdr workspace. The implementation enforces the
+single-supervisor assumption at daemon startup (`.relay/relay.lock` plus a
+non-destructive `.relay/relay.sock` ownership probe; see the top-level
+`README.md` §"Single-supervisor invariant"). Because the boundary excludes
+concurrent daemons, generation allocation in the implementation stays
+process-local (`restartingWorkers` + a commit-time generation re-check); the model
+needs **no** generation reservation table, distributed lock, or leader election,
+and none is added.
+
+This assumption is not hidden — it is the reason the model has a single implicit
+supervisor. See [Historical bugs and mutations](#historical-bugs-and-mutations)
+for why a multi-daemon race is deliberately *not* a TLA+ mutation.
+
+---
+
 ## Why a TLA+ model at all
 
 Relay's core promise (from the top-level `README.md`) is a loop invariant:
@@ -66,7 +89,10 @@ in a bounded state space, so it finds the interleaving you did not think of.
   environment**: a worker may progress, ask permission, block internally, crash,
   stall, or finish a turn at any time;
 - unbounded retries and unbounded generations (both are bounded so TLC can
-  terminate; see [Environment assumptions](#environment-assumptions)).
+  terminate; see [Environment assumptions](#environment-assumptions));
+- **two concurrent supervisor processes** on one control-plane DB / Herdr
+  workspace. This is outside the model by the
+  [implementation boundary](#implementation-boundary-single-supervisor) above.
 
 ## The state
 
@@ -84,7 +110,7 @@ Variables (all functions / relations, see `Relay.tla`):
 | `workerState`, `workerTask`, `workerGeneration`, `workerLease`, `workerWoken` | worker lifecycle, task held, current generation, fence token, "was nudged" |
 | `permissionPending` | a permission request is outstanding |
 | `detached` | worker was explicitly detached (permanent) |
-| `failedOnce` | the worker's finite failure budget (crash / stall / attach timeout / internal block) |
+| `failureCount` | shared per-worker count (0..`FailureBudget`) of environment failures consumed (crash / stall / attach timeout / internal block) |
 | `sessionManaged`, `sessionGeneration` | whether a managed session is bound, and at which generation |
 | `runtimeState`, `runtimePersisted`, `runtimeRelayOwned`, `runtimeBootstrapSent` | per-`(worker,generation)` runtime record |
 | `genWatermark` | highest generation ever allocated for a worker |
@@ -105,7 +131,7 @@ is checkable:
 | `PersistRuntime(w)` | **durable commit**: runtime row exists and the worker points at it, *before* any wake |
 | `BootstrapDelivered(w)` / `BootstrapFailed(w)` | deliver the bootstrap prompt (requires persisted runtime); failure is a stutter/retry |
 | `Attach(w)` | managed attach (requires persisted + relay-owned + bootstrap sent) |
-| `AttachTimeout(w)` | a generation that never attaches transitions to `dead` but **stays relay-owned** (recoverable) |
+| `AttachTimeout(w)` | a generation that never attaches transitions to `dead` but **stays relay-owned** (recoverable); consumes one unit of the failure budget |
 | `ManualAttach(w)` | adopt an existing session (`relay_owned = FALSE`, never closed by Relay) |
 | `Detach(w)` | permanent removal from supervision (rejected for a busy worker) |
 | `MarkStale(w)`, `DetectDead(w)` | failed generation becomes `stale` / `dead` |
@@ -116,9 +142,11 @@ is checkable:
 | `Submit(w)`, `BlockHuman(w)`, `BlockInternal(w)`, `Fail(w)` | end a turn; each verifies owner + fence token |
 | `PermissionAsked(w)`, `PermissionReplied(w)` | `working → waiting_input → working/idle` |
 | `IdleSignal(w)` | `session.idle`; **never** completion |
-| `Crash(w)`, `DetectStall(w)` | environment failures (bounded by `failedOnce`) |
+| `Crash(w)`, `DetectStall(w)` | environment failures (each consumes one unit of the shared `failureCount < FailureBudget` budget) |
 | `Requeue(w)` | release a failed worker's task back to `queued` with a new fence token |
 | `Approve(t)`, `Reject(t)`, `RetryInternal(t)`, `UnblockHuman(t)` | review / human / internal-block environment |
+| `WorkerDecision(w)` | combined worker decision (`Submit` / `BlockHuman` / `BlockInternal` / `Fail`) — the unit of worker fairness |
+| `ReviewDecision(t)` | combined reviewer decision (`Approve` / `Reject`) — the unit of review fairness |
 
 ## Safety invariants
 
@@ -143,6 +171,16 @@ is checkable:
 | `QuiescenceIsLegitimate` | runnable work + nobody working, with no legitimate reason |
 | `QuiescenceCoversReview` | the same for tasks sitting in `review` |
 
+`formal/RelayFailures.cfg` re-checks the same invariants on a deliberately small
+instance (`Tasks = {t1}`, `Workers = {w1}`, `FailureBudget = 2`) so TLC can
+explore **≥2 sequential failures of different kinds** — e.g.
+`working → crash → requeue → fresh generation → attach → working → stall →
+requeue → fresh generation`, `fresh generation → attach timeout → recover → later
+crash`, or `running → blocked_internal → retry → claim → crash`. The main safety
+model exhaustively checks its bounded failure abstraction; `RelayFailures.cfg`
+widens that abstraction to multiple sequential failures. (Wording is deliberate: a
+green `Relay.cfg` does not mean "no safety bug is hidden anywhere else".)
+
 `QuiescenceIsLegitimate` is the machine-checked form of the top-level invariant:
 
 ```tla
@@ -161,43 +199,53 @@ occupied, so "nobody working" is legitimate. That is the abstraction of
 ## Liveness properties and fairness
 
 Safety only proves "never enters a bad state". Liveness proves work is not
-permanently abandoned. `formal/RelayLiveness.cfg` checks:
+permanently abandoned. `formal/RelayLiveness.cfg` uses `SpecFair = Spec /\ Fairness`
+and checks:
 
 ```tla
 RunnableEventuallyMoves ==
   []( (RunnableExists /\ HasSupervised /\ ~HumanOnlyWaiting)
       => <>( WorkerWorking \/ ~RunnableExists \/ HumanOnlyWaiting \/ ~HasSupervised ) )
 
-TaskTermination ==
-  []( (HasSupervised /\ \E t: taskState[t] \notin TerminalTaskStates)
-      => <>( (\A t: taskState[t] \in TerminalTaskStates) \/ ~HasSupervised ) )
+TaskProgress ==
+  []( (HasSupervised /\ \E t: taskState[t] \in {"running","review"})
+      => <>( ~HasSupervised
+              \/ (\A t: taskState[t] \notin {"running","review"}) ) )
 ```
 
 - **Property A — `RunnableEventuallyMoves`** is Relay's own obligation: while it
   supervises a worker and runnable work exists, some worker eventually works.
-- **Property B — `TaskTermination`** is the worker-fairness obligation: every
-  task eventually reaches `done` / `blocked_human` / `failed`. Note
-  `blocked_internal` is **not** terminal.
+- **Property B — `TaskProgress`** is the worker/reviewer-fairness obligation: a
+  task never stalls forever inside a **live decision state** (`running` waiting on
+  the worker, `review` waiting on the reviewer). The *outcome* is deliberately
+  nondeterministic — the environment may keep rejecting or re-blocking — so we do
+  **not** claim "eventually terminal" here. `blocked_internal` is not terminal, and
+  a task can loop `review → queued → running → review` forever if a reviewer keeps
+  rejecting. The stronger "all tasks eventually `done`" claim is Property C only.
 
 ### Fairness assumptions
 
-`SpecFair = Spec /\ Fairness`. We assume weak fairness on the supervisor chain
-and strong fairness where the *worker/agent* makes an internal choice that must
-not be postponed forever:
+`SpecFair = Spec /\ Fairness`. The environment assumption is only that an agent
+that *can* decide does not stutter forever — **not** that each outcome occurs. So
+fairness is attached to *decisions*, not to outcomes:
 
 | Assumption | Why |
 | --- | --- |
 | `WF(SpawnTransport)`, `WF(PersistRuntime)`, `WF(BootstrapDelivered)`, `WF(Attach)` | transport can always eventually perform an enabled recovery |
 | `WF(Wake)`, `WF(Claim)` | an enabled wake/claim is eventually taken |
 | `WF(Requeue)`, `WF(MarkStale)`, `WF(DetectDead)` | crash recovery is not starved |
-| `WF(PermissionReplied)` | a permission request is eventually answered |
-| `SF(Submit)`, `SF(BlockHuman)`, `SF(BlockInternal)` | a working worker eventually ends its turn instead of stuttering forever |
-| `SF(Approve)` | a review eventually approves (otherwise it can reject forever) |
+| `WF(PermissionReplied)` | a permission request is eventually answered (environment assumption — see below) |
+| `SF(WorkerDecision(w))` | a working worker eventually ends its turn instead of stuttering forever. It may `Submit`, `BlockHuman`, `BlockInternal`, or `Fail`; **no single outcome is forced** |
+| `SF(ReviewDecision(t))` | a review is never ignored forever. It may `Approve` or `Reject`; the choice stays nondeterministic |
 | `WF(RetryInternal)`, `WF(UnblockHuman)` | internal retries and human unblocks are eventual |
 
-We do **not** over-fair: the environment is allowed to crash, stall, ask
-permission, reject, block internally, and detach workers, as long as it does so
-under the fairness above.
+This is deliberately weaker than per-outcome fairness: we do **not** require
+`Submit` and `BlockHuman` and `BlockInternal` each to happen, only that the worker
+does not stutter. Likewise `Approve` is not forced in normal liveness.
+
+> **Permission fairness.** Relay cannot force the user/host to answer a permission
+> request. `WF(PermissionReplied)` is an explicit environment assumption used
+> **only** for liveness; the safety config needs no fairness at all.
 
 ### Why the `~HasSupervised` escape hatch
 
@@ -214,32 +262,45 @@ These are the assumptions under which the liveness properties hold. They are
 modelling assumptions, stated explicitly rather than hidden inside fairness:
 
 1. **Failures are finite per worker.** `Crash`, `DetectStall`, `AttachTimeout`,
-   and `BlockInternal` share a one-shot `failedOnce[w]` budget. This is a
-   *liveness* device: it stops the environment from consuming the finite
-   generation budget with infinitely many failures. Safety is checked with the
-   same bound, so it cannot hide a safety bug.
-2. **Internal blocks are finite.** `BlockInternal` is bounded by `failedOnce`
-   (a worker cannot block internally forever), while `RetryInternal` is always
+   and `BlockInternal` share one counter `failureCount[w]`, bounded by the
+   constant `FailureBudget`. This is a *liveness* device: it stops the
+   environment from consuming the finite generation budget with infinitely many
+   failures. `Relay.cfg` / `RelayLiveness.cfg` / `RelayDone.cfg` use
+   `FailureBudget = 1`; `RelayFailures.cfg` uses `2` to explore ≥2 sequential
+   failures. Safety is checked with the same bound, so it cannot hide a safety
+   bug.
+2. **Internal blocks are finite.** `BlockInternal` consumes the same budget (a
+   worker cannot block internally forever), while `RetryInternal` is always
    enabled. So a `blocked_internal` task is always retryable and, once the
    failure budget is spent, must be submitted / blocked on a human / failed.
 3. **Generations are finite but never reused.** `genWatermark` only increases and
    `NextGen = genWatermark + 1`; TLC's `MaxGeneration` is a size bound, not a
    semantic one.
-4. **Human actions are eventual but not guaranteed.** `UnblockHuman`,
-   `PermissionReplied`, and `Approve` are fair (assumption 1–3 above); a task
-   blocked on a human is treated as *terminal* by `TaskTermination`, because
-   Relay cannot force a human.
+4. **Human actions are eventual but not guaranteed.** `UnblockHuman` and
+   `PermissionReplied` are fair. Relay cannot force a human, so a task blocked on
+   a human is treated as *terminal*; `Approve` is **not** assumed under normal
+   liveness (Property A/B) — only Property C assumes eventual approval.
 5. **Detach is optional.** The constant `AllowDetach` gates `Detach(w)`. It is
    `TRUE` for safety and liveness (a human *may* detach a worker — hence the
    `~HasSupervised` escape above), and `FALSE` for Property C, which assumes no
    worker is permanently removed from supervision.
+6. **The worker pool is fixed.** Relay guarantees progress *within the
+   registered/supervised worker pool*. It does not promise elastic worker
+   creation merely because all workers are waiting on input (that design is
+   unchanged; auto-scaling is not part of the spec).
 
-`formal/RelayDone.cfg` additionally sets `AllowFailure = FALSE` and
-`AllowDetach = FALSE`, and checks the stronger property:
+`formal/RelayDone.cfg` uses `SpecDone = Spec /\ StrongFairness` and additionally
+sets `AllowFailure = FALSE` / `AllowDetach = FALSE`. It checks the stronger
+property:
 
 ```tla
 AllTasksDone == <>(\A t: taskState[t] = "done")
 ```
+
+`StrongFairness` is the **only** place eventual approval is assumed: it adds
+`SF(Approve(t))` (plus `SF(Submit)` / `SF(BlockInternal)`) on top of the normal
+weak supervisor fairness. It is deliberately **not** mixed into
+`RelayLiveness.cfg`.
 
 > **This is conditional.** It holds only because we additionally assume no task
 > failure, no permanent detach, no permanent human block, and
@@ -258,6 +319,9 @@ bun run formal:liveness
 
 # Optional Property C (stronger environment assumptions).
 bun run formal:done
+
+# Safety widened to >=2 sequential failures.
+bun run formal:failures
 ```
 
 The scripts call `formal/run-tlc.sh`, which downloads `tla2tools.jar` into the
@@ -268,19 +332,21 @@ JDK 11+ (`java` on `PATH`); model-check output goes to the gitignored
 Manual invocation (equivalent):
 
 ```sh
-formal/run-tlc.sh Relay           # or RelayLiveness / RelayDone
+formal/run-tlc.sh Relay           # or RelayLiveness / RelayDone / RelayFailures
 ```
 
 The model is intentionally tiny: `Tasks = {t1,t2}`, `Workers = {w1,w2}`,
 `MaxGeneration = 3`, `LeaseMax = 1`. Bump these in the `.cfg` files to widen the
 search (expect the state space to grow quickly).
 
-`MaxGeneration = 3` is the model bound; in practice generation 3 is **unreachable**
-because `failedOnce` lets each worker fail at most once, so every recovery path
+`MaxGeneration = 3` is the model bound; with `FailureBudget = 1` generation 3 is
+**unreachable** because each worker can fail at most once, so every recovery path
 uses generation 1 or 2. The safety config is exhaustive over the full
-2-task × 2-worker instance. The liveness and Property-C configs use a 1-task
-instance (`Tasks = {t1}`) because TLC's temporal-property check is much more
-expensive than safety and the 2-task graph is ~10× larger.
+2-task × 2-worker instance. `RelayFailures.cfg` uses `FailureBudget = 2` on a
+1-task instance, where generation 3 *is* reachable across two sequential
+failures. The liveness and Property-C configs use a 1-task instance
+(`Tasks = {t1}`) because TLC's temporal-property check is much more expensive than
+safety and the 2-task graph is ~10× larger.
 
 ## How to read a counterexample
 
@@ -340,6 +406,13 @@ Counterexample shapes (read top-to-bottom):
 > throwaway copy. To reproduce, copy `formal/Relay.tla`, apply the edit described
 > above, and run it with `formal/Relay.cfg`; TLC prints the counterexample.
 
+> **Multi-daemon races are not a TLA+ mutation.** They are excluded by the
+> [implementation-level single-supervisor boundary](#implementation-boundary-single-supervisor),
+> not by a `Daemons = {d1,d2}` machine. Relay is specified as a *single*
+> deterministic supervisor, and the model verifies correctness inside that
+> boundary; two concurrent daemons racing through one SQLite DB / Herdr workspace
+> are outside its scope by construction.
+
 ## TLA+ ↔ TypeScript mapping
 
 | TLA+ | TypeScript |
@@ -370,17 +443,25 @@ Counterexample shapes (read top-to-bottom):
 _This section is updated from actual TLC output; timings depend on the machine._
 
 - `bun run formal` (safety, all behaviours): **no invariant violated**.
-  `9,382,049` states generated, `1,850,128` distinct states, depth `38`, ~1m06s
-  (`Tasks = {t1,t2}`, `Workers = {w1,w2}`, `MaxGeneration = 3`, `LeaseMax = 1`).
-- `bun run formal:done` (Property C): **`AllTasksDone` holds** under the stronger
-  assumptions (`AllowFailure = FALSE`, `AllowDetach = FALSE`).
-  `477,241` states generated, `109,216` distinct states, ~58s.
+  `9,382,049` states generated, `1,850,128` distinct states, depth `38`, ~1m43s
+  (`Tasks = {t1,t2}`, `Workers = {w1,w2}`, `MaxGeneration = 3`, `LeaseMax = 1`,
+  `FailureBudget = 1`).
+- `bun run formal:failures` (safety widened to ≥2 sequential failures): **no
+  invariant violated**. `17,479` states generated, `6,490` distinct states, depth
+  `25`, <1s (`Tasks = {t1}`, `Workers = {w1}`, `FailureBudget = 2`).
+- `bun run formal:done` (Property C): **`AllTasksDone` holds** under `SpecDone`
+  (`AllowFailure = FALSE`, `AllowDetach = FALSE`, stronger fairness).
+  `477,241` states generated, `109,216` distinct states, ~29s.
 - `bun run formal:liveness` (Property A `RunnableEventuallyMoves` + Property B
-  `TaskTermination`): **no violation** under the documented fairness.
-  `819,633` states generated, `193,520` distinct states, depth `32`, ~9m38s
-  (the temporal check itself is ~8m46s; safety is ~1m). Note this is the
-  documented 1-task reduction (`Tasks = {t1}`); the safety config is the full
-  2-task instance.
+  `TaskProgress`): **no violation** under `SpecFair` (decision-level fairness).
+  `819,633` states generated, `193,520` distinct states, depth `32`, ~2m21s (the
+  temporal check is ~33s). This is the documented 1-task reduction
+  (`Tasks = {t1}`); the safety config is the full 2-task instance.
+
+Wording: the main safety model (`Relay.cfg`) **exhaustively checks its bounded
+failure abstraction**. `RelayFailures.cfg` widens that abstraction to multiple
+sequential failures. This is evidence about the abstractions we checked — not a
+proof that no safety bug is hidden anywhere in the implementation.
 
 ## Files
 
@@ -389,5 +470,6 @@ _This section is updated from actual TLC output; timings depend on the machine._
 | `Relay.tla` | the model |
 | `Relay.cfg` | safety config (all behaviours) |
 | `RelayLiveness.cfg` | Property A + B (fair behaviours) |
-| `RelayDone.cfg` | Property C (stronger environment assumptions) |
+| `RelayDone.cfg` | Property C (`SpecDone`, stronger environment assumptions) |
+| `RelayFailures.cfg` | safety widened to ≥2 sequential failures (small instance) |
 | `run-tlc.sh` | downloads TLC and runs a config |

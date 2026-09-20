@@ -1,10 +1,11 @@
 import type { Database } from "bun:sqlite";
-import { unlinkSync } from "node:fs";
+import { existsSync, statSync, unlinkSync } from "node:fs";
 import { defaultSockPath } from "./db";
 import { logEvent } from "./events";
 import { handleErrorSignal, handleIdleSignal, reconcile } from "./reconciler";
 import type { HerdrIdentity, Runtime } from "./runtime/runtime";
 import { attachSession, detachSession, gateEvent, managedWorkerForSession } from "./sessions";
+import type { DaemonIdentity } from "./singleton";
 import { getWorker, setWorkerState, touchSeen } from "./workers";
 
 // JSON Lines over a Unix domain socket. Small protocol:
@@ -44,6 +45,12 @@ export interface SocketContext {
   runtime: Runtime;
   /** Set when the daemon should reconcile immediately. */
   wakeReconcile: { value: boolean };
+  /**
+   * Daemon identity (pid / DB path / runtime). Echoed by `ping` so a starting
+   * daemon can prove whether a live socket belongs to the SAME control-plane DB
+   * before it ever considers the socket stale (single-supervisor guard).
+   */
+  identity?: DaemonIdentity;
 }
 
 // `session.idle` is the stable protocol type; the OpenCode plugin normalizes
@@ -66,7 +73,9 @@ export async function handleSocketMessage(msg: SocketMessage, ctx: SocketContext
   const { db, runtime } = ctx;
   const type = msg.type;
 
-  if (type === "ping") return { ok: true, pong: true };
+  if (type === "ping") {
+    return { ok: true, pong: true, ...(ctx.identity ? { identity: ctx.identity } : {}) };
+  }
 
   if (type === "session.attach") {
     if (!msg.session_id) return { ok: false, reason: "no-session" };
@@ -176,9 +185,26 @@ export async function handleSocketMessage(msg: SocketMessage, ctx: SocketContext
   return { ok: true };
 }
 
-export function startSocketServer(ctx: SocketContext, sockPath?: string): { stop: () => void; path: string } {
+export interface SocketHandle {
+  path: string;
+  stop(): void;
+}
+
+/**
+ * Bind the relay unix socket.
+ *
+ * Ownership is decided by the CALLER before this is called (the daemon runs the
+ * `assertSocketFree` probe/lock guard, `src/singleton.ts`). This function NEVER
+ * unlinks a pre-existing path — an unconditional unlink is exactly what let a
+ * second daemon steal a live daemon's socket. A bind failure propagates: in
+ * production the daemon must fail startup rather than run socket-less and
+ * reconcile the same DB as a second supervisor.
+ *
+ * `stop()` removes the path ONLY if it is still the exact socket this call
+ * bound (inode check), so a late shutdown never deletes a newer daemon's socket.
+ */
+export function startSocketServer(ctx: SocketContext, sockPath?: string): SocketHandle {
   const path = sockPath ?? defaultSockPath();
-  try { unlinkSync(path); } catch { /* stale socket */ }
   const server = Bun.listen({
     unix: path,
     socket: {
@@ -204,5 +230,19 @@ export function startSocketServer(ctx: SocketContext, sockPath?: string): { stop
       error() { /* best effort; ignore */ },
     },
   });
-  return { stop: () => server.stop(), path };
+  let ino: number | bigint | null = null;
+  try { ino = statSync(path).ino; } catch { ino = null; }
+  let stopped = false;
+  return {
+    path,
+    stop() {
+      if (stopped) return;
+      stopped = true;
+      try { server.stop(); } catch { /* ignore */ }
+      // Remove the socket file only while it is provably the one we bound.
+      try {
+        if (ino !== null && existsSync(path) && statSync(path).ino === ino) unlinkSync(path);
+      } catch { /* ignore */ }
+    },
+  };
 }

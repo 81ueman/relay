@@ -13,7 +13,8 @@
     "daemon": "bun src/cli.ts daemon",
     "formal": "formal/run-tlc.sh Relay",
     "formal:liveness": "formal/run-tlc.sh RelayLiveness",
-    "formal:done": "formal/run-tlc.sh RelayDone"
+    "formal:done": "formal/run-tlc.sh RelayDone",
+    "formal:failures": "formal/run-tlc.sh RelayFailures"
   },
   "devDependencies": {
     "@opencode-ai/plugin": "^1.18.31",

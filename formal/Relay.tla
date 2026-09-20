@@ -16,6 +16,8 @@ CONSTANTS
   MaxGeneration,        \* bound on the per-worker fencing number
   LeaseMax,             \* bound on the claim/fence token (used as a modulus)
   AllowFailure,         \* TRUE => a worker turn may nondeterministically fail
+  FailureBudget,        \* shared bound on environment failures per worker (Crash/
+                        \* DetectStall/AttachTimeout/BlockInternal share one counter)
   AllowDetach           \* TRUE => the environment may permanently detach a worker
 None == "none"
 Gen == 0..MaxGeneration                 \* 0 = "no generation"
@@ -27,28 +29,28 @@ WorkerStates == {"starting","idle","working","waiting_input","stalled","dead"}
 RuntimeStates == {"none","starting","active","stale","dead","cleaned"}
 VARIABLES taskState, taskOwner, taskLease, taskReviewed,
           workerState, workerTask, workerGeneration, workerLease, workerWoken,
-          permissionPending, detached, failedOnce,
+          permissionPending, detached, failureCount,
           sessionManaged, sessionGeneration,
           runtimeState, runtimePersisted, runtimeRelayOwned, runtimeBootstrapSent,
           genWatermark, genAtPrev
 \* Variable groups, used to write UNCHANGED compactly (nested tuples).
 TV == <<taskState, taskOwner, taskLease, taskReviewed>>
 WV == <<workerState, workerTask, workerGeneration, workerLease, workerWoken>>
-PV == <<permissionPending, detached, failedOnce>>
+PV == <<permissionPending, detached, failureCount>>
 SV == <<sessionManaged, sessionGeneration>>
 RV == <<runtimeState, runtimePersisted, runtimeRelayOwned, runtimeBootstrapSent>>
 GV == <<genWatermark>>
 baseVars ==
   << taskState, taskOwner, taskLease, taskReviewed,
      workerState, workerTask, workerGeneration, workerLease, workerWoken,
-     permissionPending, detached, failedOnce,
+     permissionPending, detached, failureCount,
      sessionManaged, sessionGeneration,
      runtimeState, runtimePersisted, runtimeRelayOwned, runtimeBootstrapSent,
      genWatermark >>
 vars ==
   << taskState, taskOwner, taskLease, taskReviewed,
      workerState, workerTask, workerGeneration, workerLease, workerWoken,
-     permissionPending, detached, failedOnce,
+     permissionPending, detached, failureCount,
      sessionManaged, sessionGeneration,
      runtimeState, runtimePersisted, runtimeRelayOwned, runtimeBootstrapSent,
      genWatermark, genAtPrev >>
@@ -84,7 +86,7 @@ Init ==
   /\ workerState = [w \in Workers |-> "idle"]      /\ workerTask = [w \in Workers |-> None]
   /\ workerGeneration = [w \in Workers |-> 0]      /\ workerLease = [w \in Workers |-> 0]
   /\ workerWoken = [w \in Workers |-> FALSE]       /\ permissionPending = [w \in Workers |-> FALSE]
-  /\ detached = [w \in Workers |-> FALSE]          /\ failedOnce = [w \in Workers |-> FALSE]
+  /\ detached = [w \in Workers |-> FALSE]          /\ failureCount = [w \in Workers |-> 0]
   /\ sessionManaged = [w \in Workers |-> FALSE]    /\ sessionGeneration = [w \in Workers |-> 0]
   /\ runtimeState = [r \in Runtimes |-> "none"]    /\ runtimePersisted = [r \in Runtimes |-> FALSE]
   /\ runtimeRelayOwned = [r \in Runtimes |-> FALSE]
@@ -108,7 +110,7 @@ PersistRuntime(w) ==
         /\ workerState' = [workerState EXCEPT ![w] = "starting"] /\ workerTask' = [workerTask EXCEPT ![w] = None]
         /\ workerWoken' = [workerWoken EXCEPT ![w] = FALSE] /\ workerLease' = [workerLease EXCEPT ![w] = 0]
         /\ permissionPending' = [permissionPending EXCEPT ![w] = FALSE] /\ sessionManaged' = [sessionManaged EXCEPT ![w] = FALSE])
-  /\ UNCHANGED <<TV, <<detached, failedOnce, sessionGeneration,   runtimeState, runtimeRelayOwned, runtimeBootstrapSent>>, GV>>
+  /\ UNCHANGED <<TV, <<detached, failureCount, sessionGeneration,   runtimeState, runtimeRelayOwned, runtimeBootstrapSent>>, GV>>
 BootstrapDelivered(w) ==
   /\ ~detached[w] /\ workerState[w] = "starting" /\ workerGeneration[w] > 0
   /\ LET g == workerGeneration[w] IN
@@ -128,14 +130,16 @@ Attach(w) ==
        /\ runtimeState' = [runtimeState EXCEPT ![w,g] = "active"] /\ sessionManaged' = [sessionManaged EXCEPT ![w] = TRUE]
        /\ sessionGeneration' = [sessionGeneration EXCEPT ![w] = g] /\ workerState' = [workerState EXCEPT ![w] = "idle"]
        /\ workerWoken' = [workerWoken EXCEPT ![w] = FALSE]
-  /\ UNCHANGED <<TV, <<workerTask, workerGeneration, workerLease, permissionPending,   detached, failedOnce, runtimePersisted, runtimeRelayOwned,   runtimeBootstrapSent>>, GV>>
-\* A generation that never attaches times out but STAYS relay-owned (recoverable).
+  /\ UNCHANGED <<TV, <<workerTask, workerGeneration, workerLease, permissionPending,   detached, failureCount, runtimePersisted, runtimeRelayOwned,   runtimeBootstrapSent>>, GV>>
+\* An attach timeout consumes one unit of the shared failure budget but STAYS
+\* relay-owned (recoverable).
 AttachTimeout(w) ==
-  /\ ~detached[w] /\ workerState[w] = "starting" /\ workerGeneration[w] > 0 /\ ~failedOnce[w]
+  /\ ~detached[w] /\ workerState[w] = "starting" /\ workerGeneration[w] > 0
+  /\ failureCount[w] < FailureBudget
   /\ LET g == workerGeneration[w] IN
        /\ runtimeState[w,g] = "starting" /\ runtimePersisted[w,g] /\ runtimeRelayOwned[w,g]
        /\ runtimeState' = [runtimeState EXCEPT ![w,g] = "dead"] /\ workerState' = [workerState EXCEPT ![w] = "dead"]
-       /\ sessionManaged' = [sessionManaged EXCEPT ![w] = FALSE] /\ failedOnce' = [failedOnce EXCEPT ![w] = TRUE]
+       /\ sessionManaged' = [sessionManaged EXCEPT ![w] = FALSE] /\ failureCount' = [failureCount EXCEPT ![w] = failureCount[w] + 1]
   /\ UNCHANGED <<TV, <<workerTask, workerGeneration, workerLease, workerWoken,   permissionPending, detached, sessionGeneration,   runtimePersisted, runtimeRelayOwned, runtimeBootstrapSent>>, GV>>
 ManualAttach(w) ==
   /\ ~detached[w] /\ NoPendingSpawn(w) /\ workerTask[w] = None /\ ~sessionManaged[w]
@@ -152,7 +156,7 @@ Detach(w) ==
   /\ sessionManaged[w] /\ NoPendingSpawn(w) /\ workerState[w] = "idle" /\ workerTask[w] = None
   /\ sessionManaged' = [sessionManaged EXCEPT ![w] = FALSE] /\ detached' = [detached EXCEPT ![w] = TRUE]
   /\ workerWoken' = [workerWoken EXCEPT ![w] = FALSE] /\ permissionPending' = [permissionPending EXCEPT ![w] = FALSE]
-  /\ UNCHANGED <<TV, <<workerState, workerTask, workerGeneration, workerLease,   failedOnce, sessionGeneration>>, RV, GV>>
+  /\ UNCHANGED <<TV, <<workerState, workerTask, workerGeneration, workerLease,   failureCount, sessionGeneration>>, RV, GV>>
 \* Core loop invariant: runnable work + idle operational worker => wake it.
 Wake(w) ==
   /\ ~detached[w] /\ Operational(w) /\ workerState[w] = "idle"
@@ -207,25 +211,26 @@ BlockHuman(w) ==
        /\ taskLease' = [taskLease EXCEPT ![t] = FreshLease(t)] /\ workerTask' = [workerTask EXCEPT ![w] = None]
        /\ workerState' = [workerState EXCEPT ![w] = "idle"]
   /\ UNCHANGED <<<<taskReviewed>>, <<workerGeneration, workerLease, workerWoken>>, PV, SV, RV, GV>>
-\* Internal block: bounded by failedOnce (env assumption); still retryable.
+\* Internal block: consumes the shared failure budget (env assumption); still
+\* retryable, so blocked_internal is NOT terminal.
 BlockInternal(w) ==
-  /\ SessionCurrent(w) /\ ~failedOnce[w] /\ workerState[w] = "working" /\ workerTask[w] # None
+  /\ SessionCurrent(w) /\ failureCount[w] < FailureBudget /\ workerState[w] = "working" /\ workerTask[w] # None
   /\ LET t == workerTask[w] IN
        /\ taskState[t] = "running" /\ taskOwner[t] = w /\ workerLease[w] = taskLease[t]
        /\ taskState' = [taskState EXCEPT ![t] = "blocked_internal"] /\ taskOwner' = [taskOwner EXCEPT ![t] = None]
        /\ taskLease' = [taskLease EXCEPT ![t] = FreshLease(t)] /\ workerTask' = [workerTask EXCEPT ![w] = None]
        /\ workerState' = [workerState EXCEPT ![w] = "idle"]
-  /\ failedOnce' = [failedOnce EXCEPT ![w] = TRUE]
+  /\ failureCount' = [failureCount EXCEPT ![w] = failureCount[w] + 1]
   /\ UNCHANGED <<<<taskReviewed>>, <<workerGeneration, workerLease, workerWoken>>, <<permissionPending, detached>>, SV, RV, GV>>
 \* working -> waiting_input.  waiting_input is OCCUPIED (still holds its task).
 PermissionAsked(w) ==
   /\ SessionCurrent(w) /\ workerState[w] = "working" /\ workerTask[w] # None
   /\ permissionPending' = [permissionPending EXCEPT ![w] = TRUE] /\ workerState' = [workerState EXCEPT ![w] = "waiting_input"]
-  /\ UNCHANGED <<TV, <<workerTask, workerGeneration, workerLease, workerWoken>>, <<detached, failedOnce>>, SV, RV, GV>>
+  /\ UNCHANGED <<TV, <<workerTask, workerGeneration, workerLease, workerWoken>>, <<detached, failureCount>>, SV, RV, GV>>
 PermissionReplied(w) ==
   /\ SessionCurrent(w) /\ workerState[w] = "waiting_input"
   /\ permissionPending' = [permissionPending EXCEPT ![w] = FALSE] /\ workerState' = [workerState EXCEPT ![w] = IF workerTask[w] # None THEN "working" ELSE "idle"]
-  /\ UNCHANGED <<TV, <<workerTask, workerGeneration, workerLease, workerWoken>>, <<detached, failedOnce>>, SV, RV, GV>>
+  /\ UNCHANGED <<TV, <<workerTask, workerGeneration, workerLease, workerWoken>>, <<detached, failureCount>>, SV, RV, GV>>
 \* session.idle is NEVER completion.
 IdleSignal(w) ==
   /\ SessionCurrent(w) /\ workerState[w] \in {"working","idle"}
@@ -237,15 +242,15 @@ Fail(w) ==
        /\ taskState' = [taskState EXCEPT ![t] = "failed"] /\ taskOwner' = [taskOwner EXCEPT ![t] = None]
        /\ workerTask' = [workerTask EXCEPT ![w] = None] /\ workerState' = [workerState EXCEPT ![w] = "idle"]
   /\ UNCHANGED <<<<taskLease, taskReviewed>>, <<workerGeneration, workerLease, workerWoken>>, PV, SV, RV, GV>>
-\* Crash / stall.  failedOnce bounds environment failures (liveness assumption).
+\* Crash / stall.  Each consumes one unit of the SHARED failure budget.
 Crash(w) ==
-  /\ Operational(w) /\ ~failedOnce[w] /\ workerState[w] \in {"idle","working","waiting_input"}
-  /\ failedOnce' = [failedOnce EXCEPT ![w] = TRUE] /\ workerState' = [workerState EXCEPT ![w] = "dead"]
+  /\ Operational(w) /\ failureCount[w] < FailureBudget /\ workerState[w] \in {"idle","working","waiting_input"}
+  /\ failureCount' = [failureCount EXCEPT ![w] = failureCount[w] + 1] /\ workerState' = [workerState EXCEPT ![w] = "dead"]
   /\ permissionPending' = [permissionPending EXCEPT ![w] = FALSE]
   /\ UNCHANGED <<TV, <<workerTask, workerGeneration, workerLease, workerWoken>>, <<detached>>, SV, RV, GV>>
 DetectStall(w) ==
-  /\ SessionCurrent(w) /\ ~failedOnce[w] /\ workerState[w] = "working" /\ workerTask[w] # None
-  /\ failedOnce' = [failedOnce EXCEPT ![w] = TRUE] /\ workerState' = [workerState EXCEPT ![w] = "stalled"]
+  /\ SessionCurrent(w) /\ failureCount[w] < FailureBudget /\ workerState[w] = "working" /\ workerTask[w] # None
+  /\ failureCount' = [failureCount EXCEPT ![w] = failureCount[w] + 1] /\ workerState' = [workerState EXCEPT ![w] = "stalled"]
   /\ UNCHANGED <<TV, <<workerTask, workerGeneration, workerLease, workerWoken>>, <<permissionPending, detached>>, SV, RV, GV>>
 Requeue(w) ==
   /\ Failed(w) /\ workerTask[w] # None
@@ -293,19 +298,42 @@ Next ==
          \/ (\E t \in Tasks : RetryInternal(t))     \/ (\E t \in Tasks : UnblockHuman(t)) )
   /\ genAtPrev' = workerGeneration
 Spec == Init /\ [][Next]_vars
-\* Fairness: supervisor chain is weak-fair; worker/review choices are strong-fair
-\* so a turn/decision cannot be postponed forever.  See formal/README.md.
+\* Combined DECISIONS.  The environment assumption is only that an agent which
+\* can decide does not stutter forever -- NOT that every outcome occurs.  The
+\* worker may submit / block internally / block on the human / fail, and the
+\* reviewer may approve / reject; the choice stays nondeterministic.
+WorkerDecision(w) ==
+  \/ Submit(w) \/ BlockHuman(w) \/ BlockInternal(w) \/ Fail(w)
+ReviewDecision(t) ==
+  \/ Approve(t) \/ Reject(t)
+\* Fairness (normal liveness): supervisor chain is weak-fair; each worker/reviewer
+\* DECISION is strong-fair, so a live decision state cannot be postponed forever.
+\* See formal/README.md ("Fairness and environment assumptions").
 Fairness ==
   /\ \A w \in Workers : WF_baseVars(SpawnTransport(w))    /\ WF_baseVars(PersistRuntime(w))
   /\ \A w \in Workers : WF_baseVars(BootstrapDelivered(w)) /\ WF_baseVars(Attach(w))
   /\ \A w \in Workers : WF_baseVars(Wake(w))              /\ WF_baseVars(Claim(w))
   /\ \A w \in Workers : WF_baseVars(Requeue(w))           /\ WF_baseVars(MarkStale(w))
   /\ \A w \in Workers : WF_baseVars(DetectDead(w))        /\ WF_baseVars(PermissionReplied(w))
-  /\ \A w \in Workers : SF_baseVars(Submit(w))            /\ SF_baseVars(BlockHuman(w))
-  /\ \A w \in Workers : SF_baseVars(BlockInternal(w))
-  /\ \A t \in Tasks   : SF_baseVars(Approve(t))
+  /\ \A w \in Workers : SF_baseVars(WorkerDecision(w))
+  /\ \A t \in Tasks   : SF_baseVars(ReviewDecision(t))
   /\ \A t \in Tasks   : WF_baseVars(RetryInternal(t))     /\ WF_baseVars(UnblockHuman(t))
 SpecFair == Spec /\ Fairness
+
+\* Property C ONLY (RelayDone.cfg): the environment additionally chooses each
+\* outcome "well" -- it eventually submits, never keeps a task in human-block, and
+\* eventually approves.  These per-outcome assumptions are deliberately isolated
+\* here and are NOT part of normal liveness (RelayLiveness.cfg uses SpecFair).
+StrongFairness ==
+  /\ \A w \in Workers : WF_baseVars(SpawnTransport(w))    /\ WF_baseVars(PersistRuntime(w))
+  /\ \A w \in Workers : WF_baseVars(BootstrapDelivered(w)) /\ WF_baseVars(Attach(w))
+  /\ \A w \in Workers : WF_baseVars(Wake(w))              /\ WF_baseVars(Claim(w))
+  /\ \A w \in Workers : WF_baseVars(Requeue(w))           /\ WF_baseVars(MarkStale(w))
+  /\ \A w \in Workers : WF_baseVars(DetectDead(w))        /\ WF_baseVars(PermissionReplied(w))
+  /\ \A w \in Workers : SF_baseVars(Submit(w))            /\ SF_baseVars(BlockInternal(w))
+  /\ \A t \in Tasks   : SF_baseVars(Approve(t))
+  /\ \A t \in Tasks   : WF_baseVars(RetryInternal(t))     /\ WF_baseVars(UnblockHuman(t))
+SpecDone == Spec /\ StrongFairness
 
 TypeOK ==
   /\ taskState \in [Tasks -> TaskStates]            /\ taskOwner \in [Tasks -> Workers \cup {None}]
@@ -314,7 +342,7 @@ TypeOK ==
   /\ workerGeneration \in [Workers -> 0..MaxGeneration]
   /\ workerLease \in [Workers -> 0..LeaseMax]       /\ workerWoken \in [Workers -> BOOLEAN]
   /\ permissionPending \in [Workers -> BOOLEAN]     /\ detached \in [Workers -> BOOLEAN]
-  /\ failedOnce \in [Workers -> BOOLEAN]            /\ sessionManaged \in [Workers -> BOOLEAN]
+  /\ failureCount \in [Workers -> 0..FailureBudget]  /\ sessionManaged \in [Workers -> BOOLEAN]
   /\ sessionGeneration \in [Workers -> 0..MaxGeneration]
   /\ runtimeState \in [Runtimes -> RuntimeStates]   /\ runtimePersisted \in [Runtimes -> BOOLEAN]
   /\ runtimeRelayOwned \in [Runtimes -> BOOLEAN]    /\ runtimeBootstrapSent \in [Runtimes -> BOOLEAN]
@@ -380,10 +408,15 @@ QuiescenceCoversReview ==
 RunnableEventuallyMoves ==
   []( (RunnableExists /\ HasSupervised /\ ~HumanOnlyWaiting)
       => <>( WorkerWorking \/ ~RunnableExists \/ HumanOnlyWaiting \/ ~HasSupervised ) )
-\* Property B (worker fairness): every task reaches a terminal state.
-TaskTermination ==
-  []( (HasSupervised /\ \E t \in Tasks : taskState[t] \notin TerminalTaskStates)
-      => <>( (\A t \in Tasks : taskState[t] \in TerminalTaskStates) \/ ~HasSupervised ) )
-\* Property C (optional, stronger environment assumptions).
+\* Property B (worker/reviewer fairness): no task stalls forever inside a LIVE
+\* decision state.  `running` waits on the worker, `review` waits on the reviewer;
+\* under decision-level fairness each such wait ends.  The OUTCOME stays
+\* nondeterministic (the environment may keep rejecting / re-blocking), so the
+\* stronger "eventually done" claim is Property C only.
+TaskProgress ==
+  []( (HasSupervised /\ \E t \in Tasks : taskState[t] \in {"running","review"})
+      => <> ( ~HasSupervised
+              \/ (\A t \in Tasks : taskState[t] \notin {"running","review"}) ) )
+\* Property C (optional, stronger environment assumptions: SpecDone).
 AllTasksDone == <>( \A t \in Tasks : taskState[t] = "done" )
 =============================================================================

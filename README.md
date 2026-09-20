@@ -42,6 +42,35 @@ if runnable_tasks > 0 and working_workers == 0:
 unfinished tasks are blocked_human`. A `blocked_human` task releases its
 worker immediately to take other runnable work.
 
+## Single-supervisor invariant
+
+```text
+Relay is a single-supervisor control plane.
+
+One SQLite control-plane DB must have exactly one active Relay daemon.
+Running multiple Relay daemons against the same DB is unsupported and rejected.
+```
+
+The daemon owns generation allocation, liveness reconciliation, restart
+decisions, and the project Unix socket, so two daemons on one DB would race on
+all of them. The boundary is enforced at startup, locally (no distributed lock,
+no leader election):
+
+- a control-plane lock next to the DB (`.relay/relay.lock`) makes a second
+  supervisor fail fast, even if `$RELAY_SOCK` points somewhere else;
+- the daemon probes `.relay/relay.sock` before binding: a **live** listener is
+  never unlinked (a second daemon is rejected), only a **stale** one (file
+  exists, nobody answers) is reclaimed; a non-socket file at the path fails
+  closed;
+- a bind failure is **fatal** in production, so there is never a socket-less
+  "poll-only" second supervisor;
+- `relay daemon --once` runs the same acquisition (it executes a supervisor
+  pass) and refuses while a live daemon owns the DB.
+
+Within this single-supervisor boundary, generation allocation stays simple and
+process-local (`restartingWorkers` in-flight guard + a commit-time generation
+re-check). Tests inject `MockRuntime` + `noSocket` to bypass the guard.
+
 ## Install
 
 ```bash
