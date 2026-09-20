@@ -82,6 +82,23 @@ tagged with a role that no worker registers are reported as unclaimable in
 `relay status`; register a matching worker, retag the task, or release/re-add it
 under `--any-role` as a temporary recovery.
 
+**Duplicate and obsolete registrations: `relay worker retire`.** Re-registering
+the same agent under a new id (a common accident when a batch of ids is created
+up front and then re-created under cleaner names) leaves two worker rows for one
+session. Deleting the old row would break historical events and task
+references, so `relay worker retire <id> [--reason <text>]` keeps the row as a
+tombstone instead and takes it out of every operational surface:
+
+- `relay worker list` hides retired workers unless `--all`; `relay status` hides
+  them entirely.
+- A retired worker is excluded from the operational/supervised sets, so it is
+  never woken, stalled, restarted or counted as a role owner (a role only
+  retired workers registered becomes visible as unclaimable).
+- Retirement refuses while the worker still owns a task — release/submit it
+  first. `relay worker unretire <id>` reverses it, and re-registering the same id
+  revives it automatically.
+- `worker.retired` / `worker.unretired` are recorded in the event log.
+
 ### Clean hand-back: `relay release`
 
 The only other exits for a running task were `block`→`unblock` or
