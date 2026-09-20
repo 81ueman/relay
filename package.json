@@ -10,7 +10,10 @@
     "build": "bun build src/cli.ts --outdir dist --target bun",
     "test": "bun test",
     "typecheck": "tsc --noEmit",
-    "daemon": "bun src/cli.ts daemon"
+    "daemon": "bun src/cli.ts daemon",
+    "formal": "formal/run-tlc.sh Relay",
+    "formal:liveness": "formal/run-tlc.sh RelayLiveness",
+    "formal:done": "formal/run-tlc.sh RelayDone"
   },
   "devDependencies": {
     "@opencode-ai/plugin": "^1.18.31",

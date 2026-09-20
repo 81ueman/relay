@@ -5,3 +5,8 @@ dist/
 *.db-wal
 *.db-shm
 .DS_Store
+
+# TLA+ tools + model-check output
+formal/.tools/
+formal/states/
+/states/
