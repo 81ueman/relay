@@ -28,16 +28,16 @@ let rt: MockRuntime;
 let ctx: SocketContext;
 
 beforeEach(() => {
-  dir = mkdtempSync(join(tmpdir(), "agentctl-lifecycle-"));
-  process.env.AGENTCTL_DB = join(dir, "state.db");
-  process.env.AGENTCTL_LEASE_MS = "120000";
-  process.env.AGENTCTL_STALL_MS = "60000";
-  process.env.AGENTCTL_WAKE_COOLDOWN_MS = "0";
-  process.env.AGENTCTL_RESTART_COOLDOWN_MS = "0";
-  process.env.AGENTCTL_ATTACH_TIMEOUT_MS = "30000";
-  process.env.AGENTCTL_RUNTIME_CLEANUP_GRACE_MS = "300000";
-  delete process.env.AGENTCTL_AUTO_APPROVE;
-  db = openDb(process.env.AGENTCTL_DB);
+  dir = mkdtempSync(join(tmpdir(), "relay-lifecycle-"));
+  process.env.RELAY_DB = join(dir, "state.db");
+  process.env.RELAY_LEASE_MS = "120000";
+  process.env.RELAY_STALL_MS = "60000";
+  process.env.RELAY_WAKE_COOLDOWN_MS = "0";
+  process.env.RELAY_RESTART_COOLDOWN_MS = "0";
+  process.env.RELAY_ATTACH_TIMEOUT_MS = "30000";
+  process.env.RELAY_RUNTIME_CLEANUP_GRACE_MS = "300000";
+  delete process.env.RELAY_AUTO_APPROVE;
+  db = openDb(process.env.RELAY_DB);
   rt = new MockRuntime();
   ctx = { db, runtime: rt, wakeReconcile: { value: false } };
 });
@@ -368,7 +368,7 @@ describe("13. repeated cleanup failures are log-deduped", () => {
 
 describe("14. a failed restart backs off instead of retrying every tick", () => {
   test("a spawn that keeps failing logs worker.restart_failed once per cooldown window", async () => {
-    process.env.AGENTCTL_RESTART_COOLDOWN_MS = "60000";
+    process.env.RELAY_RESTART_COOLDOWN_MS = "60000";
     seedWorker("w1", 1, "rt-w1-g1");
     recordRuntime(db, { workerId: "w1", generation: 1, runtimeId: "rt-w1-g1", state: "active" });
     rt.setAlive("w1", false);

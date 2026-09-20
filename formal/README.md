@@ -59,7 +59,7 @@ in a bounded state space, so it finds the interleaving you did not think of.
 
 - timestamps, cooldowns, jitter, retry backoff (timeouts are nondeterministic
   actions);
-- UUIDs, SQL rows, DDL, `agentctl` CLI plumbing;
+- UUIDs, SQL rows, DDL, `relay` CLI plumbing;
 - message/token payloads (we assume a bootstrap token is either valid or the
   attach never happens);
 - Herdr and OpenCode themselves, and the LLM. They are a **nondeterministic

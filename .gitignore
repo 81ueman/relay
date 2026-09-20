@@ -1,6 +1,6 @@
 node_modules/
 dist/
-.agentctl/
+.relay/
 *.db
 *.db-wal
 *.db-shm

@@ -36,16 +36,16 @@ let rt: MockRuntime;
 let ctx: SocketContext;
 
 beforeEach(() => {
-  dir = mkdtempSync(join(tmpdir(), "agentctl-herdr-"));
-  process.env.AGENTCTL_DB = join(dir, "state.db");
-  process.env.AGENTCTL_LEASE_MS = "120000";
-  process.env.AGENTCTL_STALL_MS = "60000";
-  process.env.AGENTCTL_WAKE_COOLDOWN_MS = "0";
-  process.env.AGENTCTL_RESTART_COOLDOWN_MS = "0";
-  process.env.AGENTCTL_ATTACH_TIMEOUT_MS = "30000";
-  process.env.AGENTCTL_RUNTIME_CLEANUP_GRACE_MS = "300000";
-  delete process.env.AGENTCTL_AUTO_APPROVE;
-  db = openDb(process.env.AGENTCTL_DB);
+  dir = mkdtempSync(join(tmpdir(), "relay-herdr-"));
+  process.env.RELAY_DB = join(dir, "state.db");
+  process.env.RELAY_LEASE_MS = "120000";
+  process.env.RELAY_STALL_MS = "60000";
+  process.env.RELAY_WAKE_COOLDOWN_MS = "0";
+  process.env.RELAY_RESTART_COOLDOWN_MS = "0";
+  process.env.RELAY_ATTACH_TIMEOUT_MS = "30000";
+  process.env.RELAY_RUNTIME_CLEANUP_GRACE_MS = "300000";
+  delete process.env.RELAY_AUTO_APPROVE;
+  db = openDb(process.env.RELAY_DB);
   rt = new MockRuntime();
   ctx = { db, runtime: rt, wakeReconcile: { value: false } };
 });
@@ -216,16 +216,16 @@ describe("G. Herdr is required to build the production runtime", () => {
   test("unavailable Herdr => buildRuntime throws; MockRuntime is never selected", () => {
     const savedEnv = process.env.HERDR_ENV;
     const savedSock = process.env.HERDR_SOCKET_PATH;
-    const savedRuntime = process.env.AGENTCTL_RUNTIME;
+    const savedRuntime = process.env.RELAY_RUNTIME;
     delete process.env.HERDR_ENV;
     delete process.env.HERDR_SOCKET_PATH;
-    delete process.env.AGENTCTL_RUNTIME;
+    delete process.env.RELAY_RUNTIME;
     try {
       expect(() => buildRuntime()).toThrow(/requires Herdr/);
     } finally {
       if (savedEnv !== undefined) process.env.HERDR_ENV = savedEnv;
       if (savedSock !== undefined) process.env.HERDR_SOCKET_PATH = savedSock;
-      if (savedRuntime !== undefined) process.env.AGENTCTL_RUNTIME = savedRuntime;
+      if (savedRuntime !== undefined) process.env.RELAY_RUNTIME = savedRuntime;
     }
   });
 });

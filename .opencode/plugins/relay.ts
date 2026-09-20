@@ -1,4 +1,4 @@
-// agentctl OpenCode plugin (relay) — OpenCode V2 plugin API.
+// relay OpenCode plugin — OpenCode V2 plugin API.
 //
 // Transport: Unix domain socket to the relay daemon — NEVER a subprocess per
 // event (tool.execute.after is high-frequency). Protocol is JSON Lines:
@@ -10,7 +10,7 @@
 //   supervisor (SQLite + real Herdr runtime) decides.
 // - Plain `opencode` sessions are UNMANAGED by default: events are forwarded
 //   cheaply but the daemon ignores them (no DB write, no Herdr call, no claim).
-//   Use agent_attach (custom tool) or `agentctl session attach` to manage one.
+//   Use agent_attach (custom tool) or `relay session attach` to manage one.
 // - All forwarding is best-effort and never throws into OpenCode.
 // - PER-SESSION routing. A single OpenCode server (`opencode serve --service`)
 //   hosts sessions from many projects and its process env names none of them,
@@ -35,19 +35,19 @@
 // per-location, so symlink it globally to get agent_attach/agent_detach in
 // every project:
 //
-//   ln -s "$(pwd)/.opencode/plugins/agentctl.ts" ~/.config/opencode/plugins/agentctl.ts
+//   ln -s "$(pwd)/.opencode/plugins/relay.ts" ~/.config/opencode/plugins/relay.ts
 
 import net from "node:net";
 import { existsSync } from "node:fs";
 import path from "node:path";
 
-const PLUGIN_ID = "relay.agentctl";
+const PLUGIN_ID = "relay";
 
 // A fresh value per module evaluation. The module is evaluated once and
 // `setup()` then runs once per project location; a hot reload is a NEW module
 // evaluation. Comparing this token lets the newest code take over the
 // server-global forwarder, while locations in the same load still dedupe.
-const LOAD = Symbol("relay.agentctl.load");
+const LOAD = Symbol("relay.plugin.load");
 
 interface RelayPluginState {
   /** Module load that currently owns the server-global forwarder. */
@@ -72,7 +72,7 @@ interface RelayPluginState {
 }
 
 // Shared across every loaded copy in this server process.
-const G: RelayPluginState = ((globalThis as any).__relayAgentctl ??= {
+const G: RelayPluginState = ((globalThis as any).__relayPlugin ??= {
   toolLocations: new Set(),
   generationCache: new Map(),
   detachedCache: new Set(),
@@ -95,10 +95,10 @@ G.pendingAttach ??= new Map();
 // Env-only auto attach is OFF by default: a shared server's process env names
 // at most one worker, so it cannot identify a session. Opt in only for
 // dedicated one-server-per-worker deployments.
-const AUTO_ATTACH_FROM_ENV = process.env.AGENTCTL_AUTO_ATTACH === "1";
-const ENV_WORKER = process.env.AGENTCTL_WORKER;
+const AUTO_ATTACH_FROM_ENV = process.env.RELAY_AUTO_ATTACH === "1";
+const ENV_WORKER = process.env.RELAY_WORKER;
 const ENV_GENERATION = (() => {
-  const n = Number(process.env.AGENTCTL_GENERATION ?? "");
+  const n = Number(process.env.RELAY_GENERATION ?? "");
   return Number.isInteger(n) && n > 0 ? n : undefined;
 })();
 
@@ -110,24 +110,24 @@ const ATTACH_MARKER = /RELAY-ATTACH\s+worker=([A-Za-z0-9._-]+)\s+gen=(\d+)(?:\s+
  * Resolve the daemon socket for a session's project directory.
  *
  * INVARIANT (fail closed): when the session directory IS known we NEVER fall
- * back to a process-global `AGENTCTL_SOCK`. A shared OpenCode server hosts
+ * back to a process-global `RELAY_SOCK`. A shared OpenCode server hosts
  * sessions from many projects and its env may name another project's daemon; a
  * wrong socket would route one project's events into another project's control
  * plane. So, with a known directory:
- *   1. the nearest existing `<dir>/.agentctl/relay.sock` (walking up), else
- *   2. the nearest `<dir>/.agentctl/` (socket not created yet), else
+ *   1. the nearest existing `<dir>/.relay/relay.sock` (walking up), else
+ *   2. the nearest `<dir>/.relay/` (socket not created yet), else
  *   3. no socket at all (drop).
- * `AGENTCTL_SOCK` is only consulted when the directory is unknown AND the
+ * `RELAY_SOCK` is only consulted when the directory is unknown AND the
  * deployment explicitly opts into dedicated single-project mode
- * (`AGENTCTL_DEDICATED=1`). Otherwise there is no session→project evidence, so
+ * (`RELAY_DEDICATED=1`). Otherwise there is no session→project evidence, so
  * the only safe action is to drop.
  */
 export function socketPathFor(directory?: string | null): string | null {
-  const envSock = process.env.AGENTCTL_SOCK;
+  const envSock = process.env.RELAY_SOCK;
 
   if (!directory) {
     // No directory: only the explicit dedicated single-project fallback is safe.
-    return process.env.AGENTCTL_DEDICATED === "1" ? (envSock ?? null) : null;
+    return process.env.RELAY_DEDICATED === "1" ? (envSock ?? null) : null;
   }
 
   const walk = (fn: (dir: string) => string | null): string | null => {
@@ -143,16 +143,16 @@ export function socketPathFor(directory?: string | null): string | null {
   };
 
   const existing = walk((d) => {
-    const sock = path.join(d, ".agentctl", "relay.sock");
+    const sock = path.join(d, ".relay", "relay.sock");
     return existsSync(sock) ? sock : null;
   });
   if (existing) return existing;
 
-  const agentctlDir = walk((d) => (existsSync(path.join(d, ".agentctl")) ? d : null));
-  if (agentctlDir) return path.join(agentctlDir, ".agentctl", "relay.sock");
+  const relayDir = walk((d) => (existsSync(path.join(d, ".relay")) ? d : null));
+  if (relayDir) return path.join(relayDir, ".relay", "relay.sock");
 
   // Known directory with no project control plane: NEVER another project's
-  // AGENTCTL_SOCK. Fail closed.
+  // RELAY_SOCK. Fail closed.
   return null;
 }
 
@@ -529,7 +529,7 @@ async function registerTools(ctx: any): Promise<void> {
         );
         if (!res?.ok) {
           return {
-            content: `attach failed (${res?.reason ?? "unknown"}). Is the relay daemon running for this project? Start it with \`agentctl daemon\` in the project root, then retry. Equivalent CLI: \`agentctl session attach --session ${sessionID} --dir <project>\`.`,
+            content: `attach failed (${res?.reason ?? "unknown"}). Is the relay daemon running for this project? Start it with \`relay daemon\` in the project root, then retry. Equivalent CLI: \`relay session attach --session ${sessionID} --dir <project>\`.`,
           };
         }
         G.generationCache.set(sessionID, res.generation);
@@ -537,7 +537,7 @@ async function registerTools(ctx: any): Promise<void> {
         G.pendingAttach.delete(sessionID);
         G.detachedCache.delete(sessionID);
         return {
-          content: `attached as worker ${res.worker_id} (generation ${res.generation}). Load the agent-worker skill and run \`agentctl next\`.`,
+          content: `attached as worker ${res.worker_id} (generation ${res.generation}). Load the agent-worker skill and run \`relay next\`.`,
         };
       },
     });

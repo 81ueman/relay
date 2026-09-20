@@ -1,4 +1,4 @@
-# relay — `agentctl`: a Herdr-only supervisor for OpenCode agents
+# relay — `relay`: a Herdr-only supervisor for OpenCode agents
 
 Goal: **as long as unblocked work exists, at least one agent keeps moving.**
 
@@ -6,7 +6,7 @@ Goal: **as long as unblocked work exists, at least one agent keeps moving.**
 > It does not support managing OpenCode outside Herdr. Every Relay-managed
 > OpenCode session must be running inside a Herdr agent.
 
-`agentctl` is a small deterministic control plane (Bun + TypeScript + SQLite).
+`relay` is a small deterministic control plane (Bun + TypeScript + SQLite).
 It is not an orchestration framework and has no parent-child model: agents are
 peers (`communication = many-to-many`, `task ownership = single writer`).
 
@@ -46,7 +46,7 @@ worker immediately to take other runnable work.
 
 ```bash
 bun install
-bun link   # global `agentctl`; or export AGENTCTL_BIN="bun $PWD/src/cli.ts"
+bun link   # global `relay`; or export RELAY_BIN="bun $PWD/src/cli.ts"
 ```
 
 Requires: Bun ≥ 1.1, `herdr` on PATH, OpenCode v2.
@@ -60,29 +60,29 @@ Plugin shape verified against the bundled `herdr-agent-state` integration
 ## Setup
 
 ```bash
-agentctl init     # creates .agentctl/state.db (WAL)
-agentctl daemon   # reconcile loop + Unix socket .agentctl/relay.sock
+relay init     # creates .relay/state.db (WAL)
+relay daemon   # reconcile loop + Unix socket .relay/relay.sock
 ```
 
-The OpenCode plugin (`.opencode/plugins/agentctl.ts`) and Skill
+The OpenCode plugin (`.opencode/plugins/relay.ts`) and Skill
 (`.opencode/skills/agent-worker/SKILL.md`) are auto-discovered under this repo:
 
 ```bash
-opencode plugin list   # relay.agentctl ... .opencode/plugins/agentctl.ts
+opencode plugin list   # relay ... .opencode/plugins/relay.ts
 ```
 
 Identity / paths / tuning:
 
 ```text
-$AGENTCTL_WORKER (or --worker, or .agentctl/worker-id)
-$AGENTCTL_DB (default .agentctl/state.db), $AGENTCTL_SOCK (default .agentctl/relay.sock)
-AGENTCTL_LEASE_MS=120000 AGENTCTL_STALL_MS=60000 AGENTCTL_LOW_WATER=3
-AGENTCTL_WAKE_COOLDOWN_MS=30000 AGENTCTL_AUTO_APPROVE AGENTCTL_INTERVAL_MS=1500
-AGENTCTL_HERDR_WORKSPACE=<ws>   # REQUIRED to spawn (falls back to $HERDR_WORKSPACE_ID)
-AGENTCTL_RUNTIME_CLEANUP_GRACE_MS=300000 AGENTCTL_ATTACH_TIMEOUT_MS=30000
-AGENTCTL_RESTART_COOLDOWN_MS=30000 AGENTCTL_CLEANUP_LOG_WINDOW_MS=60000
-AGENTCTL_BOOTSTRAP_RETRY_MS=5000 AGENTCTL_BOOTSTRAP_LOG_WINDOW_MS=60000
-AGENTCTL_DEDICATED=1            # opt-in: allow $AGENTCTL_SOCK when no session dir is known
+$RELAY_WORKER (or --worker, or .relay/worker-id)
+$RELAY_DB (default .relay/state.db), $RELAY_SOCK (default .relay/relay.sock)
+RELAY_LEASE_MS=120000 RELAY_STALL_MS=60000 RELAY_LOW_WATER=3
+RELAY_WAKE_COOLDOWN_MS=30000 RELAY_AUTO_APPROVE RELAY_INTERVAL_MS=1500
+RELAY_HERDR_WORKSPACE=<ws>   # REQUIRED to spawn (falls back to $HERDR_WORKSPACE_ID)
+RELAY_RUNTIME_CLEANUP_GRACE_MS=300000 RELAY_ATTACH_TIMEOUT_MS=30000
+RELAY_RESTART_COOLDOWN_MS=30000 RELAY_CLEANUP_LOG_WINDOW_MS=60000
+RELAY_BOOTSTRAP_RETRY_MS=5000 RELAY_BOOTSTRAP_LOG_WINDOW_MS=60000
+RELAY_DEDICATED=1            # opt-in: allow $RELAY_SOCK when no session dir is known
 ```
 
 Spawning **requires** an explicit Herdr workspace. `herdr tab create` is
@@ -118,10 +118,10 @@ agent_detach()
 ```
 
 ```bash
-agentctl session attach --session ses_xxx --dir <project>   # identify the pane by directory
-agentctl session attach --session ses_xxx --pane <pane>     # or by explicit Herdr pane
-agentctl session detach --session ses_xxx
-agentctl session list
+relay session attach --session ses_xxx --dir <project>   # identify the pane by directory
+relay session attach --session ses_xxx --pane <pane>     # or by explicit Herdr pane
+relay session detach --session ses_xxx
+relay session list
 ```
 
 The daemon **resolves the session's Herdr identity before any DB write**
@@ -177,8 +177,8 @@ RELAY-ATTACH worker=<worker-id> gen=<generation> token=<spawn-token>
 
 and the plugin reads it out of that session's own prompt text, then attaches
 **that** session with the intended worker/generation. Plain `opencode` has no
-marker and stays unmanaged. (`AGENTCTL_MANAGED/WORKER/GENERATION/DB/SOCK` are
-still exported into the spawned tab; `AGENTCTL_AUTO_ATTACH=1` enables the
+marker and stays unmanaged. (`RELAY_MANAGED/WORKER/GENERATION/DB/SOCK` are
+still exported into the spawned tab; `RELAY_AUTO_ATTACH=1` enables the
 env-only path for dedicated one-server-per-worker deployments, but it is off by
 default because a shared server cannot identify a session from process env.)
 
@@ -222,7 +222,7 @@ generation N (active)
       │
       ▼
  start() fresh generation N+1: herdr tab create --workspace <ws> --no-focus \
-   --label relay:<worker>:g<N+1> --env AGENTCTL_MANAGED=1 --env AGENTCTL_GENERATION=<N+1>
+   --label relay:<worker>:g<N+1> --env RELAY_MANAGED=1 --env RELAY_GENERATION=<N+1>
       │
       ▼
   ONE transaction: commit runtime row (gen=N+1, starting, relay_owned, attach_token)
@@ -245,10 +245,10 @@ prompt cannot arrive before its runtime row exists. If the spawn itself fails th
 old metadata is kept (`worker.restart_failed`, backoff). If only the bootstrap
 *wake* fails the generation is **kept** (`worker.bootstrap_failed`, runtime still
 `starting`, worker still supervised) and retried at most once per
-`AGENTCTL_BOOTSTRAP_RETRY_MS` until it attaches or the attach timeout fires.
+`RELAY_BOOTSTRAP_RETRY_MS` until it attaches or the attach timeout fires.
 
 A generation that never attaches (agent up, no managed session) is marked `dead`
-at `AGENTCTL_ATTACH_TIMEOUT_MS`, but the worker stays **recoverable**: after the
+at `RELAY_ATTACH_TIMEOUT_MS`, but the worker stays **recoverable**: after the
 restart cooldown the supervisor spawns generation N+2 and the timed-out tab is
 reaped through the normal grace path. Only an explicitly detached worker (state
 `idle`, no managed session, no relay-owned runtime for its current generation)
@@ -284,13 +284,13 @@ A `relay_owned=false` runtime is never a cleanup candidate, whatever its state,
 and the adapter refuses such a cleanup outright. Cleanup failures are logged as
 `runtime.cleanup_failed` and retried later; a leftover old tab is acceptable, a
 stopped fresh worker is not. Repeated failures are recorded at most once per
-`AGENTCTL_CLEANUP_LOG_WINDOW_MS` (default 60000) so a stuck cleanup cannot
+`RELAY_CLEANUP_LOG_WINDOW_MS` (default 60000) so a stuck cleanup cannot
 flood the event log. If the recorded tab is already gone there is nothing to
 reap, so the runtime is marked `cleaned` instead of retrying forever; an
 unreadable label on a tab that still exists is refused. `waiting_input` workers
-are never wake candidates for `agentctl next`.
+are never wake candidates for `relay next`.
 
-Restart attempts are throttled by `AGENTCTL_RESTART_COOLDOWN_MS` (default
+Restart attempts are throttled by `RELAY_RESTART_COOLDOWN_MS` (default
 30000), applied after **failures** too, so a spawn that cannot come up is
 retried on a slow cadence and `worker.restart_failed` cannot flood the log. If
 the target agent name already exists, `start()` reaps it only when its tab
@@ -302,7 +302,7 @@ agent it cannot prove it owns.
 ## Plugin → daemon: Unix socket, not subprocess
 
 ```text
-OpenCode event -> .agentctl/relay.sock (JSON Lines) -> daemon -> SQLite/Herdr
+OpenCode event -> .relay/relay.sock (JSON Lines) -> daemon -> SQLite/Herdr
 ```
 
 ```json
@@ -316,15 +316,15 @@ turn-complete signal, and the plugin normalizes it onto `session.idle`.
 
 The plugin never spawns processes and never throws into OpenCode; a dead
 daemon just means silent best-effort drops. High-frequency
-`tool.execute.after` is liveness only (explicit `agentctl note` is the
+`tool.execute.after` is liveness only (explicit `relay note` is the
 strongest progress signal).
 
 **Per-session routing is fail-closed.** A shared server hosts sessions from many
 projects, so when a session's project directory is known the plugin resolves the
-socket by walking up for `<dir>/.agentctl/relay.sock` (then `<dir>/.agentctl/`)
+socket by walking up for `<dir>/.relay/relay.sock` (then `<dir>/.relay/`)
 and otherwise **drops** the event — it never falls back to another project's
-`$AGENTCTL_SOCK`. `$AGENTCTL_SOCK` is only used when the directory is unknown
-**and** `AGENTCTL_DEDICATED=1` (dedicated single-project deployments). Directory
+`$RELAY_SOCK`. `$RELAY_SOCK` is only used when the directory is unknown
+**and** `RELAY_DEDICATED=1` (dedicated single-project deployments). Directory
 lookups cache successes only, so a transient failure is retried on the next
 event.
 
@@ -343,51 +343,51 @@ per location. To get the tools in every project (and guarantee the forwarder is
 present), symlink it once:
 
 ```bash
-ln -s "$(pwd)/.opencode/plugins/agentctl.ts" ~/.config/opencode/plugins/agentctl.ts
+ln -s "$(pwd)/.opencode/plugins/relay.ts" ~/.config/opencode/plugins/relay.ts
 ```
 
 ## Minimal demo: 2 workers + planner + reviewer
 
-Terminal 1 — supervisor: `agentctl daemon`
+Terminal 1 — supervisor: `relay daemon`
 
 Terminal 2 — cast + queue:
 
 ```bash
-agentctl worker register worker-1 --role worker --cwd $PWD
-agentctl worker register worker-2 --role worker --cwd $PWD
-agentctl worker register planner --role planner
-agentctl worker register reviewer --role reviewer
+relay worker register worker-1 --role worker --cwd $PWD
+relay worker register worker-2 --role worker --cwd $PWD
+relay worker register planner --role planner
+relay worker register reviewer --role reviewer
 
-agentctl task add "Add password reset endpoint" --priority 10 \
+relay task add "Add password reset endpoint" --priority 10 \
   --acceptance "POST /reset requested, token emailed, tests green"
-agentctl task add "Write reset-email template" --priority 5
+relay task add "Write reset-email template" --priority 5
 ```
 
 Workers (two OpenCode panes; run `agent_attach`, load `agent-worker` skill):
 
 ```bash
-export AGENTCTL_WORKER=worker-1
-agentctl next                                    # atomic claim, prints lease
-agentctl note T1 "endpoint scaffolded"
-agentctl submit T1 --evidence "bun test reset (8 pass)"
-agentctl next                                    # immediately, never wait
+export RELAY_WORKER=worker-1
+relay next                                    # atomic claim, prints lease
+relay note T1 "endpoint scaffolded"
+relay submit T1 --evidence "bun test reset (8 pass)"
+relay next                                    # immediately, never wait
 ```
 
-Reviewer: `agentctl next` (review first, then queued — peer, no hierarchy),
-`agentctl approve T1` (`review → done`) or `agentctl reject T1 "reason"`
+Reviewer: `relay next` (review first, then queued — peer, no hierarchy),
+`relay approve T1` (`review → done`) or `relay reject T1 "reason"`
 (`review → queued` + note). Planner tops up when the queue runs low (daemon
-wakes it). Human blocker: `agentctl block T2 --human "..."` then `agentctl
+wakes it). Human blocker: `relay block T2 --human "..."` then `relay
 next` — the system keeps moving.
 
 Messages (durable-first: INSERT → commit → wake; wake failure keeps the row):
 
 ```bash
-agentctl send worker-2 "T1 is ready for review" --task T1
-AGENTCTL_WORKER=worker-2 agentctl inbox --claim   # bulk (compat)
-AGENTCTL_WORKER=worker-2 agentctl inbox --ack 7   # per-ID ack
+relay send worker-2 "T1 is ready for review" --task T1
+RELAY_WORKER=worker-2 relay inbox --claim   # bulk (compat)
+RELAY_WORKER=worker-2 relay inbox --ack 7   # per-ID ack
 ```
 
-Observe: `agentctl status`, `agentctl events --follow`.
+Observe: `relay status`, `relay events --follow`.
 
 ## Worker protocol (also in the Skill)
 
@@ -406,7 +406,7 @@ Claims carry fencing leases; `note` heartbeats + renews; a stale worker's late
   auto-attach, activation. Old tabs are never closed in the restart path.
 - **Old generation cleanup**: a separate pass reaps `relay_owned` stale/dead
   runtimes past their grace period, only when provably relay-owned (label check)
-  and never the current generation/runtime (`agentctl runtime list` to inspect).
+  and never the current generation/runtime (`relay runtime list` to inspect).
   Adopted (`relay_owned=false`) tabs are never closed.
 - **Stalled** (running + valid lease + alive + stale progress + repeated idle):
   nudge once → still nothing → interrupt, requeue, fresh generation.
@@ -455,6 +455,6 @@ relay-owned runtime row + token · old session/generation events are fenced out.
 src/cli.ts  daemon.ts  db.ts  schema.ts  scheduler.ts  reconciler.ts
     sessions.ts  socket.ts  messages.ts  tasks.ts  workers.ts  events.ts
     runtimes.ts  runtime/{runtime,herdr}.ts
-.opencode/plugins/agentctl.ts  .opencode/skills/agent-worker/SKILL.md
+.opencode/plugins/relay.ts  .opencode/skills/agent-worker/SKILL.md
 tests/{integration,contract,lifecycle,herdr}.test.ts
 ```

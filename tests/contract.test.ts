@@ -28,13 +28,13 @@ function eventCount(): number {
 }
 
 beforeEach(() => {
-  dir = mkdtempSync(join(tmpdir(), "agentctl-contract-"));
-  process.env.AGENTCTL_DB = join(dir, "state.db");
-  process.env.AGENTCTL_LEASE_MS = "120000";
-  process.env.AGENTCTL_STALL_MS = "60000";
-  process.env.AGENTCTL_WAKE_COOLDOWN_MS = "0";
-  delete process.env.AGENTCTL_AUTO_APPROVE;
-  db = openDb(process.env.AGENTCTL_DB);
+  dir = mkdtempSync(join(tmpdir(), "relay-contract-"));
+  process.env.RELAY_DB = join(dir, "state.db");
+  process.env.RELAY_LEASE_MS = "120000";
+  process.env.RELAY_STALL_MS = "60000";
+  process.env.RELAY_WAKE_COOLDOWN_MS = "0";
+  delete process.env.RELAY_AUTO_APPROVE;
+  db = openDb(process.env.RELAY_DB);
   rt = new MockRuntime();
   ctx = { db, runtime: rt, wakeReconcile: { value: false } };
 });
@@ -71,14 +71,14 @@ describe("A. idle workers + queued task", () => {
     expect(view.working).toBe(0);
     expect(actions.some((a) => a.startsWith("woken:"))).toBe(true);
     expect(rt.wakes.length).toBe(1);
-    expect(rt.wakes[0].text).toMatch(/agentctl next/);
+    expect(rt.wakes[0].text).toMatch(/relay next/);
     // DB unchanged by the wake itself: task still queued, worker still idle.
     expect(getTask(db, "T1")!.state).toBe("queued");
     expect(getWorker(db, rt.wakes[0].workerId)!.state).toBe("idle");
   });
 
   test("wake cooldown suppresses repeat wakes to the same worker", async () => {
-    process.env.AGENTCTL_WAKE_COOLDOWN_MS = "60000";
+    process.env.RELAY_WAKE_COOLDOWN_MS = "60000";
     idleWorker("w1");
     addTask(db, { title: "T1" });
     const { reconcile } = await import("../src/reconciler");

@@ -3,14 +3,16 @@ import { existsSync, mkdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { SCHEMA } from "./schema";
 
+export const STATE_DIR = ".relay";
+
 export function defaultDbPath(cwd = process.cwd()): string {
-  if (process.env.AGENTCTL_DB) return resolve(process.env.AGENTCTL_DB);
-  return join(cwd, ".agentctl", "state.db");
+  if (process.env.RELAY_DB) return resolve(process.env.RELAY_DB);
+  return join(cwd, STATE_DIR, "state.db");
 }
 
 export function defaultSockPath(cwd = process.cwd()): string {
-  if (process.env.AGENTCTL_SOCK) return resolve(process.env.AGENTCTL_SOCK);
-  const dbPath = process.env.AGENTCTL_DB ? resolve(process.env.AGENTCTL_DB) : join(cwd, ".agentctl", "state.db");
+  if (process.env.RELAY_SOCK) return resolve(process.env.RELAY_SOCK);
+  const dbPath = process.env.RELAY_DB ? resolve(process.env.RELAY_DB) : join(cwd, STATE_DIR, "state.db");
   return join(dirname(dbPath), "relay.sock");
 }
 
@@ -71,9 +73,9 @@ export function openDb(path?: string): Database {
 
 /** Initialize a fresh control plane directory (idempotent). */
 export function initControlPlane(cwd = process.cwd()): string {
-  const dir = join(cwd, ".agentctl");
+  const dir = join(cwd, STATE_DIR);
   mkdirSync(dir, { recursive: true });
-  const dbPath = process.env.AGENTCTL_DB ? resolve(process.env.AGENTCTL_DB) : join(dir, "state.db");
+  const dbPath = process.env.RELAY_DB ? resolve(process.env.RELAY_DB) : join(dir, "state.db");
   const dbExists = existsSync(dbPath);
   const db = openDb(dbPath);
   db.close();

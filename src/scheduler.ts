@@ -5,12 +5,12 @@ import { reviewTasks, runnableTasks, taskCounts, unfinishedCount } from "./tasks
 import { listWorkers, type WorkerRow } from "./workers";
 
 export function stallMs(): number {
-  const v = Number(process.env.AGENTCTL_STALL_MS ?? "60000");
+  const v = Number(process.env.RELAY_STALL_MS ?? "60000");
   return Number.isFinite(v) && v > 0 ? v : 60000;
 }
 
 export function lowWaterMark(): number {
-  const v = Number(process.env.AGENTCTL_LOW_WATER ?? "3");
+  const v = Number(process.env.RELAY_LOW_WATER ?? "3");
   return Number.isFinite(v) && v >= 0 ? v : 3;
 }
 
@@ -36,7 +36,7 @@ export function systemStatus(db: Database): SystemStatus {
  *   managed session bound (sessions.managed=1 for worker.opencode_session_id)
  *   OR worker.state == 'starting' with a relay-owned starting runtime
  *
- * A detached worker (agentctl `session detach` / agent_detach) keeps its row but
+ * A detached worker (relay `session detach` / agent_detach) keeps its row but
  * has NO managed session, so it is NOT operational: Relay never wakes, polls,
  * stalls or restarts it. The source of truth stays sessions.managed +
  * workers.opencode_session_id — no duplicate `workers.managed` flag.
@@ -110,7 +110,7 @@ export function productiveWorkers(db: Database): { id: string; state: string }[]
 /**
  * Workers that can accept NEW work: state == idle AND holding no task.
  * waiting_input is explicitly NOT here: such a worker still owns its current
- * work and must never be told to `agentctl next`. starting workers
+ * work and must never be told to `relay next`. starting workers
  * are not ready yet either, and detached workers are not schedulable at all.
  */
 export function idleWorkers(db: Database): { id: string; role: string; state: string }[] {

@@ -23,13 +23,13 @@ export interface DaemonOptions {
 export async function runDaemon(opts: DaemonOptions = {}): Promise<void> {
   const dbPath = opts.dbPath ?? defaultDbPath();
   if (!existsSync(dbPath)) {
-    console.error(`[agentctl] DB not found at ${dbPath}. Run \`agentctl init\` first.`);
+    console.error(`[relay] DB not found at ${dbPath}. Run \`relay init\` first.`);
     process.exit(1);
   }
-  const intervalMs = opts.intervalMs ?? Number(process.env.AGENTCTL_INTERVAL_MS ?? "1500");
+  const intervalMs = opts.intervalMs ?? Number(process.env.RELAY_INTERVAL_MS ?? "1500");
   const rt = opts.runtime ?? buildRuntime();
   const sockPath = opts.sockPath ?? defaultSockPath();
-  console.error(`[agentctl] daemon starting db=${dbPath} interval=${intervalMs}ms runtime=${rt.name}`);
+  console.error(`[relay] daemon starting db=${dbPath} interval=${intervalMs}ms runtime=${rt.name}`);
 
   let stop = false;
   const onSignal = () => { stop = true; };
@@ -41,9 +41,9 @@ export async function runDaemon(opts: DaemonOptions = {}): Promise<void> {
   if (!opts.once && !opts.noSocket) {
     try {
       sock = startSocketServer(ctx, sockPath);
-      console.error(`[agentctl] socket listening at ${sock.path}`);
+      console.error(`[relay] socket listening at ${sock.path}`);
     } catch (e) {
-      console.error(`[agentctl] socket unavailable (${String(e).slice(0, 120)}); continuing poll-only`);
+      console.error(`[relay] socket unavailable (${String(e).slice(0, 120)}); continuing poll-only`);
     }
   }
 
@@ -58,11 +58,11 @@ export async function runDaemon(opts: DaemonOptions = {}): Promise<void> {
           const { view, actions } = await reconcile(ctx.db, rt);
           if (actions.length > 0) {
             console.error(
-              `[agentctl] reconcile status=${view.status} runnable=${view.runnable} working=${view.working} actions=${actions.join(",")}`
+              `[relay] reconcile status=${view.status} runnable=${view.runnable} working=${view.working} actions=${actions.join(",")}`
             );
           }
         } catch (e) {
-          console.error(`[agentctl] reconcile error: ${String(e)}`);
+          console.error(`[relay] reconcile error: ${String(e)}`);
           try { logEvent(ctx.db, { source: "supervisor", type: "supervisor.error", payload: { error: String(e) } }); } catch { /* ignore */ }
         }
       }
@@ -73,5 +73,5 @@ export async function runDaemon(opts: DaemonOptions = {}): Promise<void> {
     sock?.stop();
     ctx.db.close();
   }
-  console.error("[agentctl] daemon stopped");
+  console.error("[relay] daemon stopped");
 }

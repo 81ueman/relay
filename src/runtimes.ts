@@ -9,7 +9,7 @@ import type { RuntimeState, WorkerRuntime } from "./schema";
 
 /** Grace period between marking an old runtime stale/dead and reaping its tab. */
 export function runtimeCleanupGraceMs(): number {
-  const v = Number(process.env.AGENTCTL_RUNTIME_CLEANUP_GRACE_MS ?? "300000");
+  const v = Number(process.env.RELAY_RUNTIME_CLEANUP_GRACE_MS ?? "300000");
   return Number.isFinite(v) && v >= 0 ? v : 300000;
 }
 

@@ -58,7 +58,7 @@ const IDLE_TYPES = new Set([
 const ERROR_TYPES = new Set(["session.error", "session.execution.failed"]);
 // The plugin normalizes permission/form replies into `permission.replied`; accept
 // the raw OpenCode forms too in one place. A reply NEVER means the task is done —
-// task semantics stay explicit (`agentctl submit` / `agentctl block`).
+// task semantics stay explicit (`relay submit` / `relay block`).
 const PERMISSION_ASKED = new Set(["permission.asked", "form.created"]);
 const PERMISSION_REPLIED = new Set(["permission.replied", "form.replied", "form.cancelled"]);
 
@@ -170,7 +170,7 @@ export async function handleSocketMessage(msg: SocketMessage, ctx: SocketContext
     return { ok: true };
   }
 
-  // Liveness only. Explicit `agentctl note` remains the strongest progress signal.
+  // Liveness only. Explicit `relay note` remains the strongest progress signal.
   touchSeen(db, workerId);
   logEvent(db, { source: "opencode", workerId, type, payload: msg.payload ?? {} });
   return { ok: true };

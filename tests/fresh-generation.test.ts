@@ -36,17 +36,17 @@ let rt: MockRuntime;
 let ctx: SocketContext;
 
 beforeEach(() => {
-  dir = mkdtempSync(join(tmpdir(), "agentctl-freshgen-"));
-  process.env.AGENTCTL_DB = join(dir, "state.db");
-  process.env.AGENTCTL_LEASE_MS = "120000";
-  process.env.AGENTCTL_STALL_MS = "60000";
-  process.env.AGENTCTL_WAKE_COOLDOWN_MS = "0";
-  process.env.AGENTCTL_RESTART_COOLDOWN_MS = "0";
-  process.env.AGENTCTL_ATTACH_TIMEOUT_MS = "30000";
-  process.env.AGENTCTL_RUNTIME_CLEANUP_GRACE_MS = "300000";
-  delete process.env.AGENTCTL_BOOTSTRAP_RETRY_MS;
-  delete process.env.AGENTCTL_AUTO_APPROVE;
-  db = openDb(process.env.AGENTCTL_DB);
+  dir = mkdtempSync(join(tmpdir(), "relay-freshgen-"));
+  process.env.RELAY_DB = join(dir, "state.db");
+  process.env.RELAY_LEASE_MS = "120000";
+  process.env.RELAY_STALL_MS = "60000";
+  process.env.RELAY_WAKE_COOLDOWN_MS = "0";
+  process.env.RELAY_RESTART_COOLDOWN_MS = "0";
+  process.env.RELAY_ATTACH_TIMEOUT_MS = "30000";
+  process.env.RELAY_RUNTIME_CLEANUP_GRACE_MS = "300000";
+  delete process.env.RELAY_BOOTSTRAP_RETRY_MS;
+  delete process.env.RELAY_AUTO_APPROVE;
+  db = openDb(process.env.RELAY_DB);
   rt = new MockRuntime();
   ctx = { db, runtime: rt, wakeReconcile: { value: false } };
 });
@@ -116,7 +116,7 @@ describe("fresh generation ordering", () => {
   });
 
   test("a failed bootstrap wake keeps the generation and retries after the cooldown", async () => {
-    process.env.AGENTCTL_BOOTSTRAP_RETRY_MS = "0";
+    process.env.RELAY_BOOTSTRAP_RETRY_MS = "0";
     seedSpawned("w1", 1);
     rt.setAlive("w1", false);
     rt.failWake.add("w1");
@@ -142,9 +142,9 @@ describe("fresh generation ordering", () => {
 
 describe("attach timeout recovery", () => {
   test("a never-attaching generation stays recoverable, then gets a fresh generation and the dead one is reaped", async () => {
-    process.env.AGENTCTL_ATTACH_TIMEOUT_MS = "1";
-    process.env.AGENTCTL_RESTART_COOLDOWN_MS = "60000";
-    process.env.AGENTCTL_RUNTIME_CLEANUP_GRACE_MS = "0";
+    process.env.RELAY_ATTACH_TIMEOUT_MS = "1";
+    process.env.RELAY_RESTART_COOLDOWN_MS = "60000";
+    process.env.RELAY_RUNTIME_CLEANUP_GRACE_MS = "0";
     seedSpawned("w1", 1);
     rt.setAlive("w1", false);
 

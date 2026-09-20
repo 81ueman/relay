@@ -7,7 +7,7 @@ import type { Task, TaskState } from "./schema";
 export const STALE_LEASE = "STALE_LEASE";
 
 export function leaseMs(): number {
-  const v = Number(process.env.AGENTCTL_LEASE_MS ?? "120000");
+  const v = Number(process.env.RELAY_LEASE_MS ?? "120000");
   return Number.isFinite(v) && v > 0 ? v : 120000;
 }
 
@@ -77,7 +77,7 @@ export function taskCounts(db: Database): Record<string, number> {
  */
 export function claimNext(db: Database, workerId: string): Task | null {
   const worker = getWorker(db, workerId);
-  if (!worker) throw new Error(`unknown worker: ${workerId}. Register first: agentctl worker register ${workerId}`);
+  if (!worker) throw new Error(`unknown worker: ${workerId}. Register first: relay worker register ${workerId}`);
   const t = now();
 
   db.run("BEGIN IMMEDIATE");
@@ -132,8 +132,8 @@ export function claimNext(db: Database, workerId: string): Task | null {
 /** Atomically claim one specific task (queued -> running). Peer model: any role may claim. */
 export function claimTask(db: Database, taskId: string, workerId: string): Task {
   const worker = getWorker(db, workerId);
-  if (!worker) throw new Error(`unknown worker: ${workerId}. Register first: agentctl worker register ${workerId}`);
-  if (worker.role === "reviewer") throw new Error(`reviewers take review tasks via \`agentctl next\`, not claim`);
+  if (!worker) throw new Error(`unknown worker: ${workerId}. Register first: relay worker register ${workerId}`);
+  if (worker.role === "reviewer") throw new Error(`reviewers take review tasks via \`relay next\`, not claim`);
   const t = now();
   db.run("BEGIN IMMEDIATE");
   try {

@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { defaultDbPath, initControlPlane, now, openDb } from "./db";
+import { defaultDbPath, initControlPlane, now, openDb, STATE_DIR } from "./db";
 import { formatEvent, listEvents, logEvent } from "./events";
 import { ackMessage, claimInbox, deliverMessage, getMessage, inboxFor, sendMessage } from "./messages";
 import { runDaemon } from "./daemon";
@@ -20,53 +20,53 @@ import {
 } from "./workers";
 
 function usage(): string {
-  return `agentctl — lightweight supervisor for Herdr + OpenCode agents (SQLite is the source of truth)
+  return `relay — lightweight supervisor for Herdr + OpenCode agents (SQLite is the source of truth)
 
 Usage:
-  agentctl init
-  agentctl daemon [--once] [--interval <ms>]
+  relay init
+  relay daemon [--once] [--interval <ms>]
 
-  agentctl worker register <id> --role worker [--runtime <herdr-target>] [--session <sid>] [--cwd <dir>] [--command <cmd>]
-  agentctl worker list
-  agentctl worker status <id>
-  agentctl worker bind <id> --session <sid>
+  relay worker register <id> --role worker [--runtime <herdr-target>] [--session <sid>] [--cwd <dir>] [--command <cmd>]
+  relay worker list
+  relay worker status <id>
+  relay worker bind <id> --session <sid>
 
-  agentctl session attach --session <sid> [--role worker] [--worker <id>] [--dir <d>] [--worktree <w>] [--pane <p>] [--tab <t>]
-  agentctl session detach --session <sid>
-  agentctl session list
-  agentctl session status --session <sid>
+  relay session attach --session <sid> [--role worker] [--worker <id>] [--dir <d>] [--worktree <w>] [--pane <p>] [--tab <t>]
+  relay session detach --session <sid>
+  relay session list
+  relay session status --session <sid>
 
-  agentctl runtime list [--worker <id>] [--state <state>]
+  relay runtime list [--worker <id>] [--state <state>]
 
-  agentctl task add "description" [--title T] [--acceptance A] [--priority N] [--role R] [--parent T1]
-  agentctl task list [--state <state>]
-  agentctl task show <id>
+  relay task add "description" [--title T] [--acceptance A] [--priority N] [--role R] [--parent T1]
+  relay task list [--state <state>]
+  relay task show <id>
 
-  agentctl next [--worker <id>]
-  agentctl claim <task-id> [--worker <id>]
-  agentctl note <task-id> "progress" [--worker <id>]
-  agentctl submit <task-id> --evidence "..." [--worker <id>] [--lease <token>]
-  agentctl approve <task-id> [--worker <id>]
-  agentctl reject <task-id> "reason" [--worker <id>]
-  agentctl block <task-id> "reason" [--worker <id>] [--human]
-  agentctl unblock <task-id> [--worker <id>]
+  relay next [--worker <id>]
+  relay claim <task-id> [--worker <id>]
+  relay note <task-id> "progress" [--worker <id>]
+  relay submit <task-id> --evidence "..." [--worker <id>] [--lease <token>]
+  relay approve <task-id> [--worker <id>]
+  relay reject <task-id> "reason" [--worker <id>]
+  relay block <task-id> "reason" [--worker <id>] [--human]
+  relay unblock <task-id> [--worker <id>]
 
-  agentctl send <worker-id> "message" [--task <tid>] [--kind <k>]
-  agentctl inbox [--worker <id>] [--claim] [--ack <msg-id>]
+  relay send <worker-id> "message" [--task <tid>] [--kind <k>]
+  relay inbox [--worker <id>] [--claim] [--ack <msg-id>]
 
-  agentctl status
-  agentctl events [--follow] [--limit N]
+  relay status
+  relay events [--follow] [--limit N]
 
   # Debug entrypoint (the OpenCode plugin normally talks to the daemon socket)
-  agentctl event record --type <t> [--session <sid>] [--worker <id>] [--task <tid>] [--payload <json>]
+  relay event record --type <t> [--session <sid>] [--worker <id>] [--task <tid>] [--payload <json>]
 
-Worker identity: --worker flag, $AGENTCTL_WORKER, or .agentctl/worker-id
-DB: $AGENTCTL_DB or .agentctl/state.db (WAL mode)
-Env: AGENTCTL_LEASE_MS AGENTCTL_STALL_MS AGENTCTL_LOW_WATER AGENTCTL_AUTO_APPROVE AGENTCTL_INTERVAL_MS
-Spawn: AGENTCTL_HERDR_WORKSPACE (required to spawn; else $HERDR_WORKSPACE_ID)
+Worker identity: --worker flag, $RELAY_WORKER, or .relay/worker-id
+DB: $RELAY_DB or .relay/state.db (WAL mode)
+Env: RELAY_LEASE_MS RELAY_STALL_MS RELAY_LOW_WATER RELAY_AUTO_APPROVE RELAY_INTERVAL_MS
+Spawn: RELAY_HERDR_WORKSPACE (required to spawn; else $HERDR_WORKSPACE_ID)
 Manual attach: requires a live Herdr agent (use --pane/--tab or $HERDR_PANE_ID/$HERDR_TAB_ID)
-Runtime cleanup: AGENTCTL_RUNTIME_CLEANUP_GRACE_MS AGENTCTL_ATTACH_TIMEOUT_MS AGENTCTL_RESTART_COOLDOWN_MS
-Herdr is required. AGENTCTL_RUNTIME=mock is test-only.
+Runtime cleanup: RELAY_RUNTIME_CLEANUP_GRACE_MS RELAY_ATTACH_TIMEOUT_MS RELAY_RESTART_COOLDOWN_MS
+Herdr is required. RELAY_RUNTIME=mock is test-only.
 `;
 }
 
@@ -82,14 +82,14 @@ function hasFlag(args: string[], name: string): boolean {
 
 function resolveWorkerId(explicit?: string): string {
   if (explicit) return explicit;
-  const env = process.env.AGENTCTL_WORKER;
-  if (env) return env;
-  const f = join(process.cwd(), ".agentctl", "worker-id");
+  const envWorker = process.env.RELAY_WORKER;
+  if (envWorker) return envWorker;
+  const f = join(process.cwd(), STATE_DIR, "worker-id");
   if (existsSync(f)) {
     const v = readFileSync(f, "utf-8").trim();
     if (v) return v;
   }
-  throw new Error("no worker identity: pass --worker <id>, set $AGENTCTL_WORKER, or run `agentctl worker register`");
+  throw new Error("no worker identity: pass --worker <id>, set $RELAY_WORKER, or run `relay worker register`");
 }
 
 function fmtAge(ms: number): string {
@@ -127,7 +127,7 @@ async function main(): Promise<void> {
         const sub = argv[1];
         if (sub === "register") {
           const id = argv[2];
-          if (!id) throw new Error("usage: agentctl worker register <id> --role worker");
+          if (!id) throw new Error("usage: relay worker register <id> --role worker");
           const role = flag(argv.slice(2), "--role") ?? "worker";
           const runtimeId = flag(argv.slice(2), "--runtime");
           const sessionId = flag(argv.slice(2), "--session");
@@ -140,7 +140,7 @@ async function main(): Promise<void> {
           });
           setWorkerState(db, id, "idle");
           // Remember a default worker identity for this checkout.
-          try { writeFileSync(join(process.cwd(), ".agentctl", "worker-id"), id); } catch { /* ignore */ }
+          try { writeFileSync(join(process.cwd(), STATE_DIR, "worker-id"), id); } catch { /* ignore */ }
           console.log(`registered ${w.id} role=${w.role}`);
         } else if (sub === "list") {
           for (const w of listWorkers(db)) {
@@ -148,14 +148,14 @@ async function main(): Promise<void> {
           }
         } else if (sub === "status") {
           const id = argv[2];
-          if (!id) throw new Error("usage: agentctl worker status <id>");
+          if (!id) throw new Error("usage: relay worker status <id>");
           const w = getWorker(db, id);
           if (!w) throw new Error(`unknown worker: ${id}`);
           console.log(JSON.stringify(w, null, 2));
         } else if (sub === "bind") {
           const id = argv[2];
           const sessionId = flag(argv.slice(2), "--session");
-          if (!id || !sessionId) throw new Error("usage: agentctl worker bind <id> --session <sid>");
+          if (!id || !sessionId) throw new Error("usage: relay worker bind <id> --session <sid>");
           const w = bindSession(db, id, sessionId);
           console.log(`bound ${w.id} session=${w.opencode_session_id}`);
         } else {
@@ -169,7 +169,7 @@ async function main(): Promise<void> {
         const rest = argv.slice(2);
         if (sub === "attach") {
           const sessionId = flag(rest, "--session");
-          if (!sessionId) throw new Error("usage: agentctl session attach --session <sid> [--role R] [--worker W] [--dir D] [--pane P] [--tab T]");
+          if (!sessionId) throw new Error("usage: relay session attach --session <sid> [--role R] [--worker W] [--dir D] [--pane P] [--tab T]");
           // Manual attach: the session must provably live inside a Herdr agent.
           // Resolve + verify BEFORE touching the DB; unverifiable => fail closed.
           // `--dir <project>` identifies the pane from the session's working
@@ -199,7 +199,7 @@ async function main(): Promise<void> {
           );
         } else if (sub === "detach") {
           const sessionId = flag(rest, "--session");
-          if (!sessionId) throw new Error("usage: agentctl session detach --session <sid>");
+          if (!sessionId) throw new Error("usage: relay session detach --session <sid>");
           const s = detachSession(db, sessionId);
           console.log(s ? `detached ${s.session_id}` : "no such session (already unmanaged)");
         } else if (sub === "list") {
@@ -208,7 +208,7 @@ async function main(): Promise<void> {
           }
         } else if (sub === "status") {
           const sessionId = flag(rest, "--session");
-          if (!sessionId) throw new Error("usage: agentctl session status --session <sid>");
+          if (!sessionId) throw new Error("usage: relay session status --session <sid>");
           const s = getSession(db, sessionId);
           if (!s) {
             console.log("unmanaged (unknown session)");
@@ -223,7 +223,7 @@ async function main(): Promise<void> {
 
       case "runtime": {
         const sub = argv[1];
-        if (sub !== "list") throw new Error("usage: agentctl runtime list [--worker <id>] [--state <state>]");
+        if (sub !== "list") throw new Error("usage: relay runtime list [--worker <id>] [--state <state>]");
         const rest = argv.slice(2);
         const workerId = flag(rest, "--worker");
         const state = flag(rest, "--state");
@@ -242,7 +242,7 @@ async function main(): Promise<void> {
         const sub = argv[1];
         if (sub === "add") {
           const desc = argv[2];
-          if (!desc) throw new Error('usage: agentctl task add "description" [...]');
+          if (!desc) throw new Error('usage: relay task add "description" [...]');
           const rest = argv.slice(2);
           const t = addTask(db, {
             title: flag(rest, "--title") ?? desc.slice(0, 80),
@@ -260,7 +260,7 @@ async function main(): Promise<void> {
           }
         } else if (sub === "show") {
           const id = argv[2];
-          if (!id) throw new Error("usage: agentctl task show <id>");
+          if (!id) throw new Error("usage: relay task show <id>");
           const t = getTask(db, id);
           if (!t) throw new Error(`unknown task: ${id}`);
           console.log(JSON.stringify(t, null, 2));
@@ -289,7 +289,7 @@ async function main(): Promise<void> {
 
       case "claim": {
         const id = argv[1];
-        if (!id) throw new Error("usage: agentctl claim <task-id>");
+        if (!id) throw new Error("usage: relay claim <task-id>");
         const workerId = resolveWorkerId(flag(argv, "--worker"));
         const claimed = claimTask(db, id, workerId);
         console.log(`${claimed.id} lease=${claimed.lease_token}`);
@@ -299,7 +299,7 @@ async function main(): Promise<void> {
       case "note": {
         const id = argv[1];
         const body = argv[2];
-        if (!id || !body) throw new Error('usage: agentctl note <task-id> "progress"');
+        if (!id || !body) throw new Error('usage: relay note <task-id> "progress"');
         const workerId = resolveWorkerId(flag(argv, "--worker"));
         addNote(db, id, workerId, body);
         console.log("noted");
@@ -308,7 +308,7 @@ async function main(): Promise<void> {
 
       case "submit": {
         const id = argv[1];
-        if (!id) throw new Error("usage: agentctl submit <task-id> --evidence ...");
+        if (!id) throw new Error("usage: relay submit <task-id> --evidence ...");
         const workerId = resolveWorkerId(flag(argv, "--worker"));
         const evidence = flag(argv, "--evidence") ?? "";
         const leaseRaw = flag(argv, "--lease");
@@ -322,7 +322,7 @@ async function main(): Promise<void> {
 
       case "approve": {
         const id = argv[1];
-        if (!id) throw new Error("usage: agentctl approve <task-id>");
+        if (!id) throw new Error("usage: relay approve <task-id>");
         const workerId = resolveWorkerId(flag(argv, "--worker"));
         const t = approveTask(db, id, workerId);
         console.log(`${t.id} -> done`);
@@ -332,7 +332,7 @@ async function main(): Promise<void> {
       case "reject": {
         const id = argv[1];
         const reason = argv[2];
-        if (!id || !reason) throw new Error('usage: agentctl reject <task-id> "reason"');
+        if (!id || !reason) throw new Error('usage: relay reject <task-id> "reason"');
         const workerId = resolveWorkerId(flag(argv, "--worker"));
         const t = rejectTask(db, id, workerId, reason);
         console.log(`${t.id} -> queued`);
@@ -342,7 +342,7 @@ async function main(): Promise<void> {
       case "block": {
         const id = argv[1];
         const reason = argv[2];
-        if (!id || !reason) throw new Error('usage: agentctl block <task-id> "reason" [--human]');
+        if (!id || !reason) throw new Error('usage: relay block <task-id> "reason" [--human]');
         const workerId = resolveWorkerId(flag(argv, "--worker"));
         const t = blockTask(db, id, workerId, reason, hasFlag(argv, "--human"));
         console.log(`${t.id} -> ${t.state}`);
@@ -351,7 +351,7 @@ async function main(): Promise<void> {
 
       case "unblock": {
         const id = argv[1];
-        if (!id) throw new Error("usage: agentctl unblock <task-id>");
+        if (!id) throw new Error("usage: relay unblock <task-id>");
         const workerId = resolveWorkerId(flag(argv, "--worker"));
         const t = unblockTask(db, id, workerId);
         console.log(`${t.id} -> ${t.state}`);
@@ -361,8 +361,8 @@ async function main(): Promise<void> {
       case "send": {
         const recipient = argv[1];
         const payload = argv[2];
-        if (!recipient || !payload) throw new Error('usage: agentctl send <worker-id> "message"');
-        const sender = process.env.AGENTCTL_WORKER ?? "human";
+        if (!recipient || !payload) throw new Error('usage: relay send <worker-id> "message"');
+        const sender = process.env.RELAY_WORKER ?? "human";
         const id = sendMessage(db, sender, recipient, payload, {
           taskId: flag(argv, "--task") ?? undefined,
           kind: flag(argv, "--kind") ?? undefined,
@@ -378,7 +378,7 @@ async function main(): Promise<void> {
         };
         try {
           const rt = new HerdrRuntime();
-          await rt.wake(targetRow, `You have a new durable message (id ${id}). Run \`agentctl inbox --claim\` to receive it.`);
+          await rt.wake(targetRow, `You have a new durable message (id ${id}). Run \`relay inbox --claim\` to receive it.`);
           console.log(`sent msg=${id} (wake delivered)`);
         } catch (e) {
           console.log(`sent msg=${id} (wake failed, message remains queued: ${String(e).slice(0, 120)})`);
@@ -444,7 +444,7 @@ async function main(): Promise<void> {
           let since = 0;
           const latest = listEvents(db, { limit: 1 });
           if (latest.length > 0) since = latest[0].id;
-          console.error("[agentctl] following events (Ctrl-C to stop)");
+          console.error("[relay] following events (Ctrl-C to stop)");
           for (;;) {
             const evts = listEvents(db, { sinceId: since });
             for (const e of evts) {
@@ -459,7 +459,7 @@ async function main(): Promise<void> {
 
       case "event": {
         const sub = argv[1];
-        if (sub !== "record") throw new Error("usage: agentctl event record --type <t> [...]");
+        if (sub !== "record") throw new Error("usage: relay event record --type <t> [...]");
         const rest = argv.slice(2);
         const type = flag(rest, "--type");
         if (!type) throw new Error("event record requires --type");
@@ -520,6 +520,6 @@ function touchSeenSafe(db: ReturnType<typeof openDb>, workerId: string | undefin
 }
 
 main().catch((e) => {
-  console.error(`agentctl: ${e instanceof Error ? e.message : String(e)}`);
+  console.error(`relay: ${e instanceof Error ? e.message : String(e)}`);
   process.exit(1);
 });

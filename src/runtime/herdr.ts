@@ -52,7 +52,7 @@ export function herdrTarget(w: Pick<Worker, "id" | "runtime_id">): string {
  * in an unrelated workspace). Fail closed when unset.
  */
 export function herdrWorkspace(): string | null {
-  const v = process.env.AGENTCTL_HERDR_WORKSPACE ?? process.env.HERDR_WORKSPACE_ID ?? "";
+  const v = process.env.RELAY_HERDR_WORKSPACE ?? process.env.HERDR_WORKSPACE_ID ?? "";
   return v.trim() ? v.trim() : null;
 }
 
@@ -196,8 +196,8 @@ export const BOOTSTRAP_PROMPT = (workerId: string, generation: number, attachTok
   // stops a stale or foreign plugin from binding a session it does not own.
   `RELAY-ATTACH worker=${workerId} gen=${generation}${attachToken ? ` token=${attachToken}` : ""}\n` +
   `You are managed by the relay supervisor as worker ${workerId} (generation ${generation}). ` +
-  `Load the agent-worker skill, then run \`agentctl next\` to claim work. ` +
-  `Never wait for instructions; after each submit/block run \`agentctl next\` again.`;
+  `Load the agent-worker skill, then run \`relay next\` to claim work. ` +
+  `Never wait for instructions; after each submit/block run \`relay next\` again.`;
 
 /** Best-effort normalization of a directory for comparison (symlinks, trailing slash). */
 function normalizeDir(p: string | null | undefined): string | null {
@@ -352,7 +352,7 @@ export class HerdrRuntime implements Runtime {
     const workspace = herdrWorkspace();
     if (!workspace) {
       throw new Error(
-        "no Herdr workspace configured: set AGENTCTL_HERDR_WORKSPACE (or HERDR_WORKSPACE_ID); refusing to spawn into the focused workspace"
+        "no Herdr workspace configured: set RELAY_HERDR_WORKSPACE (or HERDR_WORKSPACE_ID); refusing to spawn into the focused workspace"
       );
     }
     const cwd = w.cwd ?? process.cwd();
@@ -375,13 +375,13 @@ export class HerdrRuntime implements Runtime {
     }
 
     const envArgs: string[] = [
-      "--env", "AGENTCTL_MANAGED=1",
-      "--env", `AGENTCTL_WORKER=${w.id}`,
-      "--env", `AGENTCTL_GENERATION=${generation}`,
+      "--env", "RELAY_MANAGED=1",
+      "--env", `RELAY_WORKER=${w.id}`,
+      "--env", `RELAY_GENERATION=${generation}`,
     ];
-    if (process.env.AGENTCTL_DB) envArgs.push("--env", `AGENTCTL_DB=${process.env.AGENTCTL_DB}`);
-    if (process.env.AGENTCTL_SOCK) envArgs.push("--env", `AGENTCTL_SOCK=${process.env.AGENTCTL_SOCK}`);
-    // The spawned agent must be able to resolve `agentctl`/`opencode` exactly
+    if (process.env.RELAY_DB) envArgs.push("--env", `RELAY_DB=${process.env.RELAY_DB}`);
+    if (process.env.RELAY_SOCK) envArgs.push("--env", `RELAY_SOCK=${process.env.RELAY_SOCK}`);
+    // The spawned agent must be able to resolve `relay`/`opencode` exactly
     // like the daemon does; tab shells do not inherit the daemon's PATH.
     if (process.env.PATH) envArgs.push("--env", `PATH=${process.env.PATH}`);
 
@@ -461,10 +461,10 @@ export class HerdrRuntime implements Runtime {
  */
 export function buildRuntime(): Runtime {
   // Explicit, non-silent test/dev opt-in only.
-  if (process.env.AGENTCTL_RUNTIME === "mock") return new MockRuntime();
+  if (process.env.RELAY_RUNTIME === "mock") return new MockRuntime();
   if (process.env.HERDR_ENV !== "1" && !process.env.HERDR_SOCKET_PATH) {
     throw new Error(
-      "relay requires Herdr; herdr CLI/socket is unavailable (no HERDR_ENV/HERDR_SOCKET_PATH). MockRuntime is test-only; run inside Herdr or set AGENTCTL_RUNTIME=mock for tests."
+      "relay requires Herdr; herdr CLI/socket is unavailable (no HERDR_ENV/HERDR_SOCKET_PATH). MockRuntime is test-only; run inside Herdr or set RELAY_RUNTIME=mock for tests."
     );
   }
   if (!runHerdr(["agent", "list"], 8000).ok) {

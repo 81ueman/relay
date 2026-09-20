@@ -40,16 +40,16 @@ let rt: MockRuntime;
 let ctx: SocketContext;
 
 beforeEach(() => {
-  dir = mkdtempSync(join(tmpdir(), "agentctl-management-"));
-  process.env.AGENTCTL_DB = join(dir, "state.db");
-  process.env.AGENTCTL_LEASE_MS = "120000";
-  process.env.AGENTCTL_STALL_MS = "60000";
-  process.env.AGENTCTL_WAKE_COOLDOWN_MS = "0";
-  process.env.AGENTCTL_RESTART_COOLDOWN_MS = "0";
-  process.env.AGENTCTL_ATTACH_TIMEOUT_MS = "30000";
-  process.env.AGENTCTL_RUNTIME_CLEANUP_GRACE_MS = "300000";
-  delete process.env.AGENTCTL_AUTO_APPROVE;
-  db = openDb(process.env.AGENTCTL_DB);
+  dir = mkdtempSync(join(tmpdir(), "relay-management-"));
+  process.env.RELAY_DB = join(dir, "state.db");
+  process.env.RELAY_LEASE_MS = "120000";
+  process.env.RELAY_STALL_MS = "60000";
+  process.env.RELAY_WAKE_COOLDOWN_MS = "0";
+  process.env.RELAY_RESTART_COOLDOWN_MS = "0";
+  process.env.RELAY_ATTACH_TIMEOUT_MS = "30000";
+  process.env.RELAY_RUNTIME_CLEANUP_GRACE_MS = "300000";
+  delete process.env.RELAY_AUTO_APPROVE;
+  db = openDb(process.env.RELAY_DB);
   rt = new MockRuntime();
   ctx = { db, runtime: rt, wakeReconcile: { value: false } };
 });

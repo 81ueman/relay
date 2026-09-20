@@ -1,10 +1,10 @@
 {
   "name": "relay",
   "version": "0.1.0",
-  "description": "Lightweight deterministic supervisor (agentctl) that keeps Herdr + OpenCode agents moving while SQLite stays the source of truth.",
+  "description": "Lightweight deterministic supervisor that keeps Herdr + OpenCode agents moving while SQLite stays the source of truth.",
   "type": "module",
   "bin": {
-    "agentctl": "./dist/cli.js"
+    "relay": "./dist/cli.js"
   },
   "scripts": {
     "build": "bun build src/cli.ts --outdir dist --target bun",

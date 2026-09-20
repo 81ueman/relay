@@ -22,13 +22,13 @@ let db: Database;
 let rt: MockRuntime;
 
 beforeEach(() => {
-  dir = mkdtempSync(join(tmpdir(), "agentctl-test-"));
-  process.env.AGENTCTL_DB = join(dir, "state.db");
-  process.env.AGENTCTL_LEASE_MS = "120000";
-  process.env.AGENTCTL_STALL_MS = "60000";
-  process.env.AGENTCTL_WAKE_COOLDOWN_MS = "0";
-  delete process.env.AGENTCTL_AUTO_APPROVE;
-  db = openDb(process.env.AGENTCTL_DB);
+  dir = mkdtempSync(join(tmpdir(), "relay-test-"));
+  process.env.RELAY_DB = join(dir, "state.db");
+  process.env.RELAY_LEASE_MS = "120000";
+  process.env.RELAY_STALL_MS = "60000";
+  process.env.RELAY_WAKE_COOLDOWN_MS = "0";
+  delete process.env.RELAY_AUTO_APPROVE;
+  db = openDb(process.env.RELAY_DB);
   rt = new MockRuntime();
 });
 
@@ -110,7 +110,7 @@ describe("failure test 1: idle false-positive", () => {
     addTask(db, { title: "waiting work" });
     const outcome = await handleIdleSignal(db, rt, "w1");
     expect(outcome).toBe("woke-next");
-    expect(rt.wakes[0].text).toMatch(/agentctl next/);
+    expect(rt.wakes[0].text).toMatch(/relay next/);
   });
 
   test("idle in review => woken to next, task untouched", async () => {
@@ -250,13 +250,13 @@ describe("failure test 6: no productive worker", () => {
     expect(view.working).toBe(0);
     expect(actions.some((a) => a.startsWith("woken:"))).toBe(true);
     expect(rt.wakes.length).toBe(1);
-    expect(rt.wakes[0].text).toMatch(/agentctl next/);
+    expect(rt.wakes[0].text).toMatch(/relay next/);
   });
 });
 
 describe("stalled detection (multi-signal, never bare idle)", () => {
   test("no progress + alive + valid lease => nudge once, then stalled", async () => {
-    process.env.AGENTCTL_STALL_MS = "100";
+    process.env.RELAY_STALL_MS = "100";
     worker("w1");
     const t = addTask(db, { title: "stuck" });
     claimNext(db, "w1");
@@ -277,7 +277,7 @@ describe("stalled detection (multi-signal, never bare idle)", () => {
   });
 
   test("fresh progress prevents stall verdict", async () => {
-    process.env.AGENTCTL_STALL_MS = "60000";
+    process.env.RELAY_STALL_MS = "60000";
     worker("w1");
     const t = addTask(db, { title: "moving" });
     claimNext(db, "w1");
@@ -304,8 +304,8 @@ describe("planner / reviewer automation", () => {
     expect(getTask(db, t.id)!.state).toBe("review");
   });
 
-  test("AGENTCTL_AUTO_APPROVE drains review queue", async () => {
-    process.env.AGENTCTL_AUTO_APPROVE = "true";
+  test("RELAY_AUTO_APPROVE drains review queue", async () => {
+    process.env.RELAY_AUTO_APPROVE = "true";
     worker("w1");
     const t = addTask(db, { title: "auto" });
     claimNext(db, "w1");
@@ -316,7 +316,7 @@ describe("planner / reviewer automation", () => {
   });
 
   test("planner woken when queue runs low", async () => {
-    process.env.AGENTCTL_LOW_WATER = "3";
+    process.env.RELAY_LOW_WATER = "3";
     managedWorker("plan", "planner");
     addTask(db, { title: "last one" });
     const { actions } = await reconcile(db, rt);

@@ -39,50 +39,50 @@ import { getWorker, listWorkers, setWorkerState, touchSeen, type WorkerRow } fro
 // Deterministic reconciler. No LLM: pure DB state + runtime transport.
 // Callers pass full Worker rows; only the Runtime adapter maps to targets.
 
-export const NEXT_NUDGE = "Run `agentctl next` now. Do not wait for instructions.";
+export const NEXT_NUDGE = "Run `relay next` now. Do not wait for instructions.";
 export const CONTINUE_NUDGE = (taskId: string) =>
   `Your task ${taskId} is still running. ` +
   `Continue the next concrete action. ` +
   `If blocked, explicitly block it. ` +
   `Do not wait for instructions.`;
 export const STALL_NUDGE = (taskId: string) =>
-  `No progress on ${taskId} for a while. If you can proceed, continue now. If you are stuck, run \`agentctl block ${taskId} "<reason>"\` (or --human only when a human is truly required), then run \`agentctl next\`.`;
-export const REVIEW_NUDGE = "There are tasks waiting for review. Run `agentctl next` to pick one up.";
+  `No progress on ${taskId} for a while. If you can proceed, continue now. If you are stuck, run \`relay block ${taskId} "<reason>"\` (or --human only when a human is truly required), then run \`relay next\`.`;
+export const REVIEW_NUDGE = "There are tasks waiting for review. Run `relay next` to pick one up.";
 export const PLANNER_NUDGE =
-  "Task queue is running low. Decompose the next objective into small tasks with acceptance criteria (agentctl task add), then go idle. Do not monitor other workers.";
+  "Task queue is running low. Decompose the next objective into small tasks with acceptance criteria (relay task add), then go idle. Do not monitor other workers.";
 
 function wakeCooldownMs(): number {
-  const v = Number(process.env.AGENTCTL_WAKE_COOLDOWN_MS ?? "30000");
+  const v = Number(process.env.RELAY_WAKE_COOLDOWN_MS ?? "30000");
   return Number.isFinite(v) && v >= 0 ? v : 30000;
 }
 
 /** How long a fresh generation may wait for managed attach before we give up. */
 function attachTimeoutMs(): number {
-  const v = Number(process.env.AGENTCTL_ATTACH_TIMEOUT_MS ?? "30000");
+  const v = Number(process.env.RELAY_ATTACH_TIMEOUT_MS ?? "30000");
   return Number.isFinite(v) && v > 0 ? v : 30000;
 }
 
 /** Backoff between restart attempts for the same worker (avoids tab thrash). */
 function restartCooldownMs(): number {
-  const v = Number(process.env.AGENTCTL_RESTART_COOLDOWN_MS ?? "30000");
+  const v = Number(process.env.RELAY_RESTART_COOLDOWN_MS ?? "30000");
   return Number.isFinite(v) && v >= 0 ? v : 30000;
 }
 
 /** Retry interval for a bootstrap prompt that failed to be delivered. */
 function bootstrapRetryMs(): number {
-  const v = Number(process.env.AGENTCTL_BOOTSTRAP_RETRY_MS ?? "5000");
+  const v = Number(process.env.RELAY_BOOTSTRAP_RETRY_MS ?? "5000");
   return Number.isFinite(v) && v >= 0 ? v : 5000;
 }
 
 /** At most one `worker.bootstrap_failed` event per worker per window. */
 function bootstrapFailureLogWindowMs(): number {
-  const v = Number(process.env.AGENTCTL_BOOTSTRAP_LOG_WINDOW_MS ?? "60000");
+  const v = Number(process.env.RELAY_BOOTSTRAP_LOG_WINDOW_MS ?? "60000");
   return Number.isFinite(v) && v >= 0 ? v : 60000;
 }
 
 /** At most one `runtime.cleanup_failed` event per worker per window. */
 function cleanupFailureLogWindowMs(): number {
-  const v = Number(process.env.AGENTCTL_CLEANUP_LOG_WINDOW_MS ?? "60000");
+  const v = Number(process.env.RELAY_CLEANUP_LOG_WINDOW_MS ?? "60000");
   return Number.isFinite(v) && v >= 0 ? v : 60000;
 }
 
@@ -409,7 +409,7 @@ async function cleanupOldRuntimes(db: Database, rt: Runtime, actions: string[], 
 }
 
 function autoApproveEnabled(): boolean {
-  return process.env.AGENTCTL_AUTO_APPROVE === "true";
+  return process.env.RELAY_AUTO_APPROVE === "true";
 }
 
 export interface ReconcileResult {
