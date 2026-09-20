@@ -94,11 +94,22 @@ relay daemon   # reconcile loop + Unix socket .relay/relay.sock
 ```
 
 The OpenCode plugin (`.opencode/plugins/relay.ts`) and Skill
-(`.opencode/skills/agent-worker/SKILL.md`) are auto-discovered under this repo:
+(`skills/agent-worker/SKILL.md`, symlinked from `.opencode/skills/agent-worker`)
+are auto-discovered under this repo:
 
 ```bash
 opencode plugin list   # relay ... .opencode/plugins/relay.ts
 ```
+
+The `agent-worker` skill is also published through APM (Agent Package Manager):
+
+```bash
+apm install -g --target agent-skills 81ueman/relay
+```
+
+APM deploys skills only — install the `relay` CLI itself separately
+(`bun link` in this repo) and keep the plugin symlinked
+(`~/.config/opencode/plugins/relay.ts`).
 
 Identity / paths / tuning:
 
@@ -484,6 +495,6 @@ relay-owned runtime row + token · old session/generation events are fenced out.
 src/cli.ts  daemon.ts  db.ts  schema.ts  scheduler.ts  reconciler.ts
     sessions.ts  socket.ts  messages.ts  tasks.ts  workers.ts  events.ts
     runtimes.ts  runtime/{runtime,herdr}.ts
-.opencode/plugins/relay.ts  .opencode/skills/agent-worker/SKILL.md
+.opencode/plugins/relay.ts  skills/agent-worker/SKILL.md
 tests/{integration,contract,lifecycle,herdr}.test.ts
 ```
