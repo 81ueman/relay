@@ -304,6 +304,8 @@ describe("L2. a FIRST attach is allowed while the worker holds a task", () => {
     expect(w.runtime_id).toBe("herdr-a");
     expect(findRuntime(db, "w1", w.generation)!.pane_id).toBe("w9:p3");
     expect(getTask(db, t.id)!.assignee).toBe("w1");
+    // Attaching must not force 'idle': a rebind is not evidence the work stopped.
+    expect(w.state).toBe("working");
   });
 });
 

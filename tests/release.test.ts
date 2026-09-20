@@ -284,4 +284,31 @@ describe("C. liveness-aware lease expiry — crash recovery only", () => {
     expect(actions).toContain(`lease-expired:${t.id}`);
     expect(getTask(db, t.id)!.state).toBe("queued");
   });
+
+  test("an idle worker still holding a running task is nudged, not skipped", async () => {
+    managedWorker("w1", "worker");
+    const t = addTask(db, { title: "premature stop" });
+    claimNext(db, "w1");
+    // A session rebind used to force this exact drift: idle while owning a task.
+    db.query(`UPDATE workers SET state = 'idle', last_progress_at = 0, nudged_at = NULL WHERE id = 'w1'`).run();
+
+    const { actions } = await reconcile(db, rt);
+    expect(actions).toContain("nudge:w1");
+    expect(getWorker(db, "w1")!.nudged_at).not.toBeNull();
+    expect(getTask(db, t.id)!.state).toBe("running");
+  });
+
+  test("a LAPSED lease does not suppress the nudge for a live worker", async () => {
+    managedWorker("w1", "worker");
+    const t = addTask(db, { title: "lapsed but alive" });
+    claimNext(db, "w1");
+    const leaseUntil = getTask(db, t.id)!.lease_until!;
+    db.query(`UPDATE workers SET last_progress_at = 0, nudged_at = NULL WHERE id = 'w1'`).run();
+    rt.setAlive("w1", true); // transport alive => lease held, not revoked
+
+    const { actions } = await reconcile(db, rt, leaseUntil + 1);
+    expect(actions).not.toContain(`lease-expired:${t.id}`);
+    expect(actions).toContain("nudge:w1");
+    expect(getTask(db, t.id)!.state).toBe("running");
+  });
 });

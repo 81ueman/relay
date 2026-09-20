@@ -12,6 +12,7 @@ import {
   recordRuntime,
 } from "./runtimes";
 import { getWorker, registerWorker } from "./workers";
+import { getTask } from "./tasks";
 
 export interface Session {
   session_id: string;
@@ -219,12 +220,20 @@ export function attachSession(db: Database, sessionId: string, opts: AttachOptio
   }
 
   const runtimeId = spawned ? (runtimeRow!.runtime_id ?? worker.runtime_id) : opts.identity!.agent;
+  // Rebinding a session is NOT evidence the work stopped. A worker that already
+  // owns a RUNNING task keeps state 'working'; forcing 'idle' here stranded the
+  // task, because the supervisor's stall nudge only walks working/waiting_input
+  // workers — so an idle worker holding a running task was never revived
+  // (observed when a worker re-attached after its lease lapsed yet it still
+  // owned the re-claimed task).
+  const held = worker.current_task_id ? getTask(db, worker.current_task_id) : null;
+  const stillWorking = !!held && held.state === "running" && held.assignee === worker.id;
   db.query(
     `UPDATE workers
        SET opencode_session_id = ?, role = COALESCE(?, role), runtime_id = COALESCE(?, runtime_id),
-           state = 'idle', generation = ?, nudged_at = NULL, updated_at = ?
+           state = ?, generation = ?, nudged_at = NULL, updated_at = ?
      WHERE id = ?`
-  ).run(sessionId, explicitRole ?? null, runtimeId ?? null, generation, t, worker.id);
+  ).run(sessionId, explicitRole ?? null, runtimeId ?? null, stillWorking ? "working" : "idle", generation, t, worker.id);
 
   if (spawned) {
     // Promote the matching freshly spawned runtime row.

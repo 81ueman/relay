@@ -567,7 +567,13 @@ export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<
     }
 
     // Alive but DB moved on (task reassigned/completed elsewhere): resync to idle.
-    if ((fresh.state === "working" || fresh.state === "waiting_input") && fresh.current_task_id) {
+    // An 'idle' worker that still holds a task is included: it is the same
+    // "premature stop" state (e.g. a session rebind used to force idle), and if
+    // it were skipped here nothing would ever revive it.
+    if (
+      (fresh.state === "working" || fresh.state === "waiting_input" || fresh.state === "idle") &&
+      fresh.current_task_id
+    ) {
       const task = getTask(db, fresh.current_task_id);
       if (!task || (task.state !== "running" && task.state !== "review") || task.assignee !== w.id) {
         db.query(`UPDATE workers SET current_task_id = NULL, state = 'idle', updated_at = ? WHERE id = ?`).run(at, w.id);
@@ -575,12 +581,17 @@ export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<
         actions.push(`resynced:${w.id}`);
         continue;
       }
-      // Stalled: running + valid lease + stale progress + process alive.
-      if (task.state === "running" && (task.lease_until ?? 0) >= at && at - fresh.last_progress_at > stallTimeout) {
+      // Stalled: running + stale progress + process alive.
+      // A lapsed lease is NOT a reason to skip the nudge: lease expiry already
+      // decided ownership (a live worker keeps its task), so a live-but-quiet
+      // owner must still be revived even after it stopped running relay commands.
+      if (task.state === "running" && at - fresh.last_progress_at > stallTimeout) {
         if (!fresh.nudged_at) {
-          await tryWake(rt, db, fresh, STALL_NUDGE(task.id), "stall-nudge", at);
+          const woke = await tryWake(rt, db, fresh, STALL_NUDGE(task.id), "stall-nudge", at);
           db.query(`UPDATE workers SET nudged_at = ?, updated_at = ? WHERE id = ?`).run(at, at, w.id);
-          actions.push(`nudge:${w.id}`);
+          // Record the outcome: a failed wake is logged as worker.wake_failed and
+          // must not look like a delivered nudge.
+          actions.push(woke ? `nudge:${w.id}` : `nudge-failed:${w.id}`);
         } else if (at - fresh.nudged_at > stallTimeout) {
           setWorkerState(db, w.id, "stalled");
           logEvent(db, { source: "supervisor", workerId: w.id, taskId: task.id, type: "worker.stalled" });
