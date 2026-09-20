@@ -323,7 +323,13 @@ export function gateEvent(
   if (!sessionId) return { ok: false, reason: "no-session" };
   const s = getSession(db, sessionId);
   if (!s || s.managed !== 1) return { ok: false, reason: "unmanaged" };
-  if (eventGeneration === undefined) return { ok: false, reason: "no-generation" };
+  // The plugin only knows the generations it attached ITSELF; a session attached
+  // via the CLI (or before a plugin/server reload) is forwarded with no
+  // generation. The managed session row is the authority in that case — it is
+  // managed and `managedWorkerForSession` still proves the worker binding — so
+  // accept it rather than silently dropping every idle/error/permission event.
+  // An EXPLICIT generation must still match (a superseded generation is stale).
+  if (eventGeneration === undefined) return { ok: true, session: s };
   if (eventGeneration !== s.generation) return { ok: false, reason: "stale-generation" };
   return { ok: true, session: s };
 }

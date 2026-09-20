@@ -9,7 +9,7 @@ import { handleSocketMessage, type SocketContext } from "../src/socket";
 import { MockRuntime, type HerdrIdentity } from "../src/runtime/runtime";
 import { buildRuntime, pickIdentityByDirectory, resolveHerdrTarget, type HerdrAgentEntry } from "../src/runtime/herdr";
 import { reconcile } from "../src/reconciler";
-import { attachSession, getSession } from "../src/sessions";
+import { attachSession, gateEvent, getSession } from "../src/sessions";
 import {
   cleanupCandidates,
   findRuntime,
@@ -409,5 +409,34 @@ describe("L. wake target resolution", () => {
   test("no live match falls back to the recorded target (honest error)", () => {
     expect(resolveHerdrTarget({ id: "ghost", runtime_id: null }, [])).toBe("ghost");
     expect(resolveHerdrTarget({ id: "ghost", runtime_id: "stale-runtime" }, [])).toBe("stale-runtime");
+  });
+});
+
+describe("M. events without an explicit generation are gated by the session", () => {
+  test("a managed session is accepted; an explicit wrong generation is rejected", async () => {
+    rt.setIdentity("ses_g", IDENTITY);
+    const a = await handleSocketMessage(
+      { type: "session.attach", session_id: "ses_g", role: "worker", worker_id: "w1", pane_id: IDENTITY.paneId },
+      ctx
+    );
+    expect(a.ok).toBe(true);
+    const g = getSession(db, "ses_g")!.generation;
+    // The plugin does not always know the generation (CLI/other attach, or a
+    // plugin reload); the managed session row is the authority.
+    expect(gateEvent(db, "ses_g", undefined).ok).toBe(true);
+    expect(gateEvent(db, "ses_g", g).ok).toBe(true);
+    expect(gateEvent(db, "ses_g", g + 99).ok).toBe(false);
+  });
+
+  test("session.idle with no generation still reaches the idle handler", async () => {
+    rt.setIdentity("ses_i", IDENTITY);
+    await handleSocketMessage(
+      { type: "session.attach", session_id: "ses_i", role: "worker", worker_id: "w1", pane_id: IDENTITY.paneId },
+      ctx
+    );
+    const res = await handleSocketMessage({ type: "session.idle", session_id: "ses_i" }, ctx);
+    expect(res.ok).toBe(true);
+    expect(res.ignored).toBeUndefined();
+    expect(listEvents(db, { limit: 30 }).some((e) => e.type === "session.idle")).toBe(true);
   });
 });
