@@ -9,6 +9,7 @@ import { getWorker, setWorkerState, touchSeen } from "./workers";
 
 // JSON Lines over a Unix domain socket. Small protocol:
 //   {"type":"session.idle","session_id":"ses_xxx","generation":2}
+//     (also accepted raw as session.execution.succeeded / .interrupted)
 //   {"type":"session.error",...,"payload":{...}}
 //   {"type":"permission.asked" | "permission.replied" | "tool.execute.after" | "session.status" | ..., ...}
 //   {"type":"session.attach","session_id":...,"role":...,"worker_id":...,"generation":N,...}
@@ -45,7 +46,15 @@ export interface SocketContext {
   wakeReconcile: { value: boolean };
 }
 
-const IDLE_TYPES = new Set(["session.idle"]);
+// `session.idle` is the stable protocol type; the OpenCode plugin normalizes
+// OpenCode 2's `session.execution.succeeded` / `.interrupted` onto it. Accept
+// the raw execution variants too, so a raw client can never silently lose the
+// turn-complete trigger.
+const IDLE_TYPES = new Set([
+  "session.idle",
+  "session.execution.succeeded",
+  "session.execution.interrupted",
+]);
 const ERROR_TYPES = new Set(["session.error", "session.execution.failed"]);
 // The plugin normalizes permission/form replies into `permission.replied`; accept
 // the raw OpenCode forms too in one place. A reply NEVER means the task is done —

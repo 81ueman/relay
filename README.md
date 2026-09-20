@@ -19,7 +19,7 @@ Relay   = deterministic supervisor
 
 - durable task queue (SQLite is the **only** source of truth, WAL mode)
 - worker state, durable inbox, append-only event log, managed-session table
-- OpenCode event hooks (triggers only — `session.idle` is never completion)
+- OpenCode event hooks (triggers only — idle/turn-end is never completion)
 - Herdr agent/tab adapter (the only transport; never truth)
 - stalled/dead worker recovery with fresh-generation regeneration
 - planner/worker/reviewer auto wake-up, OpenCode Skill (`agent-worker`)
@@ -274,6 +274,10 @@ OpenCode event -> .agentctl/relay.sock (JSON Lines) -> daemon -> SQLite/Herdr
 {"type": "session.idle", "session_id": "ses_xxx", "generation": 2}
 {"ok": true, "outcome": "woke-next"}
 ```
+
+OpenCode 2 does not emit `session.idle` itself: a finished execution
+(`session.execution.succeeded`) or an interrupt (`.interrupted`) is the
+turn-complete signal, and the plugin normalizes it onto `session.idle`.
 
 The plugin never spawns processes and never throws into OpenCode; a dead
 daemon just means silent best-effort drops. High-frequency

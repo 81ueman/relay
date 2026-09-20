@@ -43,11 +43,18 @@ import path from "node:path";
 
 const PLUGIN_ID = "relay.agentctl";
 
+// A fresh value per module evaluation. The module is evaluated once and
+// `setup()` then runs once per project location; a hot reload is a NEW module
+// evaluation. Comparing this token lets the newest code take over the
+// server-global forwarder, while locations in the same load still dedupe.
+const LOAD = Symbol("relay.agentctl.load");
+
 interface RelayPluginState {
-  /** One server-global forwarder (hooks + event subscription) across copies. */
-  forwarderStarted: boolean;
-  /** Locations whose tool catalog already got agent_attach/agent_detach. */
-  registeredLocations: Set<string>;
+  /** Module load that currently owns the server-global forwarder. */
+  forwarderLoad?: symbol;
+  /** Module load + locations whose tool catalog already got the tools. */
+  toolsLoad?: symbol;
+  toolLocations: Set<string>;
   /** sessionID -> generation observed at attach (zombie protection). */
   generationCache: Map<string, number>;
   /** Sessions detached via the in-process tool: skip even the socket write. */
@@ -56,14 +63,13 @@ interface RelayPluginState {
   directoryCache: Map<string, string | null>;
   /** Sessions we already told the daemon to attach (marker or env). */
   autoAttached: Set<string>;
-  /** Torn down on the forwarder instance's cleanup. */
+  /** The live forwarder's controller (aborted when a reload takes over). */
   controller?: AbortController;
 }
 
 // Shared across every loaded copy in this server process.
 const G: RelayPluginState = ((globalThis as any).__relayAgentctl ??= {
-  forwarderStarted: false,
-  registeredLocations: new Set(),
+  toolLocations: new Set(),
   generationCache: new Map(),
   detachedCache: new Set(),
   directoryCache: new Map(),
@@ -308,7 +314,15 @@ function errorOf(data: any): string {
   }
 }
 
-const IDLE_TYPES = new Set(["session.idle"]);
+// OpenCode 2.0.x does NOT emit `session.idle` on the plugin event stream: a
+// finished execution (`session.execution.succeeded`) or an interrupt is the
+// turn-complete signal. Normalize both onto the stable `session.idle` protocol
+// type — the supervisor treats it as a trigger, never as task completion.
+const IDLE_TYPES = new Set([
+  "session.idle",
+  "session.execution.succeeded",
+  "session.execution.interrupted",
+]);
 const ERROR_TYPES = new Set(["session.error", "session.execution.failed"]);
 const PERMISSION_ASKED = new Set(["permission.asked", "form.created"]);
 const PERMISSION_REPLIED = new Set(["permission.replied", "form.replied", "form.cancelled"]);
@@ -327,10 +341,16 @@ async function forwardEvent(
 
   if (AUTO_ATTACH_FROM_ENV) maybeAttachFromEnv(sessionID, directory);
 
-  if (IDLE_TYPES.has(type) || ERROR_TYPES.has(type)) {
+  if (IDLE_TYPES.has(type)) {
+    // Always forwarded; the daemon gates on managed + generation. Normalized to
+    // the protocol's `session.idle` so the daemon never has to know the host's
+    // raw execution event name.
+    sendEvent({ type: "session.idle", ...withGeneration(sessionID) }, directory);
+    return;
+  }
+  if (ERROR_TYPES.has(type)) {
     // Always forwarded; the daemon gates on managed + generation.
-    const payload = ERROR_TYPES.has(type) ? { payload: { error: errorOf(data) } } : {};
-    sendEvent({ type, ...withGeneration(sessionID, payload) }, directory);
+    sendEvent({ type, ...withGeneration(sessionID, { payload: { error: errorOf(data) } }) }, directory);
     return;
   }
   if (PERMISSION_ASKED.has(type)) {
@@ -441,10 +461,15 @@ export default {
   id: PLUGIN_ID,
   async setup(ctx: any) {
     // Tools are registered per location; dedupe when both a project copy and
-    // the global copy have loaded the same location.
+    // the global copy have loaded the same location. Scoped to this load so a
+    // hot reload re-registers them (the host rebuilds the catalog).
     const location = typeof ctx?.location?.directory === "string" ? ctx.location.directory : "(unknown)";
-    if (!G.registeredLocations.has(location)) {
-      G.registeredLocations.add(location);
+    if (G.toolsLoad !== LOAD) {
+      G.toolsLoad = LOAD;
+      G.toolLocations = new Set();
+    }
+    if (!G.toolLocations.has(location)) {
+      G.toolLocations.add(location);
       try {
         await registerTools(ctx);
       } catch {
@@ -452,9 +477,20 @@ export default {
       }
     }
 
-    // Exactly one server-global forwarder across every copy/location.
-    if (G.forwarderStarted) return;
-    G.forwarderStarted = true;
+    // Exactly one server-global forwarder across every location in this module
+    // load. A hot reload (new LOAD) takes ownership and aborts the previous
+    // forwarder, so a code change applies without a server restart.
+    if (G.forwarderLoad === LOAD) return;
+    G.forwarderLoad = LOAD;
+    const previous = G.controller;
+    G.controller = undefined;
+    if (previous) {
+      try {
+        previous.abort();
+      } catch {
+        // Already gone: nothing to stop.
+      }
+    }
 
     // The relay bootstrap marker is in a spawned session's own prompt text.
     // This hook is the reliable signal (the raw event type name may change).
@@ -503,7 +539,11 @@ export default {
 
     return () => {
       controller.abort();
-      G.forwarderStarted = false;
+      // Only the owner clears state; a newer load may already have taken over.
+      if (G.controller === controller) {
+        G.controller = undefined;
+        G.forwarderLoad = undefined;
+      }
     };
   },
 };

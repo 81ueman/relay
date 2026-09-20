@@ -159,6 +159,30 @@ describe("D. idle uses the injected (real) runtime", () => {
     expect(getTask(db, t.id)!.state).toBe("running");
     expect(getTask(db, t.id)!.assignee).toBe(workerId);
   });
+
+  // OpenCode 2.0.x never emits `session.idle`; a finished execution (or an
+  // interrupt) is the turn-complete signal. It must behave exactly like idle.
+  test("execution.succeeded / interrupted are accepted as the turn-complete idle", async () => {
+    const s = attachSession(db, "ses-exec", { role: "worker", identity: IDENTITY });
+    const workerId = s.worker_id!;
+    rt.setAlive(workerId, true);
+    db.query(`UPDATE workers SET state = 'idle' WHERE id = ?`).run(workerId);
+    addTask(db, { title: "queued while the turn finishes" });
+
+    const succeeded = await handleSocketMessage(
+      { type: "session.execution.succeeded", session_id: "ses-exec", generation: s.generation },
+      ctx
+    );
+    expect(succeeded).toMatchObject({ ok: true, outcome: "woke-next" });
+    expect(rt.wakes.length).toBe(1);
+
+    const interrupted = await handleSocketMessage(
+      { type: "session.execution.interrupted", session_id: "ses-exec", generation: s.generation },
+      ctx
+    );
+    expect(interrupted).toMatchObject({ ok: true, outcome: "woke-next" });
+    expect(rt.wakes.length).toBe(2);
+  });
 });
 
 describe("E. dead worker real restart", () => {
