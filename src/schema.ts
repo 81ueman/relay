@@ -42,6 +42,7 @@ export interface Task {
   lease_token: number;
   lease_until: number | null;
   parent_task_id: string | null;
+  plan_id: string | null; // [ext] link to an agent-status plan.json item (nullable)
   created_at: number;
   updated_at: number;
 }
@@ -132,6 +133,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   lease_token INTEGER NOT NULL DEFAULT 0,
   lease_until INTEGER,
   parent_task_id TEXT,
+  plan_id TEXT,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );

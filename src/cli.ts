@@ -12,7 +12,7 @@ import { attachSession, detachSession, getSession, listSessions } from "./sessio
 import { listRuntimes } from "./runtimes";
 import {
   addTask, approveTask, blockTask, claimNext, claimTask, getNotes, getTask,
-  listTasks, rejectTask, submitTask, taskCounts, unblockTask, addNote, withPlanTag,
+  listTasks, rejectTask, submitTask, taskCounts, unblockTask, addNote, setTaskPlan,
 } from "./tasks";
 import {
   bindSession, findWorkerBySession, getWorker, listWorkers,
@@ -38,7 +38,9 @@ Usage:
 
   relay runtime list [--worker <id>] [--state <state>]
 
-  relay task add "description" [--title T] [--acceptance A] [--priority N] [--role R] [--parent T1] [--plan <tag>]
+  relay task add "description" [--title T] [--acceptance A] [--priority N] [--role R] [--parent T1] [--plan <plan-id>]
+  relay task link <task-id> <plan-id>
+  relay task unlink <task-id>
   relay task list [--state <state>]
   relay task show <id>
 
@@ -121,17 +123,21 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
   task: {
     about: "Manage tasks in the durable ledger.",
     usage: [
-      'relay task add "description" [--title T] [--acceptance A] [--priority N] [--role R] [--parent T1] [--plan <tag>]',
+      'relay task add "description" [--title T] [--acceptance A] [--priority N] [--role R] [--parent T1] [--plan <plan-id>]',
       "relay task list [--state <state>]",
       "relay task show <id>",
+      "relay task link <id> <plan-id>",
+      "relay task unlink <id>",
     ],
   },
   "task add": {
-    about: "Queue a new task. --parent nests it under T1 (the tree is display-side). --plan <tag> prefixes the title with \"<tag>: \" so agent-status links it to that plan.json item.",
-    usage: ['relay task add "description" [--title T] [--acceptance A] [--priority N] [--role R] [--parent T1] [--plan <tag>]'],
+    about: "Queue a new task. --parent nests it under T1 (the tree is display-side). --plan <plan-id> records which agent-status plan.json item this task belongs to.",
+    usage: ['relay task add "description" [--title T] [--acceptance A] [--priority N] [--role R] [--parent T1] [--plan <plan-id>]'],
   },
-  "task list": { about: "List tasks (id, state, priority, role, assignee, title).", usage: ["relay task list [--state <state>]"] },
+  "task list": { about: "List tasks (id, state, priority, role, assignee, plan, title).", usage: ["relay task list [--state <state>]"] },
   "task show": { about: "Print one task as JSON, plus its notes.", usage: ["relay task show <id>"] },
+  "task link": { about: "Link a task to a plan.json item (agent-status shows the plan status from relay).", usage: ["relay task link <task-id> <plan-id>"] },
+  "task unlink": { about: "Remove a task's plan linkage.", usage: ["relay task unlink <task-id>"] },
   next: {
     about: "Claim the next queued task for the worker (prints NO_TASK if none).",
     usage: ["relay next [--worker <id>]"],
@@ -355,23 +361,31 @@ async function main(): Promise<void> {
           const desc = argv[2];
           if (!desc) throw new Error('usage: relay task add "description" [...]');
           const rest = argv.slice(2);
-          const planTag = flag(rest, "--plan");
-          let title = flag(rest, "--title") ?? desc.slice(0, 80);
-          if (planTag) title = withPlanTag(title, planTag);
           const t = addTask(db, {
-            title,
+            title: flag(rest, "--title") ?? desc.slice(0, 80),
             description: desc,
             acceptance: flag(rest, "--acceptance") ?? "",
             priority: flag(rest, "--priority") ? Number(flag(rest, "--priority")) : 0,
             role: flag(rest, "--role") ?? undefined,
             parentTaskId: flag(rest, "--parent") ?? undefined,
+            planId: flag(rest, "--plan") ?? undefined,
           });
-          console.log(`${t.id} queued priority=${t.priority}`);
+          console.log(`${t.id} queued priority=${t.priority}${t.plan_id ? ` plan=${t.plan_id}` : ""}`);
         } else if (sub === "list") {
           const state = flag(argv.slice(1), "--state");
           for (const t of listTasks(db, state)) {
-            console.log(`${t.id}\t${t.state}\tprio=${t.priority}\trole=${t.role ?? "-"}\tassignee=${t.assignee ?? "-"}\t${t.title}`);
+            console.log(`${t.id}\t${t.state}\tprio=${t.priority}\trole=${t.role ?? "-"}\tassignee=${t.assignee ?? "-"}\tplan=${t.plan_id ?? "-"}\t${t.title}`);
           }
+        } else if (sub === "link") {
+          const [taskId, planId] = [argv[2], argv[3]];
+          if (!taskId || !planId) throw new Error("usage: relay task link <task-id> <plan-id>");
+          const t = setTaskPlan(db, taskId, planId);
+          console.log(`${t.id} plan=${planId}`);
+        } else if (sub === "unlink") {
+          const taskId = argv[2];
+          if (!taskId) throw new Error("usage: relay task unlink <task-id>");
+          const t = setTaskPlan(db, taskId, null);
+          console.log(`${t.id} plan=-`);
         } else if (sub === "show") {
           const id = argv[2];
           if (!id) throw new Error("usage: relay task show <id>");

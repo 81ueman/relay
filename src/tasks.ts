@@ -27,14 +27,15 @@ export function addTask(
     priority?: number;
     role?: string;
     parentTaskId?: string;
+    planId?: string;
   }
 ): Task {
   const t = now();
   const id = nextTaskId(db);
   db.query(
     `INSERT INTO tasks (id, title, description, acceptance, state, priority, role, assignee,
-      lease_token, lease_until, parent_task_id, created_at, updated_at)
-     VALUES (?, ?, ?, ?, 'queued', ?, ?, NULL, 0, NULL, ?, ?, ?)`
+      lease_token, lease_until, parent_task_id, plan_id, created_at, updated_at)
+     VALUES (?, ?, ?, ?, 'queued', ?, ?, NULL, 0, NULL, ?, ?, ?, ?)`
   ).run(
     id,
     input.title,
@@ -43,23 +44,34 @@ export function addTask(
     input.priority ?? 0,
     input.role ?? null,
     input.parentTaskId ?? null,
+    input.planId ?? null,
     t,
     t
   );
-  logEvent(db, { source: "cli", taskId: id, type: "task.created", payload: { title: input.title } });
+  logEvent(db, {
+    source: "cli", taskId: id, type: "task.created",
+    payload: { title: input.title, plan: input.planId ?? null },
+  });
   return getTask(db, id)!;
 }
 
 /**
- * Prefix a task title with its plan tag (e.g. "U1-A: ...").
+ * Set (or clear, with null) the plan.json item this task belongs to.
  *
- * agent-status links a relay task to a plan.json item by reading this tag off the
- * title, so `relay task add --plan U1-A` keeps the ledger linked without anyone
- * editing plan.json. Idempotent: an already-tagged title is left alone.
+ * agent-status joins relay tasks to plan items on this column, so the linkage is
+ * data instead of a title convention that breaks when someone rewords a title.
  */
-export function withPlanTag(title: string, tag: string): string {
-  const prefix = `${tag}: `;
-  return title.startsWith(prefix) ? title : prefix + title;
+export function setTaskPlan(db: Database, taskId: string, planId: string | null): Task {
+  const t = getTask(db, taskId);
+  if (!t) throw new Error(`unknown task: ${taskId}`);
+  db.query(`UPDATE tasks SET plan_id = ?, updated_at = ? WHERE id = ?`).run(planId, now(), taskId);
+  logEvent(db, {
+    source: "cli",
+    taskId,
+    type: planId ? "task.plan_linked" : "task.plan_unlinked",
+    payload: { plan: planId ?? null },
+  });
+  return getTask(db, taskId)!;
 }
 
 export function getTask(db: Database, id: string): Task | null {

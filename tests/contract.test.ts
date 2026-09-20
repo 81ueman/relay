@@ -9,7 +9,7 @@ import { handleSocketMessage, type SocketContext } from "../src/socket";
 import { MockRuntime } from "../src/runtime/runtime";
 import { supervisorView } from "../src/scheduler";
 import { attachSession, detachSession, getSession } from "../src/sessions";
-import { addTask, blockTask, claimNext, getTask, withPlanTag } from "../src/tasks";
+import { addTask, blockTask, claimNext, getTask, setTaskPlan } from "../src/tasks";
 import { getWorker, registerWorker } from "../src/workers";
 
 // Correctness contract for the relay control plane (spec section 11).
@@ -286,16 +286,24 @@ describe("message per-ID deliver/ack", () => {
   });
 });
 
-describe("plan tags link tasks to the agent-status ledger", () => {
-  test("withPlanTag prefixes once and is idempotent", () => {
-    expect(withPlanTag("VRF-aware dataplane", "U1-A")).toBe("U1-A: VRF-aware dataplane");
-    expect(withPlanTag("U1-A: VRF-aware dataplane", "U1-A")).toBe("U1-A: VRF-aware dataplane");
-    // A different tag still prefixes (the caller asked for it explicitly).
-    expect(withPlanTag("U1-A: VRF", "U1-B")).toBe("U1-B: U1-A: VRF");
+describe("plan linkage is stored data, not a title convention", () => {
+  test("addTask records plan_id and leaves the title alone", () => {
+    const t = addTask(db, { title: "kinds + interface aliases", planId: "B2" });
+    const got = getTask(db, t.id)!;
+    expect(got.title).toBe("kinds + interface aliases");
+    expect(got.plan_id).toBe("B2");
   });
 
-  test("the tag ends up on the stored title", () => {
-    const t = addTask(db, { title: withPlanTag("kinds + interface aliases", "U1-B2") });
-    expect(getTask(db, t.id)!.title).toBe("U1-B2: kinds + interface aliases");
+  test("a task without --plan has no linkage", () => {
+    const t = addTask(db, { title: "unlinked work" });
+    expect(getTask(db, t.id)!.plan_id).toBeNull();
+  });
+
+  test("setTaskPlan links, relinks and unlinks", () => {
+    const t = addTask(db, { title: "Rust VRF" });
+    expect(setTaskPlan(db, t.id, "A1").plan_id).toBe("A1");
+    expect(setTaskPlan(db, t.id, "A2").plan_id).toBe("A2");
+    expect(setTaskPlan(db, t.id, null).plan_id).toBeNull();
+    expect(() => setTaskPlan(db, "T404", "A1")).toThrow();
   });
 });

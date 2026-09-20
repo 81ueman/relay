@@ -35,6 +35,16 @@ function migrate(db: Database): void {
   try {
     db.exec("UPDATE tasks SET state = 'queued' WHERE state = 'claimed';");
   } catch { /* tasks table may not exist yet on first init */ }
+  // Plan linkage: relay stores which agent-status plan item a task belongs to, so
+  // the dashboard joins on data instead of parsing the title. The index is created
+  // here (not in SCHEMA) because SCHEMA runs before this on DBs that predate the
+  // column, where "CREATE INDEX ... (plan_id)" would fail.
+  if (columnExists(db, "tasks", "id")) {
+    if (!columnExists(db, "tasks", "plan_id")) {
+      db.exec("ALTER TABLE tasks ADD COLUMN plan_id TEXT;");
+    }
+    db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_plan ON tasks(plan_id);");
+  }
   // Per-spawn attach token (generation fencing for managed attaches).
   if (columnExists(db, "worker_runtimes", "id") && !columnExists(db, "worker_runtimes", "attach_token")) {
     db.exec("ALTER TABLE worker_runtimes ADD COLUMN attach_token TEXT;");
