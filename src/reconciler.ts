@@ -656,7 +656,11 @@ export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<
       // A lapsed lease is NOT a reason to skip the nudge: lease expiry already
       // decided ownership (a live worker keeps its task), so a live-but-quiet
       // owner must still be revived even after it stopped running relay commands.
-      if (task.state === "running" && at - fresh.last_progress_at > stallTimeout) {
+      // An agent Herdr reports as "working" is executing right now (e.g. a long
+      // benchmark inside one tool call): that is PROGRESS for the stall clock, so
+      // neither nudge nor release it — no relay command is expected mid-command.
+      const agentBusy = await rt.isWorking(fresh).catch(() => false);
+      if (task.state === "running" && !agentBusy && at - fresh.last_progress_at > stallTimeout) {
         if (!fresh.nudged_at) {
           const woke = await tryWake(rt, db, fresh, STALL_NUDGE(task.id), "stall-nudge", at);
           db.query(`UPDATE workers SET nudged_at = ?, updated_at = ? WHERE id = ?`).run(at, at, w.id);

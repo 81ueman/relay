@@ -330,6 +330,18 @@ export class HerdrRuntime implements Runtime {
     return runHerdr(["agent", "get", this.target(w)], 5000).ok;
   }
 
+  /**
+   * Herdr `agent_status === "working"` means the agent is executing right now
+   * (e.g. a long benchmark inside one tool call). That is PROGRESS for the stall
+   * clock even though no relay command has been issued.
+   */
+  async isWorking(w: Worker): Promise<boolean> {
+    const r = runHerdr(["agent", "get", this.target(w)], 5000);
+    if (!r.ok) return false;
+    const parsed = tryParseJson(r.stdout);
+    return parsed?.result?.agent?.agent_status === "working";
+  }
+
   async wake(w: Worker, text: string): Promise<void> {
     // No --wait: the daemon must never block on an agent turn.
     const target = this.target(w);

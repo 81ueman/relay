@@ -287,6 +287,23 @@ describe("stalled detection (multi-signal, never bare idle)", () => {
     expect(rt.starts).not.toContain("w1");
   });
 
+  test("an agent that is executing (Herdr working) is not stalled", async () => {
+    process.env.RELAY_STALL_MS = "100";
+    worker("w1");
+    db.query(`UPDATE worker_runtimes SET relay_owned = 1 WHERE worker_id = 'w1'`).run();
+    const t = addTask(db, { title: "long benchmark" });
+    claimNext(db, "w1");
+    // No relay command for a long time, but the agent is mid-command.
+    db.query(`UPDATE workers SET last_progress_at = ? WHERE id = 'w1'`).run(Date.now() - 10000);
+    rt.setWorking("w1", true);
+    const r = await reconcile(db, rt);
+    expect(r.actions).not.toContain("nudge:w1");
+    expect(r.actions).not.toContain("stall-released:w1");
+    expect(getTask(db, t.id)!.state).toBe("running");
+    expect(getWorker(db, "w1")!.nudged_at).toBeNull();
+    rt.setWorking("w1", false);
+  });
+
   test("fresh progress prevents stall verdict", async () => {
     process.env.RELAY_STALL_MS = "60000";
     worker("w1");

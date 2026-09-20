@@ -69,6 +69,13 @@ export interface HerdrIdentityHint {
 export interface Runtime {
   readonly name: string;
   isAlive(worker: Worker): Promise<boolean>;
+  /**
+   * Is the agent actively executing right now (Herdr reports `working`)? Used to
+   * treat a long command/benchmark as PROGRESS for the stall clock: an agent
+   * inside one tool call makes no relay command for minutes, which must not read
+   * as "stalled".
+   */
+  isWorking(worker: Worker): Promise<boolean>;
   wake(worker: Worker, text: string): Promise<void>;
   interrupt(worker: Worker): Promise<void>;
   /**
@@ -95,6 +102,8 @@ export interface Runtime {
 export class MockRuntime implements Runtime {
   readonly name = "mock";
   alive = new Map<string, boolean>();
+  /** workerId -> Herdr agent_status === "working" (for the stall clock). */
+  working = new Map<string, boolean>();
   /** Every transport target actually used, in call order (for routing tests). */
   targets: { op: string; target: string }[] = [];
   wakes: { workerId: string; target: string; text: string }[] = [];
@@ -126,6 +135,10 @@ export class MockRuntime implements Runtime {
     this.alive.set(id, v);
   }
 
+  setWorking(id: string, v: boolean): void {
+    this.working.set(id, v);
+  }
+
   setIdentity(sessionId: string, identity: HerdrIdentity): void {
     this.identities.set(sessionId, identity);
   }
@@ -133,6 +146,10 @@ export class MockRuntime implements Runtime {
   async isAlive(w: Worker): Promise<boolean> {
     this.targets.push({ op: "isAlive", target: MockRuntime.targetOf(w) });
     return this.alive.get(this.key(w)) ?? true;
+  }
+  async isWorking(w: Worker): Promise<boolean> {
+    this.targets.push({ op: "isWorking", target: MockRuntime.targetOf(w) });
+    return this.working.get(this.key(w)) ?? false;
   }
   async wake(w: Worker, text: string): Promise<void> {
     const target = MockRuntime.targetOf(w);
