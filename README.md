@@ -89,8 +89,9 @@ Plugin shape verified against the bundled `herdr-agent-state` integration
 ## Setup
 
 ```bash
-relay init     # creates .relay/state.db (WAL)
-relay daemon   # reconcile loop + Unix socket .relay/relay.sock
+scripts/install.sh   # bun install + build + `bun link` + OpenCode plugin symlink
+relay init           # creates .relay/state.db (WAL)
+relay daemon         # reconcile loop + Unix socket .relay/relay.sock
 ```
 
 The OpenCode plugin (`.opencode/plugins/relay.ts`) and Skill
@@ -107,9 +108,10 @@ The `agent-worker` skill is also published through APM (Agent Package Manager):
 apm install -g --target agent-skills 81ueman/relay
 ```
 
-APM deploys skills only — install the `relay` CLI itself separately
-(`bun link` in this repo) and keep the plugin symlinked
-(`~/.config/opencode/plugins/relay.ts`).
+APM deploys skills only. Install the `relay` CLI itself and symlink the
+plugin with `scripts/install.sh` (runs `bun install`, `bun run build`,
+`bun link`, and links `.opencode/plugins/relay.ts` into
+`~/.config/opencode/plugins/relay.ts`).
 
 Identity / paths / tuning:
 
