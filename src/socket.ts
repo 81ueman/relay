@@ -12,9 +12,10 @@ import { getWorker, setWorkerState, touchSeen } from "./workers";
 //   {"type":"session.error",...,"payload":{...}}
 //   {"type":"permission.asked" | "permission.replied" | "tool.execute.after" | "session.status" | ..., ...}
 //   {"type":"session.attach","session_id":...,"role":...,"worker_id":...,"generation":N,...}
-//     (generation present = relay-spawned session; absent = manual attach and
-//      then Herdr identity hints (pane_id/tab_id/workspace_id) are REQUIRED,
-//      verified daemon-side; unverifiable => rejected, never guessed)
+//     (generation present = relay-spawned session; absent = manual attach, then
+//      the daemon resolves the Herdr identity from the session `directory`
+//      and/or pane_id/tab_id/workspace_id hints; unverifiable => rejected,
+//      never guessed)
 //   {"type":"session.detach","session_id":...}
 //   {"type":"ping"}
 // Response per line: {"ok":true,...} or {"ok":false,"reason":...}
@@ -31,7 +32,7 @@ export interface SocketMessage {
   worktree?: string;
   /** Per-spawn attach secret (relay-spawned generations only). */
   token?: string;
-  /** Herdr identity hints from the plugin's pane env (manual attach). */
+  /** Herdr identity hints (manual attach): directory is authoritative when no pane is given. */
   pane_id?: string;
   tab_id?: string;
   workspace_id?: string;

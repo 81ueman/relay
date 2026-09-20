@@ -1,4 +1,4 @@
-// agentctl OpenCode plugin (relay).
+// agentctl OpenCode plugin (relay) — OpenCode V2 plugin API.
 //
 // Transport: Unix domain socket to the relay daemon — NEVER a subprocess per
 // event (tool.execute.after is high-frequency). Protocol is JSON Lines:
@@ -12,80 +12,104 @@
 //   cheaply but the daemon ignores them (no DB write, no Herdr call, no claim).
 //   Use agent_attach (custom tool) or `agentctl session attach` to manage one.
 // - All forwarding is best-effort and never throws into OpenCode.
-// - Verified against the installed OpenCode v2 API shapes: the default
-//   { id, setup } export (proven by the bundled herdr integration) and the
-//   official Plugin function type (for custom tools). A module-level guard
-//   ensures only one shape activates if a host loads both.
+// - PER-SESSION routing. A single OpenCode server (`opencode serve --service`)
+//   hosts sessions from many projects and its process env names none of them,
+//   so we NEVER trust process env for socket path, pane identity, or
+//   generation. The session id and its project directory are the only
+//   authoritative inputs; the directory (asked of `ctx.session.get`, which
+//   returns it under `location.directory`) picks the daemon socket, and the
+//   daemon resolves the Herdr identity itself.
+// - The relay bootstrap marker travels with a spawned session's own prompt
+//   text, so the `prompt` hook (not a guessed event type) is what binds the
+//   RIGHT session of a shared server to its worker/generation.
+// - Loaded shape is the V2 default export `{ id, setup(ctx) }`. Tools are
+//   registered through `ctx.tool.transform`; hooks/events come from
+//   `ctx.tool.hook` / `ctx.session.hook` / `ctx.event.subscribe`. The V1
+//   `tool()` helper / returned hook object does not run under OpenCode 2.
+// - Tools are registered per LOCATION, so install this plugin where worker
+//   sessions run (e.g. symlink it into `~/.config/opencode/plugins/`) if you
+//   want the `agent_attach` / `agent_detach` tools everywhere. The event
+//   forwarder and bootstrap auto-attach are server-global once ANY location
+//   has loaded the plugin.
 
 import net from "node:net";
+import { existsSync } from "node:fs";
 import path from "node:path";
 
 const PLUGIN_ID = "relay.agentctl";
 
+// One forwarder per server process, even if several project locations load this
+// module (tool registration and the event subscription are process-wide).
 let initialized = false;
+
 // sessionID -> generation observed at attach (zombie protection on the way in).
 const generationCache = new Map<string, number>();
 // Sessions detached via the in-process tool: skip even the socket write for pings.
 const detachedCache = new Set<string>();
+// sessionID -> project directory (resolved once from the OpenCode server).
+const directoryCache = new Map<string, string | null>();
+// Sessions we already told the daemon to attach (marker or env).
+const autoAttached = new Set<string>();
 
-// Relay-spawned sessions are launched with AGENTCTL_MANAGED=1 and an explicit
-// worker + generation. A plain `opencode` launch has none of these and stays
-// unmanaged.
-const MANAGED = process.env.AGENTCTL_MANAGED === "1";
+// Env-only auto attach is OFF by default: a shared server's process env names
+// at most one worker, so it cannot identify a session. Opt in only for
+// dedicated one-server-per-worker deployments.
+const AUTO_ATTACH_FROM_ENV = process.env.AGENTCTL_AUTO_ATTACH === "1";
 const ENV_WORKER = process.env.AGENTCTL_WORKER;
 const ENV_GENERATION = (() => {
   const n = Number(process.env.AGENTCTL_GENERATION ?? "");
-  return Number.isFinite(n) && n > 0 ? n : undefined;
+  return Number.isInteger(n) && n > 0 ? n : undefined;
 })();
-// Env-only auto attach is OFF by default. A single OpenCode server can host
-// many sessions (`opencode serve --service`) and its process env names only one
-// worker, so env cannot identify a session. It is opt-in for dedicated
-// one-server-per-worker deployments.
-const AUTO_ATTACH_FROM_ENV = process.env.AGENTCTL_AUTO_ATTACH === "1";
-const autoAttached = new Set<string>();
 
-// Herdr sets these on every pane process. For a manual attach the daemon
-// verifies them against live Herdr state (never trusts them blindly): the pane
-// must exist, run an opencode agent, and be consistent with the hint.
-const HERDR_PANE_ID = process.env.HERDR_ENV === "1" ? process.env.HERDR_PANE_ID : undefined;
-const HERDR_TAB_ID = process.env.HERDR_ENV === "1" ? process.env.HERDR_TAB_ID : undefined;
-const HERDR_WORKSPACE_ID = process.env.HERDR_ENV === "1" ? process.env.HERDR_WORKSPACE_ID : undefined;
-
-function herdrIdentityFields(): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
-  if (HERDR_PANE_ID) out.pane_id = HERDR_PANE_ID;
-  if (HERDR_TAB_ID) out.tab_id = HERDR_TAB_ID;
-  if (HERDR_WORKSPACE_ID) out.workspace_id = HERDR_WORKSPACE_ID;
-  return out;
-}
-
-// Per-spawn marker carried in the relay bootstrap prompt. It travels with the
-// session's own prompt text, so this plugin can bind the RIGHT session to the
-// intended worker/generation even when many sessions share one server (whose
-// process env identifies nobody).
+// Per-spawn marker carried in the relay bootstrap prompt. `token` is optional
+// (manual attaches have none; relay-spawned attaches always do).
 const ATTACH_MARKER = /RELAY-ATTACH\s+worker=([A-Za-z0-9._-]+)\s+gen=(\d+)(?:\s+token=([A-Za-z0-9._-]+))?/;
-// Only these carry prompt text; scanning the high-frequency stream for a marker
-// would be pointless (and there is nothing to find once attached).
-const ATTACH_HINT_TYPES = new Set([
-  "session.inbox.enqueued",
-  "session.renamed",
-  "session.created",
-  "session.idle",
-  "session.status",
-  "session.viewed",
-]);
 
-function sockPath(explicitDir?: string): string {
-  if (process.env.AGENTCTL_SOCK) return process.env.AGENTCTL_SOCK;
-  const dir = explicitDir ?? process.cwd();
-  return path.join(dir, ".agentctl", "relay.sock");
+/**
+ * Resolve the daemon socket for a session's project directory.
+ *
+ * Priority:
+ *   1. the nearest existing `.agentctl/relay.sock` walking up from the session
+ *      directory (a session opened in a subdirectory still finds its project);
+ *   2. `AGENTCTL_SOCK` — only meaningful for a dedicated server/CLI run;
+ *   3. the nearest `.agentctl/` dir walking up (socket not created yet);
+ *   4. `<directory>/.agentctl/relay.sock`.
+ */
+function socketPathFor(directory?: string | null): string {
+  const walk = (fn: (dir: string) => string | null): string | null => {
+    if (!directory) return null;
+    let dir = directory;
+    for (let i = 0; i < 16; i++) {
+      const hit = fn(dir);
+      if (hit) return hit;
+      const parent = path.dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+    return null;
+  };
+
+  const existing = walk((d) => {
+    const sock = path.join(d, ".agentctl", "relay.sock");
+    return existsSync(sock) ? sock : null;
+  });
+  if (existing) return existing;
+
+  const envSock = process.env.AGENTCTL_SOCK;
+  if (envSock && !directory) return envSock;
+
+  const agentctlDir = walk((d) => (existsSync(path.join(d, ".agentctl")) ? d : null));
+  if (agentctlDir) return path.join(agentctlDir, ".agentctl", "relay.sock");
+
+  if (envSock) return envSock;
+  return path.join(directory ?? process.cwd(), ".agentctl", "relay.sock");
 }
 
 /** Fire-and-forget event forward. Never throws, never blocks the session. */
-function sendEvent(msg: Record<string, unknown>, explicitDir?: string): void {
+function sendEvent(msg: Record<string, unknown>, directory?: string | null): void {
   const line = JSON.stringify(msg) + "\n";
   try {
-    const sock = net.createConnection(sockPath(explicitDir));
+    const sock = net.createConnection(socketPathFor(directory));
     const done = () => {
       try { sock.destroy(); } catch { /* ignore */ }
     };
@@ -104,7 +128,11 @@ function sendEvent(msg: Record<string, unknown>, explicitDir?: string): void {
 }
 
 /** Request/response for tools (attach/detach need the daemon's answer). */
-function sendRequest(msg: Record<string, unknown>, explicitDir?: string, timeoutMs = 4000): Promise<any> {
+function sendRequest(
+  msg: Record<string, unknown>,
+  directory?: string | null,
+  timeoutMs = 4000
+): Promise<any> {
   return new Promise((resolve) => {
     let settled = false;
     const finish = (v: any) => {
@@ -115,7 +143,7 @@ function sendRequest(msg: Record<string, unknown>, explicitDir?: string, timeout
     };
     let sock: net.Socket;
     try {
-      sock = net.createConnection(sockPath(explicitDir));
+      sock = net.createConnection(socketPathFor(directory));
     } catch {
       resolve({ ok: false, reason: "no-daemon" });
       return;
@@ -149,14 +177,44 @@ function sendRequest(msg: Record<string, unknown>, explicitDir?: string, timeout
   });
 }
 
-function generationFor(sessionID: string | undefined): number | undefined {
-  // Cached generation wins (it is set by auto-attach from env, or by a manual
-  // attach's response); otherwise fall back to the env generation.
-  if (sessionID) {
-    const cached = generationCache.get(sessionID);
-    if (cached !== undefined) return cached;
+/** Collect every string in a nested value (bounded), for marker scanning. */
+function stringsOf(value: unknown, out: string[] = [], depth = 0): string[] {
+  if (out.length > 200 || depth > 6) return out;
+  if (typeof value === "string") {
+    out.push(value);
+  } else if (Array.isArray(value)) {
+    for (const v of value) stringsOf(v, out, depth + 1);
+  } else if (value && typeof value === "object") {
+    for (const v of Object.values(value as Record<string, unknown>)) stringsOf(v, out, depth + 1);
   }
-  return ENV_GENERATION;
+  return out;
+}
+
+/**
+ * The session's project directory, asked of the OpenCode server (never the
+ * process env). `Session.Info` carries it under `location.directory`. Cached
+ * per session. Returns undefined when unknown.
+ */
+async function directoryFor(ctx: any, sessionID?: string): Promise<string | undefined> {
+  if (!sessionID || !sessionID.startsWith("ses")) return undefined;
+  if (directoryCache.has(sessionID)) return directoryCache.get(sessionID) ?? undefined;
+  let dir: string | null = null;
+  try {
+    const info = await ctx.session.get({ sessionID });
+    const candidate = info?.location?.directory ?? info?.directory;
+    if (typeof candidate === "string" && candidate) dir = candidate;
+  } catch {
+    // Unknown/unmounted session: leave undefined and fall back to the env sock.
+  }
+  directoryCache.set(sessionID, dir);
+  return dir ?? undefined;
+}
+
+function generationFor(sessionID: string | undefined): number | undefined {
+  // Only an attach this plugin performed is trustworthy. The server's process
+  // env belongs to the server, not the session, so it is never a generation.
+  if (!sessionID) return undefined;
+  return generationCache.get(sessionID);
 }
 
 function withGeneration(sessionID: string | undefined, extra: Record<string, unknown> = {}): Record<string, unknown> {
@@ -173,13 +231,7 @@ function withGeneration(sessionID: string | undefined, extra: Record<string, unk
  * Bind a session to a worker/generation and tell the daemon. Fire-and-forget:
  * the generation is cached locally so later events fence correctly.
  */
-function autoAttach(
-  sessionID: string,
-  workerId: string | undefined,
-  generation: number,
-  directory?: string,
-  token?: string
-): void {
+function autoAttach(sessionID: string, workerId: string | undefined, generation: number, directory?: string, token?: string): void {
   if (autoAttached.has(sessionID)) return;
   autoAttached.add(sessionID);
   generationCache.set(sessionID, generation);
@@ -192,31 +244,24 @@ function autoAttach(
       token,
       role: "worker",
       directory,
-      ...herdrIdentityFields(),
     },
     directory
   );
 }
 
 /** Per-session identity from the relay bootstrap prompt marker. */
-function maybeAttachFromMarker(sessionID: string | undefined, data: any, directory?: string): void {
-  if (!sessionID || autoAttached.has(sessionID) || !sessionID.startsWith("ses_")) return;
-  let text = "";
-  try {
-    text = [data?.item?.payload?.text, data?.text, data?.title, data?.input?.prompt, data?.prompt]
-      .filter((x) => typeof x === "string")
-      .join("\n");
-    if (!text) text = JSON.stringify(data ?? {});
-  } catch {
-    return;
-  }
-  const m = ATTACH_MARKER.exec(text);
-  if (m) autoAttach(sessionID, m[1], Number(m[2]), directory, m[3]);
+async function maybeAttachFromText(ctx: any, sessionID: string | undefined, text: string): Promise<boolean> {
+  if (!sessionID || autoAttached.has(sessionID) || !sessionID.startsWith("ses_")) return false;
+  const m = ATTACH_MARKER.exec(text || "");
+  if (!m) return false;
+  const directory = await directoryFor(ctx, sessionID);
+  autoAttach(sessionID, m[1], Number(m[2]), directory, m[3]);
+  return true;
 }
 
 /** Opt-in env auto attach (only safe when one server serves exactly one worker). */
 function maybeAttachFromEnv(sessionID: string | undefined, directory?: string): void {
-  if (!AUTO_ATTACH_FROM_ENV || !MANAGED || !sessionID || !sessionID.startsWith("ses_")) return;
+  if (!AUTO_ATTACH_FROM_ENV || !sessionID || !sessionID.startsWith("ses_")) return;
   if (ENV_GENERATION === undefined) return;
   autoAttach(sessionID, ENV_WORKER, ENV_GENERATION, directory);
 }
@@ -228,6 +273,11 @@ function sessionIDOf(data: any): string | undefined {
     if (typeof c === "string" && c) return c;
   }
   return undefined;
+}
+
+function directoryOfEvent(data: any): string | undefined {
+  const d = data?.location?.directory;
+  return typeof d === "string" && d ? d : undefined;
 }
 
 function errorOf(data: any): string {
@@ -244,111 +294,129 @@ const ERROR_TYPES = new Set(["session.error", "session.execution.failed"]);
 const PERMISSION_ASKED = new Set(["permission.asked", "form.created"]);
 const PERMISSION_REPLIED = new Set(["permission.replied", "form.replied", "form.cancelled"]);
 const LIVENESS_TYPES = new Set(["session.status", "session.created", "session.viewed"]);
-// tool.execute.after arrives via the tool hook (see setup); keep it out of the
-// event-stream switch so the two paths stay explicit.
+// tool.execute.after also arrives via the tool hook; both paths funnel here.
 const TOOL_AFTER = "tool.execute.after";
 
-function forwardEvent(type: string, sessionID: string | undefined, data: any, explicitDir?: string): void {
-  // Attach THIS session only when the event proves its per-session identity:
-  // either the relay bootstrap marker in its own prompt text, or (opt-in) env.
-  if (ATTACH_HINT_TYPES.has(type)) maybeAttachFromMarker(sessionID, data, explicitDir);
-  maybeAttachFromEnv(sessionID, explicitDir);
+async function forwardEvent(
+  ctx: any,
+  type: string,
+  sessionID: string | undefined,
+  data: any,
+  directoryHint?: string
+): Promise<void> {
+  const directory = directoryHint ?? (await directoryFor(ctx, sessionID));
+
+  if (AUTO_ATTACH_FROM_ENV) maybeAttachFromEnv(sessionID, directory);
+
   if (IDLE_TYPES.has(type) || ERROR_TYPES.has(type)) {
     // Always forwarded; the daemon gates on managed + generation.
     const payload = ERROR_TYPES.has(type) ? { payload: { error: errorOf(data) } } : {};
-    sendEvent({ type, ...withGeneration(sessionID, payload) }, explicitDir);
+    sendEvent({ type, ...withGeneration(sessionID, payload) }, directory);
     return;
   }
   if (PERMISSION_ASKED.has(type)) {
-    sendEvent({ type: "permission.asked", ...withGeneration(sessionID) }, explicitDir);
+    sendEvent({ type: "permission.asked", ...withGeneration(sessionID) }, directory);
     return;
   }
   if (PERMISSION_REPLIED.has(type)) {
-    sendEvent({ type: "permission.replied", ...withGeneration(sessionID) }, explicitDir);
+    sendEvent({ type: "permission.replied", ...withGeneration(sessionID) }, directory);
     return;
   }
   if (LIVENESS_TYPES.has(type)) {
-    sendEvent({ type, ...withGeneration(sessionID) }, explicitDir);
+    sendEvent({ type, ...withGeneration(sessionID) }, directory);
     return;
   }
   if (type === TOOL_AFTER) {
     // High-frequency path: skip the socket entirely for sessions we detached
     // in-process. Everything else is gated daemon-side (cheap local write).
     if (sessionID && detachedCache.has(sessionID)) return;
-    sendEvent({ type: TOOL_AFTER, ...withGeneration(sessionID) }, explicitDir);
+    sendEvent({ type: TOOL_AFTER, ...withGeneration(sessionID) }, directory);
   }
 }
 
-async function handleStreamEvent(event: { type?: string; data?: any }, explicitDir?: string): Promise<void> {
+async function handleStreamEvent(ctx: any, event: { type?: string; data?: any }): Promise<void> {
   const type = typeof event?.type === "string" ? event.type : "unknown";
-  forwardEvent(type, sessionIDOf(event?.data), event?.data, explicitDir);
+  const data = event?.data;
+  const sessionID = sessionIDOf(data);
+  const directoryHint = directoryOfEvent(data);
+  if (sessionID && directoryHint) directoryCache.set(sessionID, directoryHint);
+  // Marker fallback for hosts whose prompt hook does not deliver the text.
+  if (type === "session.inbox.enqueued" || type === "session.renamed") {
+    await maybeAttachFromText(ctx, sessionID, stringsOf(data).join("\n"));
+  }
+  await forwardEvent(ctx, type, sessionID, data, directoryHint);
 }
 
-// --- custom tools (official Plugin shape) ---------------------------------
+// --- custom tools (V2 `ctx.tool.transform`) --------------------------------
 
-async function buildTools(): Promise<Record<string, any>> {
-  let tool: any;
-  try {
-    ({ tool } = await import("@opencode-ai/plugin"));
-  } catch {
-    return {}; // offline / no install: events still forward; attach via CLI.
-  }
-  return {
-    agent_attach: tool({
+async function registerTools(ctx: any): Promise<void> {
+  await ctx.tool.transform((editor: any) => {
+    editor.add({
+      name: "agent_attach",
       description:
         "Attach this OpenCode session to relay supervision as a managed worker. After attaching, session idle/error events drive the deterministic task supervisor (SQLite-backed). No process restart needed.",
-      args: {
-        role: tool.schema.string().optional().describe("worker (default), planner, reviewer, coordinator"),
-        worker_id: tool.schema.string().optional().describe("Existing worker id to bind, else auto-derived"),
-        generation: tool.schema.number().optional().describe("Relay generation to bind (relay-spawned sessions); omit for a manual attach"),
-        token: tool.schema.string().optional().describe("Per-spawn attach token (relay-spawned sessions)"),
+      input: {
+        type: "object",
+        properties: {
+          role: { type: "string", description: "worker (default), planner, reviewer, coordinator" },
+          worker_id: { type: "string", description: "Existing worker id to bind, else auto-derived" },
+          generation: { type: "number", description: "Relay generation to bind (relay-spawned sessions); omit for a manual attach" },
+          token: { type: "string", description: "Per-spawn attach token (relay-spawned sessions)" },
+        },
+        additionalProperties: false,
       },
-      async execute(args: { role?: string; worker_id?: string; generation?: number; token?: string }, context: any): Promise<string> {
+      async execute(raw: any, context: any): Promise<{ content: string }> {
+        const args = (raw ?? {}) as { role?: string; worker_id?: string; generation?: number; token?: string };
+        const sessionID: string = context?.sessionID;
+        const directory = await directoryFor(ctx, sessionID);
         const res = await sendRequest(
           {
             type: "session.attach",
-            session_id: context.sessionID,
+            session_id: sessionID,
             role: args.role ?? "worker",
             worker_id: args.worker_id,
             generation: args.generation,
             token: args.token,
-            directory: context.directory,
-            worktree: context.worktree,
-            ...herdrIdentityFields(),
+            directory,
           },
-          context.directory
+          directory
         );
         if (!res?.ok) {
-          return `attach failed (${res?.reason ?? "unknown"}). Is the relay daemon running? Start it with \`agentctl daemon\` in the project root, then retry. Equivalent CLI: \`agentctl session attach --session ${context.sessionID}\`.`;
+          return {
+            content: `attach failed (${res?.reason ?? "unknown"}). Is the relay daemon running for this project? Start it with \`agentctl daemon\` in the project root, then retry. Equivalent CLI: \`agentctl session attach --session ${sessionID} --dir <project>\`.`,
+          };
         }
-        generationCache.set(context.sessionID, res.generation);
-        detachedCache.delete(context.sessionID);
-        return `attached as worker ${res.worker_id} (generation ${res.generation}). Load the agent-worker skill and run \`agentctl next\`.`;
+        generationCache.set(sessionID, res.generation);
+        detachedCache.delete(sessionID);
+        return {
+          content: `attached as worker ${res.worker_id} (generation ${res.generation}). Load the agent-worker skill and run \`agentctl next\`.`,
+        };
       },
-    }),
-    agent_detach: tool({
+    });
+
+    editor.add({
+      name: "agent_detach",
       description:
         "Detach this OpenCode session from relay supervision. The session returns to a normal standalone session; its events are ignored afterwards.",
-      args: {},
-      async execute(_args: Record<string, never>, context: any): Promise<string> {
-        const res = await sendRequest(
-          { type: "session.detach", session_id: context.sessionID },
-          context.directory
-        );
+      input: { type: "object", properties: {}, additionalProperties: false },
+      async execute(_raw: any, context: any): Promise<{ content: string }> {
+        const sessionID: string = context?.sessionID;
+        const directory = await directoryFor(ctx, sessionID);
+        const res = await sendRequest({ type: "session.detach", session_id: sessionID }, directory);
         if (!res?.ok) {
           // Rejected (e.g. the worker still owns a task): stay managed. Do not
           // poison the local caches — the session is NOT detached.
-          return `detach failed (${res?.reason ?? "unknown"}); session is still managed.`;
+          return { content: `detach failed (${res?.reason ?? "unknown"}); session is still managed.` };
         }
-        detachedCache.add(context.sessionID);
-        generationCache.delete(context.sessionID);
-        return "detached. This session is now a normal standalone OpenCode session.";
+        detachedCache.add(sessionID);
+        generationCache.delete(sessionID);
+        return { content: "detached. This session is now a normal standalone OpenCode session." };
       },
-    }),
-  };
+    });
+  });
 }
 
-// --- exports ---------------------------------------------------------------
+// --- export -----------------------------------------------------------------
 
 export default {
   id: PLUGIN_ID,
@@ -357,9 +425,35 @@ export default {
     initialized = true;
 
     try {
-      await ctx.tool.hook("execute.after", async (input: any) => {
-        const sessionID = typeof input?.sessionID === "string" ? input.sessionID : sessionIDOf(input);
-        forwardEvent(TOOL_AFTER, sessionID, input);
+      await registerTools(ctx);
+    } catch {
+      // A host without the tool transform: events still forward; attach via CLI.
+    }
+
+    // The relay bootstrap marker is in a spawned session's own prompt text.
+    // This hook is the reliable signal (the raw event type name may change).
+    try {
+      await ctx.session.hook("prompt", async (event: any) => {
+        try {
+          const sessionID = typeof event?.sessionID === "string" ? event.sessionID : undefined;
+          const text = stringsOf(event?.prompt ?? event).join("\n");
+          await maybeAttachFromText(ctx, sessionID, text);
+        } catch {
+          // Never break the session.
+        }
+      });
+    } catch {
+      // Older hosts may lack the prompt hook; the event stream fallback covers us.
+    }
+
+    try {
+      await ctx.tool.hook("execute.after", async (event: any) => {
+        try {
+          const sessionID = typeof event?.sessionID === "string" ? event.sessionID : sessionIDOf(event);
+          await forwardEvent(ctx, TOOL_AFTER, sessionID, event);
+        } catch {
+          // Never break the session.
+        }
       });
     } catch {
       // Older hosts may lack tool hooks; the event stream still covers us.
@@ -370,7 +464,7 @@ export default {
       try {
         for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
           try {
-            await handleStreamEvent(event);
+            await handleStreamEvent(ctx, event);
           } catch {
             // Per-event failure must not kill the stream.
           }
@@ -382,31 +476,4 @@ export default {
 
     return () => controller.abort();
   },
-};
-
-// Official Plugin-function shape (enables agent_attach/agent_detach tools).
-// Ignored by hosts that only support the default export (like the v2 setup
-// shape above); the module guard prevents double activation otherwise.
-export const RelayPlugin = async (input: any) => {
-  if (initialized) return {};
-  initialized = true;
-  const directory = input?.directory;
-  return {
-    tool: await buildTools(),
-    event: async ({ event }: any) => {
-      try {
-        await handleStreamEvent(event, directory);
-      } catch {
-        // Never break the session.
-      }
-    },
-    "tool.execute.after": async (toolInput: any) => {
-      try {
-        const sessionID = typeof toolInput?.sessionID === "string" ? toolInput.sessionID : sessionIDOf(toolInput);
-        forwardEvent(TOOL_AFTER, sessionID, toolInput, directory);
-      } catch {
-        // Never break the session.
-      }
-    },
-  };
 };

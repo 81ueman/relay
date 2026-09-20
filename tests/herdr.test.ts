@@ -7,7 +7,7 @@ import { openDb } from "../src/db";
 import { listEvents } from "../src/events";
 import { handleSocketMessage, type SocketContext } from "../src/socket";
 import { MockRuntime, type HerdrIdentity } from "../src/runtime/runtime";
-import { buildRuntime } from "../src/runtime/herdr";
+import { buildRuntime, pickIdentityByDirectory, type HerdrAgentEntry } from "../src/runtime/herdr";
 import { reconcile } from "../src/reconciler";
 import { attachSession, getSession } from "../src/sessions";
 import {
@@ -295,5 +295,75 @@ describe("J. old session/generation events are fenced out", () => {
     expect(staleGen).toMatchObject({ ignored: "stale-generation" });
     expect(eventCount()).toBe(before);
     expect(rt.wakes).toHaveLength(0);
+  });
+});
+
+describe("K. directory identification for a shared OpenCode server", () => {
+  const agent = (over: Partial<HerdrAgentEntry>): HerdrAgentEntry => ({
+    name: "a1",
+    agent: "opencode",
+    pane_id: "w1:p1",
+    tab_id: "w1:t1",
+    workspace_id: "w1",
+    foreground_cwd: "/proj/one",
+    ...over,
+  });
+
+  test("a unique opencode agent in the directory resolves", () => {
+    const id = pickIdentityByDirectory(
+      [agent({ name: "a1", pane_id: "w1:p1", foreground_cwd: "/proj/one" })],
+      "ses_x",
+      "/proj/one"
+    );
+    expect(id).toMatchObject({ agent: "a1", paneId: "w1:p1", tabId: "w1:t1", agentKind: "opencode" });
+  });
+
+  test("no matching agent (or only non-opencode) is rejected", () => {
+    expect(() =>
+      pickIdentityByDirectory([agent({ agent: "bash" })], "ses_x", "/proj/one")
+    ).toThrow(/not running inside Herdr/);
+    expect(() =>
+      pickIdentityByDirectory([agent({ foreground_cwd: "/proj/two" })], "ses_x", "/proj/one")
+    ).toThrow(/not running inside Herdr/);
+  });
+
+  test("two opencode agents in the directory is ambiguous and rejected", () => {
+    expect(() =>
+      pickIdentityByDirectory(
+        [agent({ pane_id: "w1:p1" }), agent({ name: "a2", pane_id: "w1:p2" })],
+        "ses_x",
+        "/proj/one"
+      )
+    ).toThrow(/ambiguous/);
+  });
+
+  test("a pane with no cwd never matches (no manufactured ambiguity)", () => {
+    const id = pickIdentityByDirectory(
+      [agent({ name: "a1", foreground_cwd: null, cwd: null }), agent({ name: "a2", foreground_cwd: "/proj/one" })],
+      "ses_x",
+      "/proj/one"
+    );
+    expect(id.agent).toBe("a2");
+  });
+
+  test("a subdirectory session matches its project pane", () => {
+    const id = pickIdentityByDirectory(
+      [agent({ name: "a1", foreground_cwd: "/proj/one" })],
+      "ses_x",
+      "/proj/one/pkg/sub"
+    );
+    expect(id.agent).toBe("a1");
+  });
+
+  test("directory-only manual attach resolves through the socket (no pane env)", async () => {
+    rt.setIdentity("ses_dir", { ...IDENTITY, agent: "dir-agent", paneId: "w1:p9", tabId: "w1:t9" });
+    const res = await handleSocketMessage(
+      { type: "session.attach", session_id: "ses_dir", role: "worker", directory: "/proj/one" },
+      ctx
+    );
+    expect(res.ok).toBe(true);
+    // No pane hints were sent: the daemon must have resolved from the directory.
+    expect(rt.resolves[0]?.hint).toMatchObject({ directory: "/proj/one", paneId: undefined });
+    expect(getWorker(db, String(res.worker_id))!.runtime_id).toBe("dir-agent");
   });
 });

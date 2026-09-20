@@ -169,23 +169,28 @@ async function main(): Promise<void> {
         const rest = argv.slice(2);
         if (sub === "attach") {
           const sessionId = flag(rest, "--session");
-          if (!sessionId) throw new Error("usage: agentctl session attach --session <sid> [--role R] [--worker W] [--pane P] [--tab T]");
+          if (!sessionId) throw new Error("usage: agentctl session attach --session <sid> [--role R] [--worker W] [--dir D] [--pane P] [--tab T]");
           // Manual attach: the session must provably live inside a Herdr agent.
           // Resolve + verify BEFORE touching the DB; unverifiable => fail closed.
+          // `--dir <project>` identifies the pane from the session's working
+          // directory (exactly one opencode agent there); it takes precedence
+          // over the caller's $HERDR_* env, which leaks the CALLER's pane when
+          // attaching a session in another pane/workspace.
+          const dir = flag(rest, "--dir") ?? undefined;
           const rt = buildRuntime();
           const identity = await rt.resolveIdentity({
             sessionId,
             hint: {
-              paneId: flag(rest, "--pane") ?? process.env.HERDR_PANE_ID,
-              tabId: flag(rest, "--tab") ?? process.env.HERDR_TAB_ID,
-              workspaceId: flag(rest, "--workspace") ?? process.env.HERDR_WORKSPACE_ID,
-              directory: flag(rest, "--dir") ?? undefined,
+              paneId: flag(rest, "--pane") ?? (dir ? undefined : process.env.HERDR_PANE_ID),
+              tabId: flag(rest, "--tab") ?? (dir ? undefined : process.env.HERDR_TAB_ID),
+              workspaceId: flag(rest, "--workspace") ?? (dir ? undefined : process.env.HERDR_WORKSPACE_ID),
+              directory: dir,
             },
           });
           const s = attachSession(db, sessionId, {
             role: flag(rest, "--role") ?? undefined,
             workerId: flag(rest, "--worker") ?? undefined,
-            directory: flag(rest, "--dir") ?? undefined,
+            directory: dir,
             worktree: flag(rest, "--worktree") ?? undefined,
             identity,
           });

@@ -116,17 +116,22 @@ agent_detach()
 ```
 
 ```bash
-agentctl session attach --session ses_xxx --role worker   # uses $HERDR_PANE_ID/$HERDR_TAB_ID
+agentctl session attach --session ses_xxx --dir <project>   # identify the pane by directory
+agentctl session attach --session ses_xxx --pane <pane>     # or by explicit Herdr pane
 agentctl session detach --session ses_xxx
 agentctl session list
 ```
 
 The daemon **resolves the session's Herdr identity before any DB write**
-(agent, tab id, pane id, workspace id). The plugin sends its pane env
-(`HERDR_PANE_ID`/`HERDR_TAB_ID`/`HERDR_WORKSPACE_ID`); the daemon verifies the
-pane exists, runs an `opencode` agent, and is consistent with the hint. If Herdr
-itself reports a session id for a pane, that mapping is authoritative. If the
-identity cannot be proven — missing, ambiguous, or a mismatch — the attach is
+(agent, tab id, pane id, workspace id). If Herdr itself reports a session id for
+a pane, that mapping is authoritative. Otherwise the daemon identifies the pane
+by the session's `directory`: **exactly one** live `opencode` agent must run
+there. This is why a shared OpenCode server (`opencode serve --service`) is
+safe — its process env names no session, so the plugin never sends pane env; it
+sends the session id and project directory, and the daemon resolves the pane
+itself. An explicit `--pane`/`--tab`/`--workspace` hint (or the plugin's pane
+env on a dedicated server) is verified against that pane's cwd. If the identity
+cannot be proven — missing, ambiguous, or a mismatch — the attach is
 **rejected** (`attach failed: session is not running inside Herdr`): Relay never
 guesses and never creates a half-managed state (`managed=true`, `runtime_id=null`).
 
@@ -274,6 +279,17 @@ The plugin never spawns processes and never throws into OpenCode; a dead
 daemon just means silent best-effort drops. High-frequency
 `tool.execute.after` is liveness only (explicit `agentctl note` is the
 strongest progress signal).
+
+Install the plugin where the sessions run. One OpenCode server can host many
+projects and it loads `.opencode/plugins/` per project **location**; the event
+forwarder and bootstrap auto-attach are server-global once any location has
+loaded the plugin, but the `agent_attach` / `agent_detach` tools are registered
+per location. To get the tools in every project (and guarantee the forwarder is
+present), symlink it once:
+
+```bash
+ln -s "$(pwd)/.opencode/plugins/agentctl.ts" ~/.config/opencode/plugins/agentctl.ts
+```
 
 ## Minimal demo: 2 workers + planner + reviewer
 

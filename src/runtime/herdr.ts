@@ -108,7 +108,7 @@ function extractTabId(parsed: any): string | null {
   return null;
 }
 
-interface HerdrAgentEntry {
+export interface HerdrAgentEntry {
   name?: string | null;
   agent?: string | null;
   pane_id?: string | null;
@@ -217,6 +217,41 @@ function dirsCompatible(a: string | null | undefined, b: string | null | undefin
   return na === nb || na.startsWith(nb + "/") || nb.startsWith(na + "/");
 }
 
+/**
+ * Strict directory overlap for IDENTIFYING a pane: both sides must be known and
+ * equal or in an ancestor/descendant relationship. An unknown pane cwd never
+ * matches (a pane with no cwd must not manufacture ambiguity).
+ */
+function dirsOverlap(a: string | null | undefined, b: string | null | undefined): boolean {
+  const na = normalizeDir(a);
+  const nb = normalizeDir(b);
+  if (!na || !nb) return false;
+  return na === nb || na.startsWith(nb + "/") || nb.startsWith(na + "/");
+}
+
+/**
+ * Pure directory -> identity resolution. Used when the caller has no pane hint
+ * (e.g. this plugin on a shared OpenCode server, whose process env cannot name
+ * the session's pane). Exactly one live `opencode` agent must run in the
+ * session directory; zero or many is rejected (never guess).
+ */
+export function pickIdentityByDirectory(
+  agents: HerdrAgentEntry[],
+  sessionId: string,
+  directory: string
+): HerdrIdentity {
+  const matches = agents.filter(
+    (a) => a?.agent === "opencode" && dirsOverlap(directory, a.foreground_cwd ?? a.cwd)
+  );
+  if (matches.length === 0) {
+    throw new Error(`session ${sessionId} is not running inside Herdr (no opencode agent with cwd ${directory})`);
+  }
+  if (matches.length > 1) {
+    throw new Error(`ambiguous Herdr identity for ${sessionId}: ${matches.length} opencode agents in ${directory}`);
+  }
+  return identityFromAgent(matches[0]);
+}
+
 function identityFromAgent(a: HerdrAgentEntry): HerdrIdentity {
   const paneId = typeof a.pane_id === "string" ? a.pane_id : "";
   const tabId = typeof a.tab_id === "string" ? a.tab_id : "";
@@ -253,7 +288,11 @@ export class HerdrRuntime implements Runtime {
    * Resolve the Herdr identity of a live OpenCode session for manual attach.
    * Order of trust:
    *   1. A pane that itself reported this exact session id (`agent_session`).
-   *   2. A plugin-supplied pane hint, but only after verifying the pane exists,
+   *   2. Directory identification (`hint.directory`, no `hint.paneId`): exactly
+   *      one live opencode agent runs in that directory. This is how a session
+   *      on a shared OpenCode server is resolved, since that server's process
+   *      env cannot name the session's pane.
+   *   3. A caller-supplied pane hint, but only after verifying the pane exists,
    *      runs an opencode agent, and is consistent with the hint (tab/workspace/
    *      session-id/cwd). Ambiguous or unverifiable => throw (never guess).
    */
@@ -268,9 +307,13 @@ export class HerdrRuntime implements Runtime {
     }
     if (reported.length === 1) return identityFromAgent(reported[0]);
 
-    // 2. Plugin-provided pane hint, verified against current Herdr state.
+    // 2. No pane hint: identify the pane by the session's working directory. A
+    // shared OpenCode server cannot supply a per-session pane env, but the
+    // session directory plus live Herdr state DOES identify the pane when it is
+    // unique. Zero or many matches is rejected (never guess).
     const paneId = hint?.paneId;
     if (!paneId) {
+      if (hint?.directory) return pickIdentityByDirectory(agents, sessionId, hint.directory);
       throw new Error(`session ${sessionId} is not running inside Herdr (no pane mapping and no pane supplied)`);
     }
     const pane = getPaneInfo(paneId);

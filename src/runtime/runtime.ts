@@ -52,12 +52,17 @@ export interface HerdrIdentity {
   agentKind: string;
 }
 
-/** Caller-provided hints (from the plugin's pane environment). Verified, never trusted blindly. */
+/**
+ * Caller-provided hints. Verified against live Herdr state, never trusted
+ * blindly. A `directory` alone is enough to identify the pane when it is the
+ * only live opencode agent in that directory (a shared OpenCode server has no
+ * per-session pane env); a pane hint is verified against that pane's cwd.
+ */
 export interface HerdrIdentityHint {
   paneId?: string;
   tabId?: string;
   workspaceId?: string;
-  /** OpenCode session working directory, cross-checked against the pane cwd. */
+  /** OpenCode session working directory: identifies/validates the pane. */
   directory?: string;
 }
 
