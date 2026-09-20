@@ -508,11 +508,12 @@ async function registerTools(ctx: any): Promise<void> {
           worker_id: { type: "string", description: "Existing worker id to bind, else auto-derived" },
           generation: { type: "number", description: "Relay generation to bind (relay-spawned sessions); omit for a manual attach" },
           token: { type: "string", description: "Per-spawn attach token (relay-spawned sessions)" },
+          pane_id: { type: "string", description: "Your Herdr pane id (e.g. \"$HERDR_PANE_ID\"). REQUIRED in a shared checkout where several agents run in the same directory, because the daemon cannot otherwise tell which pane this session is (Herdr does not always report agent_session)." },
         },
         additionalProperties: false,
       },
       async execute(raw: any, context: any): Promise<{ content: string }> {
-        const args = (raw ?? {}) as { role?: string; worker_id?: string; generation?: number; token?: string };
+        const args = (raw ?? {}) as { role?: string; worker_id?: string; generation?: number; token?: string; pane_id?: string };
         const sessionID: string = context?.sessionID;
         const directory = await directoryFor(ctx, sessionID);
         const res = await sendRequest(
@@ -523,13 +524,14 @@ async function registerTools(ctx: any): Promise<void> {
             worker_id: args.worker_id,
             generation: args.generation,
             token: args.token,
+            pane_id: args.pane_id,
             directory,
           },
           directory
         );
         if (!res?.ok) {
           return {
-            content: `attach failed (${res?.reason ?? "unknown"}). Is the relay daemon running for this project? Start it with \`relay daemon\` in the project root, then retry. Equivalent CLI: \`relay session attach --session ${sessionID} --dir <project>\`.`,
+            content: `attach failed (${res?.reason ?? "unknown"}). Is the relay daemon running for this project? Start it with \`relay daemon\` in the project root, then retry. Equivalent CLI: \`relay session attach --session ${sessionID} --dir <project>\`. If the reason is ambiguous identity / no pane mapping, pass pane_id: "$HERDR_PANE_ID" (several agents share this directory).`,
           };
         }
         G.generationCache.set(sessionID, res.generation);

@@ -289,7 +289,10 @@ export function pickIdentityByDirectory(
     throw new Error(`session ${sessionId} is not running inside Herdr (no opencode agent with cwd ${directory})`);
   }
   if (matches.length > 1) {
-    throw new Error(`ambiguous Herdr identity for ${sessionId}: ${matches.length} opencode agents in ${directory}`);
+    throw new Error(
+      `ambiguous Herdr identity for ${sessionId}: ${matches.length} opencode agents run in ${directory}; ` +
+      `supply a pane hint (e.g. pane_id="$HERDR_PANE_ID") to disambiguate`
+    );
   }
   return identityFromAgent(matches[0]);
 }

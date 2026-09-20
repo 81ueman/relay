@@ -263,15 +263,25 @@ Attach a live session without restarting it (custom tool or CLI):
 
 ```text
 agent_attach(role="worker")   # OpenCode tool; context gives sessionID/directory/worktree
+agent_attach(role="worker", pane_id="$HERDR_PANE_ID")  # shared checkout: name your pane
 agent_detach()
 ```
 
 ```bash
 relay session attach --session ses_xxx --dir <project>   # identify the pane by directory
 relay session attach --session ses_xxx --pane <pane>     # or by explicit Herdr pane
+relay session attach --session ses_xxx                   # no --dir: uses $HERDR_PANE_ID (your pane)
 relay session detach --session ses_xxx
 relay session list
 ```
+
+When several opencode agents run in the SAME directory (a shared checkout), the
+directory identifies nothing: Herdr no longer reliably reports `agent_session`,
+so a manual attach with only `--dir` is ambiguous and is refused, and the worker
+stays at gen 0 / runtime null even if it then claims a task. Pass the pane
+explicitly (`pane_id` / `--pane`, or omit `--dir` so the caller's own
+`$HERDR_PANE_ID` is used). Every rejection is logged as `session.attach_failed`
+and `relay status` lists workers that hold a task without a managed session.
 
 The daemon **resolves the session's Herdr identity before any DB write**
 (agent, tab id, pane id, workspace id). If Herdr itself reports a session id for

@@ -7,7 +7,7 @@ import { ackMessage, claimInbox, deliverMessage, getMessage, HUMAN_RECIPIENT, in
 import { runDaemon } from "./daemon";
 import { handleErrorSignal, handleIdleSignal, reconcile } from "./reconciler";
 import { buildRuntime, HerdrRuntime } from "./runtime/herdr";
-import { supervisorView } from "./scheduler";
+import { supervisorView, isOperationalWorker } from "./scheduler";
 import { attachSession, detachSession, getSession, listSessions } from "./sessions";
 import { listRuntimes } from "./runtimes";
 import {
@@ -656,6 +656,14 @@ async function main(): Promise<void> {
         console.log("-----------");
         if (stranded.length === 0) console.log("(none)");
         for (const t of stranded) console.log(`${t.id}  role=${t.role}  ${t.title}`);
+        const unattached = workers.filter((w) => w.current_task_id && !isOperationalWorker(db, w));
+        console.log("");
+        console.log("Unattached (holding a task)");
+        console.log("---------------------------");
+        if (unattached.length === 0) console.log("(none)");
+        for (const w of unattached) {
+          console.log(`${w.id}  task=${w.current_task_id}  runtime=${w.runtime_id ?? "-"}  session=${w.opencode_session_id ?? "-"}  (no managed session: relay cannot wake it by name)`);
+        }
         const unread = unreadCounts(db);
         console.log("");
         console.log("Unread mail");

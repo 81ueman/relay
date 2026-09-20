@@ -100,7 +100,17 @@ export async function handleSocketMessage(msg: SocketMessage, ctx: SocketContext
           },
         });
       } catch (e) {
-        return { ok: false, reason: String(e).slice(0, 200) };
+        const reason = String(e).slice(0, 200);
+        // Manual attach verification failed. Log it: the client gets the reason,
+        // but without a server event an operator can never see WHY a worker
+        // ended up unattached (and possibly working anyway).
+        logEvent(db, {
+          source: "opencode",
+          workerId: msg.worker_id,
+          type: "session.attach_failed",
+          payload: { sessionId: msg.session_id, stage: "identity", directory: msg.directory ?? null, reason },
+        });
+        return { ok: false, reason };
       }
     }
 
@@ -118,7 +128,14 @@ export async function handleSocketMessage(msg: SocketMessage, ctx: SocketContext
         identity,
       });
     } catch (e) {
-      return { ok: false, reason: String(e).slice(0, 200) };
+      const reason = String(e).slice(0, 200);
+      logEvent(db, {
+        source: "opencode",
+        workerId: msg.worker_id,
+        type: "session.attach_failed",
+        payload: { sessionId: msg.session_id, stage: "attach", reason },
+      });
+      return { ok: false, reason };
     }
     ctx.wakeReconcile.value = true;
     return { ok: true, worker_id: s.worker_id, generation: s.generation, managed: true };

@@ -112,7 +112,9 @@ describe("B. non-Herdr attach is rejected", () => {
     expect(getSession(db, "ses_outside")).toBeNull();
     expect(listWorkers(db)).toHaveLength(0);
     expect(listRuntimes(db)).toHaveLength(0);
-    expect(eventCount()).toBe(before);
+    // A rejection writes ONLY a diagnostic event: no session/worker/runtime state.
+    expect(eventCount()).toBe(before + 1);
+    expect(listEvents(db, { limit: 1 })[0]?.type).toBe("session.attach_failed");
   });
 });
 
@@ -242,6 +244,9 @@ describe("H. manual attach requires an exact Herdr identity", () => {
     expect(getSession(db, "ses_x")).toBeNull();
     expect(listWorkers(db)).toHaveLength(0);
     expect(listRuntimes(db)).toHaveLength(0);
+    // The rejection is logged, so an operator can see WHY a worker stayed
+    // unattached instead of only the agent knowing.
+    expect(listEvents(db, { limit: 10 }).some((e) => e.type === "session.attach_failed")).toBe(true);
   });
 });
 

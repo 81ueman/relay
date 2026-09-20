@@ -290,6 +290,23 @@ describe("L. manual attach to a busy worker is rejected", () => {
   });
 });
 
+describe("L2. a FIRST attach is allowed while the worker holds a task", () => {
+  test("claim-before-attach is recoverable: no session to migrate, so bind and record", async () => {
+    registerWorker(db, "w1", { role: "worker" });
+    const t = addTask(db, { title: "claimed before attach" });
+    claimNext(db, "w1"); // claiming does not require an attached session
+
+    const res = await manualAttach("ses_first", IDENTITY, "w1");
+    expect(res.ok).toBe(true);
+    const w = getWorker(db, "w1")!;
+    expect(w.opencode_session_id).toBe("ses_first");
+    expect(w.generation).toBeGreaterThan(0);
+    expect(w.runtime_id).toBe("herdr-a");
+    expect(findRuntime(db, "w1", w.generation)!.pane_id).toBe("w9:p3");
+    expect(getTask(db, t.id)!.assignee).toBe("w1");
+  });
+});
+
 describe("M. manual attach cannot steal another managed worker binding", () => {
   test("w1 managed by ses_A, idle => ses_B attach rejected", async () => {
     await manualAttach("ses_A", IDENTITY, "w1");

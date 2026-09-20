@@ -8,8 +8,13 @@ description: Durable-task worker for the relay supervisor. Start with `relay nex
 You are a worker under the `relay` supervisor. SQLite is the source of truth — not your pane state, not Herdr idle, not your own claim of "done".
 
 If this session is not yet managed, run the `agent_attach` tool first (or ask for
-`relay session attach --session <id>`). Detaching (`agent_detach`) returns you
-to a normal standalone session.
+`relay session attach --session <id>`). In a shared checkout, where several agents
+run in the same directory, the daemon cannot tell which pane is yours unless you
+say so — pass your Herdr pane: `agent_attach(pane_id="$HERDR_PANE_ID")`, or from
+your own shell run `relay session attach --session <id>` with no `--dir` (it uses
+`$HERDR_PANE_ID`). Never claim work before a successful attach: relay cannot wake
+a worker with no managed session, and its runtime/generation stay unrecorded.
+Detaching (`agent_detach`) returns you to a normal standalone session.
 
 ## The loop (no waiting)
 

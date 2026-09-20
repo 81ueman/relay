@@ -158,9 +158,18 @@ export function attachSession(db: Database, sessionId: string, opts: AttachOptio
     if (!opts.identity?.agent) {
       throw new Error("attach failed: session is not running inside Herdr");
     }
-    // Never silently migrate a busy worker: an owned task must be
-    // submitted/blocked/requeued before its session is rebound.
-    if (worker0 && worker0.current_task_id) {
+    // Never silently MIGRATE a busy worker to a different session: an owned task
+    // must be submitted/blocked/requeued before its session is rebound. A FIRST
+    // attach (no bound session yet) is allowed even while the worker holds a
+    // task: the worker is already running, and refusing here would trap it at
+    // gen 0 / runtime null forever (claiming does not require an attached
+    // session, so a claim-before-attach ordering must still be recoverable).
+    if (
+      worker0 &&
+      worker0.current_task_id &&
+      worker0.opencode_session_id &&
+      worker0.opencode_session_id !== sessionId
+    ) {
       throw new Error(`attach rejected: worker ${workerId} is busy with task ${worker0.current_task_id}`);
     }
     // Do not steal another managed worker binding without an explicit detach.
