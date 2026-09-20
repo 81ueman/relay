@@ -42,6 +42,63 @@ if runnable_tasks > 0 and working_workers == 0:
 unfinished tasks are blocked_human`. A `blocked_human` task releases its
 worker immediately to take other runnable work.
 
+## Task roles, claiming, and release
+
+Peer ownership stays single-writer, but a task's `role` is a **real claim gate
+by default (strict)**:
+
+```text
+role IS NULL            -> claimable by any worker
+role = R (non-null)     -> claimable ONLY by a worker registered with role R
+```
+
+- `relay next` / `relay claim` enforce the gate. A `role=worker` pane is never
+  woken for a queue that is entirely `role=dataplane-rust`; it simply gets
+  `NO_TASK` and stays idle.
+- `--role <r>` overrides the match role for a single call
+  (`relay next --role dataplane-rust`). It does not change the worker's
+  registered role.
+- `--any-role`, or `RELAY_ROLE_STRICT=false`, is the **recovery escape hatch**
+  that restores the old any-worker behavior (ignore task roles). Strict is the
+  default; a live fleet must be migrated (see below) or it will strand
+  role-tagged tasks.
+- Review tasks (`state=review`) are still claimable only by `role=reviewer`
+  workers, and reviewers check the review queue before queued work. A reviewer
+  also claims queued `role=reviewer` tasks.
+- `relay task add --role R` warns (stderr, non-fatal) when `R` matches no
+  registered worker and is not a built-in special role
+  (`worker`/`planner`/`reviewer`) — a typo cannot silently create an
+  unclaimable task.
+- `relay status` lists **Unclaimable** runnable tasks (non-null role, no
+  registered worker role); the supervisor view carries the same count and the
+  daemon logs `supervisor.unclaimable_work` instead of looping on a wake that
+  cannot help.
+
+**Migration (strict roles):** every existing worker must be registered with the
+role it is meant to serve, e.g.
+`relay worker register <worker-id> --role <role>` (or
+`relay worker register <worker-id> --role worker` for generic workers). Tasks
+tagged with a role that no worker registers are reported as unclaimable in
+`relay status`; register a matching worker, retag the task, or release/re-add it
+under `--any-role` as a temporary recovery.
+
+### Clean hand-back: `relay release`
+
+The only other exits for a running task were `block`→`unblock` or
+`submit`→`reject`, both of which fabricate a block/reject note just to fix
+ownership. `relay release <task-id> [--worker <id>]` hands a **running** task
+straight back to `queued`:
+
+```text
+running -> queued   assignee=NULL  lease_until=NULL  lease_token += 1
+owner.current_task_id cleared       task_notes kind='release'   event task.released
+```
+
+The current assignee may release, **and a human/any other worker may also
+release** — this is the recovery path for a mis-claimed task whose owner is gone
+(no hard fencing is imposed, by design). The bumped `lease_token` still fences
+the old owner's later `submit` with `STALE_LEASE`.
+
 ## Single-supervisor invariant
 
 ```text
@@ -145,7 +202,8 @@ Identity / paths / tuning:
 ```text
 $RELAY_WORKER (or --worker, or .relay/worker-id)
 $RELAY_DB (default .relay/state.db), $RELAY_SOCK (default .relay/relay.sock)
-RELAY_LEASE_MS=120000 RELAY_STALL_MS=60000 RELAY_LOW_WATER=3
+RELAY_LEASE_MS=120000 RELAY_LEASE_LIVENESS_GRACE_MS=300000
+RELAY_STALL_MS=60000 RELAY_LOW_WATER=3 RELAY_ROLE_STRICT=true
 RELAY_WAKE_COOLDOWN_MS=30000 RELAY_AUTO_APPROVE RELAY_INTERVAL_MS=1500
 RELAY_HERDR_WORKSPACE=<ws>   # REQUIRED to spawn (falls back to $HERDR_WORKSPACE_ID)
 RELAY_RUNTIME_CLEANUP_GRACE_MS=300000 RELAY_ATTACH_TIMEOUT_MS=30000
@@ -426,20 +484,31 @@ relay worker register worker-1 --role worker --cwd $PWD
 relay worker register worker-2 --role worker --cwd $PWD
 relay worker register planner --role planner
 relay worker register reviewer --role reviewer
+# role-tagged work only goes to a worker with the SAME role (strict default):
+relay worker register rust-1 --role dataplane-rust --cwd $PWD
 
 relay task add "Add password reset endpoint" --priority 10 \
   --acceptance "POST /reset requested, token emailed, tests green"
 relay task add "Write reset-email template" --priority 5
+relay task add "Port the parser to Rust" --role dataplane-rust
 ```
+
+(Registering a worker that will serve role R with `--role worker` is the
+classic migration mistake: role-tagged tasks then show up as **Unclaimable** in
+`relay status` until a matching worker exists.)
 
 Workers (two OpenCode panes; run `agent_attach`, load `agent-worker` skill):
 
 ```bash
 export RELAY_WORKER=worker-1
-relay next                                    # atomic claim, prints lease
+relay next                                    # atomic claim (role-gated), prints lease
 relay note T1 "endpoint scaffolded"
 relay submit T1 --evidence "bun test reset (8 pass)"
 relay next                                    # immediately, never wait
+
+# claimed the wrong task? hand it back without a fake block/reject note:
+relay release T1
+relay next
 ```
 
 Reviewer: `relay next` (review first, then queued — peer, no hierarchy),
@@ -462,8 +531,10 @@ Observe: `relay status`, `relay events --follow`.
 
 `next → claim → work → note → work → submit|block → next …`
 `submit` moves `running → review`; only `approve` moves `review → done`.
-Claims carry fencing leases; `note` heartbeats + renews; a stale worker's late
-`submit` is rejected with `STALE_LEASE`. Pane/Herdr `idle` is never completion.
+`relay next` only offers tasks your registered role may claim (strict); use
+`relay release <id>` to hand a running task back cleanly. Claims carry fencing
+leases; `note` heartbeats + renews; a stale worker's late `submit` is rejected
+with `STALE_LEASE`. Pane/Herdr `idle` is never completion.
 
 ## Recovery (all deterministic, no LLM)
 
@@ -479,7 +550,12 @@ Claims carry fencing leases; `note` heartbeats + renews; a stale worker's late
   Adopted (`relay_owned=false`) tabs are never closed.
 - **Stalled** (running + valid lease + alive + stale progress + repeated idle):
   nudge once → still nothing → interrupt, requeue, fresh generation.
-- **Crash between heartbeats**: lease expiry returns the task to queued.
+- **Crash between heartbeats**: a **liveness-aware** lease expiry returns the
+  task to queued — but only when the assignee is **missing or dead/stalled**
+  (or has gone silent past `RELAY_LEASE_LIVENESS_GRACE_MS`, default 300000). A
+  live-but-slow worker keeps its lease even after `RELAY_LEASE_MS` (the
+  reconciler's transport `isAlive` check still requeues a genuinely crashed
+  process). A `relay release` is the manual equivalent.
 - **All work done**: the system goes quiet. The planner is not woken to invent
   new work unless unfinished work still exists and the queue is below low-water.
 
@@ -496,8 +572,8 @@ Message: queued delivered acked (+ failed)
 ## Tests
 
 ```bash
-bun test            # 53 tests across integration / contract / lifecycle / herdr
-bunx tsc --noEmit
+bun test            # 133 tests across integration / contract / lifecycle / herdr / release
+bun run typecheck   # tsc --noEmit
 ```
 
 Contract: idle+queued forces a wake · unmanaged sessions cause zero
@@ -510,6 +586,14 @@ synchronously · cleanup happens only after the grace period · the current
 generation is never cleaned · cleanup failure retries without breaking work ·
 relay-spawned sessions auto-attach · plain sessions stay unmanaged ·
 `waiting_input` is not wakeable · all-done stays quiet.
+
+Release / roles / leases: `relay release` returns running→queued with a bumped
+fencing token and clears the owner · a different worker can then claim it ·
+release on a non-running task throws · strict role gating (a `role=worker`
+cannot steal `role=dataplane-rust`; `role IS NULL` stays open) · `--any-role` /
+`RELAY_ROLE_STRICT=false` restore any-worker claiming · unclaimable tasks are
+exposed in the supervisor view and never trigger a pointless wake · a live
+worker keeps its lapsed lease while a dead/missing one is requeued.
 
 Herdr-only: manual attach registers the existing runtime `relay_owned=false` ·
 non-Herdr / ambiguous attach is rejected with no half-state · an adopted runtime
@@ -525,5 +609,5 @@ src/cli.ts  daemon.ts  db.ts  schema.ts  scheduler.ts  reconciler.ts
     sessions.ts  socket.ts  messages.ts  tasks.ts  workers.ts  events.ts
     runtimes.ts  runtime/{runtime,herdr}.ts
 .opencode/plugins/relay.ts  skills/agent-worker/SKILL.md
-tests/{integration,contract,lifecycle,herdr}.test.ts
+tests/{integration,contract,lifecycle,herdr,release}.test.ts
 ```

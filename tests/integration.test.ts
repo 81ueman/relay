@@ -143,12 +143,15 @@ describe("failure test 2: worker crash", () => {
     expect(claimed?.id).toBe(t.id);
   });
 
-  test("lease expiry alone returns task to queued (no heartbeat)", () => {
+  test("lease expiry of a NOT-ALIVE worker returns task to queued (no heartbeat)", () => {
     worker("w1");
     worker("w2");
     const t = addTask(db, { title: "expiring" });
     claimNext(db, "w1");
     db.query(`UPDATE tasks SET lease_until = ? WHERE id = ?`).run(Date.now() - 1000, t.id);
+    // Liveness-aware expiry: only a missing/dead assignee is a crash. A live but
+    // slow worker would keep its lease (see tests/release.test.ts C).
+    db.query(`UPDATE workers SET state = 'dead' WHERE id = 'w1'`).run();
     const expired = expireLeases(db, Date.now());
     expect(expired.map((x) => x.id)).toContain(t.id);
     expect(getTask(db, t.id)!.state).toBe("queued");
@@ -163,8 +166,9 @@ describe("failure test 3: zombie completion", () => {
     const t = addTask(db, { title: "zombie" });
     const first = claimNext(db, "wA")!;
     expect(first.lease_token).toBe(1);
-    // wA loses the task: lease expires, wB claims (token bumps to 2).
+    // wA crashes: its lapsed lease is revoked, wB claims (token bumps to 2).
     db.query(`UPDATE tasks SET lease_until = ? WHERE id = ?`).run(Date.now() - 1000, t.id);
+    db.query(`UPDATE workers SET state = 'dead' WHERE id = 'wA'`).run();
     expireLeases(db, Date.now());
     const second = claimNext(db, "wB")!;
     expect(second.lease_token).toBeGreaterThan(first.lease_token);
