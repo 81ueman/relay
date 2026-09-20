@@ -12,7 +12,7 @@ import { attachSession, detachSession, getSession, listSessions } from "./sessio
 import { listRuntimes } from "./runtimes";
 import {
   addTask, approveTask, blockTask, claimNext, claimTask, getNotes, getTask,
-  listTasks, rejectTask, submitTask, taskCounts, unblockTask, addNote,
+  listTasks, rejectTask, submitTask, taskCounts, unblockTask, addNote, withPlanTag,
 } from "./tasks";
 import {
   bindSession, findWorkerBySession, getWorker, listWorkers,
@@ -38,7 +38,7 @@ Usage:
 
   relay runtime list [--worker <id>] [--state <state>]
 
-  relay task add "description" [--title T] [--acceptance A] [--priority N] [--role R] [--parent T1]
+  relay task add "description" [--title T] [--acceptance A] [--priority N] [--role R] [--parent T1] [--plan <tag>]
   relay task list [--state <state>]
   relay task show <id>
 
@@ -121,14 +121,14 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
   task: {
     about: "Manage tasks in the durable ledger.",
     usage: [
-      'relay task add "description" [--title T] [--acceptance A] [--priority N] [--role R] [--parent T1]',
+      'relay task add "description" [--title T] [--acceptance A] [--priority N] [--role R] [--parent T1] [--plan <tag>]',
       "relay task list [--state <state>]",
       "relay task show <id>",
     ],
   },
   "task add": {
-    about: "Queue a new task. --parent nests it under T1 (the tree is display-side).",
-    usage: ['relay task add "description" [--title T] [--acceptance A] [--priority N] [--role R] [--parent T1]'],
+    about: "Queue a new task. --parent nests it under T1 (the tree is display-side). --plan <tag> prefixes the title with \"<tag>: \" so agent-status links it to that plan.json item.",
+    usage: ['relay task add "description" [--title T] [--acceptance A] [--priority N] [--role R] [--parent T1] [--plan <tag>]'],
   },
   "task list": { about: "List tasks (id, state, priority, role, assignee, title).", usage: ["relay task list [--state <state>]"] },
   "task show": { about: "Print one task as JSON, plus its notes.", usage: ["relay task show <id>"] },
@@ -355,8 +355,11 @@ async function main(): Promise<void> {
           const desc = argv[2];
           if (!desc) throw new Error('usage: relay task add "description" [...]');
           const rest = argv.slice(2);
+          const planTag = flag(rest, "--plan");
+          let title = flag(rest, "--title") ?? desc.slice(0, 80);
+          if (planTag) title = withPlanTag(title, planTag);
           const t = addTask(db, {
-            title: flag(rest, "--title") ?? desc.slice(0, 80),
+            title,
             description: desc,
             acceptance: flag(rest, "--acceptance") ?? "",
             priority: flag(rest, "--priority") ? Number(flag(rest, "--priority")) : 0,

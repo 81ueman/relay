@@ -50,6 +50,18 @@ export function addTask(
   return getTask(db, id)!;
 }
 
+/**
+ * Prefix a task title with its plan tag (e.g. "U1-A: ...").
+ *
+ * agent-status links a relay task to a plan.json item by reading this tag off the
+ * title, so `relay task add --plan U1-A` keeps the ledger linked without anyone
+ * editing plan.json. Idempotent: an already-tagged title is left alone.
+ */
+export function withPlanTag(title: string, tag: string): string {
+  const prefix = `${tag}: `;
+  return title.startsWith(prefix) ? title : prefix + title;
+}
+
 export function getTask(db: Database, id: string): Task | null {
   return (db.query(`SELECT * FROM tasks WHERE id = ?`).get(id) as Task | null) ?? null;
 }

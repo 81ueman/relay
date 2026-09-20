@@ -9,7 +9,7 @@ import { handleSocketMessage, type SocketContext } from "../src/socket";
 import { MockRuntime } from "../src/runtime/runtime";
 import { supervisorView } from "../src/scheduler";
 import { attachSession, detachSession, getSession } from "../src/sessions";
-import { addTask, blockTask, claimNext, getTask } from "../src/tasks";
+import { addTask, blockTask, claimNext, getTask, withPlanTag } from "../src/tasks";
 import { getWorker, registerWorker } from "../src/workers";
 
 // Correctness contract for the relay control plane (spec section 11).
@@ -283,5 +283,19 @@ describe("message per-ID deliver/ack", () => {
     expect(deliverMessage(db, id).state).toBe("delivered");
     expect(ackMessage(db, id, "w2").state).toBe("acked");
     expect(() => ackMessage(db, id, "w1")).toThrow();
+  });
+});
+
+describe("plan tags link tasks to the agent-status ledger", () => {
+  test("withPlanTag prefixes once and is idempotent", () => {
+    expect(withPlanTag("VRF-aware dataplane", "U1-A")).toBe("U1-A: VRF-aware dataplane");
+    expect(withPlanTag("U1-A: VRF-aware dataplane", "U1-A")).toBe("U1-A: VRF-aware dataplane");
+    // A different tag still prefixes (the caller asked for it explicitly).
+    expect(withPlanTag("U1-A: VRF", "U1-B")).toBe("U1-B: U1-A: VRF");
+  });
+
+  test("the tag ends up on the stored title", () => {
+    const t = addTask(db, { title: withPlanTag("kinds + interface aliases", "U1-B2") });
+    expect(getTask(db, t.id)!.title).toBe("U1-B2: kinds + interface aliases");
   });
 });
