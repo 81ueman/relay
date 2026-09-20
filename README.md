@@ -134,14 +134,15 @@ a path spelling and not to a socket path: the DB is canonicalized with
 cannot smuggle a second supervisor onto the same state. The boundary is enforced
 at startup, locally (no distributed lock, no leader election):
 
-- a lock keyed to the canonical DB (`<canonical-db>.relay.lock`, e.g.
-  `.relay/state.db.relay.lock`) makes a second supervisor fail fast, even if
-  `$RELAY_SOCK` points somewhere else. The lock carries a pid **and** a
-  per-acquisition random token, and is only unlinked by its exact owner: a valid
-  live-pid lock is rejected, a dead-pid lock is reclaimed;
-- a lock file that is still empty/partial is **never** reclaimed immediately —
-  another process may be initializing it. A fresh malformed lock is protected for
-  a short grace window; only a sufficiently old corrupt lock is reclaimed;
+- **the supervisor lock is an OS-backed SQLite writer lock, not a lockfile.**
+  Relay derives `<canonical-state-db>.relay-lock.db` and holds a long-lived
+  `BEGIN IMMEDIATE` transaction on it for the daemon lifetime. A second supervisor
+  cannot acquire that SQLite writer lock and is rejected with a clear
+  "already has an active supervisor" error. If the owner process exits or crashes
+  (even `SIGKILL`), the OS/SQLite lock is released automatically — there is no
+  pid, token, mtime, grace window, or stale-reclaim step. The lock DB is just a
+  reusable container (`file exists != lock held`) and is never deleted; the
+  canonical `state.db` itself is **never** held under a long-lived transaction;
 - the daemon probes `.relay/relay.sock` before binding: a **live** listener is
   never unlinked (a second daemon is rejected), only a **stale** one (file
   exists, nobody answers) is reclaimed; a non-socket file at the path fails
@@ -151,9 +152,13 @@ at startup, locally (no distributed lock, no leader election):
 - `relay daemon --once` runs the same acquisition (it executes a supervisor
   pass) and refuses while a live daemon owns the DB.
 
+Legacy `<canonical-db>.relay.lock` files from older versions are ignored: the
+SQLite supervisor lock is the singleton authority, and no migration cleanup is
+performed.
+
 Within this single-supervisor boundary, generation allocation stays simple and
 process-local (`restartingWorkers` in-flight guard + a commit-time generation
-re-check). Tests inject `MockRuntime` + `noSocket` to bypass the guard.
+re-check). Tests inject `MockRuntime` + `bypassSingleton` to bypass the guard.
 
 ## Install
 

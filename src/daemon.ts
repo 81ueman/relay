@@ -7,27 +7,26 @@ import type { Runtime } from "./runtime/runtime";
 import { reconcile } from "./reconciler";
 import { startSocketServer, type SocketContext, type SocketHandle } from "./socket";
 import {
-  acquireLock,
+  acquireSupervisorLock,
   assertSocketFree,
   canonicalizeDbPath,
   daemonIdentity,
-  lockPathFor,
-  type LockHandle,
+  type SupervisorLock,
 } from "./singleton";
 
 export interface DaemonOptions {
   dbPath?: string;
   sockPath?: string;
-  lockPath?: string;
   intervalMs?: number;
   once?: boolean;
   runtime?: Runtime;
   /**
-   * Explicit TEST-ONLY bypass of the single-supervisor guard: no lock, no socket
-   * ownership probe, no bind. Unit/integration tests inject a MockRuntime and
-   * reconcile a throwaway DB directly. The production CLI never sets this.
+   * Explicit TEST-ONLY bypass of the single-supervisor guard: no SQLite
+   * supervisor lock, no socket ownership probe, no bind. Unit/integration tests
+   * inject a MockRuntime and reconcile a throwaway DB directly. The production
+   * CLI never sets this.
    */
-  noSocket?: boolean;
+  bypassSingleton?: boolean;
 }
 
 /**
@@ -37,10 +36,10 @@ export interface DaemonOptions {
  *
  * Single-supervisor boundary (see `src/singleton.ts`): one physical
  * (canonical) control-plane DB has at most one active daemon. Startup
- * canonicalizes the DB, acquires the DB-specific lock and probes the socket; a
- * live daemon is rejected, a stale socket is reclaimed, and a bind failure is
- * fatal. `--once` runs the SAME acquisition (it executes a supervisor pass) but
- * does not bind, since it never serves.
+ * canonicalizes the DB, takes the dedicated SQLite supervisor lock and probes
+ * the socket; a live daemon is rejected, a stale socket is reclaimed, and a bind
+ * failure is fatal. `--once` runs the SAME acquisition (it executes a supervisor
+ * pass) but does not bind, since it never serves.
  */
 export async function runDaemon(opts: DaemonOptions = {}): Promise<void> {
   const requestedDbPath = opts.dbPath ?? defaultDbPath();
@@ -54,9 +53,9 @@ export async function runDaemon(opts: DaemonOptions = {}): Promise<void> {
   const intervalMs = opts.intervalMs ?? Number(process.env.RELAY_INTERVAL_MS ?? "1500");
   const rt = opts.runtime ?? buildRuntime();
   const sockPath = opts.sockPath ?? defaultSockPath();
-  const guard = !opts.noSocket;
+  const guard = !opts.bypassSingleton;
 
-  let lock: LockHandle | null = null;
+  let lock: SupervisorLock | null = null;
   let sock: SocketHandle | null = null;
   let db: Database | null = null;
   let stop = false;
@@ -67,10 +66,11 @@ export async function runDaemon(opts: DaemonOptions = {}): Promise<void> {
   try {
     if (guard) {
       // Fail fast BEFORE any DB/runtime work: a second supervisor must never
-      // reconcile. Acquire the canonical-DB-specific lock first, then prove the
-      // socket is either absent, stale (reclaimable), or ours to bind — never a
-      // live daemon's (that socket is never unlinked).
-      lock = await acquireLock(opts.lockPath ?? lockPathFor(dbPath), { dbPath });
+      // reconcile. Take the SQLite supervisor lock first (the canonical state DB
+      // is never held under a transaction), then prove the socket is either
+      // absent, stale (reclaimable), or ours to bind — never a live daemon's
+      // (that socket is never unlinked).
+      lock = acquireSupervisorLock(dbPath);
       await assertSocketFree(sockPath, dbPath);
     }
 
@@ -112,8 +112,9 @@ export async function runDaemon(opts: DaemonOptions = {}): Promise<void> {
       await Bun.sleep(250);
     }
   } finally {
-    // Graceful shutdown: stop serving, release the lock, close the DB. The socket
-    // path is removed by sock.stop() only while it is still ours.
+    // Graceful shutdown: stop serving, release the SQLite supervisor lock (ROLLBACK
+    // + close), close the state DB. The socket path is removed by sock.stop() only
+    // while it is still ours.
     sock?.stop();
     lock?.release();
     db?.close();

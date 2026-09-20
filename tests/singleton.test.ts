@@ -1,14 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import {
-  existsSync,
-  mkdtempSync,
-  readFileSync,
-  rmSync,
-  statSync,
-  symlinkSync,
-  utimesSync,
-  writeFileSync,
-} from "node:fs";
+import { existsSync, mkdtempSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -17,19 +8,20 @@ import { runDaemon } from "../src/daemon";
 import { MockRuntime } from "../src/runtime/runtime";
 import { startSocketServer, type SocketContext } from "../src/socket";
 import {
-  acquireLock,
+  acquireSupervisorLock,
   assertSocketFree,
   canonicalizeDbPath,
   daemonIdentity,
-  lockPathFor,
+  lockDbPathFor,
   probeSocket,
 } from "../src/singleton";
 
 // Single-supervisor boundary: one PHYSICAL control-plane SQLite DB == one active
-// relay daemon. The guard is (1) a DB-specific lock keyed to the canonical
-// (realpath) DB and released only with the exact (pid, token) and (2) a socket
-// ownership probe that never unlinks a live listener and reclaims only a
-// provably stale one.
+// relay daemon. The guard is (1) a dedicated SQLite lock DB held under a
+// long-lived BEGIN IMMEDIATE transaction (the OS releases it on process death,
+// so there is no pid/token/mtime/stale-reclaim step) and (2) a socket ownership
+// probe that never unlinks a live listener and reclaims only a provably stale
+// one.
 
 const REPO = join(import.meta.dir, "..");
 const dirs: string[] = [];
@@ -58,14 +50,6 @@ async function makeStaleSocket(path: string): Promise<void> {
   const server = createServer(() => {});
   await new Promise<void>((resolve) => server.listen(path, resolve));
   await new Promise<void>((resolve) => server.close(() => resolve()));
-}
-
-function deadPid(): number {
-  return Bun.spawnSync({ cmd: ["true"] }).pid;
-}
-
-function readLock(path: string): Record<string, unknown> {
-  return JSON.parse(readFileSync(path, "utf-8")) as Record<string, unknown>;
 }
 
 describe("socket ownership probe", () => {
@@ -151,16 +135,16 @@ describe("socket ownership probe", () => {
 });
 
 describe("canonical DB identity", () => {
-  test("a physical DB yields a DB-specific lock path (not a directory-wide one)", () => {
+  test("a physical DB yields a DB-specific supervisor lock DB (not a directory-wide one)", () => {
     const dir = tempDir();
-    const a = lockPathFor(canonicalizeDbPath(join(dir, "a.db")));
-    const b = lockPathFor(canonicalizeDbPath(join(dir, "b.db")));
+    const a = lockDbPathFor(canonicalizeDbPath(join(dir, "a.db")));
+    const b = lockDbPathFor(canonicalizeDbPath(join(dir, "b.db")));
     expect(a).not.toBe(b);
-    expect(a.endsWith("a.db.relay.lock")).toBe(true);
-    expect(b.endsWith("b.db.relay.lock")).toBe(true);
+    expect(a.endsWith("a.db.relay-lock.db")).toBe(true);
+    expect(b.endsWith("b.db.relay-lock.db")).toBe(true);
   });
 
-  test("symlink aliases converge on one canonical DB and one lock", () => {
+  test("symlink aliases share the same supervisor lock DB", () => {
     const realDir = tempDir();
     const aliasDir = tempDir();
     const realDb = join(realDir, "state.db");
@@ -169,112 +153,76 @@ describe("canonical DB identity", () => {
     symlinkSync(realDb, aliasDb);
 
     expect(canonicalizeDbPath(aliasDb)).toBe(canonicalizeDbPath(realDb));
-    expect(lockPathFor(canonicalizeDbPath(aliasDb))).toBe(lockPathFor(canonicalizeDbPath(realDb)));
+    expect(lockDbPathFor(canonicalizeDbPath(aliasDb))).toBe(lockDbPathFor(canonicalizeDbPath(realDb)));
   });
 });
 
-describe("control-plane lock", () => {
-  test("a live holder rejects a second acquisition", async () => {
+describe("SQLite supervisor lock", () => {
+  test("acquire succeeds and a second holder is rejected", () => {
     const dir = tempDir();
     const dbPath = join(dir, "state.db");
     openDb(dbPath).close();
-    const lock = lockPathFor(canonicalizeDbPath(dbPath));
-    const held = await acquireLock(lock, { dbPath: canonicalizeDbPath(dbPath) });
+    const canonical = canonicalizeDbPath(dbPath);
+
+    const held = acquireSupervisorLock(canonical);
     try {
-      await expect(
-        acquireLock(lock, { dbPath: canonicalizeDbPath(dbPath) })
-      ).rejects.toThrow(/active supervisor|second supervisor/);
+      expect(() => acquireSupervisorLock(canonical)).toThrow(
+        /active supervisor|second supervisor/
+      );
     } finally {
       held.release();
     }
-    expect(existsSync(lock)).toBe(false);
   });
 
-  test("a valid lock left by a dead process is reclaimed", async () => {
+  test("release allows the next supervisor and is idempotent", () => {
     const dir = tempDir();
     const dbPath = join(dir, "state.db");
     openDb(dbPath).close();
     const canonical = canonicalizeDbPath(dbPath);
-    const lock = lockPathFor(canonical);
-    writeFileSync(
-      lock,
-      JSON.stringify({ pid: deadPid(), token: "dead-token", db_path: canonical, created_at: Date.now() })
-    );
 
-    const held = await acquireLock(lock, { dbPath: canonical });
-    expect(readLock(lock).token).toBe(held.token);
-    held.release();
-    expect(existsSync(lock)).toBe(false);
+    const a = acquireSupervisorLock(canonical);
+    a.release();
+    a.release(); // must not crash
+
+    const b = acquireSupervisorLock(canonical);
+    b.release();
   });
 
-  test("release requires the exact ownership token (same pid, different token stays)", async () => {
+  test("the lock DB is a reusable container (file persists, ownership is transactional)", () => {
     const dir = tempDir();
     const dbPath = join(dir, "state.db");
     openDb(dbPath).close();
     const canonical = canonicalizeDbPath(dbPath);
-    const lock = lockPathFor(canonical);
-    const held = await acquireLock(lock, { dbPath: canonical });
+    const lockDb = lockDbPathFor(canonical);
 
-    // A replacement lock with the same PID but a different incarnation.
-    writeFileSync(
-      lock,
-      JSON.stringify({ pid: process.pid, token: "someone-else", db_path: canonical, created_at: Date.now() })
-    );
-    held.release();
-    expect(existsSync(lock)).toBe(true);
-    expect(readLock(lock).token).toBe("someone-else");
+    const a = acquireSupervisorLock(canonical);
+    expect(existsSync(lockDb)).toBe(true);
+    a.release();
+    // The file is NOT deleted: `file exists != lock held`.
+    expect(existsSync(lockDb)).toBe(true);
+
+    const b = acquireSupervisorLock(canonical);
+    b.release();
   });
 
-  test("a fresh empty lock is never reclaimed immediately", async () => {
+  test("holding the supervisor lock does NOT block writes to the state DB", () => {
     const dir = tempDir();
     const dbPath = join(dir, "state.db");
-    openDb(dbPath).close();
+    const state = openDb(dbPath);
     const canonical = canonicalizeDbPath(dbPath);
-    const lock = lockPathFor(canonical);
-    writeFileSync(lock, "");
 
-    const pending = acquireLock(lock, { dbPath: canonical, initGraceMs: 250 });
-    await Bun.sleep(80);
-    // Still protected while fresh: not unlinked.
-    expect(existsSync(lock)).toBe(true);
-    expect(readFileSync(lock, "utf-8")).toBe("");
-
-    const held = await pending; // reclaimed only once it aged past the grace
-    expect(readLock(lock).token).toBe(held.token);
-    held.release();
-  });
-
-  test("a fresh partial-JSON lock is never reclaimed immediately", async () => {
-    const dir = tempDir();
-    const dbPath = join(dir, "state.db");
-    openDb(dbPath).close();
-    const canonical = canonicalizeDbPath(dbPath);
-    const lock = lockPathFor(canonical);
-    writeFileSync(lock, `{"pid":`);
-
-    const pending = acquireLock(lock, { dbPath: canonical, initGraceMs: 250 });
-    await Bun.sleep(80);
-    expect(readFileSync(lock, "utf-8")).toBe(`{"pid":`);
-
-    const held = await pending;
-    expect(readLock(lock).token).toBe(held.token);
-    held.release();
-  });
-
-  test("an old corrupt lock is reclaimed", async () => {
-    const dir = tempDir();
-    const dbPath = join(dir, "state.db");
-    openDb(dbPath).close();
-    const canonical = canonicalizeDbPath(dbPath);
-    const lock = lockPathFor(canonical);
-    writeFileSync(lock, `{"pid":`);
-    const old = new Date(Date.now() - 10_000);
-    utimesSync(lock, old, old);
-
-    const held = await acquireLock(lock, { dbPath: canonical });
-    expect(readLock(lock).token).toBe(held.token);
-    held.release();
-    expect(existsSync(lock)).toBe(false);
+    const lock = acquireSupervisorLock(canonical);
+    try {
+      // The main state DB must stay fully writable: the long-lived transaction
+      // lives on the dedicated lock DB only.
+      state.exec("CREATE TABLE IF NOT EXISTS lock_probe (id INTEGER PRIMARY KEY);");
+      state.exec("INSERT INTO lock_probe (id) VALUES (1);");
+      const row = state.query("SELECT COUNT(*) AS n FROM lock_probe").get() as { n: number };
+      expect(row.n).toBe(1);
+    } finally {
+      lock.release();
+      state.close();
+    }
   });
 });
 
@@ -431,29 +379,27 @@ describe("daemon single-supervisor enforcement (subprocess)", () => {
     expect(err).toMatch(/active supervisor|second supervisor|active daemon/);
   }, 20000);
 
-  test("F: MockRuntime + noSocket bypasses the singleton for tests", async () => {
+  test("F: MockRuntime + bypassSingleton skips the guard for tests", async () => {
     const dir = tempDir();
     const dbPath = join(dir, "state.db");
     openDb(dbPath).close();
     const canonical = canonicalizeDbPath(dbPath);
 
-    await runDaemon({ once: true, noSocket: true, runtime: new MockRuntime(), dbPath, intervalMs: 0 });
+    await runDaemon({ once: true, bypassSingleton: true, runtime: new MockRuntime(), dbPath, intervalMs: 0 });
 
-    expect(existsSync(lockPathFor(canonical))).toBe(false);
+    expect(existsSync(lockDbPathFor(canonical))).toBe(false);
     expect(existsSync(join(dir, "relay.sock"))).toBe(false);
   }, 20000);
 
-  test("G: simultaneous lock acquisitions have exactly one winner", async () => {
+  test("G: simultaneous acquisitions have exactly one winner", async () => {
     const dir = tempDir();
     const dbPath = join(dir, "state.db");
     openDb(dbPath).close();
     const canonical = canonicalizeDbPath(dbPath);
-    const lock = lockPathFor(canonical);
     const startAt = Date.now() + 1200;
 
     const env = (): Record<string, string | undefined> => ({
       ...process.env,
-      LOCK_PATH: lock,
       LOCK_DB: canonical,
       START_AT: String(startAt),
       HOLD_MS: "1000",
@@ -466,6 +412,30 @@ describe("daemon single-supervisor enforcement (subprocess)", () => {
     const outputs = [outA, outB];
     expect(outputs.filter((o) => o.includes("ACQUIRED")).length).toBe(1);
     expect(outputs.filter((o) => o.includes("REJECTED")).length).toBe(1);
+  }, 20000);
+
+  test("SIGKILL releases the supervisor lock (no stale cleanup)", async () => {
+    const dir = tempDir();
+    const dbPath = join(dir, "state.db");
+    openDb(dbPath).close();
+    const canonical = canonicalizeDbPath(dbPath);
+    const readyFile = join(dir, "holding");
+
+    const holder = spawnFixture("lock-hold.ts", {
+      ...process.env,
+      LOCK_DB: canonical,
+      READY_FILE: readyFile,
+    });
+    await waitFor(async () => existsSync(readyFile));
+    // While the child holds it, this process cannot acquire.
+    expect(() => acquireSupervisorLock(canonical)).toThrow(/active supervisor|second supervisor/);
+
+    holder.kill(9);
+    await holder.exited;
+
+    // The OS/SQLite released the writer lock automatically — no stale cleanup.
+    const lock = acquireSupervisorLock(canonical);
+    lock.release();
   }, 20000);
 
   test("H: simultaneous `daemon --once` runs exactly one supervisor pass", async () => {
@@ -497,6 +467,8 @@ describe("daemon single-supervisor enforcement (subprocess)", () => {
     openDb(dbB).close();
     const sockA = join(dir, "a.sock");
     const sockB = join(dir, "b.sock");
+
+    expect(lockDbPathFor(canonicalizeDbPath(dbA))).not.toBe(lockDbPathFor(canonicalizeDbPath(dbB)));
 
     spawnDaemon(daemonEnv(dbA, sockA));
     spawnDaemon(daemonEnv(dbB, sockB));
