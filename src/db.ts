@@ -7,13 +7,24 @@ export const STATE_DIR = ".relay";
 
 export function defaultDbPath(cwd = process.cwd()): string {
   if (process.env.RELAY_DB) return resolve(process.env.RELAY_DB);
+  // Reuse the checkout's EXISTING control plane. Running a relay command from a
+  // subdirectory must not silently create a SECOND `.relay/state.db` there (that
+  // split the task ledger); walk up to the nearest existing one.
+  let cur = resolve(cwd);
+  for (;;) {
+    const p = join(cur, STATE_DIR, "state.db");
+    if (existsSync(p)) return p;
+    const parent = dirname(cur);
+    if (parent === cur) break;
+    cur = parent;
+  }
   return join(cwd, STATE_DIR, "state.db");
 }
 
 export function defaultSockPath(cwd = process.cwd()): string {
   if (process.env.RELAY_SOCK) return resolve(process.env.RELAY_SOCK);
-  const dbPath = process.env.RELAY_DB ? resolve(process.env.RELAY_DB) : join(cwd, STATE_DIR, "state.db");
-  return join(dirname(dbPath), "relay.sock");
+  // The socket lives beside the resolved DB (same control plane).
+  return join(dirname(defaultDbPath(cwd)), "relay.sock");
 }
 
 function columnExists(db: Database, table: string, column: string): boolean {
