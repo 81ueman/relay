@@ -28,6 +28,8 @@ export interface RecordRuntimeInput {
   state?: RuntimeState;
   /** Absolute time after which a stale/dead runtime may be cleaned. */
   cleanupAfter?: number | null;
+  /** Timestamp of the last successful bootstrap delivery (if replayed). */
+  bootstrapSentAt?: number | null;
   createdAt?: number;
 }
 
@@ -43,8 +45,8 @@ export function recordRuntime(db: Database, input: RecordRuntimeInput): WorkerRu
   const info = db
     .query(
       `INSERT INTO worker_runtimes
-        (worker_id, generation, runtime_id, tab_id, pane_id, workspace_id, session_id, attach_token, relay_owned, state, created_at, stale_at, cleanup_after, cleaned_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
+        (worker_id, generation, runtime_id, tab_id, pane_id, workspace_id, session_id, attach_token, relay_owned, state, created_at, bootstrap_sent_at, stale_at, cleanup_after, cleaned_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
     )
     .run(
       input.workerId,
@@ -58,6 +60,7 @@ export function recordRuntime(db: Database, input: RecordRuntimeInput): WorkerRu
       input.relayOwned ?? 1,
       state,
       t,
+      input.bootstrapSentAt ?? null,
       state === "stale" || state === "dead" ? t : null,
       cleanupAfter
     );
@@ -179,6 +182,39 @@ export function markRuntimeDead(db: Database, id: number, at = now()): WorkerRun
 export function markRuntimeCleaned(db: Database, id: number, at = now()): WorkerRuntime | null {
   db.query(`UPDATE worker_runtimes SET state = 'cleaned', cleaned_at = ? WHERE id = ?`).run(at, id);
   return getRuntime(db, id);
+}
+
+/** Record that the bootstrap prompt for this generation was delivered. */
+export function markBootstrapSent(db: Database, id: number, at = now()): WorkerRuntime | null {
+  db.query(`UPDATE worker_runtimes SET bootstrap_sent_at = ? WHERE id = ?`).run(at, id);
+  return getRuntime(db, id);
+}
+
+/** Highest generation ever recorded for a worker (0 when it has no history). */
+export function maxRuntimeGeneration(db: Database, workerId: string): number {
+  const row = db
+    .query(`SELECT COALESCE(MAX(generation), 0) AS g FROM worker_runtimes WHERE worker_id = ?`)
+    .get(workerId) as { g: number } | null;
+  return row?.g ?? 0;
+}
+
+/**
+ * Generation is a per-worker fencing number and MUST be monotonic: a new
+ * generation is strictly greater than every generation the worker has ever held
+ * (its own counter, its previous session and its whole runtime history). This
+ * makes replaying a stale generation impossible and keeps fresh spawns / manual
+ * attaches / restarts from ever reusing a number.
+ *
+ * This always returns `max(...) + 1`. Idempotent re-binds do not call it: the
+ * attach path returns the existing binding before reaching here.
+ */
+export function nextGeneration(
+  db: Database,
+  workerId: string,
+  workerGeneration = 0,
+  sessionGeneration = 0
+): number {
+  return Math.max(workerGeneration, sessionGeneration, maxRuntimeGeneration(db, workerId)) + 1;
 }
 
 /**

@@ -71,7 +71,12 @@ export interface Runtime {
   isAlive(worker: Worker): Promise<boolean>;
   wake(worker: Worker, text: string): Promise<void>;
   interrupt(worker: Worker): Promise<void>;
-  /** Spawn a brand-new generation in a fresh tab (must work when nothing exists). */
+  /**
+   * Spawn a brand-new generation in a fresh tab (must work when nothing exists).
+   * Transport primitive only: it MUST NOT send the bootstrap prompt or touch the
+   * DB. The supervisor records the generation durably, then delivers the
+   * bootstrap itself.
+   */
   start(worker: Worker, generation: number): Promise<StartedRuntime>;
   /**
    * Safely reap an old generation's tab. MUST refuse if it cannot prove relay

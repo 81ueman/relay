@@ -81,6 +81,8 @@ AGENTCTL_WAKE_COOLDOWN_MS=30000 AGENTCTL_AUTO_APPROVE AGENTCTL_INTERVAL_MS=1500
 AGENTCTL_HERDR_WORKSPACE=<ws>   # REQUIRED to spawn (falls back to $HERDR_WORKSPACE_ID)
 AGENTCTL_RUNTIME_CLEANUP_GRACE_MS=300000 AGENTCTL_ATTACH_TIMEOUT_MS=30000
 AGENTCTL_RESTART_COOLDOWN_MS=30000 AGENTCTL_CLEANUP_LOG_WINDOW_MS=60000
+AGENTCTL_BOOTSTRAP_RETRY_MS=5000 AGENTCTL_BOOTSTRAP_LOG_WINDOW_MS=60000
+AGENTCTL_DEDICATED=1            # opt-in: allow $AGENTCTL_SOCK when no session dir is known
 ```
 
 Spawning **requires** an explicit Herdr workspace. `herdr tab create` is
@@ -223,13 +225,41 @@ generation N (active)
    --label relay:<worker>:g<N+1> --env AGENTCTL_MANAGED=1 --env AGENTCTL_GENERATION=<N+1>
       │
       ▼
- OpenCode session.created -> plugin session.attach(worker, generation=N+1, token)
+  ONE transaction: commit runtime row (gen=N+1, starting, relay_owned, attach_token)
+  + point workers at it (generation=N+1, runtime_id, session=NULL, state=starting)
+      │
+      ▼
+ ONLY THEN deliver the bootstrap (durable-before-wake); the plugin attaches with
+  (worker, generation=N+1, token) and ALWAYS finds the committed runtime row
       │
       ▼
  worker active (state idle, generation N+1)
       │
       └─ old generation N: stale → grace → safe cleanup (relay_owned only) → cleaned
 ```
+
+`HerdrRuntime.start()` is a transport primitive: it does **not** send the
+bootstrap prompt and does **not** touch the DB. The supervisor records the
+generation durably and delivers the prompt itself, so an attach that races the
+prompt cannot arrive before its runtime row exists. If the spawn itself fails the
+old metadata is kept (`worker.restart_failed`, backoff). If only the bootstrap
+*wake* fails the generation is **kept** (`worker.bootstrap_failed`, runtime still
+`starting`, worker still supervised) and retried at most once per
+`AGENTCTL_BOOTSTRAP_RETRY_MS` until it attaches or the attach timeout fires.
+
+A generation that never attaches (agent up, no managed session) is marked `dead`
+at `AGENTCTL_ATTACH_TIMEOUT_MS`, but the worker stays **recoverable**: after the
+restart cooldown the supervisor spawns generation N+2 and the timed-out tab is
+reaped through the normal grace path. Only an explicitly detached worker (state
+`idle`, no managed session, no relay-owned runtime for its current generation)
+is left unsupervised forever.
+
+Generation is a **per-worker fencing number and is monotonic**: every manual
+attach, fresh spawn and restart computes
+`nextGeneration = max(workers.generation, session.generation, MAX(worker_runtimes.generation)) + 1`.
+A new manual attach on a worker at generation 4 is therefore >= 5, and a legacy
+`worker.generation=2` with runtime history at 5 yields 6. Re-binding the exact
+same session/worker/Herdr runtime is idempotent and does not bump it.
 
 A dead/stalled **manual** runtime follows the same path: g1 (`relay_owned=false`)
 goes stale but is never closed, and Relay spawns a fresh relay-owned g2.
@@ -283,6 +313,22 @@ The plugin never spawns processes and never throws into OpenCode; a dead
 daemon just means silent best-effort drops. High-frequency
 `tool.execute.after` is liveness only (explicit `agentctl note` is the
 strongest progress signal).
+
+**Per-session routing is fail-closed.** A shared server hosts sessions from many
+projects, so when a session's project directory is known the plugin resolves the
+socket by walking up for `<dir>/.agentctl/relay.sock` (then `<dir>/.agentctl/`)
+and otherwise **drops** the event — it never falls back to another project's
+`$AGENTCTL_SOCK`. `$AGENTCTL_SOCK` is only used when the directory is unknown
+**and** `AGENTCTL_DEDICATED=1` (dedicated single-project deployments). Directory
+lookups cache successes only, so a transient failure is retried on the next
+event.
+
+**Auto-attach is request/response.** The plugin only records the generation and
+stops re-trying once the daemon answers `{ok:true, managed:true, generation:G}`.
+An `ok:false`, a rejection, a timeout or a missing daemon leaves the local caches
+untouched and the attach is retried on the next prompt/status/idle (at most once
+per ~1.5s). A failed attach can therefore never poison later events with a stale
+generation.
 
 Install the plugin where the sessions run. One OpenCode server can host many
 projects and it loads `.opencode/plugins/` per project **location**; the event

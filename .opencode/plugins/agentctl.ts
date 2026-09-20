@@ -59,10 +59,14 @@ interface RelayPluginState {
   generationCache: Map<string, number>;
   /** Sessions detached via the in-process tool: skip even the socket write. */
   detachedCache: Set<string>;
-  /** sessionID -> project directory (resolved once from the server). */
+  /** sessionID -> project directory (resolved once from the server, successes only). */
   directoryCache: Map<string, string | null>;
   /** Sessions we already told the daemon to attach (marker or env). */
   autoAttached: Set<string>;
+  /** sessionID -> last auto-attach attempt time (retry cooldown). */
+  attachAttemptAt: Map<string, number>;
+  /** sessionID -> per-spawn identity seen in a marker, awaiting a successful attach. */
+  pendingAttach: Map<string, { workerId?: string; generation: number; token?: string }>;
   /** The live forwarder's controller (aborted when a reload takes over). */
   controller?: AbortController;
 }
@@ -74,7 +78,19 @@ const G: RelayPluginState = ((globalThis as any).__relayAgentctl ??= {
   detachedCache: new Set(),
   directoryCache: new Map(),
   autoAttached: new Set(),
+  attachAttemptAt: new Map(),
+  pendingAttach: new Map(),
 }) as RelayPluginState;
+
+// A hot reload can adopt a globalThis state object created by an older load that
+// lacks newer fields. Normalize them rather than crashing on undefined.
+G.toolLocations ??= new Set();
+G.generationCache ??= new Map();
+G.detachedCache ??= new Set();
+G.directoryCache ??= new Map();
+G.autoAttached ??= new Set();
+G.attachAttemptAt ??= new Map();
+G.pendingAttach ??= new Map();
 
 // Env-only auto attach is OFF by default: a shared server's process env names
 // at most one worker, so it cannot identify a session. Opt in only for
@@ -93,16 +109,28 @@ const ATTACH_MARKER = /RELAY-ATTACH\s+worker=([A-Za-z0-9._-]+)\s+gen=(\d+)(?:\s+
 /**
  * Resolve the daemon socket for a session's project directory.
  *
- * Priority:
- *   1. the nearest existing `.agentctl/relay.sock` walking up from the session
- *      directory (a session opened in a subdirectory still finds its project);
- *   2. `AGENTCTL_SOCK` — only meaningful for a dedicated server/CLI run;
- *   3. the nearest `.agentctl/` dir walking up (socket not created yet);
- *   4. `<directory>/.agentctl/relay.sock`.
+ * INVARIANT (fail closed): when the session directory IS known we NEVER fall
+ * back to a process-global `AGENTCTL_SOCK`. A shared OpenCode server hosts
+ * sessions from many projects and its env may name another project's daemon; a
+ * wrong socket would route one project's events into another project's control
+ * plane. So, with a known directory:
+ *   1. the nearest existing `<dir>/.agentctl/relay.sock` (walking up), else
+ *   2. the nearest `<dir>/.agentctl/` (socket not created yet), else
+ *   3. no socket at all (drop).
+ * `AGENTCTL_SOCK` is only consulted when the directory is unknown AND the
+ * deployment explicitly opts into dedicated single-project mode
+ * (`AGENTCTL_DEDICATED=1`). Otherwise there is no session→project evidence, so
+ * the only safe action is to drop.
  */
-function socketPathFor(directory?: string | null): string {
+export function socketPathFor(directory?: string | null): string | null {
+  const envSock = process.env.AGENTCTL_SOCK;
+
+  if (!directory) {
+    // No directory: only the explicit dedicated single-project fallback is safe.
+    return process.env.AGENTCTL_DEDICATED === "1" ? (envSock ?? null) : null;
+  }
+
   const walk = (fn: (dir: string) => string | null): string | null => {
-    if (!directory) return null;
     let dir = directory;
     for (let i = 0; i < 16; i++) {
       const hit = fn(dir);
@@ -120,21 +148,21 @@ function socketPathFor(directory?: string | null): string {
   });
   if (existing) return existing;
 
-  const envSock = process.env.AGENTCTL_SOCK;
-  if (envSock && !directory) return envSock;
-
   const agentctlDir = walk((d) => (existsSync(path.join(d, ".agentctl")) ? d : null));
   if (agentctlDir) return path.join(agentctlDir, ".agentctl", "relay.sock");
 
-  if (envSock) return envSock;
-  return path.join(directory ?? process.cwd(), ".agentctl", "relay.sock");
+  // Known directory with no project control plane: NEVER another project's
+  // AGENTCTL_SOCK. Fail closed.
+  return null;
 }
 
 /** Fire-and-forget event forward. Never throws, never blocks the session. */
 function sendEvent(msg: Record<string, unknown>, directory?: string | null): void {
+  const sockPath = socketPathFor(directory);
+  if (!sockPath) return; // no project daemon: drop rather than cross-route
   const line = JSON.stringify(msg) + "\n";
   try {
-    const sock = net.createConnection(socketPathFor(directory));
+    const sock = net.createConnection(sockPath);
     const done = () => {
       try { sock.destroy(); } catch { /* ignore */ }
     };
@@ -153,11 +181,13 @@ function sendEvent(msg: Record<string, unknown>, directory?: string | null): voi
 }
 
 /** Request/response for tools (attach/detach need the daemon's answer). */
-function sendRequest(
+export function sendRequest(
   msg: Record<string, unknown>,
   directory?: string | null,
   timeoutMs = 4000
 ): Promise<any> {
+  const sockPath = socketPathFor(directory);
+  if (!sockPath) return Promise.resolve({ ok: false, reason: "no-socket" });
   return new Promise((resolve) => {
     let settled = false;
     const finish = (v: any) => {
@@ -168,7 +198,7 @@ function sendRequest(
     };
     let sock: net.Socket;
     try {
-      sock = net.createConnection(socketPathFor(directory));
+      sock = net.createConnection(sockPath);
     } catch {
       resolve({ ok: false, reason: "no-daemon" });
       return;
@@ -217,22 +247,27 @@ function stringsOf(value: unknown, out: string[] = [], depth = 0): string[] {
 
 /**
  * The session's project directory, asked of the OpenCode server (never the
- * process env). `Session.Info` carries it under `location.directory`. Cached
- * per session. Returns undefined when unknown.
+ * process env). `Session.Info` carries it under `location.directory`. Only
+ * SUCCESSFUL lookups are cached: a transient failure must not pin the session
+ * to the env fallback forever, so the next event retries.
  */
-async function directoryFor(ctx: any, sessionID?: string): Promise<string | undefined> {
+export async function directoryFor(ctx: any, sessionID?: string): Promise<string | undefined> {
   if (!sessionID || !sessionID.startsWith("ses")) return undefined;
-  if (G.directoryCache.has(sessionID)) return G.directoryCache.get(sessionID) ?? undefined;
+  const cached = G.directoryCache.get(sessionID);
+  if (typeof cached === "string" && cached) return cached;
   let dir: string | null = null;
   try {
     const info = await ctx.session.get({ sessionID });
     const candidate = info?.location?.directory ?? info?.directory;
     if (typeof candidate === "string" && candidate) dir = candidate;
   } catch {
-    // Unknown/unmounted session: leave undefined and fall back to the env sock.
+    // Unknown/unmounted session: do NOT cache the miss; retry on the next event.
   }
-  G.directoryCache.set(sessionID, dir);
-  return dir ?? undefined;
+  if (dir) {
+    G.directoryCache.set(sessionID, dir);
+    return dir;
+  }
+  return undefined;
 }
 
 function generationFor(sessionID: string | undefined): number | undefined {
@@ -252,15 +287,65 @@ function withGeneration(sessionID: string | undefined, extra: Record<string, unk
   return out;
 }
 
+// Auto-attach is retried on later prompts/events, but at most once per cooldown
+// so a daemon outage cannot turn every event into a socket round-trip.
+const ATTACH_RETRY_MS = 1500;
+
+/** Local attach bookkeeping (a subset of RelayPluginState, for testing). */
+export interface AttachState {
+  autoAttached: Set<string>;
+  attachAttemptAt: Map<string, number>;
+  generationCache: Map<string, number>;
+  detachedCache: Set<string>;
+}
+
 /**
- * Bind a session to a worker/generation and tell the daemon. Fire-and-forget:
- * the generation is cached locally so later events fence correctly.
+ * Whether a fresh auto-attach attempt is allowed now. Never once attached;
+ * otherwise rate-limited to one attempt per cooldown.
  */
-function autoAttach(sessionID: string, workerId: string | undefined, generation: number, directory?: string, token?: string): void {
-  if (G.autoAttached.has(sessionID)) return;
-  G.autoAttached.add(sessionID);
-  G.generationCache.set(sessionID, generation);
-  sendEvent(
+export function attachAllowed(
+  state: AttachState, sessionID: string, nowMs: number, cooldownMs = ATTACH_RETRY_MS
+): boolean {
+  if (!sessionID) return false;
+  if (state.autoAttached.has(sessionID)) return false;
+  const last = state.attachAttemptAt.get(sessionID);
+  if (last !== undefined && nowMs - last < cooldownMs) return false;
+  return true;
+}
+
+/**
+ * Apply the daemon's attach response. ONLY an explicit
+ * `{ok:true, managed:true, generation:G}` binds the session locally. Anything
+ * else (ok=false, a rejection, a timeout, no daemon) leaves the caches
+ * untouched, so the next event retries and no stale generation is ever cached.
+ */
+export function applyAttachResult(
+  state: AttachState, sessionID: string, requestedGeneration: number, res: any
+): boolean {
+  if (!res || res.ok !== true || res.managed !== true) return false;
+  state.autoAttached.add(sessionID);
+  state.attachAttemptAt.delete(sessionID);
+  const g =
+    typeof res.generation === "number" && Number.isInteger(res.generation)
+      ? res.generation
+      : requestedGeneration;
+  state.generationCache.set(sessionID, g);
+  state.detachedCache.delete(sessionID);
+  return true;
+}
+
+/**
+ * Bind a session to a worker/generation: request/response with the daemon. The
+ * local generation cache is only populated after the daemon confirms the
+ * attach, so a failed/absent daemon can never poison a later event.
+ */
+async function autoAttach(
+  sessionID: string, workerId: string | undefined, generation: number,
+  directory?: string, token?: string
+): Promise<boolean> {
+  if (!attachAllowed(G, sessionID, Date.now())) return false;
+  G.attachAttemptAt.set(sessionID, Date.now());
+  const res = await sendRequest(
     {
       type: "session.attach",
       session_id: sessionID,
@@ -272,23 +357,43 @@ function autoAttach(sessionID: string, workerId: string | undefined, generation:
     },
     directory
   );
+  const bound = applyAttachResult(G, sessionID, generation, res);
+  if (bound) G.pendingAttach.delete(sessionID);
+  return bound;
+}
+
+/**
+ * Retry a previously-seen marker identity on a later event (status/idle/tool).
+ * A failed attach never poisons the cache, so the next event is a retry trigger;
+ * the per-session cooldown inside autoAttach keeps it to one attempt per window.
+ */
+function retryPendingAttach(sessionID: string | undefined, directory?: string): void {
+  if (!sessionID) return;
+  const pending = G.pendingAttach.get(sessionID);
+  if (!pending) return;
+  void autoAttach(sessionID, pending.workerId, pending.generation, directory, pending.token);
 }
 
 /** Per-session identity from the relay bootstrap prompt marker. */
-async function maybeAttachFromText(ctx: any, sessionID: string | undefined, text: string): Promise<boolean> {
-  if (!sessionID || G.autoAttached.has(sessionID) || !sessionID.startsWith("ses_")) return false;
+export async function maybeAttachFromText(ctx: any, sessionID: string | undefined, text: string): Promise<boolean> {
+  if (!sessionID || !sessionID.startsWith("ses_")) return false;
   const m = ATTACH_MARKER.exec(text || "");
   if (!m) return false;
+  // The marker is authoritative for worker/generation/token; it is never
+  // derived from the shared server's process env. Remember it so a failed
+  // attach can be retried when the next status/idle event arrives.
+  const pending = { workerId: m[1], generation: Number(m[2]), token: m[3] };
+  G.pendingAttach.set(sessionID, pending);
   const directory = await directoryFor(ctx, sessionID);
-  autoAttach(sessionID, m[1], Number(m[2]), directory, m[3]);
-  return true;
+  return autoAttach(sessionID, pending.workerId, pending.generation, directory, pending.token);
 }
 
 /** Opt-in env auto attach (only safe when one server serves exactly one worker). */
-function maybeAttachFromEnv(sessionID: string | undefined, directory?: string): void {
-  if (!AUTO_ATTACH_FROM_ENV || !sessionID || !sessionID.startsWith("ses_")) return;
-  if (ENV_GENERATION === undefined) return;
-  autoAttach(sessionID, ENV_WORKER, ENV_GENERATION, directory);
+async function maybeAttachFromEnv(sessionID: string | undefined, directory?: string): Promise<boolean> {
+  if (!AUTO_ATTACH_FROM_ENV || !sessionID || !sessionID.startsWith("ses_")) return false;
+  if (ENV_GENERATION === undefined) return false;
+  G.pendingAttach.set(sessionID, { workerId: ENV_WORKER, generation: ENV_GENERATION });
+  return autoAttach(sessionID, ENV_WORKER, ENV_GENERATION, directory);
 }
 
 function sessionIDOf(data: any): string | undefined {
@@ -339,7 +444,10 @@ async function forwardEvent(
 ): Promise<void> {
   const directory = directoryHint ?? (await directoryFor(ctx, sessionID));
 
-  if (AUTO_ATTACH_FROM_ENV) maybeAttachFromEnv(sessionID, directory);
+  if (AUTO_ATTACH_FROM_ENV) void maybeAttachFromEnv(sessionID, directory);
+  // A marker was seen but the attach had not (yet) succeeded: any later event is
+  // a retry trigger (rate-limited by the per-session cooldown).
+  retryPendingAttach(sessionID, directory);
 
   if (IDLE_TYPES.has(type)) {
     // Always forwarded; the daemon gates on managed + generation. Normalized to
@@ -381,7 +489,7 @@ async function handleStreamEvent(ctx: any, event: { type?: string; data?: any })
   if (sessionID && directoryHint) G.directoryCache.set(sessionID, directoryHint);
   // Marker fallback for hosts whose prompt hook does not deliver the text.
   if (type === "session.inbox.enqueued" || type === "session.renamed") {
-    await maybeAttachFromText(ctx, sessionID, stringsOf(data).join("\n"));
+    void maybeAttachFromText(ctx, sessionID, stringsOf(data).join("\n"));
   }
   await forwardEvent(ctx, type, sessionID, data, directoryHint);
 }
@@ -426,6 +534,8 @@ async function registerTools(ctx: any): Promise<void> {
           };
         }
         G.generationCache.set(sessionID, res.generation);
+        G.attachAttemptAt.delete(sessionID);
+        G.pendingAttach.delete(sessionID);
         G.detachedCache.delete(sessionID);
         return {
           content: `attached as worker ${res.worker_id} (generation ${res.generation}). Load the agent-worker skill and run \`agentctl next\`.`,
@@ -449,6 +559,11 @@ async function registerTools(ctx: any): Promise<void> {
         }
         G.detachedCache.add(sessionID);
         G.generationCache.delete(sessionID);
+        G.attachAttemptAt.delete(sessionID);
+        G.pendingAttach.delete(sessionID);
+        // Drop the cached directory too: a detached session may be recreated
+        // elsewhere, and a stale directory would re-route its events.
+        G.directoryCache.delete(sessionID);
         return { content: "detached. This session is now a normal standalone OpenCode session." };
       },
     });
@@ -499,7 +614,9 @@ export default {
         try {
           const sessionID = typeof event?.sessionID === "string" ? event.sessionID : undefined;
           const text = stringsOf(event?.prompt ?? event).join("\n");
-          await maybeAttachFromText(ctx, sessionID, text);
+          // Request/response runs in the background so a slow/absent daemon can
+          // never stall the prompt; the caches are only set once it confirms.
+          void maybeAttachFromText(ctx, sessionID, text);
         } catch {
           // Never break the session.
         }

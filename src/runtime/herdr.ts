@@ -400,10 +400,11 @@ export class HerdrRuntime implements Runtime {
 
     try {
       await startAgentWithRetry(name, paneId);
-      // Best-effort bootstrap: a hiccup here must not abort an otherwise good spawn.
-      try {
-        await this.wake({ ...w, runtime_id: name }, BOOTSTRAP_PROMPT(w.id, generation, attachToken));
-      } catch { /* the daemon's wake loop will kick it once active */ }
+      // NOTE: `start` is a transport primitive ONLY. It does NOT send the
+      // bootstrap prompt and does NOT touch the DB: the supervisor must first
+      // durably record this generation (relay_owned, attach_token) and only then
+      // deliver the bootstrap, so a matching runtime row always exists at the
+      // instant the session attaches.
       if (!(await this.isAlive({ ...w, runtime_id: name }))) {
         throw new Error(`started agent ${name} is not reachable`);
       }

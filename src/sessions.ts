@@ -8,6 +8,7 @@ import {
   listRuntimes,
   markRuntimeActive,
   markRuntimeStale,
+  nextGeneration,
   recordRuntime,
 } from "./runtimes";
 import { getWorker, registerWorker } from "./workers";
@@ -85,7 +86,7 @@ export function attachSession(db: Database, sessionId: string, opts: AttachOptio
   const role = opts.role ?? prev?.role ?? "worker";
   const workerId = opts.workerId ?? prev?.worker_id ?? slugSession(sessionId);
   const spawned = opts.generation !== undefined;
-  const generation = spawned ? opts.generation! : (prev?.generation ?? 0) + 1;
+  const worker0 = getWorker(db, workerId);
 
   // A managed session belongs to exactly one worker. Refuse a cross-worker
   // steal (e.g. a stale plugin on a shared server claiming another session).
@@ -93,10 +94,24 @@ export function attachSession(db: Database, sessionId: string, opts: AttachOptio
     throw new Error(`attach rejected: ${sessionId} is already managed by ${prev.worker_id}`);
   }
 
-  const worker0 = getWorker(db, workerId);
+  // Generation is a per-worker fencing number and is monotonic. A relay-spawned
+  // attach carries the authoritative generation from the bootstrap marker; a
+  // manual attach is bumped across the worker's own counter, its previous
+  // session and its ENTIRE runtime history, so it can never regress.
+  const generation = spawned
+    ? opts.generation!
+    : nextGeneration(db, workerId, worker0?.generation ?? 0, prev?.generation ?? 0);
+
   const runtimeRow = spawned ? findRuntime(db, workerId, generation) : null;
 
   if (spawned) {
+    // A spawned generation must never be older than the worker already is: that
+    // would replay a fenced-out generation.
+    if (worker0 && generation < worker0.generation) {
+      throw new Error(
+        `attach rejected: generation ${generation} is older than worker ${workerId} g${worker0.generation}`
+      );
+    }
     if (!runtimeRow) {
       throw new Error(`attach rejected: no runtime row for ${workerId} g${generation}`);
     }

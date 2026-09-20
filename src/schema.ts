@@ -87,6 +87,8 @@ export interface WorkerRuntime {
   relay_owned: number;
   state: RuntimeState;
   created_at: number;
+  /** When the bootstrap prompt was last delivered for this generation (retry bookkeeping). */
+  bootstrap_sent_at: number | null;
   stale_at: number | null;
   cleanup_after: number | null;
   cleaned_at: number | null;
@@ -222,6 +224,7 @@ CREATE TABLE IF NOT EXISTS worker_runtimes (
   relay_owned INTEGER NOT NULL DEFAULT 1,
   state TEXT NOT NULL DEFAULT 'starting',
   created_at INTEGER NOT NULL,
+  bootstrap_sent_at INTEGER,
   stale_at INTEGER,
   cleanup_after INTEGER,
   cleaned_at INTEGER

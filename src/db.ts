@@ -44,6 +44,18 @@ function migrate(db: Database): void {
   if (columnExists(db, "worker_runtimes", "id") && !columnExists(db, "worker_runtimes", "workspace_id")) {
     db.exec("ALTER TABLE worker_runtimes ADD COLUMN workspace_id TEXT;");
   }
+  // Bootstrap delivery bookkeeping: when the fresh generation last got its
+  // bootstrap prompt (so a failed wake can be retried after a cooldown without
+  // discarding the generation).
+  if (columnExists(db, "worker_runtimes", "id") && !columnExists(db, "worker_runtimes", "bootstrap_sent_at")) {
+    db.exec("ALTER TABLE worker_runtimes ADD COLUMN bootstrap_sent_at INTEGER;");
+  }
+  // NOTE: (worker_id, generation) is kept unique by application logic (the
+  // monotonic `nextGeneration` helper), not by a DB constraint. Legacy rows may
+  // legitimately share a generation (e.g. an active row plus a protected stale
+  // duplicate from a botched spawn), so a UNIQUE index would reject valid
+  // history. The fencing invariant only requires that a LIVE generation is
+  // never re-created; that is enforced at the attach path.
 }
 
 export function openDb(path?: string): Database {

@@ -1,5 +1,5 @@
 import type { Database } from "bun:sqlite";
-import { getStartingRuntime } from "./runtimes";
+import { findRuntime, getStartingRuntime } from "./runtimes";
 import { getSession } from "./sessions";
 import { reviewTasks, runnableTasks, taskCounts, unfinishedCount } from "./tasks";
 import { listWorkers, type WorkerRow } from "./workers";
@@ -56,6 +56,39 @@ export function isOperationalWorker(db: Database, w: WorkerRow): boolean {
 /** All workers the supervisor may act on (managed session or relay-spawn start). */
 export function operationalWorkers(db: Database): WorkerRow[] {
   return listWorkers(db).filter((w) => isOperationalWorker(db, w));
+}
+
+/**
+ * A worker whose current generation FAILED but which Relay still owns and must
+ * recover. This is the distinction between an attach-timeout / crashed spawn
+ * generation and an explicitly detached worker:
+ *
+ *   - state is 'dead' or 'stalled' (a failed generation), AND
+ *   - the worker's CURRENT generation has a relay-owned runtime row (proving
+ *     Relay created the lifecycle and may replace it).
+ *
+ * A detached worker is state 'idle' with no relay-owned runtime for its current
+ * generation (manual runtimes are relay_owned=false), so it is NEVER recoverable
+ * and NEVER restarted.
+ */
+export function isRecoverableWorker(db: Database, w: WorkerRow): boolean {
+  if (isOperationalWorker(db, w)) return false;
+  if (w.state !== "dead" && w.state !== "stalled") return false;
+  const rr = findRuntime(db, w.id, w.generation);
+  return !!rr && rr.relay_owned === 1;
+}
+
+/**
+ * The full supervision set: operational workers (live/managed or mid-spawn) plus
+ * recoverable workers (a failed relay-owned generation still awaiting a fresh
+ * one). Detached/plain workers are in neither set.
+ */
+export function isSupervisedWorker(db: Database, w: WorkerRow): boolean {
+  return isOperationalWorker(db, w) || isRecoverableWorker(db, w);
+}
+
+export function supervisedWorkers(db: Database): WorkerRow[] {
+  return listWorkers(db).filter((w) => isSupervisedWorker(db, w));
 }
 
 /**

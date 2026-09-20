@@ -1,31 +1,37 @@
 import type { Database } from "bun:sqlite";
 import { now } from "./db";
 import { countIdleSinceProgress, logEvent } from "./events";
-import type { Runtime } from "./runtime/runtime";
+import type { Runtime, StartedRuntime } from "./runtime/runtime";
 import {
   cleanupCandidates,
   getActiveRuntime,
   getStartingRuntime,
   listRuntimes,
+  markBootstrapSent,
   markRuntimeActive,
   markRuntimeCleaned,
   markRuntimeDead,
   markRuntimeStale,
+  nextGeneration,
   recordRuntime,
   runtimeCleanupGraceMs,
 } from "./runtimes";
 import {
   idleWorkers,
   isOperationalWorker,
+  isSupervisedWorker,
   needsPlanner,
   needsReviewer,
   needsWorkerWakeup,
   operationalWorkers,
   planners,
   stallMs,
+  supervisedWorkers,
   supervisorView,
 } from "./scheduler";
+import { BOOTSTRAP_PROMPT } from "./runtime/herdr";
 import type { Session } from "./sessions";
+import type { WorkerRuntime } from "./schema";
 import { approveTask, expireLeases, getTask, reviewTasks, runnableTasks } from "./tasks";
 import { getWorker, listWorkers, setWorkerState, touchSeen, type WorkerRow } from "./workers";
 
@@ -59,6 +65,18 @@ function attachTimeoutMs(): number {
 function restartCooldownMs(): number {
   const v = Number(process.env.AGENTCTL_RESTART_COOLDOWN_MS ?? "30000");
   return Number.isFinite(v) && v >= 0 ? v : 30000;
+}
+
+/** Retry interval for a bootstrap prompt that failed to be delivered. */
+function bootstrapRetryMs(): number {
+  const v = Number(process.env.AGENTCTL_BOOTSTRAP_RETRY_MS ?? "5000");
+  return Number.isFinite(v) && v >= 0 ? v : 5000;
+}
+
+/** At most one `worker.bootstrap_failed` event per worker per window. */
+function bootstrapFailureLogWindowMs(): number {
+  const v = Number(process.env.AGENTCTL_BOOTSTRAP_LOG_WINDOW_MS ?? "60000");
+  return Number.isFinite(v) && v >= 0 ? v : 60000;
 }
 
 /** At most one `runtime.cleanup_failed` event per worker per window. */
@@ -111,9 +129,14 @@ function releaseTaskOfDeadWorker(db: Database, workerId: string, taskId: string 
  * Restart = CONTROL-PLANE policy, built from transport primitives:
  *   1. mark the current generation stale (history kept; tab NOT closed here)
  *   2. best-effort interrupt the old generation
- *   3. start a FRESH relay-owned generation (rt.start)
+ *   3. start a FRESH relay-owned generation (rt.start) — transport ONLY
+ *   4. COMMIT the runtime row + worker pointer + event log in ONE transaction
+ *   5. only THEN deliver the bootstrap prompt
  * If the fresh spawn fails we keep the old runtime metadata: only runtimes that
- * are explicitly stale/dead are ever cleanup-eligible.
+ * are explicitly stale/dead are ever cleanup-eligible. If only the BOOTSTRAP
+ * delivery fails, the generation is KEPT (runtime still `starting`, worker
+ * still supervised) and retried after a cooldown — a generation is never
+ * discarded because a prompt could not be delivered.
  */
 async function restartWorker(db: Database, rt: Runtime, w: WorkerRow, at: number): Promise<boolean> {
   const cooldown = restartCooldownMs();
@@ -160,11 +183,26 @@ async function restartWorker(db: Database, rt: Runtime, w: WorkerRow, at: number
   }
 
   // 3. Fresh generation: a transport primitive, not a runtime "restart".
-  setWorkerState(db, w.id, "starting");
-  const generation = w.generation + 1;
+  const generation = nextGeneration(db, w.id, w.generation);
+  let started: StartedRuntime;
   try {
-    const started = await rt.start(w, generation);
-    recordRuntime(db, {
+    started = await rt.start(w, generation);
+  } catch (e) {
+    setWorkerState(db, w.id, "dead");
+    logEvent(db, {
+      source: "supervisor",
+      workerId: w.id,
+      type: "worker.restart_failed",
+      payload: { generation, error: String(e).slice(0, 200) },
+    });
+    return false;
+  }
+
+  // 4. Durable control-plane commit BEFORE any wake/prompt. The runtime row and
+  //    the worker pointer move together (one transaction), so an attach racing
+  //    the bootstrap ALWAYS finds a matching relay-owned/attach_token/starting row.
+  const runtimeRow = db.transaction(() => {
+    const rr = recordRuntime(db, {
       workerId: w.id,
       generation,
       runtimeId: started.runtimeId,
@@ -185,15 +223,43 @@ async function restartWorker(db: Database, rt: Runtime, w: WorkerRow, at: number
       type: "worker.restarting",
       payload: { generation, runtimeId: started.runtimeId, tabId: started.tabId ?? null },
     });
+    return rr;
+  })();
+
+  // 5. Bootstrap AFTER the commit. A delivery failure must not abandon the
+  //    generation; activatePendingRuntimes retries it after a cooldown.
+  await deliverBootstrap(db, rt, w.id, generation, runtimeRow, at);
+  return true;
+}
+
+/**
+ * Deliver the bootstrap prompt for a freshly committed generation. The caller
+ * MUST have durably recorded the runtime row first. A failed delivery is retried
+ * later; it never deletes the runtime or desupervises the worker.
+ */
+async function deliverBootstrap(
+  db: Database, rt: Runtime, workerId: string, generation: number, row: WorkerRuntime, at: number
+): Promise<boolean> {
+  // A tokenless generation is never attachable, so prompting it is pointless.
+  if (!row.attach_token) return false;
+  const worker = getWorker(db, workerId);
+  if (!worker) return false;
+  try {
+    await rt.wake(
+      { ...worker, runtime_id: row.runtime_id ?? worker.runtime_id },
+      BOOTSTRAP_PROMPT(workerId, generation, row.attach_token)
+    );
+    markBootstrapSent(db, row.id, at);
     return true;
   } catch (e) {
-    setWorkerState(db, w.id, "dead");
-    logEvent(db, {
-      source: "supervisor",
-      workerId: w.id,
-      type: "worker.restart_failed",
-      payload: { generation, error: String(e).slice(0, 200) },
-    });
+    if (!recentlyEvent(db, workerId, "worker.bootstrap_failed", at, bootstrapFailureLogWindowMs())) {
+      logEvent(db, {
+        source: "supervisor",
+        workerId,
+        type: "worker.bootstrap_failed",
+        payload: { generation, error: String(e).slice(0, 200) },
+      });
+    }
     return false;
   }
 }
@@ -203,7 +269,7 @@ async function restartWorker(db: Database, rt: Runtime, w: WorkerRow, at: number
  * time out the ones that never attach. Keeps workers starting until then: a tab
  * existing is NOT restart success.
  */
-async function activatePendingRuntimes(db: Database, actions: string[], at: number): Promise<void> {
+async function activatePendingRuntimes(db: Database, rt: Runtime, actions: string[], at: number): Promise<void> {
   for (const w of listWorkers(db)) {
     if (w.state !== "starting") continue;
     // Only Relay-owned spawns are ours to promote/time out; a detached or plain
@@ -226,6 +292,17 @@ async function activatePendingRuntimes(db: Database, actions: string[], at: numb
       logEvent(db, { source: "supervisor", workerId: w.id, type: "worker.active", payload: { generation: w.generation, sessionId: sess.session_id } });
       actions.push(`active:${w.id}:g${w.generation}`);
       continue;
+    }
+
+    // No managed attach yet. If the bootstrap was never SUCCESSFULLY delivered,
+    // retry it — rate-limited by the failure-event log so a flapping daemon is
+    // not hammered. A successful delivery is never repeated: a prompt that was
+    // delivered but never attached is handled by the attach timeout below.
+    if (
+      sr.bootstrap_sent_at === null &&
+      !recentlyEvent(db, w.id, "worker.bootstrap_failed", at, bootstrapRetryMs())
+    ) {
+      await deliverBootstrap(db, rt, w.id, w.generation, sr, at);
     }
 
     if (at - sr.created_at > attachTimeoutMs()) {
@@ -295,7 +372,7 @@ export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<
   for (const t of expired) actions.push(`lease-expired:${t.id}`);
 
   // 2. Promote fresh generations that have completed managed attach.
-  await activatePendingRuntimes(db, actions, at);
+  await activatePendingRuntimes(db, rt, actions, at);
 
   // 3. Walk workers (starting is owned by step 2).
   const stallTimeout = stallMs();
@@ -305,16 +382,31 @@ export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<
     if (fresh.state === "starting") continue;
     // Detached / never-attached workers are NOT supervised: skip liveness
     // polling, dead detection, stall detection and restart entirely.
-    if (!isOperationalWorker(db, fresh)) continue;
+    if (!isSupervisedWorker(db, fresh)) continue;
+
+    // A failed generation (dead/stalled) is recovered even if the transport
+    // process is still alive: the GENERATION, not the process, is the unit of
+    // recovery. This is how an attach-timeout (agent up, never attached) or a
+    // stalled worker gets a fresh generation. The old tab is not closed here;
+    // restartWorker marks it stale and cleanup reaps it after the grace period.
+    if (fresh.state === "dead" || fresh.state === "stalled") {
+      const requeued = releaseTaskOfDeadWorker(db, w.id, fresh.current_task_id, at);
+      if (requeued) actions.push(`requeued:${requeued}`);
+      db.query(`UPDATE workers SET current_task_id = NULL, updated_at = ? WHERE id = ?`).run(at, w.id);
+      if (await restartWorker(db, rt, fresh, at)) {
+        actions.push(fresh.state === "stalled" ? `stalled-restarted:${w.id}` : `restarted:${w.id}`);
+      } else {
+        actions.push(fresh.state === "stalled" ? `stalled:${w.id}` : `restart-skipped:${w.id}`);
+      }
+      continue;
+    }
 
     const alive = await rt.isAlive(fresh).catch(() => false);
 
     if (!alive) {
-      if (fresh.state !== "dead") {
-        setWorkerState(db, w.id, "dead");
-        logEvent(db, { source: "supervisor", workerId: w.id, type: "worker.dead" });
-        actions.push(`dead:${w.id}`);
-      }
+      setWorkerState(db, w.id, "dead");
+      logEvent(db, { source: "supervisor", workerId: w.id, type: "worker.dead" });
+      actions.push(`dead:${w.id}`);
       // Transport is gone; restartWorker marks the old generation stale before
       // spawning fresh (old metadata is never deleted here).
       const requeued = releaseTaskOfDeadWorker(db, w.id, fresh.current_task_id, at);
@@ -379,7 +471,7 @@ export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<
     if (!woken) {
       // No idle worker can take it. Recover a fallen one, or wait for a fresh
       // generation to finish attaching. Never nudge waiting_input workers.
-      const fallen = operationalWorkers(db)
+      const fallen = supervisedWorkers(db)
         .filter((x) => x.state === "dead" || x.state === "stalled")
         .sort((a, b) => a.id.localeCompare(b.id))[0];
       if (fallen) {
