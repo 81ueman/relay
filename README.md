@@ -552,6 +552,15 @@ runtime, its id, or the sanitized agent name (`u2-corpus` → `u2_corpus`) — s
 worker registered before its pane was recorded is still woken instead of
 failing with `agent_not_found` (the message stays queued either way).
 
+`human` is the operator's mailbox, not a Herdr agent. Mail addressed to `human`
+is routed to the configured operator — `RELAY_OPERATOR=<worker-id>` or a
+one-line `.relay/operator` file — which may read and ack it via `relay inbox`
+(the durable `recipient` is never rewritten). Separately, the daemon nudges any
+recipient with **undelivered** mail once per `RELAY_MAIL_NUDGE_MS` (default 3
+min), so a missed send-time wake cannot leave a backlog invisible; reading the
+inbox marks messages delivered and stops the nudge. `relay status` reports
+unread counts per recipient.
+
 `relay task show <id>` keeps stdout a single parseable JSON document (notes go
 to stderr); `relay task show <id> --json` emits ONE document with the task and
 its notes.

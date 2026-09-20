@@ -43,6 +43,7 @@ import {
   unclaimableRunnableTasks,
 } from "./tasks";
 import { getWorker, listWorkers, setWorkerState, touchSeen, type WorkerRow } from "./workers";
+import { HUMAN_RECIPIENT, operatorId } from "./messages";
 
 // Deterministic reconciler. No LLM: pure DB state + runtime transport.
 // Callers pass full Worker rows; only the Runtime adapter maps to targets.
@@ -62,6 +63,15 @@ export const PLANNER_NUDGE =
 function wakeCooldownMs(): number {
   const v = Number(process.env.RELAY_WAKE_COOLDOWN_MS ?? "30000");
   return Number.isFinite(v) && v >= 0 ? v : 30000;
+}
+
+/**
+ * How long an undelivered message waits before its recipient is nudged, and how
+ * often the nudge repeats. Long enough to let the send-time wake land first.
+ */
+function mailNudgeMs(): number {
+  const v = Number(process.env.RELAY_MAIL_NUDGE_MS ?? "180000");
+  return Number.isFinite(v) && v > 0 ? v : 180000;
 }
 
 /** How long a fresh generation may wait for managed attach before we give up. */
@@ -453,6 +463,44 @@ async function transportAliveAssignees(
   return alive;
 }
 
+/**
+ * Surface undelivered mail. The send-time wake is best-effort and cannot reach
+ * a recipient with no Herdr agent (`human`), so a durable unread backlog would
+ * otherwise sit silently. Nudge each recipient at most once per mail-nudge
+ * window; `human` is routed to the configured operator. Reading the inbox marks
+ * messages delivered, which stops the nudge.
+ */
+async function nudgeUnreadMail(
+  db: Database, rt: Runtime, actions: string[], at: number
+): Promise<void> {
+  const window = mailNudgeMs();
+  const rows = db
+    .query(
+      `SELECT recipient, COUNT(*) AS n, MIN(created_at) AS oldest
+         FROM messages WHERE state = 'queued'
+        GROUP BY recipient`
+    )
+    .all() as { recipient: string; n: number; oldest: number }[];
+  if (rows.length === 0) return;
+  const operator = operatorId();
+  for (const { recipient, n, oldest } of rows) {
+    if (at - oldest < window) continue; // let the send-time wake land first
+    const target = recipient === HUMAN_RECIPIENT ? operator : recipient;
+    if (!target) continue;
+    const w = getWorker(db, target);
+    if (!w || w.retired_at !== null) continue;
+    if (recentlyEvent(db, target, "worker.mail_nudged", at, window)) continue;
+    const where = recipient === HUMAN_RECIPIENT ? " for the operator" : "";
+    try {
+      await rt.wake(w, `You have ${n} unread durable message(s)${where}. Run \`relay inbox --claim\` to receive them.`);
+      logEvent(db, { source: "supervisor", workerId: target, type: "worker.mail_nudged", payload: { recipient, count: n } });
+      actions.push(`mail-nudged:${target}`);
+    } catch (e) {
+      logEvent(db, { source: "supervisor", workerId: target, type: "worker.wake_failed", payload: { reason: "unread-mail", error: String(e).slice(0, 200) } });
+    }
+  }
+}
+
 /** One deterministic reconcile pass. Safe to run every 1-2s. */
 export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<ReconcileResult> {
   const actions: string[] = [];
@@ -622,7 +670,11 @@ export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<
     }
   }
 
-  // 5. Reap old generations, isolated from all of the above.
+  // 5. Nudge recipients with undelivered mail (a durable safety net for a missed
+  //    send-time wake, and the only path that can reach `human`).
+  await nudgeUnreadMail(db, rt, actions, at);
+
+  // 6. Reap old generations, isolated from all of the above.
   await cleanupOldRuntimes(db, rt, actions, at);
 
   return { view: supervisorView(db), actions };
