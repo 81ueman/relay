@@ -2,6 +2,12 @@ import type { Database } from "bun:sqlite";
 import { now } from "./db";
 import { logEvent } from "./events";
 
+/**
+ * Prefix for relay-originated text (wake prompts and self-generated messages), so
+ * it is never mistaken for a human or peer message in the agent's session.
+ */
+export const RELAY_TAG = "relay: ";
+
 export function sendMessage(
   db: Database,
   sender: string,

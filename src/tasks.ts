@@ -9,7 +9,7 @@ import {
   touchProgress,
 } from "./workers";
 import type { Task, TaskState } from "./schema";
-import { sendMessage } from "./messages";
+import { RELAY_TAG, sendMessage } from "./messages";
 
 export const STALE_LEASE = "STALE_LEASE";
 
@@ -415,7 +415,7 @@ function bubbleChildDone(db: Database, child: Task, actor: string, at: number): 
   if (!parentId) return;
   const parent = getTask(db, parentId);
   if (!parent) return; // dangling parent: the child still completes
-  const body = `${child.id} done: ${child.title}`;
+  const body = `${RELAY_TAG}${child.id} done: ${child.title}`;
   db.query(
     `INSERT INTO task_notes (task_id, worker_id, kind, body, created_at) VALUES (?, ?, 'child_done', ?, ?)`
   ).run(parentId, actor, body, at);
@@ -430,7 +430,7 @@ function bubbleChildDone(db: Database, child: Task, actor: string, at: number): 
   if (allDone) {
     db.query(
       `INSERT INTO task_notes (task_id, worker_id, kind, body, created_at) VALUES (?, ?, 'children_done', ?, ?)`
-    ).run(parentId, actor, `All direct children of ${parentId} are done (${counts.done}/${counts.total}).`, at);
+    ).run(parentId, actor, `${RELAY_TAG}All direct children of ${parentId} are done (${counts.done}/${counts.total}).`, at);
   }
 
   if (parent.assignee) {

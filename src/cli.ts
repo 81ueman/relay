@@ -3,7 +3,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { defaultDbPath, initControlPlane, now, openDb, STATE_DIR } from "./db";
 import { formatEvent, listEvents, logEvent } from "./events";
-import { ackMessage, claimInbox, deliverMessage, getMessage, inboxFor, sendMessage, unreadCounts } from "./messages";
+import { ackMessage, claimInbox, deliverMessage, getMessage, inboxFor, RELAY_TAG, sendMessage, unreadCounts } from "./messages";
 import { runDaemon } from "./daemon";
 import { handleErrorSignal, handleIdleSignal, reconcile } from "./reconciler";
 import { buildRuntime, HerdrRuntime } from "./runtime/herdr";
@@ -618,7 +618,7 @@ async function main(): Promise<void> {
         };
         try {
           const rt = new HerdrRuntime();
-          await rt.wake(targetRow, `A durable message arrived (id ${id}). Not urgent — finish what you are doing, then run \`relay inbox --claim\` when you reach a stopping point. It is stored and will not be lost.`);
+          await rt.wake(targetRow, `${RELAY_TAG}A durable message arrived (id ${id}). Not urgent — finish what you are doing, then run \`relay inbox --claim\` when you reach a stopping point. It is stored and will not be lost.`);
           console.log(`sent msg=${id} (wake delivered)`);
         } catch (e) {
           console.log(`sent msg=${id} (wake failed, message remains queued: ${String(e).slice(0, 120)})`);

@@ -43,25 +43,26 @@ import {
   unclaimableRunnableTasks,
 } from "./tasks";
 import { getWorker, listWorkers, setWorkerState, touchSeen, type WorkerRow } from "./workers";
+import { RELAY_TAG } from "./messages";
 
 // Deterministic reconciler. No LLM: pure DB state + runtime transport.
 // Callers pass full Worker rows; only the Runtime adapter maps to targets.
 
-export const NEXT_NUDGE = "Run `relay next` now. Do not wait for instructions.";
+export const NEXT_NUDGE = "relay: Run `relay next` now. Do not wait for instructions.";
 export const CONTINUE_NUDGE = (taskId: string) =>
-  `Your task ${taskId} is still running. ` +
+  `relay: Your task ${taskId} is still running. ` +
   `If you are waiting on a long-running step (a background command, build or ` +
   `test run), that is fine — no action needed, continue when it returns. ` +
   `Otherwise do the next concrete action; if you are blocked, run ` +
   `\`relay block ${taskId} "<reason>"\`, then \`relay next\`.`;
 export const STALL_NUDGE = (taskId: string) =>
-  `No progress on ${taskId} for a while. ` +
+  `relay: No progress on ${taskId} for a while. ` +
   `If you are working or just waiting on a long-running step, that is fine — ` +
   `no action needed; relay will check again later. ` +
   `If you are actually stuck, run \`relay block ${taskId} "<reason>"\`, then \`relay next\`.`;
-export const REVIEW_NUDGE = "There are tasks waiting for review. Run `relay next` to pick one up.";
+export const REVIEW_NUDGE = "relay: There are tasks waiting for review. Run `relay next` to pick one up.";
 export const PLANNER_NUDGE =
-  "Task queue is running low. Decompose the next objective into small tasks with acceptance criteria (relay task add), then go idle. Do not monitor other workers.";
+  "relay: Task queue is running low. Decompose the next objective into small tasks with acceptance criteria (relay task add), then go idle. Do not monitor other workers.";
 
 function wakeCooldownMs(): number {
   const v = Number(process.env.RELAY_WAKE_COOLDOWN_MS ?? "30000");
@@ -552,7 +553,7 @@ async function nudgeUnreadMail(
     if (!w || w.retired_at !== null) continue;
     if (recentlyEvent(db, recipient, "worker.mail_nudged", at, window)) continue;
     try {
-      await rt.wake(w, `You have ${n} unread durable message(s). Not urgent — finish your current step, then run \`relay inbox --claim\` at a stopping point. Relay keeps reminding you until you read it.`);
+      await rt.wake(w, `${RELAY_TAG}You have ${n} unread durable message(s). Not urgent — finish your current step, then run \`relay inbox --claim\` at a stopping point. Relay keeps reminding you until you read it.`);
       logEvent(db, { source: "supervisor", workerId: recipient, type: "worker.mail_nudged", payload: { recipient, count: n } });
       actions.push(`mail-nudged:${recipient}`);
     } catch (e) {

@@ -47,6 +47,8 @@ describe("periodic unread-mail nudge", () => {
     const { actions } = await reconcile(db, rt);
     expect(actions).toContain("mail-nudged:worker-b");
     expect(rt.wakes.some((w) => w.workerId === "worker-b")).toBe(true);
+    // Tagged as relay-originated, not a human/peer message.
+    expect(rt.wakes.find((w) => w.workerId === "worker-b")!.text.startsWith("relay: ")).toBe(true);
   });
 
   test("a fresh peer message is left to the send-time wake (no early nudge)", async () => {

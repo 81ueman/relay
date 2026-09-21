@@ -46,7 +46,10 @@ describe("one-hop completion bubbling", () => {
     complete(c1.id);
 
     expect(getNotes(db, parent.id).some((n) => n.kind === "child_done" && n.body.includes(`${c1.id} done`))).toBe(true);
+    // Relay-originated text is tagged so it is never mistaken for a human/peer.
+    expect(getNotes(db, parent.id).find((n) => n.kind === "child_done")!.body.startsWith("relay: ")).toBe(true);
     expect(inboxFor(db, "p").map((m) => m.kind)).toEqual(["child_done", "children_done"]);
+    expect(inboxFor(db, "p")[0].payload.startsWith("relay: ")).toBe(true);
     expect(getTask(db, parent.id)!.state).toBe("running"); // never auto-done
   });
 
