@@ -51,14 +51,16 @@ import { RELAY_TAG } from "./messages";
 export const NEXT_NUDGE = "relay: Run `relay next` now. Do not wait for instructions.";
 export const CONTINUE_NUDGE = (taskId: string) =>
   `relay: Your task ${taskId} is still running. ` +
-  `If you are waiting on a long-running step (a background command, build or ` +
-  `test run), that is fine — no action needed, continue when it returns. ` +
-  `Otherwise do the next concrete action; if you are blocked, run ` +
+  `If you are only waiting on a long-running step (a background command, build or ` +
+  `test run), declare it as a bounded quiet lease: ` +
+  `\`relay wait ${taskId} --for <30s|2m|1h> "<reason>"\` — then no action is needed ` +
+  `until it returns. Otherwise do the next concrete action; if you are blocked, run ` +
   `\`relay block ${taskId} "<reason>"\`, then \`relay next\`.`;
 export const STALL_NUDGE = (taskId: string) =>
   `relay: No progress on ${taskId} for a while. ` +
-  `If you are working or just waiting on a long-running step, that is fine — ` +
-  `no action needed; relay will check again later. ` +
+  `If you are only waiting on a long-running step, declare a bounded quiet lease: ` +
+  `\`relay wait ${taskId} --for <30s|2m|1h> "<reason>"\`. ` +
+  `If you are working, no action is needed; relay will check again later. ` +
   `If you are actually stuck, run \`relay block ${taskId} "<reason>"\`, then \`relay next\`.`;
 export const REVIEW_NUDGE = "relay: There are tasks waiting for review. Run `relay next` to pick one up.";
 export const PLANNER_NUDGE =
@@ -542,7 +544,7 @@ async function nudgeUnreadMail(
   const rows = db
     .query(
       `SELECT recipient, COUNT(*) AS n, MIN(created_at) AS oldest,
-              SUM(CASE WHEN kind IN ('child_done','children_done') THEN 1 ELSE 0 END) AS immediate
+              SUM(CASE WHEN kind IN ('child_done','children_done','child_blocked','children_blocked') THEN 1 ELSE 0 END) AS immediate
          FROM messages WHERE state = 'queued'
         GROUP BY recipient`
     )

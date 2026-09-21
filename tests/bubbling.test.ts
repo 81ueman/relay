@@ -5,7 +5,7 @@ import { join } from "node:path";
 import type { Database } from "bun:sqlite";
 import { openDb } from "../src/db";
 import { inboxFor, sendMessage } from "../src/messages";
-import { addTask, approveTask, claimTask, getNotes, getTask, releaseTask, submitTask } from "../src/tasks";
+import { addTask, approveTask, claimTask, getNotes, getTask, releaseTask, submitTask, blockTask } from "../src/tasks";
 import { registerWorker } from "../src/workers";
 
 // One-hop completion bubbling: a done child tells its IMMEDIATE parent via a
@@ -171,5 +171,44 @@ describe("one-hop completion bubbling", () => {
     complete(t.id, "wperf");
     const n = (db.query(`SELECT COUNT(*) AS n FROM messages`).get() as { n: number }).n;
     expect(n).toBe(0); // no role-based broadcast, no operator notice
+  });
+
+  test("15. a blocked child notifies the immediate parent assignee", () => {
+    registerWorker(db, "p", { role: "worker" });
+    const parent = addTask(db, { title: "parent" });
+    claimTask(db, parent.id, "p");
+    const child = addTask(db, { title: "child", parentTaskId: parent.id });
+    claimTask(db, child.id, "w1");
+    blockTask(db, child.id, "w1", "need API semantics", true);
+
+    expect(getNotes(db, parent.id).some(
+      (n) => n.kind === "child_blocked" && n.body.includes(`${child.id} blocked_human`))).toBe(true);
+    const inbox = inboxFor(db, "p");
+    expect(inbox.some((m) => m.kind === "child_blocked")).toBe(true);
+    expect(inbox.find((m) => m.kind === "child_blocked")!.payload).toContain("need API semantics");
+    // The parent is not auto-changed.
+    expect(getTask(db, parent.id)!.state).toBe("running");
+  });
+
+  test("16. children_blocked when ALL direct children are blocked", () => {
+    const parent = addTask(db, { title: "parent" });
+    const c1 = addTask(db, { title: "c1", parentTaskId: parent.id });
+    const c2 = addTask(db, { title: "c2", parentTaskId: parent.id });
+    claimTask(db, c1.id, "w1");
+    blockTask(db, c1.id, "w1", "a", false);
+    expect(getNotes(db, parent.id).filter((n) => n.kind === "children_blocked")).toHaveLength(0);
+    claimTask(db, c2.id, "w1");
+    blockTask(db, c2.id, "w1", "b", false);
+    expect(getNotes(db, parent.id).filter((n) => n.kind === "children_blocked")).toHaveLength(1);
+  });
+
+  test("17. an unassigned parent still gets the note, no message", () => {
+    const parent = addTask(db, { title: "parent" });
+    const child = addTask(db, { title: "child", parentTaskId: parent.id });
+    claimTask(db, child.id, "w1");
+    blockTask(db, child.id, "w1", "x", false);
+    expect(getNotes(db, parent.id).some((n) => n.kind === "child_blocked")).toBe(true);
+    const n = (db.query(`SELECT COUNT(*) AS n FROM messages`).get() as { n: number }).n;
+    expect(n).toBe(0);
   });
 });

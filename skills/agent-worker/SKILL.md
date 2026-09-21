@@ -40,14 +40,13 @@ Never wait for instructions or for another agent to finish. If your task is gone
 - Never busy-wait on another agent. Send a durable message instead: `relay send <worker-id> "..."`.
   Workers are peers; there is no `human`/operator alias — address a real worker id.
 - If you are **waiting on a long-running step** (a background command, build or
-  test run), that is fine: keep your task, and if relay sends a "continue"/"stall"
-  nudge, **no action is needed until it returns**. Only act on a nudge when you are
-  genuinely stuck (`relay block`) or have nothing left to do.
-- If you *intentionally end your turn* while a background process or timed wait is
-  still part of your **current** task, say so explicitly with a bounded quiet
-  lease: `relay wait T12 --for 2m "benchmark running in background"`. You stay
-  `working` and keep the task; while the lease is active relay will not treat your
-  session idle as a stall. Do not use it for human blockers or indefinitely
+  test run), **declare it** with a bounded quiet lease:
+  `relay wait T12 --for 2m "benchmark running in background"`. You keep the task
+  and stay `working`; while the lease is active relay will not nudge or stall you.
+  If relay sends a "continue"/"stall" nudge and you are only waiting, the fix is to
+  run `relay wait` (then continue when it returns) — not to do busywork. Only act on
+  a nudge otherwise when you are genuinely stuck (`relay block`) or have nothing
+  left to do. Do not use `relay wait` for human blockers or indefinitely
   (`relay block --human` is the tool there). Important messages and child-completion
   signals may still wake you early, and the lease clears the moment you resume
   (note/submit/block/release/next).

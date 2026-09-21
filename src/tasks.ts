@@ -512,6 +512,54 @@ function bubbleChildDone(db: Database, child: Task, actor: string, at: number): 
   });
 }
 
+/**
+ * One-hop roll-up of a BLOCKED/FAILED child, mirroring bubbleChildDone. A
+ * supervisor must learn that a subtree is stuck without polling: record a
+ * `child_blocked` note on the immediate parent (+ `children_blocked` when ALL
+ * direct children are blocked/failed) and send a durable message to the parent's
+ * current assignee. No recursion; no automatic parent state change.
+ */
+function bubbleChildBlocked(db: Database, child: Task, actor: string, reason: string, at: number): void {
+  const parentId = child.parent_task_id;
+  if (!parentId) return;
+  const parent = getTask(db, parentId);
+  if (!parent) return; // dangling parent: the child is still blocked
+  const body = `${RELAY_TAG}${child.id} ${child.state}${reason ? `: ${reason}` : ""}`;
+  db.query(
+    `INSERT INTO task_notes (task_id, worker_id, kind, body, created_at) VALUES (?, ?, 'child_blocked', ?, ?)`
+  ).run(parentId, actor, body, at);
+
+  const counts = db
+    .query(
+      `SELECT COUNT(*) AS total,
+              SUM(CASE WHEN state IN ('blocked_internal','blocked_human','failed') THEN 1 ELSE 0 END) AS blocked
+         FROM tasks WHERE parent_task_id = ?`
+    )
+    .get(parentId) as { total: number; blocked: number };
+  const allBlocked = counts.total > 0 && counts.blocked === counts.total;
+  if (allBlocked) {
+    db.query(
+      `INSERT INTO task_notes (task_id, worker_id, kind, body, created_at) VALUES (?, ?, 'children_blocked', ?, ?)`
+    ).run(parentId, actor, `${RELAY_TAG}All direct children of ${parentId} are blocked (${counts.blocked}/${counts.total}).`, at);
+  }
+
+  if (parent.assignee) {
+    sendMessage(db, "relay", parent.assignee, body, { kind: "child_blocked", taskId: parentId });
+    if (allBlocked) {
+      sendMessage(db, "relay", parent.assignee, `${RELAY_TAG}All direct children of ${parentId} are blocked (${counts.blocked}/${counts.total}).`, {
+        kind: "children_blocked",
+        taskId: parentId,
+      });
+    }
+  }
+  logEvent(db, {
+    source: "supervisor",
+    taskId: parentId,
+    type: "task.child_blocked",
+    payload: { child: child.id, state: child.state, allBlocked, assignee: parent.assignee ?? null },
+  });
+}
+
 export function rejectTask(db: Database, taskId: string, workerId: string, reason: string): Task {
   const task = getTask(db, taskId);
   if (!task) throw new Error(`unknown task: ${taskId}`);
@@ -537,26 +585,32 @@ export function blockTask(db: Database, taskId: string, workerId: string, reason
   const task = getTask(db, taskId);
   if (!task) throw new Error(`unknown task: ${taskId}`);
   const t = now();
-  db.query(`INSERT INTO task_notes (task_id, worker_id, kind, body, created_at) VALUES (?, ?, ?, ?, ?)`).run(
-    taskId, workerId, human ? "blocked_human" : "blocked_internal", reason, t
-  );
   const state: TaskState = human ? "blocked_human" : "blocked_internal";
-  // Blocking releases ownership completely: no stale assignee/lease survives, so
-  // the task cannot be "submitted" later by a worker that no longer owns it.
-  db.query(
-    `UPDATE tasks SET state = ?, assignee = NULL, lease_until = NULL, lease_token = lease_token + 1, updated_at = ? WHERE id = ?`
-  ).run(state, t, taskId);
-  // A blocked task never parks the worker: it must immediately take the next runnable task.
-  if (task.assignee) {
-    clearCurrentTask(db, task.assignee);
-    normalizeWorkerAfterTaskRelease(db, task.assignee, t);
-  }
-  db.query(`UPDATE workers SET current_task_id = NULL WHERE id = ? AND current_task_id = ?`).run(workerId, taskId);
-  normalizeWorkerAfterTaskRelease(db, workerId, t);
-  touchProgress(db, workerId, t);
-  if (task.assignee) clearQuietLogged(db, task.assignee, taskId);
-  clearQuietLogged(db, workerId, taskId);
-  logEvent(db, { source: "worker", workerId, taskId, type: human ? "task.blocked_human" : "task.blocked_internal", payload: { reason } });
+  // Durable first, in ONE transaction: the block, its parent notification (note +
+  // message) and the worker release either all commit or none do.
+  db.transaction(() => {
+    db.query(`INSERT INTO task_notes (task_id, worker_id, kind, body, created_at) VALUES (?, ?, ?, ?, ?)`).run(
+      taskId, workerId, human ? "blocked_human" : "blocked_internal", reason, t
+    );
+    // Blocking releases ownership completely: no stale assignee/lease survives, so
+    // the task cannot be "submitted" later by a worker that no longer owns it.
+    db.query(
+      `UPDATE tasks SET state = ?, assignee = NULL, lease_until = NULL, lease_token = lease_token + 1, updated_at = ? WHERE id = ?`
+    ).run(state, t, taskId);
+    // A blocked task never parks the worker: it must immediately take the next runnable task.
+    if (task.assignee) {
+      clearCurrentTask(db, task.assignee);
+      normalizeWorkerAfterTaskRelease(db, task.assignee, t);
+    }
+    db.query(`UPDATE workers SET current_task_id = NULL WHERE id = ? AND current_task_id = ?`).run(workerId, taskId);
+    normalizeWorkerAfterTaskRelease(db, workerId, t);
+    touchProgress(db, workerId, t);
+    if (task.assignee) clearQuietLogged(db, task.assignee, taskId);
+    clearQuietLogged(db, workerId, taskId);
+    logEvent(db, { source: "worker", workerId, taskId, type: human ? "task.blocked_human" : "task.blocked_internal", payload: { reason } });
+    // One-hop roll-up: the immediate parent assignee must learn a child is stuck.
+    bubbleChildBlocked(db, getTask(db, taskId)!, workerId, reason, t);
+  })();
   return getTask(db, taskId)!;
 }
 

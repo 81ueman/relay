@@ -7,7 +7,7 @@ import { openDb } from "../src/db";
 import { sendMessage } from "../src/messages";
 import { reconcile } from "../src/reconciler";
 import { MockRuntime } from "../src/runtime/runtime";
-import { addTask, approveTask, claimTask, submitTask } from "../src/tasks";
+import { addTask, approveTask, blockTask, claimTask, submitTask } from "../src/tasks";
 import { registerWorker } from "../src/workers";
 
 // The send-time wake is best-effort, so the daemon nudges any durable unread
@@ -69,6 +69,20 @@ describe("periodic unread-mail nudge", () => {
     claimTask(db, child.id, "worker-c");
     submitTask(db, child.id, "worker-c", { evidence: "x" });
     approveTask(db, child.id, "reviewer"); // fresh child_done message to worker-b
+
+    const { actions } = await reconcile(db, rt);
+    expect(actions).toContain("mail-nudged:worker-b");
+  });
+
+  test("block notices (child_blocked) skip the initial delay", async () => {
+    process.env.RELAY_MAIL_NUDGE_MS = "600000"; // large window
+    registerWorker(db, "worker-b", { role: "worker" }); // parent owner
+    registerWorker(db, "worker-c", { role: "worker" }); // child owner
+    const parent = addTask(db, { title: "parent" });
+    claimTask(db, parent.id, "worker-b");
+    const child = addTask(db, { title: "child", parentTaskId: parent.id });
+    claimTask(db, child.id, "worker-c");
+    blockTask(db, child.id, "worker-c", "stuck", false);
 
     const { actions } = await reconcile(db, rt);
     expect(actions).toContain("mail-nudged:worker-b");
