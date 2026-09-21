@@ -62,8 +62,8 @@ Usage:
   relay note <task-id> "progress" [--worker <id>]
   relay submit <task-id> --evidence "..." [--worker <id>] [--lease <token>]
   relay approve <task-id> [--worker <id>]
-  relay reject <task-id> "reason" [--worker <id>]
-  relay block <task-id> "reason" [--worker <id>] [--human]
+  relay reject <task-id> "reason" | --reason <text> [--worker <id>]
+  relay block <task-id> "reason" | --reason <text> [--worker <id>] [--human]
   relay unblock <task-id> [--worker <id>]
   relay release <task-id> [--worker <id>]
   relay wait <task-id> --for <30s|2m|1h> "reason" [--worker <id>]
@@ -182,8 +182,8 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
   note: { about: "Record a progress note (the strongest liveness signal).", usage: ['relay note <task-id> "progress" [--worker <id>]'] },
   submit: { about: "Submit work for review (task -> review).", usage: ['relay submit <task-id> --evidence "..." [--worker <id>] [--lease <token>]'] },
   approve: { about: "Approve a reviewed task (task -> done).", usage: ["relay approve <task-id> [--worker <id>]"] },
-  reject: { about: "Reject a reviewed task (task -> queued).", usage: ['relay reject <task-id> "reason" [--worker <id>]'] },
-  block: { about: "Block a task. --human marks it blocked_human (needs a person).", usage: ['relay block <task-id> "reason" [--worker <id>] [--human]'] },
+  reject: { about: "Reject a reviewed task (task -> queued).", usage: ['relay reject <task-id> "reason" | --reason <text> [--worker <id>]'] },
+  block: { about: "Block a task. --human marks it blocked_human (needs a person).", usage: ['relay block <task-id> "reason" | --reason <text> [--worker <id>] [--human]'] },
   unblock: { about: "Unblock a task.", usage: ["relay unblock <task-id> [--worker <id>]"] },
   release: {
     about: "Hand a RUNNING task back to the queue cleanly (no block/reject note): clears assignee + lease, bumps the fencing token. The current assignee or any human/worker may release.",
@@ -321,14 +321,58 @@ function printTaskContext(db: ReturnType<typeof openDb>, taskId: string): void {
   return ms;
 }
 
-/** Positional args only, skipping flags and their values (e.g. ["T12","reason"]). */
+/**
+ * Flags that CONSUME the following token as their value. Boolean flags
+ * (`--human`, `--any-role`, `--json`, ...) are deliberately absent, so a
+ * positional immediately after one is not swallowed.
+ */
+const VALUE_FLAGS = new Set([
+  "--worker", "--reason", "--evidence", "--lease", "--kind", "--task", "--for",
+  "--role", "--state", "--limit", "--interval", "--session", "--runtime", "--cwd",
+  "--command", "--title", "--acceptance", "--priority", "--parent", "--plan",
+  "--dir", "--worktree", "--pane", "--tab", "--workspace", "--type", "--payload",
+  "--ack",
+]);
+
+/** Positional args only, skipping flags and their (known) values, e.g. ["T12","reason"]. */
 function positionals(args: string[]): string[] {
   const out: string[] = [];
   for (let i = 0; i < args.length; i++) {
-    if (args[i].startsWith("-")) { i++; continue; }
+    if (args[i].startsWith("-")) {
+      if (VALUE_FLAGS.has(args[i])) i++;
+      continue;
+    }
     out.push(args[i]);
   }
   return out;
+}
+
+/**
+ * Resolve REQUIRED free text (a reason / note body) from its positional form OR
+ * its `--flag <text>` form, in any order. Fail closed: a missing value or a bare
+ * flag token is refused instead of being persisted as the text.
+ *
+ * Regression (`send-guard` sibling): `relay block T152 --reason "the real
+ * explanation" --worker w` read `argv[2]`, which is the literal "--reason", and
+ * stored that as the block reason while discarding the explanation.
+ *
+ * @param args      the command's own args, starting with the task id
+ * @param usageLine the command's usage string, restated on failure
+ * @param flagName  the optional `--flag <text>` form (omitted when there is none)
+ */
+function resolveText(args: string[], usageLine: string, flagName?: string): string {
+  const explicit = flagName ? flag(args, flagName) : undefined;
+  const text = explicit ?? positionals(args)[1];
+  const where = flagName ? `positionally or via ${flagName} <text>` : "positionally";
+  if (text === undefined || text.trim() === "") {
+    throw new Error(`${usageLine}\n  the text is required (pass it ${where}, after the task id)`);
+  }
+  if (text.startsWith("-")) {
+    throw new Error(
+      `${usageLine}\n  refusing the flag-like text "${text}" — pass the text ${where}, after the task id`
+    );
+  }
+  return text;
 }
 
 async function main(): Promise<void> {
@@ -495,9 +539,12 @@ async function main(): Promise<void> {
       case "task": {
         const sub = argv[1];
         if (sub === "add") {
-          const desc = argv[2];
-          if (!desc) throw new Error('usage: relay task add "description" [...]');
           const rest = argv.slice(2);
+          // The description is the first POSITIONAL (same blind-argv[2] class as
+          // block/reject/note): `task add --title X "desc"` used to store the
+          // literal "--title" as the description.
+          const desc = positionals(rest)[0];
+          if (!desc) throw new Error('usage: relay task add "description" [...]');
           const role = flag(rest, "--role") ?? undefined;
           if (role && !knownRole(db, role)) {
             console.error(
@@ -585,9 +632,11 @@ async function main(): Promise<void> {
       }
 
       case "note": {
-        const id = argv[1];
-        const body = argv[2];
-        if (!id || !body) throw new Error('usage: relay note <task-id> "progress"');
+        const rest = argv.slice(1);
+        const id = positionals(rest)[0];
+        const usage = 'usage: relay note <task-id> "progress" [--worker <id>]';
+        if (!id) throw new Error(usage);
+        const body = resolveText(rest, usage);
         const workerId = resolveWorkerId(db, flag(argv, "--worker"));
         addNote(db, id, workerId, body);
         console.log("noted");
@@ -618,9 +667,11 @@ async function main(): Promise<void> {
       }
 
       case "reject": {
-        const id = argv[1];
-        const reason = argv[2];
-        if (!id || !reason) throw new Error('usage: relay reject <task-id> "reason"');
+        const rest = argv.slice(1);
+        const id = positionals(rest)[0];
+        const usage = 'usage: relay reject <task-id> "reason" | --reason <text> [--worker <id>]';
+        if (!id) throw new Error(usage);
+        const reason = resolveText(rest, usage, "--reason");
         const workerId = resolveWorkerId(db, flag(argv, "--worker"));
         const t = rejectTask(db, id, workerId, reason);
         console.log(`${t.id} -> queued`);
@@ -628,9 +679,11 @@ async function main(): Promise<void> {
       }
 
       case "block": {
-        const id = argv[1];
-        const reason = argv[2];
-        if (!id || !reason) throw new Error('usage: relay block <task-id> "reason" [--human]');
+        const rest = argv.slice(1);
+        const id = positionals(rest)[0];
+        const usage = 'usage: relay block <task-id> "reason" | --reason <text> [--worker <id>] [--human]';
+        if (!id) throw new Error(usage);
+        const reason = resolveText(rest, usage, "--reason");
         const workerId = resolveWorkerId(db, flag(argv, "--worker"));
         const t = blockTask(db, id, workerId, reason, hasFlag(argv, "--human"));
         console.log(`${t.id} -> ${t.state}`);
