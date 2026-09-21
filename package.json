@@ -12,7 +12,12 @@
     "typecheck": "tsc --noEmit",
     "daemon": "bun src/cli.ts daemon",
     "formal": "formal/run-tlc.sh Relay",
+    "formal:safety": "formal/run-tlc.sh RelaySafety",
+    "formal:scheduling": "formal/run-tlc.sh RelayScheduling",
+    "formal:recovery": "formal/run-tlc.sh RelayRecovery",
     "formal:liveness": "formal/run-tlc.sh RelayLiveness",
+    "formal:completion": "formal/run-tlc.sh RelayCompletion",
+    "formal:mutations": "formal/run-mutations.sh",
     "formal:done": "formal/run-tlc.sh RelayDone",
     "formal:failures": "formal/run-tlc.sh RelayFailures"
   },

@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # Run TLC on one of the Relay*.cfg configs.
 #
-#   formal/run-tlc.sh Relay           # safety invariants (all behaviours)
-#   formal/run-tlc.sh RelayLiveness   # Property A + B (fair behaviours)
-#   formal/run-tlc.sh RelayDone       # Property C (stronger env assumptions)
-#   formal/run-tlc.sh RelayFailures   # safety widened to >=2 sequential failures
+#   formal/run-tlc.sh RelaySafety      # Level A -- structural safety, exhaustive
+#   formal/run-tlc.sh RelayScheduling  # Level B -- reconcile-boundary responsiveness
+#   formal/run-tlc.sh RelayRecovery    # recovery + fencing under failure
+#   formal/run-tlc.sh RelayLiveness    # Level C -- bounded suppression under FairSpec
+#   formal/run-tlc.sh RelayCompletion  # Level D -- AllTasksDone demonstration (NOT a guarantee)
+#
+# Old names Relay / RelayFailures / RelayDone are thin compatibility aliases.
 #
 # The TLA+ tools are downloaded on first use into formal/.tools/ (gitignored).
 # No JAR is committed to the repository.
