@@ -34,7 +34,7 @@ import {
 
 function runHerdr(args: string[], timeoutMs = 8000): { ok: boolean; stdout: string; stderr: string } {
   try {
-    const r = spawnSync("herdr", args, { encoding: "utf-8", timeout: timeoutMs });
+    const r = spawnSync("herdr", args, { encoding: "utf-8", timeout: timeoutMs, env: process.env });
     return { ok: r.status === 0, stdout: String(r.stdout ?? ""), stderr: String(r.stderr ?? "") };
   } catch (e) {
     return { ok: false, stdout: "", stderr: String(e) };

@@ -24,7 +24,10 @@ export interface PaneTelemetry {
 
 function herdrJson(args: string[], timeoutMs = 8000): any | null {
   try {
-    const r = spawnSync("herdr", args, { encoding: "utf-8", timeout: timeoutMs });
+    // `env: process.env` matters: Bun's spawnSync otherwise resolves `herdr` with
+    // the PATH captured at process start, so a runtime PATH change (e.g. a test
+    // that puts a fake `herdr` first) is ignored.
+    const r = spawnSync("herdr", args, { encoding: "utf-8", timeout: timeoutMs, env: process.env });
     if (r.status !== 0) return null;
     return JSON.parse(String(r.stdout ?? ""));
   } catch {
@@ -34,7 +37,7 @@ function herdrJson(args: string[], timeoutMs = 8000): any | null {
 
 function herdrOk(args: string[], timeoutMs = 8000): boolean {
   try {
-    const r = spawnSync("herdr", args, { encoding: "utf-8", timeout: timeoutMs });
+    const r = spawnSync("herdr", args, { encoding: "utf-8", timeout: timeoutMs, env: process.env });
     return r.status === 0;
   } catch {
     return false;

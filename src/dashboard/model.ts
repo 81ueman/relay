@@ -372,7 +372,7 @@ function deriveAttention(
 function readGit(root: string): DashboardGit {
   const run = (args: string[]): string | null => {
     try {
-      const r = spawnSync("git", args, { cwd: root, encoding: "utf-8", timeout: 10_000 });
+      const r = spawnSync("git", args, { cwd: root, encoding: "utf-8", timeout: 10_000, env: process.env });
       return r.status === 0 ? String(r.stdout ?? "").trim() : null;
     } catch {
       return null;
