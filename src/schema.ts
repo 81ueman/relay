@@ -61,6 +61,16 @@ export interface Worker {
   last_progress_at: number;
   nudged_at: number | null; // [ext] single-nudge bookkeeping for stalled detection
   /**
+   * [ext] Bounded "quiet lease": explicit permission for a worker that OWNS a
+   * running task to be runtime-idle (session.idle) until `quiet_until` without
+   * being treated as an anomaly. It is temporary metadata, NOT a state: the
+   * worker stays `working` and the task stays `running`. `quiet_task_id` scopes
+   * it to that task so it can never leak onto another task.
+   */
+  quiet_until: number | null;
+  quiet_reason: string | null;
+  quiet_task_id: string | null;
+  /**
    * [ext] Retirement tombstone. A retired worker is history only: it is excluded
    * from the operational/supervised sets, from role discovery and from all
    * listings, but its row (and events) survive so earlier references stay
@@ -162,6 +172,9 @@ CREATE TABLE IF NOT EXISTS workers (
   nudged_at INTEGER,
   retired_at INTEGER,
   retired_reason TEXT,
+  quiet_until INTEGER,
+  quiet_reason TEXT,
+  quiet_task_id TEXT,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );

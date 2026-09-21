@@ -43,6 +43,14 @@ Never wait for instructions or for another agent to finish. If your task is gone
   test run), that is fine: keep your task, and if relay sends a "continue"/"stall"
   nudge, **no action is needed until it returns**. Only act on a nudge when you are
   genuinely stuck (`relay block`) or have nothing left to do.
+- If you *intentionally end your turn* while a background process or timed wait is
+  still part of your **current** task, say so explicitly with a bounded quiet
+  lease: `relay wait T12 --for 2m "benchmark running in background"`. You stay
+  `working` and keep the task; while the lease is active relay will not treat your
+  session idle as a stall. Do not use it for human blockers or indefinitely
+  (`relay block --human` is the tool there). Important messages and child-completion
+  signals may still wake you early, and the lease clears the moment you resume
+  (note/submit/block/release/next).
 - You may be woken about incoming messages — it is **not urgent**: finish your
   current step, then run `relay inbox --claim` at a stopping point. Relay keeps
   reminding you (and the message is stored), so nothing is lost by finishing first.
@@ -78,6 +86,7 @@ relay submit T12 --evidence "tests: bun test auth (12 pass)"
 relay release T12                           # wrong task? hand it back cleanly, then `relay next`
 relay block T12 "flaky dep, retry after T11" 
 relay block T12 --human "need prod DB credentials"
+relay wait T12 --for 2m "benchmark running in background"   # bounded intentional idle, keep the task
 relay send worker-2 "T12 ready for review" --task T12
 relay inbox --claim
 relay task add "child work" --parent T12    # optional: decompose T12; child_done bubbles back to T12

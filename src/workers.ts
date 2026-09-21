@@ -115,6 +115,38 @@ export function touchProgress(db: Database, id: string, at = now()): void {
   ).run(at, at, at, id);
 }
 
+/**
+ * A worker whose bounded quiet lease is active for its CURRENT task: it OWNS a
+ * running task and has explicitly declared that it may stay runtime-idle until
+ * `quiet_until`. A quiet lease that points at a different task is NOT active (it
+ * can never leak onto another task).
+ */
+export function quietActive(w: Worker | null | undefined, at = now()): boolean {
+  if (!w || w.quiet_until === null) return false;
+  if (w.quiet_until <= at) return false;
+  return !!w.quiet_task_id && w.quiet_task_id === w.current_task_id;
+}
+
+/**
+ * Grant a bounded quiet lease. Does NOT change the worker's state, its task, or
+ * its lease ownership — only the temporary permission to be runtime-idle.
+ */
+export function setQuiet(db: Database, workerId: string, taskId: string, until: number, reason: string): void {
+  db.query(
+    `UPDATE workers SET quiet_until = ?, quiet_reason = ?, quiet_task_id = ?, updated_at = ? WHERE id = ?`
+  ).run(until, reason, taskId, now(), workerId);
+}
+
+/** Clear a quiet lease; true when one was actually cleared (for event logging). */
+export function clearQuiet(db: Database, workerId: string): boolean {
+  const w = getWorker(db, workerId);
+  if (!w || w.quiet_until === null) return false;
+  db.query(
+    `UPDATE workers SET quiet_until = NULL, quiet_reason = NULL, quiet_task_id = NULL, updated_at = ? WHERE id = ?`
+  ).run(now(), workerId);
+  return true;
+}
+
 export function bindSession(db: Database, id: string, sessionId: string): Worker {
   const w = getWorker(db, id);
   if (!w) throw new Error(`unknown worker: ${id}`);

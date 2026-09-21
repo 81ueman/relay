@@ -42,7 +42,7 @@ import {
   reviewTasks,
   unclaimableRunnableTasks,
 } from "./tasks";
-import { getWorker, listWorkers, setWorkerState, touchSeen, type WorkerRow } from "./workers";
+import { getWorker, listWorkers, setWorkerState, touchSeen, clearQuiet, quietActive, type WorkerRow } from "./workers";
 import { RELAY_TAG } from "./messages";
 
 // Deterministic reconciler. No LLM: pure DB state + runtime transport.
@@ -327,6 +327,10 @@ async function spawnFreshGeneration(db: Database, rt: Runtime, w: WorkerRow, at:
       `UPDATE workers SET generation = ?, runtime_id = ?, opencode_session_id = NULL,
          state = 'starting', current_task_id = NULL, nudged_at = NULL, updated_at = ? WHERE id = ?`
     ).run(generation, started.runtimeId, at, w.id);
+    // A generation change is a resumed-work signal: a quiet lease never crosses it.
+    if (clearQuiet(db, w.id)) {
+      logEvent(db, { source: "supervisor", workerId: w.id, type: "worker.quiet_cleared", payload: { reason: "restart" } });
+    }
     logEvent(db, {
       source: "supervisor",
       workerId: w.id,
@@ -562,9 +566,44 @@ async function nudgeUnreadMail(
   }
 }
 
+/**
+ * Quiet-lease maintenance. A quiet lease is temporary metadata: clear it when it
+ * is stale (the worker no longer holds that task — it can never leak onto the
+ * next task) or expired, then wake the owner to resume. Durable clear BEFORE the
+ * wake. Quiet does NOT suppress crash recovery (that is isAlive-based).
+ */
+async function processQuietLeases(
+  db: Database, rt: Runtime, actions: string[], at: number
+): Promise<void> {
+  for (const w of listWorkers(db)) {
+    if (w.quiet_until === null) continue;
+    const taskId = w.quiet_task_id;
+    if (taskId && taskId !== w.current_task_id) {
+      clearQuiet(db, w.id);
+      logEvent(db, { source: "supervisor", workerId: w.id, taskId, type: "worker.quiet_cleared", payload: { reason: "task changed" } });
+      actions.push(`quiet-cleared:${w.id}`);
+      continue;
+    }
+    if (w.quiet_until > at) continue; // still active
+    clearQuiet(db, w.id);
+    logEvent(db, { source: "supervisor", workerId: w.id, taskId: taskId ?? null, type: "worker.quiet_expired", payload: { task: taskId, until: w.quiet_until } });
+    actions.push(`quiet-expired:${w.id}`);
+    const task = taskId ? getTask(db, taskId) : null;
+    if (task && task.state === "running" && task.assignee === w.id) {
+      try {
+        await rt.wake(w, `${RELAY_TAG}Quiet wait expired for ${taskId}. Resume the task now, check the background result, then continue, submit, or explicitly block.`);
+      } catch { /* best effort; the task is still owned by a live worker */ }
+    }
+  }
+}
+
 /** One deterministic reconcile pass. Safe to run every 1-2s. */
 export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<ReconcileResult> {
   const actions: string[] = [];
+
+  // 0. Quiet leases: clear a stale one (the worker no longer holds that task) or
+  //    an expired one, then wake. Durable clear BEFORE the wake.
+  await processQuietLeases(db, rt, actions, at);
 
   // 1. Expire lapsed leases first (worker crash recovery). Only a missing or
   //    not-alive assignee is requeued; a live-but-slow worker keeps its lease.
@@ -664,7 +703,8 @@ export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<
       // benchmark inside one tool call): that is PROGRESS for the stall clock, so
       // neither nudge nor release it — no relay command is expected mid-command.
       const agentBusy = await rt.isWorking(fresh).catch(() => false);
-      if (task.state === "running" && !agentBusy && at - fresh.last_progress_at > stallTimeout) {
+      const quiet = quietActive(fresh, at);
+      if (task.state === "running" && !agentBusy && !quiet && at - fresh.last_progress_at > stallTimeout) {
         if (!fresh.nudged_at) {
           const woke = await tryWake(rt, db, fresh, STALL_NUDGE(task.id), "stall-nudge", at);
           db.query(`UPDATE workers SET nudged_at = ?, updated_at = ? WHERE id = ?`).run(at, at, w.id);
@@ -835,6 +875,9 @@ export async function handleIdleSignal(db: Database, rt: Runtime, workerId: stri
     return "moved-on";
   }
   if (task.state === "running") {
+    // A bounded quiet lease makes a deliberate session-idle intentional: no
+    // nudge, no idle marking, no stall.
+    if (quietActive(w, at)) return "quiet";
     // Premature stop until proven otherwise: continue-nudge first.
     // Stalled verdicts need process-alive + stale progress + repeated idle
     // (handled by the reconciler pass, never by idle alone).

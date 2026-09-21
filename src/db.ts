@@ -50,6 +50,16 @@ function migrate(db: Database): void {
       db.exec("ALTER TABLE workers ADD COLUMN retired_reason TEXT;");
     }
     db.exec("CREATE INDEX IF NOT EXISTS idx_workers_retired ON workers(retired_at);");
+    // Quiet lease metadata (bounded intentional session-idle permission).
+    if (!columnExists(db, "workers", "quiet_until")) {
+      db.exec("ALTER TABLE workers ADD COLUMN quiet_until INTEGER;");
+    }
+    if (!columnExists(db, "workers", "quiet_reason")) {
+      db.exec("ALTER TABLE workers ADD COLUMN quiet_reason TEXT;");
+    }
+    if (!columnExists(db, "workers", "quiet_task_id")) {
+      db.exec("ALTER TABLE workers ADD COLUMN quiet_task_id TEXT;");
+    }
   }
   // `claimed` task state was removed: anything left there is runnable work.
   try {

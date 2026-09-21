@@ -13,11 +13,11 @@ import { listRuntimes } from "./runtimes";
 import {
   addTask, approveTask, blockTask, claimNext, claimTask, getNotes, getTask,
   listTasks, rejectTask, releaseTask, submitTask, taskCounts, unblockTask,
-  unclaimableRunnableTasks, addNote, setTaskPlan,
+  unclaimableRunnableTasks, addNote, setTaskPlan, waitTask,
 } from "./tasks";
 import {
   bindSession, findWorkerBySession, getWorker, listWorkers,
-  registerWorker, retireWorker, setWorkerState, touchSeen, unretireWorker,
+  quietActive, registerWorker, retireWorker, setWorkerState, touchSeen, unretireWorker,
 } from "./workers";
 import { resolveWorkerIdentity } from "./identity";
 
@@ -64,6 +64,7 @@ Usage:
   relay block <task-id> "reason" [--worker <id>] [--human]
   relay unblock <task-id> [--worker <id>]
   relay release <task-id> [--worker <id>]
+  relay wait <task-id> --for <30s|2m|1h> "reason" [--worker <id>]
 
   relay send <worker-id> "message" [--task <tid>] [--kind <k>]
   relay inbox [--worker <id>] [--claim] [--ack <msg-id>]
@@ -185,6 +186,10 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
     about: "Hand a RUNNING task back to the queue cleanly (no block/reject note): clears assignee + lease, bumps the fencing token. The current assignee or any human/worker may release.",
     usage: ["relay release <task-id> [--worker <id>]"],
   },
+  wait: {
+    about: "Declare a BOUNDED quiet lease on a running task you own: you may be runtime-idle (session idle) until the deadline without being treated as stalled. Does not change worker/task state or ownership; cleared by note/submit/block/release/claim, and by expiry.",
+    usage: ['relay wait <task-id> --for <30s|2m|1h> "reason" [--worker <id>]'],
+  },
   send: { about: "Send a durable peer-to-peer message to another worker; the best-effort wake is delivered after the commit.", usage: ['relay send <worker-id> "message" [--task <tid>] [--kind <k>]'] },
   inbox: { about: "Read (and optionally claim/ack) the worker's own inbox.", usage: ["relay inbox [--worker <id>] [--claim] [--ack <msg-id>]"] },
   status: { about: "Print workers, task counts, and the supervisor view.", usage: ["relay status"] },
@@ -278,6 +283,27 @@ function printTaskContext(db: ReturnType<typeof openDb>, taskId: string): void {
   }
 }
 
+/** Parse "30s" / "2m" / "1h" (a bare number means seconds) into milliseconds. */
+function parseDuration(s: string): number {
+  const m = /^(\d+)(s|m|h)?$/.exec(s.trim());
+  if (!m) throw new Error(`invalid duration '${s}' (use e.g. 30s, 2m, 1h)`);
+  const n = Number(m[1]);
+  const unit = m[2] ?? "s";
+  const ms = unit === "h" ? n * 3_600_000 : unit === "m" ? n * 60_000 : n * 1_000;
+  if (ms <= 0) throw new Error(`duration must be positive: ${s}`);
+  return ms;
+}
+
+/** Positional args only, skipping flags and their values (e.g. ["T12","reason"]). */
+function positionals(args: string[]): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i].startsWith("-")) { i++; continue; }
+    out.push(args[i]);
+  }
+  return out;
+}
+
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
   if (argv.length === 0 || argv[0] === "help" || argv.some((a) => a === "--help" || a === "-h")) {
@@ -329,7 +355,8 @@ async function main(): Promise<void> {
           const all = hasFlag(argv.slice(2), "--all");
           for (const w of listWorkers(db, { includeRetired: all })) {
             const retired = w.retired_at ? `\tRETIRED(${w.retired_reason ?? "-"})` : "";
-            console.log(`${w.id}\t${w.role}\t${w.state}\tgen=${w.generation}\truntime=${w.runtime_id ?? "-"}\ttask=${w.current_task_id ?? "-"}\tsession=${w.opencode_session_id ?? "-"}${retired}`);
+            const quiet = quietActive(w) ? `\tquiet=${fmtAge((w.quiet_until ?? now()) - now())} (${w.quiet_reason ?? "-"})` : "";
+            console.log(`${w.id}\t${w.role}\t${w.state}\tgen=${w.generation}\truntime=${w.runtime_id ?? "-"}\ttask=${w.current_task_id ?? "-"}\tsession=${w.opencode_session_id ?? "-"}${quiet}${retired}`);
           }
         } else if (sub === "retire") {
           const id = argv[2];
@@ -596,6 +623,20 @@ async function main(): Promise<void> {
         break;
       }
 
+      case "wait": {
+        const id = argv[1];
+        const durRaw = flag(argv, "--for");
+        const reason = positionals(argv.slice(1))[1];
+        if (!id || !durRaw || !reason) {
+          throw new Error('usage: relay wait <task-id> --for <30s|2m|1h> "reason"');
+        }
+        const workerId = resolveWorkerId(db, flag(argv, "--worker"));
+        const { until } = waitTask(db, id, workerId, parseDuration(durRaw), reason);
+        console.log(`${id} quiet until ${new Date(until).toLocaleString()}`);
+        console.log(`reason: ${reason}`);
+        break;
+      }
+
       case "send": {
         const recipient = argv[1];
         const payload = argv[2];
@@ -614,6 +655,7 @@ async function main(): Promise<void> {
           opencode_session_id: null, state: "idle" as const, current_task_id: null,
           generation: 0, last_seen_at: 0, last_progress_at: 0, nudged_at: null,
           retired_at: null, retired_reason: null,
+          quiet_until: null, quiet_reason: null, quiet_task_id: null,
           created_at: 0, updated_at: 0,
         };
         try {
@@ -659,7 +701,10 @@ async function main(): Promise<void> {
         if (workers.length === 0) console.log("(none)");
         for (const w of workers) {
           const prog = w.last_progress_at ? fmtAge(t - w.last_progress_at) : "-";
-          console.log(`${w.id}  ${w.state}  ${w.current_task_id ?? "-"}  last progress ${prog}`);
+          const quiet = quietActive(w, t)
+            ? `  quiet ${fmtAge((w.quiet_until ?? t) - t)}${w.quiet_reason ? `  ${w.quiet_reason}` : ""}`
+            : "";
+          console.log(`${w.id}  ${w.state}  ${w.current_task_id ?? "-"}  last progress ${prog}${quiet}`);
         }
         console.log("");
         console.log("Tasks");

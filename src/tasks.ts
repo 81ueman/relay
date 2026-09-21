@@ -3,15 +3,29 @@ import { now } from "./db";
 import { logEvent } from "./events";
 import {
   clearCurrentTask,
+  clearQuiet,
   getWorker,
   listWorkers,
   normalizeWorkerAfterTaskRelease,
+  setQuiet,
   touchProgress,
 } from "./workers";
 import type { Task, TaskState } from "./schema";
 import { RELAY_TAG, sendMessage } from "./messages";
 
 export const STALE_LEASE = "STALE_LEASE";
+
+/**
+ * Clear a worker's quiet lease after an explicit relay action (note/submit/block/
+ * release/claim/approve) or a generation change, logging only when one existed.
+ * A quiet lease must never survive "work resumed" and must never leak onto the
+ * next task.
+ */
+function clearQuietLogged(db: Database, workerId: string, taskId?: string | null): void {
+  if (clearQuiet(db, workerId)) {
+    logEvent(db, { source: "worker", workerId, taskId: taskId ?? null, type: "worker.quiet_cleared", payload: {} });
+  }
+}
 
 export function leaseMs(): number {
   const v = Number(process.env.RELAY_LEASE_MS ?? "120000");
@@ -265,6 +279,7 @@ export function claimTask(db: Database, taskId: string, workerId: string, opts: 
     db.query(
       `UPDATE workers SET current_task_id = ?, state = 'working', last_seen_at = ?, last_progress_at = ?, nudged_at = NULL, updated_at = ? WHERE id = ?`
     ).run(taskId, t, t, t, workerId);
+    clearQuietLogged(db, workerId, taskId); // a new task never inherits an old quiet lease
     logEvent(db, { source: "scheduler", workerId, taskId, type: "task.claimed" });
     db.run("COMMIT");
     return getTask(db, taskId)!;
@@ -286,6 +301,7 @@ export function addNote(db: Database, taskId: string, workerId: string, body: st
     db.query(`UPDATE tasks SET lease_until = ?, updated_at = ? WHERE id = ?`).run(t + leaseMs(), t, taskId);
   }
   touchProgress(db, workerId, t);
+  clearQuietLogged(db, workerId, taskId); // resumed work ends any quiet lease
   logEvent(db, { source: "worker", workerId, taskId, type: "task.note", payload: { kind } });
 }
 
@@ -340,8 +356,51 @@ export function releaseTask(db: Database, taskId: string, workerId: string, reas
     normalizeWorkerAfterTaskRelease(db, workerId, t);
   }
   touchProgress(db, workerId, t);
+  if (task.assignee) clearQuietLogged(db, task.assignee, taskId);
+  if (workerId !== task.assignee) clearQuietLogged(db, workerId, taskId);
   logEvent(db, { source: "worker", workerId, taskId, type: "task.released", payload: { reason: body } });
   return getTask(db, taskId)!;
+}
+
+/**
+ * Grant a BOUNDED quiet lease on a RUNNING task the caller owns. The worker
+ * stays `working` and the task stays `running`; only a deadline is recorded, so
+ * a deliberate session-idle is not treated as an anomaly. Also renews the
+ * heartbeat and extends the lease past the quiet deadline so `relay wait` is not
+ * immediately followed by a lease expiry. Ownership is validated: another
+ * worker's task cannot be quieted.
+ */
+export function waitTask(
+  db: Database,
+  taskId: string,
+  workerId: string,
+  durationMs: number,
+  reason: string
+): { until: number } {
+  const task = getTask(db, taskId);
+  if (!task) throw new Error(`unknown task: ${taskId}`);
+  if (task.state !== "running") throw new Error(`cannot wait on task in state ${task.state}`);
+  if (task.assignee !== workerId) {
+    throw new Error(`cannot wait on ${taskId}: owned by ${task.assignee ?? "nobody"}, not ${workerId}`);
+  }
+  const w = getWorker(db, workerId);
+  if (!w) throw new Error(`unknown worker: ${workerId}`);
+  if (w.current_task_id !== taskId) throw new Error(`cannot wait on ${taskId}: ${workerId} does not hold it`);
+  if (!(durationMs > 0)) throw new Error("duration must be positive");
+  const t = now();
+  const until = t + durationMs;
+  setQuiet(db, workerId, taskId, until, reason);
+  touchProgress(db, workerId, t);
+  db.query(`UPDATE tasks SET lease_until = MAX(COALESCE(lease_until, 0), ?), updated_at = ? WHERE id = ?`)
+    .run(until + leaseMs(), t, taskId);
+  logEvent(db, {
+    source: "worker",
+    workerId,
+    taskId,
+    type: "worker.quiet_started",
+    payload: { task: taskId, until, reason },
+  });
+  return { until };
 }
 
 export function getNotes(db: Database, taskId: string): { worker_id: string | null; kind: string; body: string; created_at: number }[] {
@@ -376,6 +435,7 @@ export function submitTask(
   clearCurrentTask(db, workerId);
   touchProgress(db, workerId, t);
   normalizeWorkerAfterTaskRelease(db, workerId, t);
+  clearQuietLogged(db, workerId, taskId);
   logEvent(db, { source: "worker", workerId, taskId, type: "task.submitted" });
   return getTask(db, taskId)!;
 }
@@ -395,6 +455,8 @@ export function approveTask(db: Database, taskId: string, workerId: string): Tas
     normalizeWorkerAfterTaskRelease(db, workerId, t);
     if (task.assignee && task.assignee !== workerId) normalizeWorkerAfterTaskRelease(db, task.assignee, t);
     touchProgress(db, workerId, t);
+    if (task.assignee) clearQuietLogged(db, task.assignee, taskId);
+    clearQuietLogged(db, workerId, taskId);
     logEvent(db, { source: "reviewer", workerId, taskId, type: "task.approved" });
     const done = getTask(db, taskId)!;
     // One-hop completion bubbling to the IMMEDIATE parent (no recursion).
@@ -436,7 +498,7 @@ function bubbleChildDone(db: Database, child: Task, actor: string, at: number): 
   if (parent.assignee) {
     sendMessage(db, "relay", parent.assignee, body, { kind: "child_done", taskId: parentId });
     if (allDone) {
-      sendMessage(db, "relay", parent.assignee, `All direct children of ${parentId} are done (${counts.done}/${counts.total}).`, {
+      sendMessage(db, "relay", parent.assignee, `${RELAY_TAG}All direct children of ${parentId} are done (${counts.done}/${counts.total}).`, {
         kind: "children_done",
         taskId: parentId,
       });
@@ -465,6 +527,8 @@ export function rejectTask(db: Database, taskId: string, workerId: string, reaso
   }
   normalizeWorkerAfterTaskRelease(db, workerId, t);
   touchProgress(db, workerId, t);
+  if (task.assignee) clearQuietLogged(db, task.assignee, taskId);
+  clearQuietLogged(db, workerId, taskId);
   logEvent(db, { source: "reviewer", workerId, taskId, type: "task.rejected", payload: { reason } });
   return getTask(db, taskId)!;
 }
@@ -490,6 +554,8 @@ export function blockTask(db: Database, taskId: string, workerId: string, reason
   db.query(`UPDATE workers SET current_task_id = NULL WHERE id = ? AND current_task_id = ?`).run(workerId, taskId);
   normalizeWorkerAfterTaskRelease(db, workerId, t);
   touchProgress(db, workerId, t);
+  if (task.assignee) clearQuietLogged(db, task.assignee, taskId);
+  clearQuietLogged(db, workerId, taskId);
   logEvent(db, { source: "worker", workerId, taskId, type: human ? "task.blocked_human" : "task.blocked_internal", payload: { reason } });
   return getTask(db, taskId)!;
 }

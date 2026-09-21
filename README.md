@@ -589,6 +589,23 @@ further only when the PARENT itself is approved — and there is **no automatic
 parent completion**: `children_done` is a signal, the parent agent decides what
 to do and submits its own work.
 
+**Runtime idle is not task idle (bounded quiet lease).** A worker may hold a
+RUNNING task and still end its turn (session idle). Normally that is an anomaly;
+to make a *deliberate* short wait explicit and bounded, declare a quiet lease:
+
+```bash
+relay wait T12 --for 2m "benchmark running in background"
+```
+
+The worker stays `working` and the task stays `running`; `quiet_until` only
+permits the runtime to be idle until the deadline (it is temporary metadata, not
+a state). While active it suppresses idle/stall nudges; on expiry relay clears it
+and wakes the owner. It is cleared by any resumed-work action
+(note/submit/block/release/claim/restart), never leaks onto another task, and
+does **not** suppress crash recovery (a dead process is recovered immediately) or
+useful wakes (peer messages, `child_done`/`children_done`). Foreground work that
+Herdr reports as `working` needs no quiet lease.
+
 `relay task show <id>` keeps stdout a single parseable JSON document (notes go
 to stderr); `relay task show <id> --json` emits ONE document with the task and
 its notes.
