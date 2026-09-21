@@ -275,6 +275,12 @@ function fmtAge(ms: number): string {
   return `${Math.floor(m / 60)}h`;
 }
 
+/** Collapse whitespace and cap a command string for a one-line status row. */
+function truncText(s: string, max = 48): string {
+  const one = s.replace(/\s+/g, " ").trim();
+  return one.length <= max ? one : one.slice(0, Math.max(1, max - 1)) + "…";
+}
+
 /** Notes worth surfacing when a worker picks up a task (context, not state). */
 const TASK_CONTEXT_KINDS = new Set([
   "child_done",
@@ -772,6 +778,7 @@ async function main(): Promise<void> {
           generation: 0, last_seen_at: 0, last_progress_at: 0, nudged_at: null,
           retired_at: null, retired_reason: null,
           quiet_until: null, quiet_reason: null, quiet_task_id: null,
+          tool_name: null, tool_command: null, tool_started_at: null, tool_timeout_ms: null,
           created_at: 0, updated_at: 0,
         };
         try {
@@ -854,7 +861,12 @@ async function main(): Promise<void> {
           const quiet = quietActive(w, t)
             ? `  quiet ${fmtAge((w.quiet_until ?? t) - t)}${w.quiet_reason ? `  ${w.quiet_reason}` : ""}`
             : "";
-          console.log(`${w.id}  ${w.state}  ${w.current_task_id ?? "-"}  last progress ${prog}${quiet}  ${nextLabel(w)}`);
+          // In-flight tool telemetry (early detection): show the running command
+          // and how long it has been going, before the stall clock can see it.
+          const tool = w.tool_started_at != null && w.tool_name
+            ? `  tool ${w.tool_name} ${fmtAge(t - w.tool_started_at)}${w.tool_command ? `: ${truncText(w.tool_command)}` : ""}`
+            : "";
+          console.log(`${w.id}  ${w.state}  ${w.current_task_id ?? "-"}  last progress ${prog}${quiet}${tool}  ${nextLabel(w)}`);
         }
         console.log("");
         console.log("Tasks");

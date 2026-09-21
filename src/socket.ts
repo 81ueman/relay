@@ -6,13 +6,13 @@ import { handleErrorSignal, handleIdleSignal, reconcile } from "./reconciler";
 import type { HerdrIdentity, Runtime } from "./runtime/runtime";
 import { attachSession, detachSession, gateEvent, managedWorkerForSession } from "./sessions";
 import type { DaemonIdentity } from "./singleton";
-import { getWorker, setWorkerState, touchSeen } from "./workers";
+import { getWorker, setWorkerState, setWorkerTool, clearWorkerTool, touchSeen } from "./workers";
 
 // JSON Lines over a Unix domain socket. Small protocol:
 //   {"type":"session.idle","session_id":"ses_xxx","generation":2}
 //     (also accepted raw as session.execution.succeeded / .interrupted)
 //   {"type":"session.error",...,"payload":{...}}
-//   {"type":"permission.asked" | "permission.replied" | "tool.execute.after" | "session.status" | ..., ...}
+//   {"type":"permission.asked" | "permission.replied" | "tool.started" | "tool.execute.after" | "session.status" | ..., ...}
 //   {"type":"session.attach","session_id":...,"role":...,"worker_id":...,"generation":N,...}
 //     (generation present = relay-spawned session; absent = manual attach, then
 //      the daemon resolves the Herdr identity from the session `directory`
@@ -68,6 +68,12 @@ const ERROR_TYPES = new Set(["session.error", "session.execution.failed"]);
 // task semantics stay explicit (`relay submit` / `relay block`).
 const PERMISSION_ASKED = new Set(["permission.asked", "form.created"]);
 const PERMISSION_REPLIED = new Set(["permission.replied", "form.replied", "form.cancelled"]);
+// In-flight tool early detection. `tool.started` marks the command a worker is
+// executing RIGHT NOW; `tool.execute.after` clears the marker. An absent
+// `tool.execute.after` is exactly what a hang looks like, so the finish side is
+// best-effort and the reconciler also sweeps stale markers.
+const TOOL_STARTED = "tool.started";
+const TOOL_AFTER = "tool.execute.after";
 
 export async function handleSocketMessage(msg: SocketMessage, ctx: SocketContext): Promise<Record<string, unknown>> {
   const { db, runtime } = ctx;
@@ -192,6 +198,31 @@ export async function handleSocketMessage(msg: SocketMessage, ctx: SocketContext
     if (w.state === "waiting_input" || w.state === "working") {
       setWorkerState(db, workerId, w.current_task_id ? "working" : "idle");
     }
+    logEvent(db, { source: "opencode", workerId, type, payload: msg.payload ?? {} });
+    return { ok: true };
+  }
+
+  // In-flight tool telemetry. `tool.started` records the running command; the
+  // matching `tool.execute.after` clears it. Neither is a state transition:
+  // task semantics stay explicit (`relay submit` / `relay block`).
+  if (type === TOOL_STARTED) {
+    touchSeen(db, workerId);
+    const p = (msg.payload ?? {}) as { tool?: unknown; command?: unknown; timeout_ms?: unknown };
+    const tool = typeof p.tool === "string" ? p.tool : "";
+    if (tool) {
+      setWorkerTool(db, workerId, {
+        name: tool,
+        command: typeof p.command === "string" ? p.command : null,
+        timeoutMs: typeof p.timeout_ms === "number" && p.timeout_ms > 0 ? p.timeout_ms : null,
+      });
+    }
+    logEvent(db, { source: "opencode", workerId, type, payload: msg.payload ?? {} });
+    return { ok: true };
+  }
+
+  if (type === TOOL_AFTER) {
+    clearWorkerTool(db, workerId);
+    touchSeen(db, workerId);
     logEvent(db, { source: "opencode", workerId, type, payload: msg.payload ?? {} });
     return { ok: true };
   }

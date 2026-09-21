@@ -71,6 +71,22 @@ export interface Worker {
   quiet_reason: string | null;
   quiet_task_id: string | null;
   /**
+   * [ext] In-flight tool marker. The OpenCode plugin pushes `tool.started` when
+   * a tool call begins and the marker is cleared on `tool.execute.after`. This is
+   * the EARLY-DETECTION signal a running command cannot otherwise give relay:
+   * `tool.execute.after` only fires when the tool FINISHES, and Herdr reports
+   * `working` for the whole time, so a hung command used to be invisible until
+   * the stall clock fired. `tool_started_at`/`tool_name`/`tool_command` are
+   * transport telemetry for surfacing (status/dashboard/events), never a state
+   * transition by themselves. `tool_timeout_ms` is the command's own timeout
+   * (OpenCode `shell` default is 120000), used to decide when the marker is
+   * stale because the finish event was lost.
+   */
+  tool_name: string | null;
+  tool_command: string | null;
+  tool_started_at: number | null;
+  tool_timeout_ms: number | null;
+  /**
    * [ext] Retirement tombstone. A retired worker is history only: it is excluded
    * from the operational/supervised sets, from role discovery and from all
    * listings, but its row (and events) survive so earlier references stay
@@ -175,6 +191,10 @@ CREATE TABLE IF NOT EXISTS workers (
   quiet_until INTEGER,
   quiet_reason TEXT,
   quiet_task_id TEXT,
+  tool_name TEXT,
+  tool_command TEXT,
+  tool_started_at INTEGER,
+  tool_timeout_ms INTEGER,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );

@@ -60,6 +60,19 @@ function migrate(db: Database): void {
     if (!columnExists(db, "workers", "quiet_task_id")) {
       db.exec("ALTER TABLE workers ADD COLUMN quiet_task_id TEXT;");
     }
+    // In-flight tool marker (early hang detection: `tool.started` from the plugin).
+    if (!columnExists(db, "workers", "tool_name")) {
+      db.exec("ALTER TABLE workers ADD COLUMN tool_name TEXT;");
+    }
+    if (!columnExists(db, "workers", "tool_command")) {
+      db.exec("ALTER TABLE workers ADD COLUMN tool_command TEXT;");
+    }
+    if (!columnExists(db, "workers", "tool_started_at")) {
+      db.exec("ALTER TABLE workers ADD COLUMN tool_started_at INTEGER;");
+    }
+    if (!columnExists(db, "workers", "tool_timeout_ms")) {
+      db.exec("ALTER TABLE workers ADD COLUMN tool_timeout_ms INTEGER;");
+    }
   }
   // `claimed` task state was removed: anything left there is runnable work.
   try {

@@ -110,8 +110,13 @@ export function touchSeen(db: Database, id: string, at = now()): void {
 }
 
 export function touchProgress(db: Database, id: string, at = now()): void {
+  // An explicit relay command is the strongest progress signal, and it can only
+  // run when no tool is blocking the turn: drop any in-flight tool marker so a
+  // backgrounded/finished tool whose `execute.after` was lost cannot linger.
   db.query(
-    `UPDATE workers SET last_seen_at = ?, last_progress_at = ?, nudged_at = NULL, updated_at = ? WHERE id = ?`
+    `UPDATE workers SET last_seen_at = ?, last_progress_at = ?, nudged_at = NULL,
+       tool_name = NULL, tool_command = NULL, tool_started_at = NULL, tool_timeout_ms = NULL,
+       updated_at = ? WHERE id = ?`
   ).run(at, at, at, id);
 }
 
@@ -143,6 +148,33 @@ export function clearQuiet(db: Database, workerId: string): boolean {
   if (!w || w.quiet_until === null) return false;
   db.query(
     `UPDATE workers SET quiet_until = NULL, quiet_reason = NULL, quiet_task_id = NULL, updated_at = ? WHERE id = ?`
+  ).run(now(), workerId);
+  return true;
+}
+
+/**
+ * Record the tool a worker is executing RIGHT NOW (`tool.started` from the
+ * plugin). This is transport telemetry used for early detection/surfacing: it
+ * never changes the worker's state, task ownership or lease. One agent loop runs
+ * one tool at a time, so a single marker per worker is enough.
+ */
+export function setWorkerTool(
+  db: Database,
+  workerId: string,
+  tool: { name: string; command?: string | null; timeoutMs?: number | null },
+  at = now()
+): void {
+  db.query(
+    `UPDATE workers SET tool_name = ?, tool_command = ?, tool_started_at = ?, tool_timeout_ms = ?, updated_at = ? WHERE id = ?`
+  ).run(tool.name, tool.command ?? null, at, tool.timeoutMs ?? null, at, workerId);
+}
+
+/** Clear the in-flight tool marker; true when one was actually set. */
+export function clearWorkerTool(db: Database, workerId: string): boolean {
+  const w = getWorker(db, workerId);
+  if (!w || w.tool_started_at === null) return false;
+  db.query(
+    `UPDATE workers SET tool_name = NULL, tool_command = NULL, tool_started_at = NULL, tool_timeout_ms = NULL, updated_at = ? WHERE id = ?`
   ).run(now(), workerId);
   return true;
 }

@@ -433,6 +433,29 @@ const PERMISSION_REPLIED = new Set(["permission.replied", "form.replied", "form.
 const LIVENESS_TYPES = new Set(["session.status", "session.created", "session.viewed"]);
 // tool.execute.after also arrives via the tool hook; both paths funnel here.
 const TOOL_AFTER = "tool.execute.after";
+// Early hang detection: sent from the tool `execute.before` hook, so relay knows
+// a command is running WHILE it runs (execute.after only fires at the end, and
+// Herdr reports `working` the whole time).
+const TOOL_STARTED = "tool.started";
+
+/**
+ * Transport telemetry extracted from a tool hook event. `tool` identifies the
+ * tool; for `shell` the command and timeout tell relay WHAT is running and how
+ * long it was allowed to run. Every field is defensive: the event shape is host
+ * data and is never trusted to be complete.
+ */
+export function toolTelemetry(event: any): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  const tool = typeof event?.tool === "string" ? event.tool : undefined;
+  if (tool) out.tool = tool;
+  const input = event?.input && typeof event.input === "object" ? event.input : undefined;
+  const cmd = input?.command ?? input?.cmd;
+  if (typeof cmd === "string" && cmd) out.command = cmd.length > 500 ? cmd.slice(0, 500) : cmd;
+  const timeout = input?.timeout;
+  if (typeof timeout === "number" && timeout > 0) out.timeout_ms = timeout;
+  if (typeof event?.status === "string") out.status = event.status;
+  return out;
+}
 
 async function forwardEvent(
   ctx: any,
@@ -472,11 +495,16 @@ async function forwardEvent(
     sendEvent({ type, ...withGeneration(sessionID) }, directory);
     return;
   }
+  if (type === TOOL_STARTED) {
+    if (sessionID && G.detachedCache.has(sessionID)) return;
+    sendEvent({ type: TOOL_STARTED, ...withGeneration(sessionID, { payload: toolTelemetry(data) }) }, directory);
+    return;
+  }
   if (type === TOOL_AFTER) {
     // High-frequency path: skip the socket entirely for sessions we detached
     // in-process. Everything else is gated daemon-side (cheap local write).
     if (sessionID && G.detachedCache.has(sessionID)) return;
-    sendEvent({ type: TOOL_AFTER, ...withGeneration(sessionID) }, directory);
+    sendEvent({ type: TOOL_AFTER, ...withGeneration(sessionID, { payload: toolTelemetry(data) }) }, directory);
   }
 }
 
@@ -637,6 +665,22 @@ export default {
       });
     } catch {
       // Older hosts may lack tool hooks; the event stream still covers us.
+    }
+
+    // Early hang detection: announce the tool BEFORE it runs, so a long/hung
+    // command is visible to relay while it is still running. Best-effort, like
+    // every other forward; a host without the hook still gets after-events.
+    try {
+      await ctx.tool.hook("execute.before", async (event: any) => {
+        try {
+          const sessionID = typeof event?.sessionID === "string" ? event.sessionID : sessionIDOf(event);
+          await forwardEvent(ctx, TOOL_STARTED, sessionID, event);
+        } catch {
+          // Never break the session.
+        }
+      });
+    } catch {
+      // Older hosts may lack tool hooks; after-events still cover liveness.
     }
 
     const controller = new AbortController();

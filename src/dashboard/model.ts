@@ -5,6 +5,7 @@ import { unreadCounts } from "../messages";
 import { nextMailNudgeIn } from "../mail-policy";
 import { findRuntime, listRuntimes } from "../runtimes";
 import { getNotes, listTasks, taskCounts, unclaimableRunnableTasks } from "../tasks";
+import { toolWarnMs } from "../scheduler";
 import { listWorkers, quietActive, type WorkerRow } from "../workers";
 import type { Task, WorkerRuntime } from "../schema";
 import { readPanes, relayWorkspaces, type PaneTelemetry } from "./herdr";
@@ -55,6 +56,12 @@ export interface DashboardWorker {
   generation: number;
   paneId: string | null;
   progressAgeMs: number | null;
+  /**
+   * In-flight tool telemetry (`tool.started`/`tool.execute.after`), surfaced for
+   * early hang detection. `null` when no tool is currently running. Read-only:
+   * never part of Relay state.
+   */
+  tool: { name: string; command: string | null; ageMs: number; timeoutMs: number | null } | null;
   quietRemainingMs: number | null;
   quietReason: string | null;
   unread: number;
@@ -164,6 +171,14 @@ export function buildDashboardView(db: Database, opts: BuildOptions): DashboardV
           && r.cleanup_after != null && r.cleanup_after <= at,
       }));
     const execLabel = executionState(w, pane, qActive, herdrOn);
+    const tool = w.tool_started_at != null && w.tool_name
+      ? {
+          name: w.tool_name,
+          command: w.tool_command,
+          ageMs: Math.max(0, at - w.tool_started_at),
+          timeoutMs: w.tool_timeout_ms,
+        }
+      : null;
     return {
       id: w.id,
       role: w.role,
@@ -174,6 +189,7 @@ export function buildDashboardView(db: Database, opts: BuildOptions): DashboardV
       generation: w.generation,
       paneId: current?.pane_id ?? null,
       progressAgeMs: w.last_progress_at ? Math.max(0, at - w.last_progress_at) : null,
+      tool,
       quietRemainingMs,
       quietReason: w.quiet_reason,
       unread: unread.get(w.id) ?? 0,
@@ -310,6 +326,15 @@ function deriveAttention(
     if (w.state === "working" && w.exec === "!idle") {
       out.push({ kind: "worker", id: w.id, ageMs: w.progressAgeMs,
                  text: `${w.taskId ?? "-"} working but runtime idle, no quiet lease` });
+    }
+    // Early hang detection: a command that has been running past the warn
+    // threshold is surfaced WITH its text, before the stall clock can see it
+    // (Herdr reports `working` for the whole command, so the stall path is blind).
+    if (w.tool && w.tool.ageMs > toolWarnMs()) {
+      const budget = w.tool.timeoutMs != null ? `, timeout ${Math.round(w.tool.timeoutMs / 1000)}s` : "";
+      const cmd = w.tool.command ? `: ${w.tool.command}` : "";
+      out.push({ kind: "worker", id: w.id, ageMs: w.tool.ageMs,
+                 text: `tool ${w.tool.name} running${cmd}${budget}` });
     }
     if (w.state === "starting" && (w.progressAgeMs ?? 0) > 120_000) {
       out.push({ kind: "worker", id: w.id, ageMs: null, text: `starting for a while (attach stuck?)` });

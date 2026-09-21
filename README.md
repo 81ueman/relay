@@ -390,6 +390,9 @@ RELAY_HERDR_WORKSPACE=<ws>   # REQUIRED to spawn (falls back to $HERDR_WORKSPACE
 RELAY_RUNTIME_CLEANUP_GRACE_MS=300000 RELAY_ATTACH_TIMEOUT_MS=30000
 RELAY_RESTART_COOLDOWN_MS=30000 RELAY_CLEANUP_LOG_WINDOW_MS=60000
 RELAY_BOOTSTRAP_RETRY_MS=5000 RELAY_BOOTSTRAP_LOG_WINDOW_MS=60000
+RELAY_TOOL_WARN_MS=60000 RELAY_TOOL_BACKGROUND_MS=180000
+RELAY_TOOL_MAX_MS=3600000 RELAY_TOOL_STALE_GRACE_MS=60000
+RELAY_BACKGROUND_KEY=ctrl+b
 RELAY_DEDICATED=1            # opt-in: allow $RELAY_SOCK when no session dir is known
 ```
 
@@ -823,6 +826,21 @@ worker, and borrowing a file default that lives in another live pane is
   live-but-slow worker keeps its lease even after `RELAY_LEASE_MS` (the
   reconciler's transport `isAlive` check still requeues a genuinely crashed
   process). A `relay release` is the manual equivalent.
+- **Hung foreground tool** (early detection + bounded recovery): a running
+  command is invisible to the stall clock — `tool.execute.after` fires only when
+  it FINISHES and Herdr reports `working` for the whole call, so the stall path
+  is skipped. The plugin's `tool.started` marker closes that gap: relay surfaces
+  the command in `relay status` / dashboard **ATTENTION** once it passes
+  `RELAY_TOOL_WARN_MS` (`worker.tool_long`, once per tool). Past
+  `RELAY_TOOL_BACKGROUND_MS` (or, when the command declared its own `timeout`,
+  once it is overdue by `RELAY_TOOL_STALE_GRACE_MS`) relay sends **Ctrl-B**
+  (`session.background`, `RELAY_BACKGROUND_KEY`) via Herdr so the blocking call
+  moves to the background and the session unblocks, then nudges the worker to
+  **check the result** (`worker.tool_backgrounded`). The action is once per tool,
+  is skipped while the worker is `waiting_input` (a permission prompt is not a
+  running tool), and `RELAY_TOOL_BACKGROUND_MS=0` disables it. A lost finish
+  event cannot pin a marker forever: it is cleared as stale past its budget
+  (`worker.tool_stale`), and any explicit relay command clears it too.
 - **All work done**: the system goes quiet. The planner is not woken to invent
   new work unless unfinished work still exists and the queue is below low-water.
 

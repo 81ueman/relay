@@ -79,6 +79,14 @@ export interface Runtime {
   wake(worker: Worker, text: string): Promise<void>;
   interrupt(worker: Worker): Promise<void>;
   /**
+   * Move the agent's currently BLOCKING tool call to the background (OpenCode
+   * `session.background`, default key Ctrl-B). Used as a recovery action for a
+   * hung foreground command: unlike `interrupt` (Esc) it does not discard the
+   * work — the command keeps running and the session unblocks, so the agent can
+   * check its result. Best-effort: the caller decides when.
+   */
+  background(worker: Worker): Promise<void>;
+  /**
    * Spawn a brand-new generation in a fresh tab (must work when nothing exists).
    * Transport primitive only: it MUST NOT send the bootstrap prompt or touch the
    * DB. The supervisor records the generation durably, then delivers the
@@ -108,6 +116,8 @@ export class MockRuntime implements Runtime {
   targets: { op: string; target: string }[] = [];
   wakes: { workerId: string; target: string; text: string }[] = [];
   interrupts: string[] = [];
+  /** Runtime targets passed to background(), in order. */
+  backgrounded: string[] = [];
   starts: string[] = [];
   /** runtime ids passed to cleanup(), in order. */
   cleanups: string[] = [];
@@ -161,6 +171,11 @@ export class MockRuntime implements Runtime {
     const target = MockRuntime.targetOf(w);
     this.targets.push({ op: "interrupt", target });
     this.interrupts.push(target);
+  }
+  async background(w: Worker): Promise<void> {
+    const target = MockRuntime.targetOf(w);
+    this.targets.push({ op: "background", target });
+    this.backgrounded.push(target);
   }
   async start(w: Worker, generation: number): Promise<StartedRuntime> {
     const target = MockRuntime.targetOf(w);

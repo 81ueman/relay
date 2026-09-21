@@ -356,6 +356,20 @@ export class HerdrRuntime implements Runtime {
   }
 
   /**
+   * Background the agent's currently blocking tool (OpenCode `session.background`
+   * keybind, default Ctrl-B). Sent to the pane's TUI like `interrupt`; it keeps
+   * the command running instead of discarding it.
+   */
+  async background(w: Worker): Promise<void> {
+    const target = this.target(w);
+    // OpenCode's `session.background` binding. Default Ctrl-B; overridable when
+    // the TUI remapped it (RELAY_BACKGROUND_KEY).
+    const key = (process.env.RELAY_BACKGROUND_KEY ?? "ctrl+b").trim() || "ctrl+b";
+    const r = runHerdr(["agent", "send-keys", target, key], 5000);
+    if (!r.ok) throw new Error(`herdr background failed for ${target}`);
+  }
+
+  /**
    * Resolve the Herdr identity of a live OpenCode session for manual attach.
    * Order of trust:
    *   1. A pane that itself reported this exact session id (`agent_session`).

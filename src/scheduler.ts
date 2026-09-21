@@ -9,6 +9,53 @@ export function stallMs(): number {
   return Number.isFinite(v) && v > 0 ? v : 60000;
 }
 
+/**
+ * Early-detection threshold for an in-flight tool (`workers.tool_started_at`).
+ * Past this age relay logs `worker.tool_long` once and the dashboard/status
+ * surface the running command — BEFORE the stall clock (which is blind while
+ * Herdr reports `working`). This is a SURFACING threshold, not a state change:
+ * relay does not nudge, interrupt or requeue because of it.
+ *
+ * Deliberately below OpenCode's 120s default `shell` timeout: the point is to
+ * see the command (and, once a budget is known, that it is overdue) while it is
+ * still running, not after the tool has already returned.
+ */
+export function toolWarnMs(): number {
+  const v = Number(process.env.RELAY_TOOL_WARN_MS ?? "60000");
+  return Number.isFinite(v) && v >= 0 ? v : 60000;
+}
+
+/**
+ * Fallback budget when a tool reports no timeout. Used only to decide when an
+ * in-flight marker is STALE because its finish event was lost (plugin reload /
+ * crash), so a missed `tool.execute.after` cannot pin a worker forever. It is
+ * not a kill deadline.
+ */
+export function toolMaxMs(): number {
+  const v = Number(process.env.RELAY_TOOL_MAX_MS ?? "3600000");
+  return Number.isFinite(v) && v > 0 ? v : 3600000;
+}
+
+/** Grace beyond a tool's own timeout before its marker is treated as stale. */
+export function toolStaleGraceMs(): number {
+  const v = Number(process.env.RELAY_TOOL_STALE_GRACE_MS ?? "60000");
+  return Number.isFinite(v) && v >= 0 ? v : 60000;
+}
+
+/**
+ * When to take the RECOVERY action for a hung foreground tool: send Ctrl-B
+ * (`session.background`) so the blocking call moves to the background and the
+ * session unblocks. This is the step past mere surfacing.
+ *
+ * A tool that declared its own `timeout` (the model asked for a long budget) is
+ * left alone until it is OVERDUE by `toolStaleGraceMs()`; only a tool with no
+ * declared budget falls back to this threshold. `0` disables the action.
+ */
+export function toolBackgroundMs(): number {
+  const v = Number(process.env.RELAY_TOOL_BACKGROUND_MS ?? "180000");
+  return Number.isFinite(v) && v >= 0 ? v : 180000;
+}
+
 export function lowWaterMark(): number {
   const v = Number(process.env.RELAY_LOW_WATER ?? "3");
   return Number.isFinite(v) && v >= 0 ? v : 3;

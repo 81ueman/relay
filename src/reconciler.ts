@@ -29,6 +29,10 @@ import {
   stallMs,
   supervisedWorkers,
   supervisorView,
+  toolBackgroundMs,
+  toolMaxMs,
+  toolStaleGraceMs,
+  toolWarnMs,
 } from "./scheduler";
 import { BOOTSTRAP_PROMPT } from "./runtime/herdr";
 import type { Session } from "./sessions";
@@ -42,7 +46,7 @@ import {
   reviewTasks,
   unclaimableRunnableTasks,
 } from "./tasks";
-import { getWorker, listWorkers, setWorkerState, touchSeen, clearQuiet, quietActive, type WorkerRow } from "./workers";
+import { getWorker, listWorkers, setWorkerState, touchSeen, clearQuiet, clearWorkerTool, quietActive, type WorkerRow } from "./workers";
 import { RELAY_TAG } from "./messages";
 import { immediateKindSql, mailNudgeMs } from "./mail-policy";
 
@@ -64,6 +68,34 @@ export const STALL_NUDGE = (taskId: string) =>
   `If you are working, no action is needed; relay will check again later. ` +
   `If you are actually stuck, run \`relay block ${taskId} "<reason>"\`, then \`relay next\`.`;
 export const REVIEW_NUDGE = "relay: There are tasks waiting for review. Run `relay next` to pick one up.";
+/**
+ * Sent AFTER the supervisor moved a hung foreground tool to the background
+ * (Ctrl-B). Its job is to make the worker CHECK the command, not to assume an
+ * outcome: the command is still running, so the worker inspects its output and
+ * decides whether it is progressing, hung, or needs a bounded wait.
+ */
+export const BACKGROUND_NUDGE = (tool: string, taskId: string | null) => {
+  const head =
+    `relay: Your ${tool} call did not return for a while, so the supervisor moved it to the ` +
+    `BACKGROUND (Ctrl-B). It is still running${taskId ? `, and your claim on ${taskId} is unchanged` : ""}.\n` +
+    `CHECK IT NOW — do not re-run it in the foreground:\n` +
+    `  1. Look at the command's current output/status (the background shell's captured output) and ` +
+    `whether it is still producing progress.\n`;
+  if (!taskId) {
+    return head +
+      `  2. Still progressing? Note it, then continue when it returns.\n` +
+      `  3. Hung (no new output / stuck child)? Stop it, then re-run the long step in the ` +
+      `background (the shell tool's \`background: true\`, or redirect to a log and poll it).\n` +
+      `  4. If you are blocked, run \`relay next\` for new work.`;
+  }
+  return head +
+    `  2. Still progressing? Declare a bounded wait: ` +
+    `\`relay wait ${taskId} --for <30s|2m|1h> "<reason>"\` and continue when it returns.\n` +
+    `  3. Hung (no new output / stuck child)? Stop it, then re-run the long step in the ` +
+    `background (the shell tool's \`background: true\`, or redirect to a log and poll it).\n` +
+    `  4. Cannot make progress or need a human? \`relay block ${taskId} "<reason>"\` ` +
+    `(add \`--human\` if needed), then \`relay next\`.`;
+};
 export const PLANNER_NUDGE =
   "relay: Task queue is running low. Decompose the next objective into small tasks with acceptance criteria (relay task add), then go idle. Do not monitor other workers.";
 
@@ -323,7 +355,9 @@ async function spawnFreshGeneration(db: Database, rt: Runtime, w: WorkerRow, at:
     }
     db.query(
       `UPDATE workers SET generation = ?, runtime_id = ?, opencode_session_id = NULL,
-         state = 'starting', current_task_id = NULL, nudged_at = NULL, updated_at = ? WHERE id = ?`
+         state = 'starting', current_task_id = NULL, nudged_at = NULL,
+         tool_name = NULL, tool_command = NULL, tool_started_at = NULL, tool_timeout_ms = NULL,
+         updated_at = ? WHERE id = ?`
     ).run(generation, started.runtimeId, at, w.id);
     // A generation change is a resumed-work signal: a quiet lease never crosses it.
     if (clearQuiet(db, w.id)) {
@@ -595,6 +629,112 @@ async function processQuietLeases(
   }
 }
 
+/**
+ * In-flight tool maintenance (EARLY DETECTION + bounded recovery).
+ *
+ * A running command is invisible to the stall clock: `tool.execute.after` fires
+ * only when it FINISHES, and Herdr reports `working` for the whole time, so
+ * `!agentBusy` is false and the reconciler neither nudges nor stalls. The
+ * plugin's `tool.started` marker fills that gap. This pass:
+ *   - logs `worker.tool_long` ONCE per tool (at most once per tool start) when it
+ *     has been running past `RELAY_TOOL_WARN_MS`; the dashboard/status project the
+ *     same marker with the command text;
+ *   - clears a marker that outlived its own timeout budget (+ grace), because a
+ *     lost finish event (plugin reload/crash) must not pin a worker forever;
+ *   - RECOVERY: once a tool is genuinely overdue, sends Ctrl-B
+ *     (`session.background`) so the blocking call moves to the background and the
+ *     session unblocks, then nudges the worker to CHECK the result. This is the
+ *     one deliberate transport action here; it is rate-limited to once per tool.
+ *
+ * A tool that declared its own `timeout` is honoured (the model asked for a long
+ * budget); only an overdue one is backgrounded. `RELAY_TOOL_BACKGROUND_MS=0`
+ * disables the action entirely, leaving surfacing + stale cleanup.
+ */
+function toolEventLogged(db: Database, workerId: string, type: string, since: number): boolean {
+  const r = db
+    .query(`SELECT COUNT(*) AS n FROM events WHERE worker_id = ? AND type = ? AND timestamp >= ?`)
+    .get(workerId, type, since) as { n: number };
+  return r.n > 0;
+}
+
+/** Past its declared budget, or past the fallback threshold when it declared none. */
+function shouldBackgroundTool(w: WorkerRow, age: number): boolean {
+  if (toolBackgroundMs() <= 0) return false;
+  if (w.tool_timeout_ms != null) return age > w.tool_timeout_ms + toolStaleGraceMs();
+  return age > toolBackgroundMs();
+}
+
+async function processInFlightTools(db: Database, rt: Runtime, actions: string[], at: number): Promise<void> {
+  const warn = toolWarnMs();
+  for (const row of listWorkers(db)) {
+    if (row.tool_started_at === null) continue;
+    const startedAt = row.tool_started_at;
+    const age = at - startedAt;
+    // A lost finish event (plugin reload/crash) must not pin a worker forever.
+    // Staleness is strictly LATER than the recovery point, so an overdue tool
+    // gets its Ctrl-B first and is only discarded if it outlives that too.
+    const grace = toolStaleGraceMs();
+    const staleAfter = row.tool_timeout_ms != null
+      ? row.tool_timeout_ms + grace * 2
+      : toolMaxMs() + grace;
+    if (age > staleAfter) {
+      clearWorkerTool(db, row.id);
+      logEvent(db, {
+        source: "supervisor",
+        workerId: row.id,
+        type: "worker.tool_stale",
+        payload: { tool: row.tool_name, ageMs: age, timeoutMs: row.tool_timeout_ms },
+      });
+      actions.push(`tool-stale:${row.id}`);
+      continue;
+    }
+    if (age > warn && !toolEventLogged(db, row.id, "worker.tool_long", startedAt)) {
+      logEvent(db, {
+        source: "supervisor",
+        workerId: row.id,
+        taskId: row.current_task_id,
+        type: "worker.tool_long",
+        payload: { tool: row.tool_name, command: row.tool_command, ageMs: age, timeoutMs: row.tool_timeout_ms },
+      });
+      actions.push(`tool-long:${row.id}`);
+    }
+
+    // Recovery: background the blocking tool so the turn can continue. Only for
+    // supervised workers, and never while blocked on a permission prompt (that
+    // is not a running tool: Ctrl-B would not answer it).
+    if (!isOperationalWorker(db, row)) continue;
+    const w = getWorker(db, row.id)!;
+    if (w.state === "waiting_input") continue;
+    if (!shouldBackgroundTool(w, age)) continue;
+    if (toolEventLogged(db, w.id, "worker.tool_backgrounded", startedAt)) continue;
+    if (toolEventLogged(db, w.id, "worker.tool_background_failed", startedAt)) continue;
+
+    try {
+      await rt.background(w);
+    } catch (e) {
+      logEvent(db, {
+        source: "supervisor",
+        workerId: w.id,
+        type: "worker.tool_background_failed",
+        payload: { tool: w.tool_name, error: String(e).slice(0, 200) },
+      });
+      actions.push(`tool-background-failed:${w.id}`);
+      continue;
+    }
+    logEvent(db, {
+      source: "supervisor",
+      workerId: w.id,
+      taskId: w.current_task_id,
+      type: "worker.tool_backgrounded",
+      payload: { tool: w.tool_name, command: w.tool_command, ageMs: age, timeoutMs: w.tool_timeout_ms },
+    });
+    actions.push(`tool-backgrounded:${w.id}`);
+    if (await tryWake(rt, db, w, BACKGROUND_NUDGE(w.tool_name ?? "tool", w.current_task_id), "tool-backgrounded", at)) {
+      actions.push(`woken:${w.id}`);
+    }
+  }
+}
+
 /** One deterministic reconcile pass. Safe to run every 1-2s. */
 export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<ReconcileResult> {
   const actions: string[] = [];
@@ -602,6 +742,11 @@ export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<
   // 0. Quiet leases: clear a stale one (the worker no longer holds that task) or
   //    an expired one, then wake. Durable clear BEFORE the wake.
   await processQuietLeases(db, rt, actions, at);
+
+  // 0b. In-flight tool telemetry: surface a long-running command early, drop
+  //     markers whose finish event was lost, and background a genuinely overdue
+  //     blocking tool so the session can continue.
+  await processInFlightTools(db, rt, actions, at);
 
   // 1. Expire lapsed leases first (worker crash recovery). Only a missing or
   //    not-alive assignee is requeued; a live-but-slow worker keeps its lease.
@@ -635,7 +780,11 @@ export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<
     if (fresh.state === "dead" || fresh.state === "stalled") {
       const requeued = releaseTaskOfDeadWorker(db, w.id, fresh.current_task_id, at);
       if (requeued) actions.push(`requeued:${requeued}`);
-      db.query(`UPDATE workers SET current_task_id = NULL, updated_at = ? WHERE id = ?`).run(at, w.id);
+      // A failed generation cannot be executing anything: drop the tool marker.
+      db.query(
+        `UPDATE workers SET current_task_id = NULL, tool_name = NULL, tool_command = NULL,
+           tool_started_at = NULL, tool_timeout_ms = NULL, updated_at = ? WHERE id = ?`
+      ).run(at, w.id);
 
       const cur = findRuntime(db, w.id, fresh.generation) ?? getActiveRuntime(db, w.id);
       const relayOwned = !!cur && cur.relay_owned === 1;
@@ -683,7 +832,10 @@ export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<
       // spawning fresh (old metadata is never deleted here).
       const requeued = releaseTaskOfDeadWorker(db, w.id, fresh.current_task_id, at);
       if (requeued) actions.push(`requeued:${requeued}`);
-      db.query(`UPDATE workers SET current_task_id = NULL, updated_at = ? WHERE id = ?`).run(at, w.id);
+      db.query(
+        `UPDATE workers SET current_task_id = NULL, tool_name = NULL, tool_command = NULL,
+           tool_started_at = NULL, tool_timeout_ms = NULL, updated_at = ? WHERE id = ?`
+      ).run(at, w.id);
       // Real recovery: spawn a fresh generation so someone can pick work up.
       if (await restartWorker(db, rt, { ...fresh, state: "dead" }, at)) {
         actions.push(`restarted:${w.id}`);
@@ -851,6 +1003,9 @@ export async function handleIdleSignal(db: Database, rt: Runtime, workerId: stri
     return "unknown-worker";
   }
   touchSeen(db, workerId, at);
+  // A session-idle turn-complete means no tool is executing any more: drop the
+  // in-flight marker even if its `tool.execute.after` was lost.
+  clearWorkerTool(db, workerId);
   logEvent(db, { source: "opencode", workerId, type: "session.idle" });
 
   // waiting_input still owns its current work: never tell it to take new work.
