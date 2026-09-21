@@ -11,28 +11,39 @@ import { logEvent } from "./events";
  */
 export const HUMAN_RECIPIENT = "human";
 
-/**
- * The worker id that fields `human`-addressed mail.
- *   RELAY_OPERATOR=<worker-id>  (wins), else a one-line `.relay/operator` file.
- * Unset => `human` mail has no delivery target; it stays visible in `relay status`.
- */
-export function operatorId(cwd = process.cwd()): string | null {
-  const env = (process.env.RELAY_OPERATOR ?? "").trim();
-  if (env) return env;
-  try {
-    const v = readFileSync(join(cwd, STATE_DIR, "operator"), "utf-8").trim();
-    if (v) return v;
-  } catch { /* no operator file */ }
-  return null;
+/** Split an id list on commas / whitespace / newlines. */
+function parseIds(raw: string): string[] {
+  return raw.split(/[\s,]+/).map((s) => s.trim()).filter(Boolean);
 }
 
 /**
- * Mailboxes `workerId` may read and ack. A configured operator also fields
- * `human`-addressed mail. The stored `recipient` is never rewritten, so the
- * durable record keeps saying who the message was for.
+ * Worker ids that field `human`-addressed mail (a coordinator hierarchy).
+ *   RELAY_OPERATOR=a,b,c  (wins), else `.relay/operator` (comma/space/newline list).
+ * Unset => `human` mail has no delivery target; it stays visible in `relay status`.
  */
-export function mailboxesFor(workerId: string, operator: string | null): string[] {
-  return operator && operator === workerId ? [workerId, HUMAN_RECIPIENT] : [workerId];
+export function operators(cwd = process.cwd()): string[] {
+  const env = (process.env.RELAY_OPERATOR ?? "").trim();
+  if (env) return parseIds(env);
+  try {
+    const v = readFileSync(join(cwd, STATE_DIR, "operator"), "utf-8").trim();
+    if (v) return parseIds(v);
+  } catch { /* no operator file */ }
+  return [];
+}
+
+/** The primary operator (first), for callers that take a single target. */
+export function operatorId(cwd = process.cwd()): string | null {
+  return operators(cwd)[0] ?? null;
+}
+
+/**
+ * Mailboxes `workerId` may read and ack. ANY configured operator also fields
+ * `human`-addressed mail. The stored `recipient` is never rewritten.
+ * Accepts a single id or a list (backwards compatible).
+ */
+export function mailboxesFor(workerId: string, operator: string | string[] | null): string[] {
+  const ops = Array.isArray(operator) ? operator : operator ? [operator] : [];
+  return ops.includes(workerId) ? [workerId, HUMAN_RECIPIENT] : [workerId];
 }
 
 export function sendMessage(
@@ -113,7 +124,7 @@ export function ackMessage(
   db: Database,
   id: number,
   workerId: string,
-  operator: string | null = null
+  operator: string | string[] | null = null
 ): InboxItem {
   const m = getMessage(db, id);
   if (!m) throw new Error(`unknown message: ${id}`);

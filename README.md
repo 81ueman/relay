@@ -579,6 +579,23 @@ whole grid drains (no queued/running/review/blocked), debounced durably so it
 never repeats while empty and re-arms when new work appears. Relay-generated
 notices skip the mail-nudge delay and are woken on the next tick.
 
+**Hierarchical routing.** Notices can fan out up a coordinator hierarchy:
+`RELAY_NOTIFY_ROUTES` (inline JSON) or `.relay/notify-routes.json`:
+
+```json
+{ "default": ["top-coord"],
+  "routes": [ { "role": "perf-*",    "to": ["dp-coord", "top-coord"] },
+              { "role": "control-*", "to": ["cp-coord", "top-coord"] } ] }
+```
+
+`default` is the top rollup and ALWAYS receives. A task-completion notice also
+goes to the FIRST route whose `role` matches the TASK's role (exact or glob,
+`*` = any run); recipients are deduped, so one message each. `drain` goes to
+`default`. With no routing configured, recipients fall back to the operator list
+(fully backwards compatible). `RELAY_OPERATOR` / `.relay/operator` may hold a
+LIST of ids (comma/space/newline separated); every operator also fields `human`
+mail.
+
 `relay task show <id>` keeps stdout a single parseable JSON document (notes go
 to stderr); `relay task show <id> --json` emits ONE document with the task and
 its notes.

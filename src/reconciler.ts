@@ -774,11 +774,11 @@ export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<
   //    it can only poll. Debounced durably by notifyGridDrained (one notice per
   //    drain), and woken immediately rather than waiting for the mail window.
   if (view.unfinished === 0) {
-    const noticeId = notifyGridDrained(db);
-    if (noticeId !== null) {
-      const op = operatorId();
-      const w = op ? getWorker(db, op) : null;
-      if (w && w.retired_at === null) {
+    const noticed = notifyGridDrained(db);
+    if (noticed.length > 0) {
+      for (const id of noticed) {
+        const w = getWorker(db, id);
+        if (!w || w.retired_at !== null) continue;
         try {
           await rt.wake(w, "all tasks done; nothing queued/running/review/blocked.");
         } catch { /* best effort; the durable message remains */ }

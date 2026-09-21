@@ -11,6 +11,7 @@ import {
   inboxFor,
   mailboxesFor,
   operatorId,
+  operators,
   sendMessage,
   unreadCounts,
 } from "../src/messages";
@@ -49,6 +50,20 @@ describe("operator alias for `human` mail", () => {
     expect(mailboxesFor("integrator", "integrator")).toEqual(["integrator", HUMAN_RECIPIENT]);
     expect(mailboxesFor("dsl-go", "integrator")).toEqual(["dsl-go"]);
     expect(mailboxesFor("integrator", null)).toEqual(["integrator"]);
+  });
+
+  test("RELAY_OPERATOR may hold a LIST; every operator fields `human`", () => {
+    process.env.RELAY_OPERATOR = "top-coord, cp-coord dp-coord";
+    expect(operators(dir)).toEqual(["top-coord", "cp-coord", "dp-coord"]);
+    expect(operatorId(dir)).toBe("top-coord");
+    expect(mailboxesFor("cp-coord", operators(dir))).toEqual(["cp-coord", HUMAN_RECIPIENT]);
+    expect(mailboxesFor("leaf", operators(dir))).toEqual(["leaf"]);
+  });
+
+  test("a multi-operator list can be given in `.relay/operator` too", () => {
+    mkdirSync(join(dir, ".relay"), { recursive: true });
+    writeFileSync(join(dir, ".relay", "operator"), "a\nb\n");
+    expect(operators(dir)).toEqual(["a", "b"]);
   });
 
   test("the operator sees and acks `human`-addressed mail", () => {
