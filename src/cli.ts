@@ -618,7 +618,7 @@ async function main(): Promise<void> {
         };
         try {
           const rt = new HerdrRuntime();
-          await rt.wake(targetRow, `You have a new durable message (id ${id}). Run \`relay inbox --claim\` to receive it.`);
+          await rt.wake(targetRow, `A durable message arrived (id ${id}). Not urgent — finish what you are doing, then run \`relay inbox --claim\` when you reach a stopping point. It is stored and will not be lost.`);
           console.log(`sent msg=${id} (wake delivered)`);
         } catch (e) {
           console.log(`sent msg=${id} (wake failed, message remains queued: ${String(e).slice(0, 120)})`);

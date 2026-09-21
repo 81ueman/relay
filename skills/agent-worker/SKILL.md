@@ -39,7 +39,9 @@ Never wait for instructions or for another agent to finish. If your task is gone
 - After every `submit`/`block`/`release`, immediately run `relay next`. No exceptions.
 - Never busy-wait on another agent. Send a durable message instead: `relay send <worker-id> "..."`.
   Workers are peers; there is no `human`/operator alias — address a real worker id.
-- Check `relay inbox --claim` when woken for messages.
+- You may be woken about incoming messages — it is **not urgent**: finish your
+  current step, then run `relay inbox --claim` at a stopping point. Relay keeps
+  reminding you (and the message is stored), so nothing is lost by finishing first.
 - Terminal/pane idle is NOT task done. Task DB is the source of truth.
 
 ## Task hierarchy (optional — work decomposition, not authority)

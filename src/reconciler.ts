@@ -548,7 +548,7 @@ async function nudgeUnreadMail(
     if (!w || w.retired_at !== null) continue;
     if (recentlyEvent(db, recipient, "worker.mail_nudged", at, window)) continue;
     try {
-      await rt.wake(w, `You have ${n} unread durable message(s). Run \`relay inbox --claim\` to receive them.`);
+      await rt.wake(w, `You have ${n} unread durable message(s). Not urgent — finish your current step, then run \`relay inbox --claim\` at a stopping point. Relay keeps reminding you until you read it.`);
       logEvent(db, { source: "supervisor", workerId: recipient, type: "worker.mail_nudged", payload: { recipient, count: n } });
       actions.push(`mail-nudged:${recipient}`);
     } catch (e) {
