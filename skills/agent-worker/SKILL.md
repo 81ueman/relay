@@ -39,6 +39,10 @@ Never wait for instructions or for another agent to finish. If your task is gone
 - After every `submit`/`block`/`release`, immediately run `relay next`. No exceptions.
 - Never busy-wait on another agent. Send a durable message instead: `relay send <worker-id> "..."`.
   Workers are peers; there is no `human`/operator alias — address a real worker id.
+- If you are **waiting on a long-running step** (a background command, build or
+  test run), that is fine: keep your task, and if relay sends a "continue"/"stall"
+  nudge, **no action is needed until it returns**. Only act on a nudge when you are
+  genuinely stuck (`relay block`) or have nothing left to do.
 - You may be woken about incoming messages — it is **not urgent**: finish your
   current step, then run `relay inbox --claim` at a stopping point. Relay keeps
   reminding you (and the message is stored), so nothing is lost by finishing first.

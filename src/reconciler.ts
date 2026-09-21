@@ -50,11 +50,15 @@ import { getWorker, listWorkers, setWorkerState, touchSeen, type WorkerRow } fro
 export const NEXT_NUDGE = "Run `relay next` now. Do not wait for instructions.";
 export const CONTINUE_NUDGE = (taskId: string) =>
   `Your task ${taskId} is still running. ` +
-  `Continue the next concrete action. ` +
-  `If blocked, explicitly block it. ` +
-  `Do not wait for instructions.`;
+  `If you are waiting on a long-running step (a background command, build or ` +
+  `test run), that is fine — no action needed, continue when it returns. ` +
+  `Otherwise do the next concrete action; if you are blocked, run ` +
+  `\`relay block ${taskId} "<reason>"\`, then \`relay next\`.`;
 export const STALL_NUDGE = (taskId: string) =>
-  `No progress on ${taskId} for a while. If you can proceed, continue now. If you are stuck, run \`relay block ${taskId} "<reason>"\` (or --human only when a human is truly required), then run \`relay next\`.`;
+  `No progress on ${taskId} for a while. ` +
+  `If you are working or just waiting on a long-running step, that is fine — ` +
+  `no action needed; relay will check again later. ` +
+  `If you are actually stuck, run \`relay block ${taskId} "<reason>"\`, then \`relay next\`.`;
 export const REVIEW_NUDGE = "There are tasks waiting for review. Run `relay next` to pick one up.";
 export const PLANNER_NUDGE =
   "Task queue is running low. Decompose the next objective into small tasks with acceptance criteria (relay task add), then go idle. Do not monitor other workers.";
