@@ -9,7 +9,7 @@ import { handleErrorSignal, handleIdleSignal, reconcile } from "./reconciler";
 import { buildRuntime, HerdrRuntime } from "./runtime/herdr";
 import { supervisorView, isOperationalWorker } from "./scheduler";
 import { attachSession, detachSession, getSession, listSessions } from "./sessions";
-import { listRuntimes } from "./runtimes";
+import { listRuntimes, adoptRuntimeTarget } from "./runtimes";
 import type { Task } from "./schema";
 import {
   addTask, approveTask, blockTask, claimNext, claimTask, claimableRunnableTasks, getNotes, getTask,
@@ -424,6 +424,13 @@ async function main(): Promise<void> {
           // registration is not evidence its work stopped. Only a fresh
           // registration (state 'starting') is normalized to idle.
           if (!existing) setWorkerState(db, id, "idle");
+          // `--runtime` names an EXISTING Herdr target. Record a real adopted
+          // worker_runtimes row (active, relay_owned=0) — setting only
+          // workers.runtime_id left the worker invisible to every projection
+          // that reads worker_runtimes (dashboard/status pane resolution).
+          if (runtimeId) {
+            adoptRuntimeTarget(db, { workerId: id, generation: w.generation, target: runtimeId });
+          }
           // Remember a default worker identity for this checkout.
           try { writeFileSync(join(process.cwd(), STATE_DIR, "worker-id"), id); } catch { /* ignore */ }
           console.log(`registered ${w.id} role=${w.role}`);
@@ -455,6 +462,10 @@ async function main(): Promise<void> {
           const sessionId = flag(argv.slice(2), "--session");
           if (!id || !sessionId) throw new Error("usage: relay worker bind <id> --session <sid>");
           const w = bindSession(db, id, sessionId);
+          // Same adopted-runtime recording as `register --runtime`: bind is the
+          // other way a worker gets a Herdr target, and the projections read
+          // worker_runtimes, not workers.runtime_id.
+          if (w.runtime_id) adoptRuntimeTarget(db, { workerId: id, generation: w.generation, target: w.runtime_id });
           console.log(`bound ${w.id} session=${w.opencode_session_id}`);
         } else {
           throw new Error(`unknown worker subcommand: ${sub}`);

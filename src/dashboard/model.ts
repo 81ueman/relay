@@ -120,9 +120,21 @@ export function buildDashboardView(db: Database, opts: BuildOptions): DashboardV
   const at = opts.at ?? now();
   const root = opts.root;
 
+  // Runtimes are read FIRST so their pane ids can be handed to readPanes as
+  // `knownPanes`: a worker's pane is resolved by its OWN runtime, not by a
+  // global cwd-root prefix (a Herdr worktree pane lives outside the repo root).
+  const runtimeRows = listRuntimes(db);
+  const runtimesByWorker = new Map<string, WorkerRuntime[]>();
+  for (const r of runtimeRows) {
+    const arr = runtimesByWorker.get(r.worker_id) ?? [];
+    arr.push(r);
+    runtimesByWorker.set(r.worker_id, arr);
+  }
+  const knownPanes = new Set(runtimeRows.map((r) => r.pane_id).filter((p): p is string => !!p));
+
   const panes = opts.panes !== undefined
     ? opts.panes
-    : readPanes({ workspaces: relayWorkspaces(db), cwdRoot: root, excludePane: opts.excludePane ?? null });
+    : readPanes({ workspaces: relayWorkspaces(db), knownPanes, cwdRoot: root, excludePane: opts.excludePane ?? null });
   const herdrOn = panes !== null;
 
   // ---- tasks: a forest by parent_task_id (work decomposition only) ----------
@@ -131,12 +143,6 @@ export function buildDashboardView(db: Database, opts: BuildOptions): DashboardV
 
   // ---- workers: durable identity + its CURRENT runtime ----------------------
   const unread = new Map(unreadCounts(db).map((u) => [u.recipient, u.queued + u.delivered]));
-  const runtimesByWorker = new Map<string, WorkerRuntime[]>();
-  for (const r of listRuntimes(db)) {
-    const arr = runtimesByWorker.get(r.worker_id) ?? [];
-    arr.push(r);
-    runtimesByWorker.set(r.worker_id, arr);
-  }
 
   const workers: DashboardWorker[] = listWorkers(db).map((w) => {
     const rows = runtimesByWorker.get(w.id) ?? [];

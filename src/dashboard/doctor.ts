@@ -31,7 +31,12 @@ export function dashboardDoctor(db: Database, dbPath: string, root: string): str
   lines.push(`runtime links    ${workers.filter((w) => placed.has(w.id)).length}/${workers.length}`);
   lines.push(`stale runtimes   ${stale.length}`);
 
-  const panes = readPanes({ cwdRoot: root });
+  const panes = readPanes({
+    cwdRoot: root,
+    // Include panes relay has a runtime row for even outside the repo root
+    // (e.g. a Herdr worktree at ~/.herdr/worktrees/...).
+    knownPanes: runtimes.map((r) => r.pane_id).filter((p): p is string => !!p),
+  });
   lines.push(`herdr            ${panes ? `OK (${panes.size} panes)` : "off"}`);
   return lines.join("\n");
 }

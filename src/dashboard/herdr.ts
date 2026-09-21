@@ -58,6 +58,14 @@ export function relayWorkspaces(db: Database): string[] {
 /** Live Herdr panes, or null when Herdr is unavailable (not inside Herdr). */
 export function readPanes(opts: {
   workspaces?: string[];
+  /**
+   * Pane ids relay has a runtime row for. A worker's pane is resolved by its OWN
+   * runtime (pane_id / workspace_id), NOT by a cwd prefix: a Herdr WORKTREE pane
+   * lives at ~/.herdr/worktrees/<repo>/<wt>, which is not under the repo root, so
+   * a global cwd-root filter silently dropped it. Known panes bypass both filters;
+   * cwdRoot remains only a best-effort for panes relay has no record of.
+   */
+  knownPanes?: Iterable<string>;
   cwdRoot?: string;
   excludePane?: string | null;
 }): Map<string, PaneTelemetry> | null {
@@ -80,9 +88,10 @@ export function readPanes(opts: {
     });
   }
   const wsSet = new Set(opts.workspaces ?? []);
+  const known = new Set(opts.knownPanes ?? []);
   let out = panes;
-  if (wsSet.size) out = out.filter((p) => wsSet.has(p.workspaceId));
-  if (opts.cwdRoot) out = out.filter((p) => isUnder(p.cwd, opts.cwdRoot!));
+  if (wsSet.size) out = out.filter((p) => wsSet.has(p.workspaceId) || known.has(p.paneId));
+  if (opts.cwdRoot) out = out.filter((p) => isUnder(p.cwd, opts.cwdRoot!) || known.has(p.paneId));
   if (opts.excludePane) out = out.filter((p) => p.paneId !== opts.excludePane);
   return new Map(out.map((p) => [p.paneId, p]));
 }

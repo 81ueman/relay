@@ -33,6 +33,60 @@ export interface RecordRuntimeInput {
   createdAt?: number;
 }
 
+/**
+ * Best-effort structural parse of a Herdr target. Structural ids carry the
+ * workspace as the prefix before ':' and the kind as `p` (pane) or `t` (tab):
+ * `w6G:p1` -> pane in workspace w6G, `w6G:t2` -> tab in w6G. An agent NAME (no
+ * structural id) yields nothing: only the live agent list can map it.
+ */
+export function parseHerdrTarget(target: string): {
+  paneId: string | null;
+  tabId: string | null;
+  workspaceId: string | null;
+} {
+  const i = target.indexOf(":");
+  if (i <= 0 || i + 1 >= target.length) return { paneId: null, tabId: null, workspaceId: null };
+  const workspaceId = target.slice(0, i) || null;
+  const kind = target[i + 1];
+  if (kind === "p") return { paneId: target, tabId: null, workspaceId };
+  if (kind === "t") return { paneId: null, tabId: target, workspaceId };
+  return { paneId: null, tabId: null, workspaceId: null };
+}
+
+/**
+ * Adopt an EXISTING Herdr runtime that a worker was registered against with
+ * `worker register --runtime <target>`.
+ *
+ * `--runtime` used to set only `workers.runtime_id`, a DISPLAY column, so no
+ * `worker_runtimes` row existed and the dashboard/status/wake projections (which
+ * read `worker_runtimes`) could not resolve the worker's pane — a worktree
+ * worker showed as "supervised worker has no visible runtime pane".
+ *
+ * Record a REAL generation row: `state: 'active'`, `relay_owned: 0` (adopted).
+ * relay_owned=0 is load-bearing: `cleanupCandidates` and `isRecoverableWorker`
+ * both require relay_owned=1, so an adopted runtime is NEVER reaped or restarted
+ * by relay. Idempotent: an existing active runtime is returned untouched, so a
+ * later re-register can never shadow a managed attach.
+ */
+export function adoptRuntimeTarget(
+  db: Database,
+  input: { workerId: string; generation: number; target: string }
+): WorkerRuntime {
+  const existing = getActiveRuntime(db, input.workerId);
+  if (existing) return existing;
+  const { paneId, tabId, workspaceId } = parseHerdrTarget(input.target);
+  return recordRuntime(db, {
+    workerId: input.workerId,
+    generation: input.generation,
+    runtimeId: input.target,
+    paneId,
+    tabId,
+    workspaceId,
+    relayOwned: 0,
+    state: "active",
+  });
+}
+
 export function recordRuntime(db: Database, input: RecordRuntimeInput): WorkerRuntime {
   const t = input.createdAt ?? now();
   const state: RuntimeState = input.state ?? "starting";
