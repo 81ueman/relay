@@ -8,6 +8,7 @@ import { listEvents } from "../src/events";
 import { handleSocketMessage, type SocketContext } from "../src/socket";
 import { reconcile } from "../src/reconciler";
 import { buildDashboardView } from "../src/dashboard/model";
+import { renderDashboard } from "../src/dashboard/render";
 import { MockRuntime } from "../src/runtime/runtime";
 import { addTask, claimNext, getTask } from "../src/tasks";
 import { attachSession } from "../src/sessions";
@@ -137,6 +138,10 @@ describe("early surfacing", () => {
     const att = view.attention.find((a) => a.id === "w1" && a.text.includes("tool shell"));
     expect(att).toBeDefined();
     expect(att!.text).toContain("bun test --watch");
+
+    // The WORKERS row also carries the running tool + age (not only ATTENTION).
+    const text = renderDashboard(view, { color: false, width: 160 });
+    expect(text).toContain("tool:shell");
   });
 
   test("a lost finish event is cleared once the marker is stale", async () => {

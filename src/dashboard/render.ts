@@ -299,6 +299,13 @@ function renderWorker(
     const reason = `  "${trim(w.quietReason, 30)}"`;
     if (used + dwidth(reason) <= width) tail += reason;
   }
+  // In-flight tool (early detection): the running tool and its age sit on the
+  // worker row itself, so a hang is visible without opening ATTENTION. The
+  // command text and the overdue flag stay in ATTENTION.
+  if (w.tool) {
+    const label = `  tool:${w.tool.name} ${fmtAge(w.tool.ageMs)}`;
+    push(label, dwidth(label));
+  }
   // Optional affinity hint for an idle peer: which task pulled it into this
   // cluster. The task column stays `-` — affinity is not ownership.
   if (indented && w.taskId == null && w.affinity.anchorTaskId && width >= 100) {
