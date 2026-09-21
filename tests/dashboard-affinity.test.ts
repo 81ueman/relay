@@ -356,6 +356,101 @@ describe("worker affinity (dashboard projection)", () => {
     assertRenderedOnce(v);
   });
 
+  test("20. cluster header shows the claimable queue of its members, matching `relay status` next:", () => {
+    const root = addTask(db, { title: "root" });
+    sealRoot(root.id);
+    const cluster = addTask(db, { title: "cluster", parentTaskId: root.id, role: "coord" });
+    const queued = addTask(db, { title: "queued work", parentTaskId: cluster.id, role: "rust" });
+    registerWorker(db, "coord", { role: "coord" });
+    claimTask(db, cluster.id, "coord");
+    registerWorker(db, "rust-idle", { role: "rust" });
+    const v = view();
+    const c = v.workerClusters.find((x) => x.clusterTaskId === cluster.id)!;
+    // rust-idle is anchored ON `queued`, so it is current affinity, not a queue.
+    expect(c.workerIds).toContain("rust-idle");
+    expect(anchorOf(v, "rust-idle")).toBe(queued.id);
+    expect(c.claimableTaskIds).toEqual([]);
+  });
+
+  test("21. a cluster with a member that can claim EXTRA work lists it in the header queue", () => {
+    const root = addTask(db, { title: "root" });
+    sealRoot(root.id);
+    const cluster = addTask(db, { title: "cluster", parentTaskId: root.id, role: "coord" });
+    const held = addTask(db, { title: "held", parentTaskId: cluster.id, role: "coord" });
+    const extra = addTask(db, { title: "extra rust work", parentTaskId: cluster.id, role: "rust" });
+    registerWorker(db, "coord", { role: "coord" });
+    registerWorker(db, "rust-busy", { role: "rust" });
+    claimTask(db, held.id, "coord");
+    // rust-busy holds `extra`? No: to keep `extra` claimable it must stay queued.
+    // Give rust-busy a current task OUTSIDE so `extra` remains a queue item and
+    // rust-busy still has cluster affinity via that task.
+    const elsewhere = addTask(db, { title: "elsewhere", parentTaskId: cluster.id, role: "rust" });
+    claimTask(db, elsewhere.id, "rust-busy");
+    const v = view();
+    const c = v.workerClusters.find((x) => x.clusterTaskId === cluster.id)!;
+    expect(c.workerIds).toContain("rust-busy");
+    expect(c.claimableTaskIds).toContain(extra.id);
+  });
+
+  test("22. the cluster queue excludes tasks its members already own", () => {
+    const root = addTask(db, { title: "root" });
+    sealRoot(root.id);
+    const cluster = addTask(db, { title: "cluster", parentTaskId: root.id, role: "rust" });
+    const owned = addTask(db, { title: "owned", parentTaskId: cluster.id, role: "rust2" });
+    registerWorker(db, "rust2-owner", { role: "rust2" });
+    claimTask(db, owned.id, "rust2-owner");
+    registerWorker(db, "rust-claim", { role: "rust" });
+    db.query(`UPDATE workers SET current_task_id = ?, state = 'working' WHERE id = 'rust-claim'`).run(cluster.id);
+    const v = view();
+    const c = v.workerClusters.find((x) => x.clusterTaskId === cluster.id)!;
+    expect(c.claimableTaskIds).not.toContain(owned.id);
+  });
+
+  test("23. --json exposes the cluster claimable queue", () => {
+    const root = addTask(db, { title: "root" });
+    sealRoot(root.id);
+    const cluster = addTask(db, { title: "cluster", parentTaskId: root.id, role: "coord" });
+    const extra = addTask(db, { title: "extra", parentTaskId: cluster.id, role: "rust" });
+    const elsewhere = addTask(db, { title: "elsewhere", parentTaskId: cluster.id, role: "rust" });
+    registerWorker(db, "coord", { role: "coord" });
+    registerWorker(db, "rust-1", { role: "rust" });
+    db.query(`UPDATE workers SET current_task_id = ?, state = 'working' WHERE id = 'coord'`).run(cluster.id);
+    // rust-1 takes one rust task, so the OTHER rust task stays a queue item while
+    // rust-1 still has cluster affinity via its current task.
+    claimTask(db, elsewhere.id, "rust-1");
+    const parsed = JSON.parse(renderDashboardJson(view()));
+    const c = parsed.worker_clusters.find((x: { cluster_task_id: string }) => x.cluster_task_id === cluster.id);
+    expect(c.claimable_task_ids).toContain(extra.id);
+    // The OTHER bucket can never have a claimable queue: a worker with claimable
+    // work always gets an anchor, and so a cluster.
+    for (const cl of parsed.worker_clusters) {
+      if (cl.cluster_task_id === null) expect(cl.claimable_task_ids).toEqual([]);
+    }
+  });
+
+  test("24. the header renders the queue text, capped to one line", () => {
+    const root = addTask(db, { title: "root" });
+    sealRoot(root.id);
+    const cluster = addTask(db, { title: "cluster", parentTaskId: root.id, role: "coord" });
+    registerWorker(db, "coord", { role: "coord" });
+    db.query(`UPDATE workers SET current_task_id = ?, state = 'working' WHERE id = 'coord'`).run(cluster.id);
+    const ids: string[] = [];
+    for (let i = 0; i < 6; i++) {
+      ids.push(addTask(db, { title: `q${i}`, parentTaskId: cluster.id, role: "rust" }).id);
+    }
+    registerWorker(db, "seed", { role: "rust" });
+    const v = view();
+    const c = v.workerClusters.find((x) => x.clusterTaskId === cluster.id)!;
+    // Six queued, but `seed` is ANCHORED on one of them, so five remain as queue.
+    expect(c.claimableTaskIds.length).toBe(5);
+    const text = renderDashboard(v, { width: 120 });
+    const workersSection = text.split("WORKERS")[1].split("ATTENTION")[0];
+    const headerLine = workersSection.split("\n").find((l) => l.includes(cluster.id))!;
+    expect(headerLine).toContain("next:");
+    expect(headerLine).toContain("+1 more"); // cap 4, so 4 shown + 1 extra
+    expect(c.workerIds).toContain("seed");
+  });
+
   test("18. no durable worker hierarchy/group columns are added", () => {
     const cols = db.query(`PRAGMA table_info(workers)`).all() as { name: string }[];
     const names = cols.map((c) => c.name);

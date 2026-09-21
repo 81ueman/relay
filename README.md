@@ -239,13 +239,20 @@ two sections read together:
 ```text
 WORKERS
 
-T149  CP-W3 control-exactness wave
+T149  CP-W3 control-exactness wave  next: T153
   program-coord    working  busy   T149  g1  w6D:p1   3s
-  control-rust     idle     idle   -     g2  w6E:p2   14m  →T150
+  control-rust     idle     idle   -     g2  w6E:p2   14m
 
 AVAILABLE / OTHER
   corpus           idle     idle   -
 ```
+
+The `next:` on a cluster header is the **dashboard form of `relay status`'s
+`next:`**: the runnable work that cluster's members could pick up right now,
+computed with the same policy and the same rule (never a task a member already
+owns or anchors on). It is shown once per cluster, not once per worker, and is
+capped to one line (`T1,T2,T3,T4,+2 more`). A cluster with no backlog simply
+omits it.
 
 Each worker gets exactly **one** derived `anchor task` (never stored):
 
@@ -284,7 +291,8 @@ Important properties, all covered by `tests/dashboard-affinity.test.ts`:
   "affinity": { "anchor_task_id": "T150", "cluster_task_id": "T149", "source": "claimable" } }
 ```
 
-plus `worker_clusters` (`cluster_task_id` null = `AVAILABLE / OTHER`).
+plus `worker_clusters` (`cluster_task_id` null = `AVAILABLE / OTHER`, and each
+cluster carries `claimable_task_ids` — the header's `next:` queue).
 
 ### ATTENTION
 

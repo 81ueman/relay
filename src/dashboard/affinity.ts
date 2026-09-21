@@ -52,6 +52,15 @@ export interface WorkerCluster {
   header: { id: string; title: string } | null;
   /** Peer rows, already ordered by `compareWorkersInCluster`. */
   workerIds: string[];
+  /**
+   * Runnable work this cluster's members could pick up right now — the
+   * dashboard form of `relay status`'s `next:`. DERIVED (never stored) from the
+   * same `claimableRunnableTasks` / `reviewTasks` policy `relay next` uses, and
+   * never includes a task a member already owns or is anchored on.
+   *
+   * Ordered by `priority DESC, created_at ASC` (the scheduler's order), deduped.
+   */
+  claimableTaskIds: string[];
 }
 
 export interface AffinityIndex {
@@ -91,7 +100,24 @@ export function buildAffinity(
     byWorker.set(id, deriveWorkerAffinity(db, id, opts.tasksById, tail, dbOrder));
   }
 
-  const clusters = groupIntoClusters(workerIds, byWorker, opts.tasksById, tail, opts.stateOf ?? (() => "worker"));
+  // Claimable lists are shared between anchor derivation and the cluster queue;
+  // compute once per worker (and once for a missing worker id).
+  const claimableCache = new Map<string, Task[]>();
+  const claimableOf = (id: string): Task[] => {
+    let list = claimableCache.get(id);
+    if (list === undefined) {
+      const w = getWorker(db, id);
+      list = w ? claimableTasksOf(db, w) : [];
+      claimableCache.set(id, list);
+    }
+    return list;
+  };
+
+  const clusters = groupIntoClusters(
+    workerIds, byWorker, opts.tasksById, tail,
+    opts.stateOf ?? (() => "worker"),
+    claimableOf
+  );
   return { byWorker, clusters, preorder: tail };
 }
 
@@ -173,15 +199,25 @@ export function primaryClaimableTask(
   dbOrder?: () => Map<string, number>
 ): Task | null {
   const order = dbOrder ?? memoizedDbPreorder(db);
-  // A reviewer takes review work before queued work (see claimNext).
-  if (w.role === "reviewer") {
-    const review = reviewTasks(db);
-    if (review.length) return pickPrimary(review, order);
-    // No reviews pending: fall through to queued role-gated work.
-  }
-  const candidates = claimableRunnableTasks(db, w.id);
+  const candidates = claimableTasksOf(db, w);
   if (!candidates.length) return null;
   return pickPrimary(candidates, order);
+}
+
+/**
+ * Every task this worker could pick up right now, in the scheduler's own order.
+ * The ONE place role matching is resolved for the dashboard: `reviewTasks` and
+ * `claimableRunnableTasks` are the same domain functions `relay next` uses, so
+ * the dashboard cannot drift from the scheduler. A reviewer takes review work
+ * first, exactly as `claimNext` does (queued role-gated work only when the
+ * review queue is empty).
+ */
+export function claimableTasksOf(db: Database, w: Worker): Task[] {
+  if (w.role === "reviewer") {
+    const review = reviewTasks(db);
+    if (review.length) return review;
+  }
+  return claimableRunnableTasks(db, w.id);
 }
 
 function pickPrimary(candidates: Task[], order: () => Map<string, number>): Task {
@@ -262,7 +298,8 @@ function groupIntoClusters(
   byWorker: Map<string, WorkerAffinity>,
   tasksById: Record<string, DashboardTaskNode>,
   preorder: Map<string, number>,
-  stateOf: (workerId: string) => string
+  stateOf: (workerId: string) => string,
+  claimableOf: (workerId: string) => Task[]
 ): WorkerCluster[] {
   const buckets = new Map<string, string[]>();
   const other: string[] = [];
@@ -286,6 +323,7 @@ function groupIntoClusters(
         clusterTaskId,
         header: { id: clusterTaskId, title: node?.title ?? "" },
         workerIds: ids.sort(cmp),
+        claimableTaskIds: clusterClaimable(ids, byWorker, claimableOf),
       };
     })
     // Cluster order == WORK preorder, so the eye does not jump between sections.
@@ -298,9 +336,43 @@ function groupIntoClusters(
       clusterTaskId: null,
       header: null,
       workerIds: other.sort((x, y) => (x < y ? -1 : x > y ? 1 : 0)),
+      claimableTaskIds: clusterClaimable(other, byWorker, claimableOf),
     });
   }
   return clusters;
+}
+
+/**
+ * The runnable work a cluster's members could pick up, deduped and in the
+ * scheduler's own order. Excludes any task a member already owns or is anchored
+ * on — that is current work, not a queue, and calling it "claimable" would be
+ * wrong (the same rule `relay status`'s `next:` applies).
+ *
+ * Tasks are not attributed to a single worker: several peers of a role may be
+ * able to take the same task, and the dashboard must not decide which one does.
+ */
+function clusterClaimable(
+  workerIds: string[],
+  byWorker: Map<string, WorkerAffinity>,
+  claimableOf: (workerId: string) => Task[]
+): string[] {
+  const held = new Set<string>();
+  for (const id of workerIds) {
+    const a = byWorker.get(id);
+    if (a?.anchorTaskId) held.add(a.anchorTaskId);
+  }
+  const seen = new Map<string, Task>();
+  for (const id of workerIds) {
+    for (const t of claimableOf(id)) {
+      if (held.has(t.id)) continue;
+      if (!seen.has(t.id)) seen.set(t.id, t);
+    }
+  }
+  return [...seen.values()]
+    .sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0)
+      || a.created_at - b.created_at
+      || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+    .map((t) => t.id);
 }
 
 function rank(id: string, preorder: Map<string, number>): number {

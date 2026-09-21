@@ -215,9 +215,12 @@ function renderWorkers(
   clusters.forEach((cluster, ci) => {
     if (cluster.header) {
       if (ci > 0) lines.push("");
-      lines.push(clusterHeader(cluster.header, width, c));
+      lines.push(clusterHeader(cluster.header, cluster.claimableTaskIds, width, c));
     } else {
-      // Ungrouped bucket: no task affinity was derivable.
+      // Ungrouped bucket: no task affinity was derivable. By construction this
+      // bucket has no claimable queue either — a worker with claimable work
+      // always gets an anchor (and so a cluster); `clusterClaimable` returns []
+      // here, so nothing extra is rendered.
       if (ci > 0) lines.push("");
       lines.push(c("AVAILABLE / OTHER", "gray"));
     }
@@ -229,14 +232,30 @@ function renderWorkers(
 }
 
 /**
- * Cluster header: `T149  CP-W3 control-exactness wave`. Deliberately carries no
- * state/assignee/role — the WORK section already shows those; repeating them
- * here would just be noise.
+ * Cluster header: `T149  CP-W3 control-exactness wave` plus, when the cluster
+ * has runnable work its members could pick up, a compact `next: T153` queue.
+ * This is the dashboard form of `relay status`'s `next:` — same policy, same
+ * "never the task already held" rule — rendered once per cluster instead of
+ * once per worker. Deliberately carries no state/assignee/role: the WORK
+ * section already shows those.
  */
-function clusterHeader(header: { id: string; title: string }, width: number, c: ColorFn): string {
+function clusterHeader(
+  header: { id: string; title: string },
+  claimableTaskIds: string[],
+  width: number,
+  c: ColorFn
+): string {
   const id = header.id;
-  const title = trim(header.title, Math.max(0, width - dwidth(id) - 4));
-  return c(`${id}${title ? `  ${title}` : ""}`, "cyan");
+  const queue = claimableTaskIds.length ? `  next: ${truncIds(claimableTaskIds)}` : "";
+  const title = trim(header.title, Math.max(0, width - dwidth(id) - dwidth(queue) - 4));
+  return c(`${id}${title ? `  ${title}` : ""}${queue}`, "cyan");
+}
+
+/** `T1,T2,+3 more` — keep a claimable queue to one line. */
+function truncIds(ids: string[], cap = 4): string {
+  const head = ids.slice(0, cap);
+  const extra = ids.length - head.length;
+  return extra > 0 ? `${head.join(",")},+${extra} more` : head.join(",");
 }
 
 function renderWorker(
@@ -315,6 +334,8 @@ export function renderDashboardJson(view: DashboardView): string {
       cluster_task_id: cl.clusterTaskId,
       title: cl.header?.title ?? null,
       workers: cl.workerIds,
+      /** Runnable work this cluster's members could pick up now (see `next:`). */
+      claimable_task_ids: cl.claimableTaskIds,
     })),
     attention: view.attention,
   }, null, 2);
