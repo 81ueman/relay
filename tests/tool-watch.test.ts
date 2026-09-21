@@ -220,6 +220,44 @@ describe("bounded recovery (Ctrl-B backgrounding)", () => {
   });
 });
 
+describe("plugin hooks are registered per location", () => {
+  test("a second location still registers its tool hooks (not only the first)", async () => {
+    const mod = await import("../.opencode/plugins/relay");
+    const plugin = mod.default as { setup: (ctx: any) => Promise<unknown> };
+    const calls: string[] = [];
+
+    const makeCtx = (dir: string) => ({
+      location: { directory: dir },
+      tool: {
+        transform: async (cb: any) => cb({ add: () => {} }),
+        hook: async (name: string) => {
+          calls.push(`${dir}:tool.${name}`);
+          return { dispose: async () => {} };
+        },
+      },
+      session: {
+        hook: async (name: string) => {
+          calls.push(`${dir}:session.${name}`);
+          return { dispose: async () => {} };
+        },
+      },
+      event: { subscribe: async function* () { /* ends immediately */ } },
+    });
+
+    await plugin.setup(makeCtx("/proj/first"));
+    await plugin.setup(makeCtx("/proj/second"));
+
+    // The event subscription is server-global (registered once), but tool/session
+    // hooks are location-scoped: the SECOND location must still get them, or its
+    // tools are invisible to relay (no tool.started / tool.execute.after).
+    for (const dir of ["/proj/first", "/proj/second"]) {
+      expect(calls).toContain(`${dir}:tool.execute.before`);
+      expect(calls).toContain(`${dir}:tool.execute.after`);
+      expect(calls).toContain(`${dir}:session.prompt`);
+    }
+  });
+});
+
 describe("plugin telemetry extraction", () => {
   test("shell command + timeout, plain tools, and completion status", () => {
     expect(toolTelemetry({ tool: "shell", input: { command: "bun test", timeout: 5000 } }))

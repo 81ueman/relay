@@ -621,20 +621,13 @@ export default {
       }
     }
 
-    // Exactly one server-global forwarder across every location in this module
-    // load. A hot reload (new LOAD) takes ownership and aborts the previous
-    // forwarder, so a code change applies without a server restart.
-    if (G.forwarderLoad === LOAD) return;
-    G.forwarderLoad = LOAD;
-    const previous = G.controller;
-    G.controller = undefined;
-    if (previous) {
-      try {
-        previous.abort();
-      } catch {
-        // Already gone: nothing to stop.
-      }
-    }
+    // Per-LOCATION hooks. Tool and session hooks are scoped to the location
+    // whose `setup()` registered them, so EVERY location must register its own.
+    // Registering them once "server-globally" (as the event stream is) leaves
+    // every OTHER location unobserved: its tools fire no execute.before/after,
+    // so relay sees no tool.started and no tool liveness at all. (Found live: a
+    // second location loaded first after a service restart and the fleet's tool
+    // events vanished while session.idle still flowed.)
 
     // The relay bootstrap marker is in a spawned session's own prompt text.
     // This hook is the reliable signal (the raw event type name may change).
@@ -681,6 +674,22 @@ export default {
       });
     } catch {
       // Older hosts may lack tool hooks; after-events still cover liveness.
+    }
+
+    // Exactly one SERVER-GLOBAL forwarder across every location in this module
+    // load: the event subscription is server-wide, so it is registered exactly
+    // once. A hot reload (new LOAD) takes ownership and aborts the previous
+    // forwarder, so a code change applies without a server restart.
+    if (G.forwarderLoad === LOAD) return;
+    G.forwarderLoad = LOAD;
+    const previous = G.controller;
+    G.controller = undefined;
+    if (previous) {
+      try {
+        previous.abort();
+      } catch {
+        // Already gone: nothing to stop.
+      }
     }
 
     const controller = new AbortController();
