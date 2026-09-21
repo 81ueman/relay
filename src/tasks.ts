@@ -506,6 +506,12 @@ export function approveTask(db: Database, taskId: string, workerId: string): Tas
     const done = getTask(db, taskId)!;
     // One-hop completion bubbling to the IMMEDIATE parent (no recursion).
     bubbleChildDone(db, done, workerId, t);
+    // The submitter always learns their OWN task's outcome. When the submitter
+    // is also the parent's assignee, the child_done message above already told
+    // them, so skip the duplicate (never two notices to one mailbox for one
+    // event).
+    const parentAssignee = done.parent_task_id ? getTask(db, done.parent_task_id)?.assignee ?? null : null;
+    notifySubmitter(db, done, "review_done", `${RELAY_TAG}${done.id} approved: ${done.title}`, parentAssignee);
   })();
   return getTask(db, taskId)!;
 }
@@ -554,6 +560,37 @@ function bubbleChildDone(db: Database, child: Task, actor: string, at: number): 
     taskId: parentId,
     type: "task.child_done",
     payload: { child: child.id, allDone, assignee: parent.assignee ?? null },
+  });
+}
+
+/**
+ * Notify the SUBMITTER of a task's review outcome. The submitter is the task's
+ * `assignee` at review time (`submitTask` keeps it). A TOP-LEVEL task has no
+ * parent to bubble to, so without this its author never learns the verdict — the
+ * live T188/T190/T197 reviews completed silently and the coordinator only found
+ * out by polling.
+ *
+ * Durable message from `relay` (same machinery as child_done/child_blocked); the
+ * reconciler's mail nudge delivers the wake. `skipRecipient` is the immediate
+ * parent's assignee when the parent bubble already messaged them for this same
+ * event, so we never drop two notices into one mailbox for one outcome.
+ */
+function notifySubmitter(
+  db: Database,
+  task: Task,
+  kind: "review_done" | "review_rejected",
+  body: string,
+  skipRecipient: string | null
+): void {
+  const submitter = task.assignee;
+  if (!submitter || submitter === skipRecipient) return;
+  sendMessage(db, "relay", submitter, body, { kind, taskId: task.id });
+  logEvent(db, {
+    source: "supervisor",
+    workerId: submitter,
+    taskId: task.id,
+    type: "task.review_outcome",
+    payload: { kind },
   });
 }
 
@@ -623,6 +660,9 @@ export function rejectTask(db: Database, taskId: string, workerId: string, reaso
   if (task.assignee) clearQuietLogged(db, task.assignee, taskId);
   clearQuietLogged(db, workerId, taskId);
   logEvent(db, { source: "reviewer", workerId, taskId, type: "task.rejected", payload: { reason } });
+  // The submitter learns the rejection even when the task is top-level (there is
+  // no parent bubble on the reject path).
+  notifySubmitter(db, task, "review_rejected", `${RELAY_TAG}${task.id} rejected: ${reason}`, null);
   return getTask(db, taskId)!;
 }
 

@@ -91,13 +91,16 @@ describe("one-hop completion bubbling", () => {
     expect(getTask(db, P.id)!.state).toBe("running");
   });
 
-  test("6. an unassigned parent gets a durable note but NO message", () => {
+  test("6. an unassigned parent gets a durable note but NO message; the submitter is told", () => {
     const parent = addTask(db, { title: "parent" });
     const child = addTask(db, { title: "child", parentTaskId: parent.id });
     complete(child.id);
 
     expect(bubblingNotes(parent.id)).toEqual(["child_done", "children_done"]);
-    expect(inboxFor(db, "w1")).toHaveLength(0);
+    // The parent has no assignee, so nobody receives the parent bubble...
+    expect(inboxFor(db, "w1").some((m) => m.kind === "child_done")).toBe(false);
+    // ...but the submitter still learns their own task's outcome.
+    expect(inboxFor(db, "w1").map((m) => m.kind)).toEqual(["review_done"]);
   });
 
   test("7. a later claimer can observe the prior child_done notes", () => {
@@ -141,11 +144,12 @@ describe("one-hop completion bubbling", () => {
     expect(items[0].payload).toContain("benchmark result");
   });
 
-  test("11. a root task completion produces no bubbling", () => {
+  test("11. a root task completion has no parent bubble, but the submitter is told", () => {
     const root = addTask(db, { title: "root" });
     complete(root.id);
-    expect(bubblingNotes(root.id)).toEqual([]);
-    expect(inboxFor(db, "w1")).toHaveLength(0);
+    expect(bubblingNotes(root.id)).toEqual([]); // nothing to bubble to
+    // The author still learns the verdict (regression: T188/T190/T197 were silent).
+    expect(inboxFor(db, "w1").map((m) => m.kind)).toEqual(["review_done"]);
     expect(getTask(db, root.id)!.state).toBe("done");
   });
 
@@ -169,8 +173,10 @@ describe("one-hop completion bubbling", () => {
     registerWorker(db, "wperf", { role: "perf-x" });
     const t = addTask(db, { title: "perf work", role: "perf-x" });
     complete(t.id, "wperf");
-    const n = (db.query(`SELECT COUNT(*) AS n FROM messages`).get() as { n: number }).n;
-    expect(n).toBe(0); // no role-based broadcast, no operator notice
+    const msgs = db.query(`SELECT recipient, kind FROM messages`).all() as { recipient: string; kind: string }[];
+    // The only message is the submitter's OWN outcome — no role fan-out, no
+    // operator notice.
+    expect(msgs).toEqual([{ recipient: "wperf", kind: "review_done" }]);
   });
 
   test("15. a blocked child notifies the immediate parent assignee", () => {
