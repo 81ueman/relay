@@ -230,8 +230,61 @@ WORKERS
   starting unavailable`). `!idle` means "the worker is `working` but the pane is
   idle with no quiet lease" — an ATTENTION row, never a state change.
 
+### WORKERS grouping (task affinity)
+
+Workers are **flat peers**; tasks may form a **tree**. The WORKERS section is a
+*projection* of the flat worker set onto the authoritative task topology, so the
+two sections read together:
+
+```text
+WORKERS
+
+T149  CP-W3 control-exactness wave
+  program-coord    working  busy   T149  g1  w6D:p1   3s
+  control-rust     idle     idle   -     g2  w6E:p2   14m  →T150
+
+AVAILABLE / OTHER
+  corpus           idle     idle   -
+```
+
+Each worker gets exactly **one** derived `anchor task` (never stored):
+
+1. `worker.current_task_id` — **ownership is observed truth** and wins over any
+   role rule (including a task held via `--any-role`);
+2. otherwise the task it could claim now, via the **same** domain functions
+   `relay next` uses (`claimableRunnableTasks` / `reviewTasks`) — the dashboard
+   never reimplements role matching. Reviewers take the review queue first,
+   exactly as `claimNext` does;
+3. otherwise the worker goes to **AVAILABLE / OTHER**.
+
+The cluster is the child directly below the root ancestor (a root task clusters
+under itself), so a big program root does not swallow every worker into one
+block. Cluster order matches WORK preorder; within a cluster, the anchor's
+preorder position comes first, then current owners, then worker state, then id.
+
+Important properties, all covered by `tests/dashboard-affinity.test.ts`:
+
+- **no worker hierarchy is invented** — indentation means "relates to this task
+  cluster", never "reports to". `integration-coord` is a peer of `perf-rust`;
+- **no durable grouping exists** — no `parent_worker_id`, `coordinator_id`,
+  `worker_group_id` or `cluster_task_id` column is added; grouping is recomputed
+  every build and follows task reparent / claim / completion automatically;
+- **no name or role is special-cased** — a coordinator appears near the top only
+  because it currently *owns* a cluster-root/ancestor task;
+- a worker is **rendered exactly once**, never duplicated across clusters it
+  could claim from; unclaimable tasks attract nobody (they surface as ATTENTION);
+- affinity is **not ownership**: an idle peer keeps `-` in the task column and
+  may show a small `→T150` hint (wide layouts only).
+
 `--json` preserves the split (`workers[].state` vs `workers[].execution.state`,
-`workers[].runtime`).
+`workers[].runtime`) and adds the derived projection:
+
+```json
+{ "id": "control-rust", "state": "idle", "taskId": null,
+  "affinity": { "anchor_task_id": "T150", "cluster_task_id": "T149", "source": "claimable" } }
+```
+
+plus `worker_clusters` (`cluster_task_id` null = `AVAILABLE / OTHER`).
 
 ### ATTENTION
 
@@ -826,8 +879,8 @@ resize instead of caching the startup value (columns drop, then come back).
 src/cli.ts  daemon.ts  db.ts  schema.ts  scheduler.ts  reconciler.ts
     sessions.ts  socket.ts  messages.ts  tasks.ts  workers.ts  events.ts
     runtimes.ts  mail-policy.ts  runtime/{runtime,herdr}.ts
-    dashboard/{command,model,render,herdr,doctor}.ts
+    dashboard/{command,model,render,affinity,herdr,doctor}.ts
 .opencode/plugins/relay.ts  integrations/herdr/{herdr-plugin.toml,focus-pane.ts}
 skills/agent-worker/SKILL.md
-tests/{integration,contract,lifecycle,herdr,release,dashboard}.test.ts
+tests/{integration,contract,lifecycle,herdr,release,dashboard,dashboard-affinity}.test.ts
 ```

@@ -8,6 +8,7 @@ import { getNotes, listTasks, taskCounts, unclaimableRunnableTasks } from "../ta
 import { listWorkers, quietActive, type WorkerRow } from "../workers";
 import type { Task, WorkerRuntime } from "../schema";
 import { readPanes, relayWorkspaces, type PaneTelemetry } from "./herdr";
+import { buildAffinity, NO_AFFINITY, type WorkerAffinity, type WorkerCluster } from "./affinity";
 
 /**
  * Dashboard view model. Built ONLY from Relay domain functions + Herdr
@@ -59,6 +60,11 @@ export interface DashboardWorker {
   unread: number;
   runtime: DashboardRuntime; // current runtime (JSON keeps the split)
   oldRuntimes: DashboardOldRuntime[];
+  /**
+   * DERIVED task affinity used to group the WORKERS section. Not a stored
+   * relationship: recomputed each build, and never a worker hierarchy.
+   */
+  affinity: WorkerAffinity;
 }
 
 export interface DashboardAttention {
@@ -88,6 +94,12 @@ export interface DashboardView {
   taskForest: DashboardTaskNode[];
   tasksById: Record<string, DashboardTaskNode>;
   workers: DashboardWorker[];
+  /**
+   * WORKERS-section projection: flat peers grouped by derived task affinity.
+   * Clusters follow WORK preorder; the ungrouped bucket (`clusterTaskId: null`)
+   * is last. Display only — no durable grouping exists.
+   */
+  workerClusters: WorkerCluster[];
   attention: DashboardAttention[];
   git: DashboardGit;
 }
@@ -167,9 +179,22 @@ export function buildDashboardView(db: Database, opts: BuildOptions): DashboardV
         paneId: current?.pane_id ?? null,
       },
       oldRuntimes: old,
+      affinity: NO_AFFINITY, // overwritten below, once the forest is known
     };
   });
   workers.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+
+  // ---- worker -> task affinity (DERIVED; grouping projection only) ----------
+  // Built from the SAME forest the WORK section renders, so cluster order
+  // matches WORK preorder. Reuses `claimableRunnableTasks` / `reviewTasks`
+  // rather than reimplementing role matching, and writes nothing to the DB.
+  const workerState = new Map(workers.map((w) => [w.id, w.state]));
+  const affinity = buildAffinity(db, workers.map((w) => w.id), {
+    forest,
+    tasksById: byId,
+    stateOf: (id) => workerState.get(id) ?? "idle",
+  });
+  for (const w of workers) w.affinity = affinity.byWorker.get(w.id) ?? NO_AFFINITY;
 
   // ---- attention (derived only; never written to the DB) --------------------
   const attention = deriveAttention(db, workers, tasks, at);
@@ -188,6 +213,7 @@ export function buildDashboardView(db: Database, opts: BuildOptions): DashboardV
     taskForest: forest,
     tasksById: byId,
     workers,
+    workerClusters: affinity.clusters,
     attention,
     git: readGit(root),
   };

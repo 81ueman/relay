@@ -113,8 +113,8 @@ export function renderDashboard(view: DashboardView, opts: RenderOptions = {}): 
   lines.push("");
   lines.push(c("WORKERS", "bold"));
   if (!view.workers.length) lines.push(c("  (none)", "gray"));
-  for (const w of view.workers) renderWorker(lines, w, width, c, links);
-  if (links) lines.push(c("  Ctrl+click a pane id → focus that pane", "dim"));
+  else renderWorkers(lines, view, width, c, links);
+  if (links && view.workers.length) lines.push(c("  Ctrl+click a pane id → focus that pane", "dim"));
 
   lines.push("");
   lines.push(c("ATTENTION", "bold"));
@@ -195,7 +195,58 @@ function renderWork(lines: string[], forest: DashboardTaskNode[], width: number,
   emitGroup(forest, "", true);
 }
 
-function renderWorker(lines: string[], w: DashboardWorker, width: number, c: ColorFn, links: boolean): void {
+/**
+ * WORKERS are flat peers; the task tree is authoritative. Rows are projected onto
+ * the WORK topology: a cluster header names the task subtree, and the workers
+ * under it are SIBLINGS ("relates to this cluster"), never a hierarchy.
+ *
+ * Grouping is kept at every width — only the per-row tail degrades.
+ */
+function renderWorkers(
+  lines: string[],
+  view: DashboardView,
+  width: number,
+  c: ColorFn,
+  links: boolean
+): void {
+  const byId = new Map(view.workers.map((w) => [w.id, w]));
+  const clusters = view.workerClusters;
+
+  clusters.forEach((cluster, ci) => {
+    if (cluster.header) {
+      if (ci > 0) lines.push("");
+      lines.push(clusterHeader(cluster.header, width, c));
+    } else {
+      // Ungrouped bucket: no task affinity was derivable.
+      if (ci > 0) lines.push("");
+      lines.push(c("AVAILABLE / OTHER", "gray"));
+    }
+    for (const id of cluster.workerIds) {
+      const w = byId.get(id);
+      if (w) renderWorker(lines, w, width, c, links, cluster.header !== null);
+    }
+  });
+}
+
+/**
+ * Cluster header: `T149  CP-W3 control-exactness wave`. Deliberately carries no
+ * state/assignee/role — the WORK section already shows those; repeating them
+ * here would just be noise.
+ */
+function clusterHeader(header: { id: string; title: string }, width: number, c: ColorFn): string {
+  const id = header.id;
+  const title = trim(header.title, Math.max(0, width - dwidth(id) - 4));
+  return c(`${id}${title ? `  ${title}` : ""}`, "cyan");
+}
+
+function renderWorker(
+  lines: string[],
+  w: DashboardWorker,
+  width: number,
+  c: ColorFn,
+  links: boolean,
+  indented = true
+): void {
   const wide = width >= 56;
   const idW = wide ? 16 : Math.max(8, Math.min(16, width - 27));
   const stW = wide ? 13 : 8;
@@ -229,6 +280,11 @@ function renderWorker(lines: string[], w: DashboardWorker, width: number, c: Col
     const reason = `  "${trim(w.quietReason, 30)}"`;
     if (used + dwidth(reason) <= width) tail += reason;
   }
+  // Optional affinity hint for an idle peer: which task pulled it into this
+  // cluster. The task column stays `-` — affinity is not ownership.
+  if (indented && w.taskId == null && w.affinity.anchorTaskId && width >= 100) {
+    push(`  →${w.affinity.anchorTaskId}`, 3 + dwidth(w.affinity.anchorTaskId));
+  }
   lines.push(lead + tail);
 }
 
@@ -243,7 +299,23 @@ export function renderDashboardJson(view: DashboardView): string {
     git: view.git,
     tasks: view.taskForest,
     task_tree: view.taskForest,
-    workers: view.workers,
+    workers: view.workers.map((w) => ({
+      ...w,
+      // Derived affinity, in the snake_case shape the spec asks for. It is a
+      // projection of task topology, never a stored worker relationship.
+      affinity: {
+        anchor_task_id: w.affinity.anchorTaskId,
+        cluster_task_id: w.affinity.clusterTaskId,
+        source: w.affinity.source,
+      },
+    })),
+    // Same grouping the WORKERS section shows: clusters in WORK preorder, the
+    // ungrouped bucket last. `cluster_task_id: null` == AVAILABLE / OTHER.
+    worker_clusters: view.workerClusters.map((cl) => ({
+      cluster_task_id: cl.clusterTaskId,
+      title: cl.header?.title ?? null,
+      workers: cl.workerIds,
+    })),
     attention: view.attention,
   }, null, 2);
 }
