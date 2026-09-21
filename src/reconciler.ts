@@ -639,24 +639,39 @@ export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<
       if (requeued) actions.push(`requeued:${requeued}`);
       db.query(`UPDATE workers SET current_task_id = NULL, updated_at = ? WHERE id = ?`).run(at, w.id);
 
-      // Spawning a fresh generation is only safe when the OLD agent is gone.
-      // A "stalled" worker is alive by definition (the verdict needs a live
-      // process); spawning then leaves TWO agents on the same task, which is how
-      // a stall produced duplicate, competing agents. So: dead => replace;
-      // stalled-but-alive => interrupt and hand the task back, never duplicate.
-      const gone = fresh.state === "dead" ? true : !(await rt.isAlive(fresh).catch(() => false));
-      if (gone) {
+      const cur = findRuntime(db, w.id, fresh.generation) ?? getActiveRuntime(db, w.id);
+      const relayOwned = !!cur && cur.relay_owned === 1;
+      if (relayOwned) {
+        // Relay owns this generation: replace it with a fresh one as before.
         if (await restartWorker(db, rt, fresh, at)) {
           actions.push(fresh.state === "stalled" ? `stalled-restarted:${w.id}` : `restarted:${w.id}`);
         } else {
           actions.push(fresh.state === "stalled" ? `stalled:${w.id}` : `restart-skipped:${w.id}`);
         }
-      } else {
-        try { await rt.interrupt(fresh); } catch { /* best effort */ }
-        setWorkerState(db, w.id, "idle");
-        logEvent(db, { source: "supervisor", workerId: w.id, type: "worker.stall_released" });
-        actions.push(`stall-released:${w.id}`);
+        continue;
       }
+
+      // Adopted (relay_owned=0) runtime: relay can NEVER replace it, so restart
+      // is not an option. If the transport is actually alive the worker was
+      // misclassified — REVIVE it (set idle + NEXT_NUDGE). This is the only
+      // recovery for an externally-owned worker; without it a transient isAlive
+      // failure leaves it dead forever and it never receives a wake.
+      const alive = await rt.isAlive(fresh).catch(() => false);
+      if (alive) {
+        if (fresh.state === "stalled") {
+          try { await rt.interrupt(fresh); } catch { /* best effort */ }
+        }
+        setWorkerState(db, w.id, "idle");
+        logEvent(db, { source: "supervisor", workerId: w.id, type: "worker.revived", payload: { was: fresh.state } });
+        actions.push(`revived:${w.id}`);
+        if (claimableRunnableTasks(db, w.id).length > 0) {
+          const full = getWorker(db, w.id)!;
+          if (await tryWake(rt, db, full, NEXT_NUDGE, "revived", at)) actions.push(`woken:${w.id}`);
+        }
+        continue;
+      }
+      // Transport gone and relay cannot replace it: surface, leave to the operator.
+      actions.push(fresh.state === "stalled" ? `stalled:${w.id}` : `restart-skipped:${w.id}`);
       continue;
     }
 
