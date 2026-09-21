@@ -10,9 +10,10 @@ import { buildRuntime, HerdrRuntime } from "./runtime/herdr";
 import { supervisorView, isOperationalWorker } from "./scheduler";
 import { attachSession, detachSession, getSession, listSessions } from "./sessions";
 import { listRuntimes } from "./runtimes";
+import type { Task } from "./schema";
 import {
-  addTask, approveTask, blockTask, claimNext, claimTask, getNotes, getTask,
-  listTasks, rejectTask, releaseTask, submitTask, taskCounts, unblockTask,
+  addTask, approveTask, blockTask, claimNext, claimTask, claimableRunnableTasks, getNotes, getTask,
+  listTasks, rejectTask, releaseTask, runnableTasks, submitTask, taskCounts, unblockTask,
   unclaimableRunnableTasks, addNote, setTaskPlan, waitTask,
 } from "./tasks";
 import {
@@ -20,6 +21,7 @@ import {
   quietActive, registerWorker, retireWorker, setWorkerState, touchSeen, unretireWorker,
 } from "./workers";
 import { resolveWorkerIdentity } from "./identity";
+import { runDashboard } from "./dashboard/command";
 
 // A role is "known" if it matches a registered worker or a built-in special role.
 // Used for a non-fatal warning on `task add --role`, never a rejection.
@@ -70,6 +72,7 @@ Usage:
   relay inbox [--worker <id>] [--claim] [--ack <msg-id>]
 
   relay status
+  relay dashboard [--watch] [--show [--tab]] [--hide] [--doctor] [--json] [--runtime-history]
   relay events [--follow] [--limit N]
 
   # Debug entrypoint (the OpenCode plugin normally talks to the daemon socket)
@@ -154,7 +157,7 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
     ],
   },
   "task add": {
-    about: "Queue a new task. --parent nests it under T1; approving a child then tells the immediate parent (one-hop completion bubbling: a child_done note on the parent, children_done when all direct children are done, and a durable message to the parent's current assignee). A --role makes the task claimable only by a worker of that role by default; an unknown role warns (non-fatal). --plan <plan-id> records which agent-status plan.json item this task belongs to.",
+    about: "Queue a new task. --parent nests it under T1; approving a child then tells the immediate parent (one-hop completion bubbling: a child_done note on the parent, children_done when all direct children are done, and a durable message to the parent's current assignee). A --role makes the task claimable only by a worker of that role by default; an unknown role warns (non-fatal), and a role no registered worker has is surfaced as Unclaimable in `relay status`. --plan <plan-id> records which agent-status plan.json item this task belongs to.",
     usage: ['relay task add "description" [--title T] [--acceptance A] [--priority N] [--role R] [--parent T1] [--plan <plan-id>]'],
   },
   "task list": { about: "List tasks (id, state, priority, role, assignee, plan, title).", usage: ["relay task list [--state <state>]"] },
@@ -192,7 +195,18 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
   },
   send: { about: "Send a durable peer-to-peer message to another worker; the best-effort wake is delivered after the commit.", usage: ['relay send <worker-id> "message" [--task <tid>] [--kind <k>]'] },
   inbox: { about: "Read (and optionally claim/ack) the worker's own inbox.", usage: ["relay inbox [--worker <id>] [--claim] [--ack <msg-id>]"] },
-  status: { about: "Print workers, task counts, and the supervisor view.", usage: ["relay status"] },
+  status: { about: "Print workers, task counts, and the supervisor view (lightweight inspection).", usage: ["relay status"] },
+  dashboard: {
+    about: "Read-only human dashboard: Relay task tree + workers (current runtime overlaid) + attention, with Herdr pane links. Never mutates state; --show/--hide manage only its own UI pane.",
+    usage: [
+      "relay dashboard",
+      "relay dashboard --watch [--interval <ms>]",
+      "relay dashboard --show [--pane <id>] [--direction right|down] [--tab]",
+      "relay dashboard --hide",
+      "relay dashboard --doctor",
+      "relay dashboard --json [--runtime-history]",
+    ],
+  },
   events: { about: "Print recent events, or follow them (Ctrl-C to stop).", usage: ["relay events [--follow] [--limit N]"] },
   event: {
     about: "Debug entrypoint: record an event. session.idle/error drive the same state machine as the daemon.",
@@ -271,6 +285,20 @@ const TASK_CONTEXT_KINDS = new Set([
   "evidence",
 ]);
 
+/** Tasks in a given state, in the same order the scheduler would offer them. */
+function tasksInState(db: ReturnType<typeof openDb>, state: string): Task[] {
+  return db
+    .query(`SELECT * FROM tasks WHERE state = ? ORDER BY priority DESC, created_at ASC`)
+    .all(state) as Task[];
+}
+
+/** `T1,T2,+3 more` — cap a "next" list so a long queue stays one line. */
+function truncIds(rows: Task[], cap = 5): string {
+  const ids = rows.slice(0, cap).map((t) => t.id);
+  const extra = rows.length - ids.length;
+  return extra > 0 ? `${ids.join(",")},+${extra} more` : ids.join(",");
+}
+
 /**
  * Print the task's relevant notes when it is claimed, so a worker that takes
  * over a parent (or any task) does not miss a child completion or a prior
@@ -283,8 +311,7 @@ function printTaskContext(db: ReturnType<typeof openDb>, taskId: string): void {
   }
 }
 
-/** Parse "30s" / "2m" / "1h" (a bare number means seconds) into milliseconds. */
-function parseDuration(s: string): number {
+/** Parse "30s" / "2m" / "1h" (a bare number means seconds) into milliseconds. */function parseDuration(s: string): number {
   const m = /^(\d+)(s|m|h)?$/.exec(s.trim());
   if (!m) throw new Error(`invalid duration '${s}' (use e.g. 30s, 2m, 1h)`);
   const n = Number(m[1]);
@@ -322,6 +349,11 @@ async function main(): Promise<void> {
     const once = hasFlag(argv, "--once");
     const interval = flag(argv, "--interval") ? Number(flag(argv, "--interval")) : undefined;
     await runDaemon({ once, intervalMs: interval });
+    return;
+  }
+
+  if (cmd === "dashboard") {
+    process.exitCode = await runDashboard(argv.slice(1));
     return;
   }
 
@@ -696,6 +728,40 @@ async function main(): Promise<void> {
         const workers = listWorkers(db);
         const counts = taskCounts(db);
         const view = supervisorView(db);
+        // Presentation only: annotate each worker with what it would pick up next.
+        // Same policy `relay next` uses — strictly role-matched queued tasks
+        // (review tasks for a reviewer), from the same ordered runnable list, so
+        // the two never disagree. No scheduling behaviour changes.
+        const claimable = new Map<string, Task[]>();
+        const reviews = tasksInState(db, "review");
+        for (const w of workers) {
+          const rows = w.role === "reviewer" ? reviews : claimableRunnableTasks(db, w.id);
+          // Never list the task the worker is already holding: it is not "next",
+          // and calling it actionable would be wrong. (Seen on a reviewer that
+          // took T136 into review and then saw "next: T136".)
+          claimable.set(w.id, rows.filter((x) => x.id !== w.current_task_id));
+        }
+        // One "next" list may be shared by several workers of the same role
+        // (e.g. two reviewers): those queued tasks are not waiting on any single
+        // one of them, so say so instead of implying a specific worker is the
+        // blocker. Same for a free worker and a busy one of the same role.
+        const sharers = new Map<string, number>();
+        for (const w of workers) {
+          const ids = claimable.get(w.id)!.map((x) => x.id).join(",");
+          if (!ids) continue;
+          sharers.set(ids, (sharers.get(ids) ?? 0) + 1);
+        }
+        const nextLabel = (w: typeof workers[number]): string => {
+          const rows = claimable.get(w.id)!;
+          const ids = rows.map((x) => x.id).join(",");
+          if (ids && (sharers.get(ids) ?? 0) > 1) return `next: ${ids} (queued, role match; any ${w.role})`;
+          if (w.state === "working") return rows.length ? `next: ${truncIds(rows)} (queued, role match)` : "next: (none)";
+          // idle / stalled / starting / waiting_input: this is the actionable line
+          // the supervisor acts on — a free worker with role-matched work.
+          return rows.length
+            ? `next: ${truncIds(rows)} (runnable, role match — wake me)`
+            : "next: (none)";
+        };
         console.log("Workers");
         console.log("-------");
         if (workers.length === 0) console.log("(none)");
@@ -704,7 +770,7 @@ async function main(): Promise<void> {
           const quiet = quietActive(w, t)
             ? `  quiet ${fmtAge((w.quiet_until ?? t) - t)}${w.quiet_reason ? `  ${w.quiet_reason}` : ""}`
             : "";
-          console.log(`${w.id}  ${w.state}  ${w.current_task_id ?? "-"}  last progress ${prog}${quiet}`);
+          console.log(`${w.id}  ${w.state}  ${w.current_task_id ?? "-"}  last progress ${prog}${quiet}  ${nextLabel(w)}`);
         }
         console.log("");
         console.log("Tasks");

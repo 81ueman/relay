@@ -44,6 +44,7 @@ import {
 } from "./tasks";
 import { getWorker, listWorkers, setWorkerState, touchSeen, clearQuiet, quietActive, type WorkerRow } from "./workers";
 import { RELAY_TAG } from "./messages";
+import { immediateKindSql, mailNudgeMs } from "./mail-policy";
 
 // Deterministic reconciler. No LLM: pure DB state + runtime transport.
 // Callers pass full Worker rows; only the Runtime adapter maps to targets.
@@ -75,11 +76,6 @@ function wakeCooldownMs(): number {
  * How long an undelivered message waits before its recipient is nudged, and how
  * often the nudge repeats. Long enough to let the send-time wake land first.
  */
-function mailNudgeMs(): number {
-  const v = Number(process.env.RELAY_MAIL_NUDGE_MS ?? "180000");
-  return Number.isFinite(v) && v > 0 ? v : 180000;
-}
-
 /** How long a fresh generation may wait for managed attach before we give up. */
 function attachTimeoutMs(): number {
   const v = Number(process.env.RELAY_ATTACH_TIMEOUT_MS ?? "30000");
@@ -544,7 +540,7 @@ async function nudgeUnreadMail(
   const rows = db
     .query(
       `SELECT recipient, COUNT(*) AS n, MIN(created_at) AS oldest,
-              SUM(CASE WHEN kind IN ('child_done','children_done','child_blocked','children_blocked') THEN 1 ELSE 0 END) AS immediate
+              SUM(CASE WHEN kind IN (${immediateKindSql()}) THEN 1 ELSE 0 END) AS immediate
          FROM messages WHERE state = 'queued'
         GROUP BY recipient`
     )

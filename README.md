@@ -73,6 +73,22 @@ role = R (non-null)     -> claimable ONLY by a worker registered with role R
   registered worker role); the supervisor view carries the same count and the
   daemon logs `supervisor.unclaimable_work` instead of looping on a wake that
   cannot help.
+- `relay status` also annotates every worker with `next:` — the tasks it would
+  pick up right now, computed with the **same** policy `relay next` uses (not a
+  second scheduler):
+
+  ```text
+  perf-research  working  T147  last progress 2m  next: T144,T145 (queued, role match)
+  reviewer       idle     -     last progress -   next: T12 (runnable, role match — wake me)
+  ```
+
+  A busy worker's `next:` is the queue waiting behind it; an **idle** worker with
+  role-matched work is marked `wake me` (the actionable supervisor line). A
+  `reviewer` lists `review` tasks instead of `queued` ones, and a worker never
+  lists the task it already holds. When several workers of one role share the same
+  queue the line says `any <role>` rather than blaming one worker. The list is
+  capped (`T1,T2,+3 more`), and a role no live worker has stays under
+  **Unclaimable** rather than being promised to anyone.
 
 **Migration (strict roles):** every existing worker must be registered with the
 role it is meant to serve, e.g.
@@ -159,6 +175,70 @@ performed.
 Within this single-supervisor boundary, generation allocation stays simple and
 process-local (`restartingWorkers` in-flight guard + a commit-time generation
 re-check). Tests inject `MockRuntime` + `bypassSingleton` to bypass the guard.
+
+## `relay dashboard` (read-only)
+
+`relay status` stays a lightweight, greppable one-shot. `relay dashboard` is the
+human view: the **task tree**, the **workers** with each one's *current* runtime
+overlaid, and **ATTENTION** — all rendered from the Relay domain functions, never
+by re-reading the SQLite schema.
+
+```bash
+relay dashboard                     # one render to the current terminal
+relay dashboard --watch             # redraw in a loop (Ctrl-C to stop)
+relay dashboard --show              # open/reuse a Herdr pane next to this one
+relay dashboard --show --tab        # ...in its own tab
+relay dashboard --hide              # close the tracked dashboard pane
+relay dashboard --doctor            # source check (db / socket / herdr / counts)
+relay dashboard --json              # machine-readable view
+relay dashboard --runtime-history   # include old runtime generations
+```
+
+It is **read-only**: it never creates tasks, mutates workers, sends messages or
+starts/stops runtimes. The one pane it manages is its own UI pane (tracked in
+`.relay/dashboard.pane`), and that pane is not a worker.
+
+Worker and Runtime stay distinct. A worker row is:
+
+```text
+WORKERS
+  dp-1   running   busy    T140   g3   w52:p8K   6m
+         ^Relay    ^Herdr  ^task  ^generation  ^pane  ^progress age
+```
+
+- the **Relay state** (`idle working waiting_input stalled dead`) is control
+  plane;
+- the **execution** column is Herdr telemetry only (`busy idle quiet !idle
+  starting unavailable`). `!idle` means "the worker is `working` but the pane is
+  idle with no quiet lease" — an ATTENTION row, never a state change.
+
+`--json` preserves the split (`workers[].state` vs `workers[].execution.state`,
+`workers[].runtime`).
+
+### ATTENTION
+
+```text
+ATTENTION
+  ! program-coord   unread messages=1 (next nudge in 42s)
+```
+
+The unread countdown is computed by the **same** policy the supervisor uses
+(`src/mail-policy.ts`: `mailNudgeMs`, `IMMEDIATE_MAIL_KINDS`, `nextMailNudgeIn`),
+so the dashboard and the daemon cannot drift. `(nudge now)` means an immediate
+notice (`child_done` / `child_blocked` / …) is queued and will be delivered on the
+next tick.
+
+### Ctrl+click a pane
+
+Pane ids are OSC8 links (`https://relay.local/pane/<pane_id>`). With the bundled
+Herdr plugin installed, a Control+click focuses that pane:
+
+```bash
+herdr plugin link "$(pwd)/integrations/herdr"   # relay.pane-links
+```
+
+See `integrations/herdr/README.md`. The handler is `relay dashboard --focus`
+(thin shim, no Python).
 
 ## Install
 
@@ -673,7 +753,7 @@ Message: queued delivered acked (+ failed)
 ## Tests
 
 ```bash
-bun test            # 133 tests across integration / contract / lifecycle / herdr / release
+bun test            # integration / contract / lifecycle / herdr / release / dashboard
 bun run typecheck   # tsc --noEmit
 ```
 
@@ -703,12 +783,25 @@ generation · the current generation is never cleaned · missing Herdr fails
 daemon startup (no mock fallback) · relay-generation attach requires a matching
 relay-owned runtime row + token · old session/generation events are fenced out.
 
+Dashboard (read-only): the task forest follows `parent_task_id` with active
+children before done · a fully-done subtree is one collapsed `allDone` node · a
+worker joins its **current** runtime by generation (old generations are history,
+never the row) · execution telemetry is a separate column from Relay state ·
+`working + runtime idle + no quiet lease` renders `!idle` and an ATTENTION row ·
+an active quiet lease renders `quiet` and suppresses it · retired workers are
+hidden · no runtime pane → `unavailable` + ATTENTION · unread ATTENTION carries
+the `relay wait`-policy next-nudge countdown · narrow widths never overflow (CJK
+counts 2) · `--json` preserves the worker/runtime split · `relay dashboard
+--json` / `--doctor` run end to end.
+
 ## Layout
 
 ```text
 src/cli.ts  daemon.ts  db.ts  schema.ts  scheduler.ts  reconciler.ts
     sessions.ts  socket.ts  messages.ts  tasks.ts  workers.ts  events.ts
-    runtimes.ts  runtime/{runtime,herdr}.ts
-.opencode/plugins/relay.ts  skills/agent-worker/SKILL.md
-tests/{integration,contract,lifecycle,herdr,release}.test.ts
+    runtimes.ts  mail-policy.ts  runtime/{runtime,herdr}.ts
+    dashboard/{command,model,render,herdr,doctor}.ts
+.opencode/plugins/relay.ts  integrations/herdr/{herdr-plugin.toml,focus-pane.ts}
+skills/agent-worker/SKILL.md
+tests/{integration,contract,lifecycle,herdr,release,dashboard}.test.ts
 ```

@@ -1,0 +1,24 @@
+id = "relay.pane-links"
+name = "relay pane links"
+version = "0.1.0"
+min_herdr_version = "0.8.2"
+description = "Ctrl+click a pane id in the relay dashboard to focus that Herdr pane"
+platforms = ["linux", "macos"]
+
+# Only invoked by the link handler below; `contexts` lists where the action may
+# also be picked from a menu. It is not required, so keep it to the pane menu.
+[[actions]]
+id = "focus-pane"
+title = "Focus Herdr pane"
+contexts = ["pane"]
+command = ["bun", "focus-pane.ts"]
+
+# `relay dashboard` renders pane ids as OSC8 links
+# `https://relay.local/pane/<pane_id>`. A Control+click (Control on every
+# platform) on one of them reaches this handler instead of opening the URL in a
+# browser.
+[[link_handlers]]
+id = "pane"
+title = "Focus Herdr pane"
+pattern = "^https://relay\\.local/pane/"
+action = "focus-pane"
