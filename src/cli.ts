@@ -672,7 +672,27 @@ async function main(): Promise<void> {
       case "send": {
         const recipient = argv[1];
         const payload = argv[2];
-        if (!recipient || !payload) throw new Error('usage: relay send <worker-id> "message"');
+        if (!recipient) throw new Error('usage: relay send <worker-id> "message" [--task <tid>] [--kind <k>]');
+        if (recipient.startsWith("-")) {
+          throw new Error(
+            `usage: relay send <worker-id> "message" [--task <tid>] [--kind <k>]\n` +
+            `  expected the RECIPIENT first, got the flag "${recipient}" (options come after the message)`
+          );
+        }
+        // A missing/empty body must never become a durable row. Quoting is the
+        // usual culprit: `relay send w --worker w "hi"` puts "--worker" in the
+        // body position and silently drops the real message, so a flag-like body
+        // is refused instead of being mailed.
+        if (!payload || payload.trim() === "") {
+          throw new Error('relay send: refusing to send an empty message (usage: relay send <worker-id> "message")');
+        }
+        if (payload.startsWith("-")) {
+          throw new Error(
+            `relay send: refusing to send the flag-like body "${payload}" — the message is the SECOND argument, ` +
+            `after the recipient (usage: relay send <worker-id> "message" [--task <tid>] [--kind <k>]). ` +
+            `If you meant an option, move it after the message.`
+          );
+        }
         const sender = process.env.RELAY_WORKER ?? "cli";
         const id = sendMessage(db, sender, recipient, payload, {
           taskId: flag(argv, "--task") ?? undefined,
