@@ -60,7 +60,7 @@ function idleWorker(id: string, role = "worker", extra: Record<string, unknown> 
 }
 
 describe("A. idle workers + queued task", () => {
-  test("w1 idle, w2 idle, T1 queued => one worker receives NEXT_NUDGE", async () => {
+  test("w1 idle, w2 idle, T1 queued => every eligible worker receives NEXT_NUDGE", async () => {
     idleWorker("w1");
     idleWorker("w2");
     addTask(db, { title: "T1" });
@@ -70,11 +70,13 @@ describe("A. idle workers + queued task", () => {
     const { view, actions } = await reconcile(db, rt);
     expect(view.working).toBe(0);
     expect(actions.some((a) => a.startsWith("woken:"))).toBe(true);
-    expect(rt.wakes.length).toBe(1);
+    // Both are idle and both can claim the (role-less) queued work, so both are
+    // nudged. Waking only one leaves the other's share of the queue untouched.
+    expect([...rt.wakes.map((w) => w.workerId)].sort()).toEqual(["w1", "w2"]);
     expect(rt.wakes[0].text).toMatch(/relay next/);
     // DB unchanged by the wake itself: task still queued, worker still idle.
     expect(getTask(db, "T1")!.state).toBe("queued");
-    expect(getWorker(db, rt.wakes[0].workerId)!.state).toBe("idle");
+    for (const w of rt.wakes) expect(getWorker(db, w.workerId)!.state).toBe("idle");
   });
 
   test("wake cooldown suppresses repeat wakes to the same worker", async () => {

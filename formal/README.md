@@ -45,9 +45,13 @@ for why a multi-daemon race is deliberately *not* a TLA+ mutation.
 Relay's core promise (from the top-level `README.md`) is a loop invariant:
 
 ```text
-if runnable_tasks > 0 and working_workers == 0:
+if runnable_tasks > 0:
     wake_or_start_some_worker()
 ```
+
+Note there is deliberately no `working_workers == 0` conjunct: in a parallel
+fleet someone is usually busy, and that says nothing about whether the queued
+work has a taker. `Wake(w)` in `Relay.tla` gates only on `RunnableExists`.
 
 The interesting failures are **ordering and recovery** failures across many
 components at once:

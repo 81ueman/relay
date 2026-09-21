@@ -751,7 +751,10 @@ export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<
     }
   }
 
-  // 4. Core invariant: runnable work + zero working workers => wake or start someone.
+  // 4. Runnable work exists => make sure every idle worker that could take some
+  //    is nudged. The old gate required `working === 0`; with a parallel fleet
+  //    that is false almost always, so idle role-matched workers were skipped and
+  //    their queued work sat until a human ran `relay next` (see needsWorkerWakeup).
   const view = supervisorView(db);
 
   if (needsWorkerWakeup(view)) {
@@ -761,15 +764,20 @@ export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<
     const idle = idleWorkers(db)
       .filter((c) => claimableRunnableTasks(db, c.id).length > 0)
       .sort((a, b) => a.id.localeCompare(b.id));
+    // Wake EVERY eligible candidate, not just the first: two idle workers of the
+    // same role each own a different queued task, and waking only one leaves the
+    // other's work stalled. `tryWake` is the storm guard (per-worker wake
+    // cooldown), so this stays one wake per worker, not one wake per tick.
     let woken = false;
-    for (const c of idle) {
-      const full = getWorker(db, c.id)!;
-      if (await tryWake(rt, db, full, NEXT_NUDGE, "no-working-worker", at)) {
-        actions.push(`woken:${c.id}`);
-        woken = true;
-        break; // one wake per pass; the loop repeats, with cooldown rotation.
-      }
-    }
+    await Promise.all(
+      idle.map(async (c) => {
+        const full = getWorker(db, c.id)!;
+        if (await tryWake(rt, db, full, NEXT_NUDGE, "no-working-worker", at)) {
+          actions.push(`woken:${c.id}`);
+          woken = true;
+        }
+      })
+    );
     if (!woken) {
       // No idle worker can take it. Recover a fallen one that could, or wait for
       // a fresh generation to finish attaching.

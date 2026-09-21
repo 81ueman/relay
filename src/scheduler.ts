@@ -154,9 +154,25 @@ export function supervisorView(db: Database): SupervisorView {
   };
 }
 
-/** Core invariant: runnable work with zero working workers => wake or start someone. */
+/**
+ * Core invariant: runnable work exists => look for someone who can take it.
+ *
+ * This deliberately does NOT require `working === 0`. That older condition is
+ * false as soon as ANY worker is busy, which is the normal state of a parallel
+ * fleet: with six workers busy and a fresh role-gated child queued, an idle
+ * role-matched worker would never be nudged and the child would sit until a
+ * human ran `relay next`. Whether the fleet has zero or many working workers
+ * says nothing about whether the *queued* work has a taker.
+ *
+ * The caller pairs this with a per-worker check
+ * (`claimableRunnableTasks(candidate)`), so "runnable exists" here only means
+ * "worth evaluating the candidates" — never "wake anybody".
+ *
+ * Rate limiting stays in `tryWake` (its per-worker wake cooldown), so relaxing
+ * this gate cannot turn into a nudge storm.
+ */
 export function needsWorkerWakeup(v: SupervisorView): boolean {
-  return v.runnable > 0 && v.working === 0;
+  return v.runnable > 0;
 }
 
 export function needsPlanner(v: SupervisorView, plannerCount = 1): boolean {

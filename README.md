@@ -31,12 +31,25 @@ Failure philosophy: `process alive ≠ progressing`, `session idle ≠ done`,
 ## Core invariant
 
 ```text
-if runnable_tasks > 0 and working_workers == 0:
-    wake_or_start_some_worker()
+if runnable_tasks > 0:
+    wake every idle operational worker that could claim some of it
 ```
 
 `working` means strictly `state == working AND current_task != null`.
 **Idle is not productive.** Reviewers/planners are counted separately.
+
+The gate is **not** `working == 0`. A parallel fleet almost always has someone
+busy, and whether anyone else is working says nothing about whether the *queued*
+work has a taker: with six workers busy and a fresh role-gated child queued, an
+idle role-matched worker must still be nudged. Requiring `working == 0` was the
+runnable-stall bug — the child sat until a human ran `relay next --worker <id>`.
+This matches `Wake(w)` in `formal/Relay.tla`, which requires only
+`RunnableExists`.
+
+Rate limiting lives in `tryWake` (per-worker wake cooldown, default 30s via
+`RELAY_WAKE_COOLDOWN_MS`), so waking every eligible candidate cannot become a
+nudge storm; a task left unclaimed is re-woken on a later pass rather than
+being treated as consumed.
 
 `WAITING_FOR_HUMAN` only when `runnable == 0 AND review == 0 AND all
 unfinished tasks are blocked_human`. A `blocked_human` task releases its
@@ -641,6 +654,13 @@ relay send worker-2 "T1 is ready for review" --task T1
 RELAY_WORKER=worker-2 relay inbox --claim   # bulk (compat)
 RELAY_WORKER=worker-2 relay inbox --ack 7   # per-ID ack
 ```
+
+The **message is the second argument**, after the recipient; options come last.
+`relay send` refuses an empty body and a body that starts with `-`, because
+`relay send <worker> --worker <id> "..."` puts the flag in the body position and
+would otherwise persist a durable message whose payload is the literal string
+`--worker` while the real text is dropped (and the recipient gets woken for an
+empty message). Both cases exit non-zero and write no row.
 
 The wake target is resolved against live Herdr state — the worker's recorded
 runtime, its id, or the sanitized agent name (`u2-corpus` → `u2_corpus`) — so a

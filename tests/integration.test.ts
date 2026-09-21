@@ -252,10 +252,10 @@ describe("failure test 6: no productive worker", () => {
     worker("w2"); // idle
     addTask(db, { title: "waiting" });
     const { view, actions } = await reconcile(db, rt);
-    // Idle does not count: the invariant fires and someone gets NEXT_NUDGE.
+    // Idle does not count: the invariant fires and the idle workers get NEXT_NUDGE.
     expect(view.working).toBe(0);
     expect(actions.some((a) => a.startsWith("woken:"))).toBe(true);
-    expect(rt.wakes.length).toBe(1);
+    expect([...rt.wakes.map((w) => w.workerId)].sort()).toEqual(["w1", "w2"]);
     expect(rt.wakes[0].text).toMatch(/relay next/);
   });
 });
