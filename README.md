@@ -198,6 +198,11 @@ It is **read-only**: it never creates tasks, mutates workers, sends messages or
 starts/stops runtimes. The one pane it manages is its own UI pane (tracked in
 `.relay/dashboard.pane`), and that pane is not a worker.
 
+`--watch` follows the pane as it is resized: width is re-read on every redraw
+(and a `resize` event triggers an immediate redraw, rather than waiting for the
+next tick), so dragging the pane drops `progress -> generation -> pane` in that
+order and never overflows. Full-width (CJK) characters count as two columns.
+
 Worker and Runtime stay distinct. A worker row is:
 
 ```text
@@ -792,7 +797,8 @@ an active quiet lease renders `quiet` and suppresses it · retired workers are
 hidden · no runtime pane → `unavailable` + ATTENTION · unread ATTENTION carries
 the `relay wait`-policy next-nudge countdown · narrow widths never overflow (CJK
 counts 2) · `--json` preserves the worker/runtime split · `relay dashboard
---json` / `--doctor` run end to end.
+--json` / `--doctor` run end to end · `--watch` re-reads the terminal width on
+resize instead of caching the startup value (columns drop, then come back).
 
 ## Layout
 

@@ -33,6 +33,20 @@ function hasFlag(args: string[], name: string): boolean {
   return args.includes(name);
 }
 
+/**
+ * Current terminal width, re-read every time. `process.stdout.columns` is
+ * resolved once by the runtime and then cached, so a resized pane keeps the
+ * width it started with; callers that redraw must call this again (the
+ * `resize` event is the trigger, this is the value).
+ */
+export function terminalWidth(fallback = 120): number {
+  const cols = (process.stdout as NodeJS.WriteStream).columns;
+  if (typeof cols === "number" && cols > 0) return cols;
+  const env = Number(process.env.COLUMNS);
+  if (Number.isFinite(env) && env > 0) return env;
+  return fallback;
+}
+
 export async function runDashboard(args: string[]): Promise<number> {
   // OSC8 link handler: Herdr passes the clicked URL in the environment. No DB.
   if (hasFlag(args, "--focus")) {
@@ -108,26 +122,37 @@ export async function runDashboard(args: string[]): Promise<number> {
   try {
     const excludePane = trackedPane(root);
     const color = process.stdout.isTTY || process.env.FORCE_COLOR === "1";
-    const width = process.stdout.columns || Number(process.env.COLUMNS) || 120;
     const json = hasFlag(args, "--json");
     const history = hasFlag(args, "--runtime-history");
     const build = () => buildDashboardView(db, { root, excludePane });
 
     if (hasFlag(args, "--watch")) {
       const interval = Number(flag(args, "--interval") ?? process.env.RELAY_DASHBOARD_INTERVAL_MS ?? 2000);
-      for (;;) {
+      // Width is re-read, not cached: `process.stdout.columns` is resolved once,
+      // so a resized pane would otherwise keep the width from startup forever.
+      let width = terminalWidth();
+      const stdout = process.stdout as NodeJS.WriteStream;
+      const draw = () => {
+        width = terminalWidth() ?? width;
         const view = build();
-        process.stdout.write("\x1b[2J\x1b[H");
-        process.stdout.write(
+        stdout.write("\x1b[2J\x1b[H");
+        stdout.write(
           (json ? renderDashboardJson(view) : renderDashboard(view, { color, links: color, width, runtimeHistory: history })) + "\n"
         );
+      };
+      // Redraw on resize instead of waiting for the next tick, so the layout
+      // follows the pane as it is dragged. `resize` only fires on a TTY.
+      stdout.on("resize", draw);
+      draw();
+      for (;;) {
         await new Promise((r) => setTimeout(r, Math.max(250, interval)));
+        draw();
       }
     }
 
     const view = build();
     if (json) console.log(renderDashboardJson(view));
-    else console.log(renderDashboard(view, { color, links: color, width, runtimeHistory: history }));
+    else console.log(renderDashboard(view, { color, links: color, width: terminalWidth() ?? 120, runtimeHistory: history }));
     return 0;
   } finally {
     db.close();

@@ -1,0 +1,119 @@
+import { describe, expect, test, beforeEach, afterEach } from "bun:test";
+import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { Database } from "bun:sqlite";
+import { openDb } from "../src/db";
+import { renderDashboard } from "../src/dashboard/render";
+import { buildDashboardView } from "../src/dashboard/model";
+import { dwidth } from "../src/dashboard/render";
+import { terminalWidth } from "../src/dashboard/command";
+import type { PaneTelemetry } from "../src/dashboard/herdr";
+import { recordRuntime } from "../src/runtimes";
+import { addTask, claimTask } from "../src/tasks";
+import { registerWorker } from "../src/workers";
+
+// A `relay dashboard --watch` pane must follow the pane as it is dragged.
+// `process.stdout.columns` is resolved once and then cached by the runtime, so
+// the loop has to re-read it on `resize` instead of trusting the startup value.
+// Width is the ONLY input: the renderer already degrades columns by width, so
+// these tests check that a resize actually changes what is drawn.
+
+let dir = "";
+let db: Database;
+const at = 1_700_000_000_000;
+
+beforeEach(() => {
+  dir = mkdtempSync(join(tmpdir(), "relay-resize-"));
+  mkdirSync(join(dir, ".relay"), { recursive: true });
+  db = openDb(join(dir, ".relay", "state.db"));
+});
+
+afterEach(() => {
+  db.close();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+const pane = (paneId: string, status = "working"): PaneTelemetry =>
+  ({ paneId, agent: "opencode", agentStatus: status, title: "", cwd: dir,
+     workspaceId: "w1", tabId: "t1", focused: false });
+
+function view() {
+  registerWorker(db, "perf-research", { role: "perf-research" });
+  const t = addTask(db, { title: "a rather long task title for the work tree", role: "perf-research" });
+  claimTask(db, t.id, "perf-research");
+  recordRuntime(db, { workerId: "perf-research", generation: 1, runtimeId: "x", paneId: "w52:p8K", state: "active", relayOwned: 0 });
+  db.query(`UPDATE workers SET generation=1 WHERE id='perf-research'`).run();
+  return buildDashboardView(db, { root: dir, panes: new Map([["w52:p8K", pane("w52:p8K")]]), at });
+}
+
+describe("dashboard resize", () => {
+  test("a narrower width drops columns instead of overflowing", () => {
+    const v = view();
+    const wide = renderDashboard(v, { color: false, width: 120 });
+    const narrow = renderDashboard(v, { color: false, width: 44 });
+
+    // Both are valid renders at their own width.
+    for (const line of narrow.split("\n")) expect(dwidth(line)).toBeLessThanOrEqual(44);
+    for (const line of wide.split("\n")) expect(dwidth(line)).toBeLessThanOrEqual(120);
+
+    // The narrow render is genuinely different: the long title is trimmed and
+    // the worker row lost its trailing columns.
+    const wideWorker = wide.split("\n").find((l) => l.startsWith("  perf-research"))!;
+    const narrowWorker = narrow.split("\n").find((l) => l.startsWith("  perf-research"))!;
+    expect(dwidth(narrowWorker)).toBeLessThan(dwidth(wideWorker));
+    expect(wide).not.toBe(narrow);
+  });
+
+  test("growing back restores the dropped columns (no stale narrow layout)", () => {
+    const v = view();
+    const narrowFirst = renderDashboard(v, { color: false, width: 44 });
+    const backWide = renderDashboard(v, { color: false, width: 120 });
+    // Rendering is a pure function of (view, width): the second call is not
+    // stuck at the previous narrow width.
+    expect(dwidth(backWide.split("\n").find((l) => l.includes("WORKERS"))!))
+      .toBeLessThanOrEqual(120);
+    const wideWorker = backWide.split("\n").find((l) => l.startsWith("  perf-research"))!;
+    const narrowWorker = narrowFirst.split("\n").find((l) => l.startsWith("  perf-research"))!;
+    expect(dwidth(wideWorker)).toBeGreaterThan(dwidth(narrowWorker));
+  });
+
+  test("terminalWidth re-reads each call instead of caching the startup value", () => {
+    // Simulate the runtime's cached property: a fixed `columns`, then a resize.
+    const stdout = process.stdout as NodeJS.WriteStream & { columns?: number };
+    const saved = stdout.columns;
+    const savedEnv = process.env.COLUMNS;
+    try {
+      delete process.env.COLUMNS;
+      stdout.columns = 120;
+      const first = terminalWidth();
+      stdout.columns = 60; // what a ResizeObserver-backed property update looks like
+      const second = terminalWidth();
+      expect(first).toBe(120);
+      expect(second).toBe(60);
+      expect(second).not.toBe(first);
+    } finally {
+      if (saved === undefined) delete (stdout as { columns?: number }).columns;
+      else stdout.columns = saved;
+      if (savedEnv === undefined) delete process.env.COLUMNS;
+      else process.env.COLUMNS = savedEnv;
+    }
+  });
+
+  test("COLUMNS is the fallback when there is no TTY width", () => {
+    const stdout = process.stdout as NodeJS.WriteStream & { columns?: number };
+    const saved = stdout.columns;
+    const savedEnv = process.env.COLUMNS;
+    try {
+      delete (stdout as { columns?: number }).columns;
+      process.env.COLUMNS = "77";
+      expect(terminalWidth()).toBe(77);
+      delete process.env.COLUMNS;
+      expect(terminalWidth()).toBe(120); // documented default
+    } finally {
+      if (saved !== undefined) stdout.columns = saved;
+      if (savedEnv !== undefined) process.env.COLUMNS = savedEnv;
+    }
+  });
+});
+
