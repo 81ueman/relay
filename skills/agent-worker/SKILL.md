@@ -29,8 +29,8 @@ Never wait for instructions or for another agent to finish. If your task is gone
 - Start work with `relay next`. Never start a task you have not claimed.
 - **Roles are strict by default**: `relay next` only offers tasks whose `role`
   is null or matches your registered role. `NO_TASK` means no *eligible* work,
-  not no work — do not reach for another worker's role-tagged task. (Operators
-  use `--any-role` / `RELAY_ROLE_STRICT=false` only for recovery.)
+  not no work — do not reach for another worker's role-tagged task. (Use
+  `--any-role` / `RELAY_ROLE_STRICT=false` only for recovery.)
 - Record real progress with `relay note <id> "..."` (strongest progress signal; also renews your lease).
 - Finish with `relay submit <id> --evidence "..."` — this moves the task to `review`, not `done`.
 - Claimed the wrong task? Hand it back cleanly with `relay release <id>` (no fake block/reject note), then `relay next`.
@@ -38,8 +38,28 @@ Never wait for instructions or for another agent to finish. If your task is gone
 - Human truly required: `relay block <id> --human "<reason>"` — then immediately `relay next`, never park yourself.
 - After every `submit`/`block`/`release`, immediately run `relay next`. No exceptions.
 - Never busy-wait on another agent. Send a durable message instead: `relay send <worker-id> "..."`.
+  Workers are peers; there is no `human`/operator alias — address a real worker id.
 - Check `relay inbox --claim` when woken for messages.
 - Terminal/pane idle is NOT task done. Task DB is the source of truth.
+
+## Task hierarchy (optional — work decomposition, not authority)
+
+A task may have a parent: `relay task add "..." --parent T12`. This expresses
+work decomposition only. You are a **peer** of every other worker; the same
+worker may own a parent and its children, and a parent's assignee can change.
+
+- When a child task is approved, its IMMEDIATE parent gets a durable
+  `child_done` note; when ALL direct children are done, `children_done` too.
+- If the parent has a **current assignee**, that worker also gets a durable
+  message (`child_done`/`children_done`) — read it with `relay inbox --claim`.
+  If the parent is unassigned, only the note is recorded.
+- **Parents are never auto-completed.** `children_done` is a signal; if you own
+  a parent, integrate/verify the children and `relay submit` it yourself.
+- Bubbling is **one hop only**: a parent rolls up further only once IT is
+  approved. A grandchild never messages the grandparent directly.
+- When you claim a task, relay prints its context notes (`child_done`,
+  `children_done`, `blocked_*`, `reject`, `evidence`) after the usual output —
+  read them before starting, especially when you pick up a parent task.
 
 ## Commands
 
@@ -54,6 +74,7 @@ relay block T12 "flaky dep, retry after T11"
 relay block T12 --human "need prod DB credentials"
 relay send worker-2 "T12 ready for review" --task T12
 relay inbox --claim
+relay task add "child work" --parent T12    # optional: decompose T12; child_done bubbles back to T12
 relay status
 ```
 
