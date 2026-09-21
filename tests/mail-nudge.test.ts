@@ -4,19 +4,19 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Database } from "bun:sqlite";
 import { openDb } from "../src/db";
-import { listEvents } from "../src/events";
-import { HUMAN_RECIPIENT, sendMessage } from "../src/messages";
+import { sendMessage } from "../src/messages";
 import { reconcile } from "../src/reconciler";
 import { MockRuntime } from "../src/runtime/runtime";
+import { addTask, approveTask, claimTask, submitTask } from "../src/tasks";
 import { registerWorker } from "../src/workers";
 
-// The send-time wake cannot reach `human` (no such agent) and can be missed by
-// any recipient, so the daemon must nudge on a durable unread backlog.
+// The send-time wake is best-effort, so the daemon nudges any durable unread
+// backlog. Ordinary peer mail keeps the send-time/retry semantics; completion
+// notices (child_done/children_done) are nudged without the initial delay.
 
 let dir = "";
 let db: Database;
 let rt: MockRuntime;
-const savedOperator = process.env.RELAY_OPERATOR;
 const savedWindow = process.env.RELAY_MAIL_NUDGE_MS;
 
 beforeEach(() => {
@@ -24,62 +24,51 @@ beforeEach(() => {
   db = openDb(join(dir, "state.db"));
   rt = new MockRuntime();
   process.env.RELAY_MAIL_NUDGE_MS = "1"; // window passes immediately
-  delete process.env.RELAY_OPERATOR;
 });
 
 afterEach(() => {
   db.close();
   rmSync(dir, { recursive: true, force: true });
-  if (savedOperator === undefined) delete process.env.RELAY_OPERATOR;
-  else process.env.RELAY_OPERATOR = savedOperator;
   if (savedWindow === undefined) delete process.env.RELAY_MAIL_NUDGE_MS;
   else process.env.RELAY_MAIL_NUDGE_MS = savedWindow;
 });
 
 /** Send a message and backdate it so the nudge window has elapsed. */
 function staleMessage(recipient: string, body = "hello"): number {
-  const id = sendMessage(db, "control-coord", recipient, body);
+  const id = sendMessage(db, "worker-a", recipient, body);
   db.query(`UPDATE messages SET created_at = ? WHERE id = ?`).run(Date.now() - 60_000, id);
   return id;
 }
 
 describe("periodic unread-mail nudge", () => {
-  test("`human` mail is nudged to the configured operator", async () => {
-    registerWorker(db, "integrator", { role: "worker" });
-    process.env.RELAY_OPERATOR = "integrator";
-    staleMessage(HUMAN_RECIPIENT, "DECISION NEEDED: pick X");
-
+  test("a stale peer backlog nudges the recipient", async () => {
+    registerWorker(db, "worker-b", { role: "worker" });
+    staleMessage("worker-b");
     const { actions } = await reconcile(db, rt);
-    expect(actions).toContain("mail-nudged:integrator");
-    expect(rt.wakes.some((w) => w.workerId === "integrator")).toBe(true);
-    expect(listEvents(db, { limit: 50 }).some((e) => e.type === "worker.mail_nudged")).toBe(true);
+    expect(actions).toContain("mail-nudged:worker-b");
+    expect(rt.wakes.some((w) => w.workerId === "worker-b")).toBe(true);
   });
 
-  test("no operator => `human` mail is not nudged anywhere", async () => {
-    registerWorker(db, "integrator", { role: "worker" });
-    staleMessage(HUMAN_RECIPIENT);
+  test("a fresh peer message is left to the send-time wake (no early nudge)", async () => {
+    process.env.RELAY_MAIL_NUDGE_MS = "600000"; // large window
+    registerWorker(db, "worker-b", { role: "worker" });
+    sendMessage(db, "worker-a", "worker-b", "just sent"); // fresh
     const { actions } = await reconcile(db, rt);
-    expect(actions).not.toContain("mail-nudged:integrator");
-    expect(rt.wakes.some((w) => w.workerId === "integrator")).toBe(false);
+    expect(actions).not.toContain("mail-nudged:worker-b");
   });
 
-  test("a worker's own backlog is nudged to that worker", async () => {
-    registerWorker(db, "dsl-go", { role: "dsl-go" });
-    staleMessage("dsl-go");
+  test("completion notices (child_done) skip the initial delay", async () => {
+    process.env.RELAY_MAIL_NUDGE_MS = "600000"; // large window
+    registerWorker(db, "worker-b", { role: "worker" }); // parent owner
+    registerWorker(db, "worker-c", { role: "worker" }); // child owner
+    const parent = addTask(db, { title: "parent" });
+    claimTask(db, parent.id, "worker-b");
+    const child = addTask(db, { title: "child", parentTaskId: parent.id });
+    claimTask(db, child.id, "worker-c");
+    submitTask(db, child.id, "worker-c", { evidence: "x" });
+    approveTask(db, child.id, "reviewer"); // fresh child_done message to worker-b
+
     const { actions } = await reconcile(db, rt);
-    expect(actions).toContain("mail-nudged:dsl-go");
-  });
-
-  test("the nudge is rate-limited (not repeated every tick)", async () => {
-    registerWorker(db, "integrator", { role: "worker" });
-    process.env.RELAY_OPERATOR = "integrator";
-    staleMessage(HUMAN_RECIPIENT);
-
-    const t0 = Date.now();
-    const first = await reconcile(db, rt, t0);
-    expect(first.actions).toContain("mail-nudged:integrator");
-    // Same clock: the recorded nudge is inside the window, so no repeat.
-    const second = await reconcile(db, rt, t0);
-    expect(second.actions).not.toContain("mail-nudged:integrator");
+    expect(actions).toContain("mail-nudged:worker-b");
   });
 });

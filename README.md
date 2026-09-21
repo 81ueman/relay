@@ -562,50 +562,32 @@ runtime, its id, or the sanitized agent name (`u2-corpus` → `u2_corpus`) — s
 worker registered before its pane was recorded is still woken instead of
 failing with `agent_not_found` (the message stays queued either way).
 
-`human` is the operator's mailbox, not a Herdr agent. Mail addressed to `human`
-is routed to the configured operator — `RELAY_OPERATOR=<worker-id>` or a
-one-line `.relay/operator` file — which may read and ack it via `relay inbox`
-(the durable `recipient` is never rewritten). Separately, the daemon nudges any
-recipient with **undelivered** mail once per `RELAY_MAIL_NUDGE_MS` (default 3
-min), so a missed send-time wake cannot leave a backlog invisible; reading the
-inbox marks messages delivered and stops the nudge. `relay status` reports
-unread counts per recipient.
+**Workers are peers.** Messages are addressed to ordinary worker ids, always
+durable. The daemon nudges any recipient with **undelivered** mail once per
+`RELAY_MAIL_NUDGE_MS` (default 3 min), so a missed send-time wake cannot leave a
+backlog invisible; reading the inbox marks messages delivered and stops the
+nudge. `relay status` reports unread counts per recipient. There is **no built-in
+human/operator mailbox** and no agent hierarchy: relay has no special "human"
+recipient, no operator alias, and no role-based coordinator routing.
 
-**Completion notices.** The operator is also told when work finishes, so it does
-not have to poll: `RELAY_NOTIFY_ON=off|task|drain|both` (env, or a one-line
-`.relay/notify` file; default `off`). `task` sends a durable message at each
-approval (`T67 done (approved by reviewer)`); `drain` sends ONE message when the
-whole grid drains (no queued/running/review/blocked), debounced durably so it
-never repeats while empty and re-arms when new work appears. Relay-generated
-notices skip the mail-nudge delay and are woken on the next tick.
+**Task hierarchy (optional).** A task may have `parent_task_id`. This expresses
+**work decomposition**, not authority between workers: the same worker may own a
+parent and its child, and a parent's assignee may change at any time. Relay
+routes work-completion through **task ownership**, not through a hierarchy of
+agents.
 
-**Hierarchical routing.** Notices can fan out up a coordinator hierarchy:
-`RELAY_NOTIFY_ROUTES` (inline JSON) or `.relay/notify-routes.json`:
-
-```json
-{ "default": ["top-coord"],
-  "routes": [ { "role": "perf-*",    "to": ["dp-coord", "top-coord"] },
-              { "role": "control-*", "to": ["cp-coord", "top-coord"] } ] }
-```
-
-`default` is the top rollup and ALWAYS receives. A task-completion notice also
-goes to the FIRST route whose `role` matches the TASK's role (exact or glob,
-`*` = any run); recipients are deduped, so one message each. `drain` goes to
-`default`. With no routing configured, recipients fall back to the operator list
-(fully backwards compatible). `RELAY_OPERATOR` / `.relay/operator` may hold a
-LIST of ids (comma/space/newline separated); every operator also fields `human`
-mail.
-
-**Completion bubbling (task tree).** Independently of the role routing above,
-`parent_task_id` drives a one-hop roll-up: when a task reaches `done`, its
-IMMEDIATE parent gets a durable `child_done` note (visible in
-`relay task show <parent> --json`), plus `children_done` when ALL direct children
-are done, and — if the parent currently has an assignee — a durable message to
-that worker (`kind=child_done`/`children_done`, woken immediately). The child's
-approval, the parent notes and the message commit in ONE transaction, so a crash
-never leaves "child done but parent never told". There is **no recursion** (the
-parent rolls up only when IT is approved) and **no automatic parent completion**
-— the parent agent decides what to do and submits its own work.
+**Completion bubbling.** When a task reaches `done`, its IMMEDIATE parent gets a
+durable `child_done` task note (visible in `relay task show <parent> --json`),
+plus `children_done` when ALL direct children are done. If the parent currently
+has an assignee, that worker also receives a durable message
+(`kind=child_done`/`children_done`, woken immediately); if it has no assignee,
+only the note is written, and whoever claims the parent later sees it (claim
+prints these notes; `--json` returns them all). The child's approval, the parent
+notes and the message commit in ONE transaction, so a crash never leaves "child
+done but parent never told". Bubbling is **one hop only** — a parent rolls up
+further only when the PARENT itself is approved — and there is **no automatic
+parent completion**: `children_done` is a signal, the parent agent decides what
+to do and submits its own work.
 
 `relay task show <id>` keeps stdout a single parseable JSON document (notes go
 to stderr); `relay task show <id> --json` emits ONE document with the task and

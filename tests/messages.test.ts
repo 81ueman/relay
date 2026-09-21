@@ -1,101 +1,69 @@
 import { describe, expect, test, beforeEach, afterEach } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Database } from "bun:sqlite";
 import { openDb } from "../src/db";
-import {
-  ackMessage,
-  claimInbox,
-  HUMAN_RECIPIENT,
-  inboxFor,
-  mailboxesFor,
-  operatorId,
-  operators,
-  sendMessage,
-  unreadCounts,
-} from "../src/messages";
+import * as messages from "../src/messages";
+import { ackMessage, claimInbox, inboxFor, sendMessage, unreadCounts } from "../src/messages";
 
-// `human` is the operator's mailbox, not a Herdr agent. It must be routable to a
-// configured operator instead of a wake that can never succeed.
+// Durable peer-to-peer messaging. There is NO human/operator special mailbox:
+// every message is addressed to an ordinary worker id.
 
 let dir = "";
 let db: Database;
-const savedOperator = process.env.RELAY_OPERATOR;
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "relay-msg-"));
   db = openDb(join(dir, "state.db"));
-  delete process.env.RELAY_OPERATOR;
 });
 
 afterEach(() => {
   db.close();
   rmSync(dir, { recursive: true, force: true });
-  if (savedOperator === undefined) delete process.env.RELAY_OPERATOR;
-  else process.env.RELAY_OPERATOR = savedOperator;
 });
 
-describe("operator alias for `human` mail", () => {
-  test("operatorId prefers RELAY_OPERATOR, then .relay/operator", () => {
-    expect(operatorId(dir)).toBeNull();
-    mkdirSync(join(dir, ".relay"), { recursive: true });
-    writeFileSync(join(dir, ".relay", "operator"), "integrator\n");
-    expect(operatorId(dir)).toBe("integrator");
-    process.env.RELAY_OPERATOR = "from-env";
-    expect(operatorId(dir)).toBe("from-env");
-  });
-
-  test("only the operator fields `human` mail", () => {
-    expect(mailboxesFor("integrator", "integrator")).toEqual(["integrator", HUMAN_RECIPIENT]);
-    expect(mailboxesFor("dsl-go", "integrator")).toEqual(["dsl-go"]);
-    expect(mailboxesFor("integrator", null)).toEqual(["integrator"]);
-  });
-
-  test("RELAY_OPERATOR may hold a LIST; every operator fields `human`", () => {
-    process.env.RELAY_OPERATOR = "top-coord, cp-coord dp-coord";
-    expect(operators(dir)).toEqual(["top-coord", "cp-coord", "dp-coord"]);
-    expect(operatorId(dir)).toBe("top-coord");
-    expect(mailboxesFor("cp-coord", operators(dir))).toEqual(["cp-coord", HUMAN_RECIPIENT]);
-    expect(mailboxesFor("leaf", operators(dir))).toEqual(["leaf"]);
-  });
-
-  test("a multi-operator list can be given in `.relay/operator` too", () => {
-    mkdirSync(join(dir, ".relay"), { recursive: true });
-    writeFileSync(join(dir, ".relay", "operator"), "a\nb\n");
-    expect(operators(dir)).toEqual(["a", "b"]);
-  });
-
-  test("the operator sees and acks `human`-addressed mail", () => {
-    sendMessage(db, "control-coord", HUMAN_RECIPIENT, "DECISION NEEDED: X");
-    const items = inboxFor(db, "integrator", false, [HUMAN_RECIPIENT]);
-    expect(items.map((m) => m.recipient)).toEqual([HUMAN_RECIPIENT]);
-    const ack = ackMessage(db, items[0].id, "integrator", "integrator");
+describe("peer-to-peer durable messages", () => {
+  test("send -> inbox -> ack round trip", () => {
+    const id = sendMessage(db, "worker-a", "worker-b", "benchmark results", { taskId: "T1", kind: "note" });
+    const items = inboxFor(db, "worker-b");
+    expect(items).toHaveLength(1);
+    expect(items[0].payload).toBe("benchmark results");
+    expect(items[0].task_id).toBe("T1");
+    expect(items[0].state).toBe("delivered"); // reading marks delivered
+    const ack = ackMessage(db, id, "worker-b");
     expect(ack.state).toBe("acked");
+    expect(inboxFor(db, "worker-b")).toHaveLength(0);
   });
 
-  test("a non-operator cannot ack `human` mail", () => {
-    const id = sendMessage(db, "control-coord", HUMAN_RECIPIENT, "DECISION NEEDED: X");
-    expect(() => ackMessage(db, id, "dsl-go", "integrator")).toThrow(/belongs to human/);
+  test("a message is private to its recipient", () => {
+    sendMessage(db, "a", "b", "hi");
+    expect(inboxFor(db, "c")).toHaveLength(0);
+    const id = inboxFor(db, "b")[0].id;
+    expect(() => ackMessage(db, id, "c")).toThrow(/belongs to b/);
   });
 
-  test("claimInbox drains the operator's extra mailbox", () => {
-    sendMessage(db, "a", HUMAN_RECIPIENT, "one");
-    sendMessage(db, "b", "integrator", "two");
-    expect(claimInbox(db, "integrator", [HUMAN_RECIPIENT])).toBe(2);
-    expect(inboxFor(db, "integrator", false, [HUMAN_RECIPIENT])).toEqual([]);
+  test("claimInbox drains the recipient's pending mail", () => {
+    sendMessage(db, "a", "b", "one");
+    sendMessage(db, "a", "b", "two");
+    expect(claimInbox(db, "b")).toBe(2);
+    expect(inboxFor(db, "b")).toHaveLength(0);
   });
 
   test("unreadCounts reports queued vs delivered per recipient", () => {
-    sendMessage(db, "a", HUMAN_RECIPIENT, "one");
-    sendMessage(db, "a", HUMAN_RECIPIENT, "two");
-    sendMessage(db, "b", "dsl-go", "three");
-    inboxFor(db, "integrator", false, [HUMAN_RECIPIENT]); // marks human mail delivered
+    sendMessage(db, "a", "b", "one");
+    sendMessage(db, "a", "b", "two");
+    sendMessage(db, "a", "c", "three");
+    inboxFor(db, "b"); // delivered
     const counts = unreadCounts(db);
-    const human = counts.find((c) => c.recipient === HUMAN_RECIPIENT)!;
-    expect(human.queued).toBe(0);
-    expect(human.delivered).toBe(2);
-    const dsl = counts.find((c) => c.recipient === "dsl-go")!;
-    expect(dsl.queued).toBe(1);
+    expect(counts.find((x) => x.recipient === "b")!.delivered).toBe(2);
+    expect(counts.find((x) => x.recipient === "c")!.queued).toBe(1);
+  });
+
+  test("no human/operator special mailbox exists", () => {
+    expect("HUMAN_RECIPIENT" in messages).toBe(false);
+    expect("operators" in messages).toBe(false);
+    expect("operatorId" in messages).toBe(false);
+    expect("mailboxesFor" in messages).toBe(false);
   });
 });

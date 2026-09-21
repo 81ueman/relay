@@ -1,50 +1,6 @@
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
 import type { Database } from "bun:sqlite";
-import { now, STATE_DIR } from "./db";
+import { now } from "./db";
 import { logEvent } from "./events";
-
-/**
- * The human operator's mailbox. There is no Herdr agent called `human`, so mail
- * addressed here is delivered through the configured operator alias instead of
- * a wake that can never succeed.
- */
-export const HUMAN_RECIPIENT = "human";
-
-/** Split an id list on commas / whitespace / newlines. */
-function parseIds(raw: string): string[] {
-  return raw.split(/[\s,]+/).map((s) => s.trim()).filter(Boolean);
-}
-
-/**
- * Worker ids that field `human`-addressed mail (a coordinator hierarchy).
- *   RELAY_OPERATOR=a,b,c  (wins), else `.relay/operator` (comma/space/newline list).
- * Unset => `human` mail has no delivery target; it stays visible in `relay status`.
- */
-export function operators(cwd = process.cwd()): string[] {
-  const env = (process.env.RELAY_OPERATOR ?? "").trim();
-  if (env) return parseIds(env);
-  try {
-    const v = readFileSync(join(cwd, STATE_DIR, "operator"), "utf-8").trim();
-    if (v) return parseIds(v);
-  } catch { /* no operator file */ }
-  return [];
-}
-
-/** The primary operator (first), for callers that take a single target. */
-export function operatorId(cwd = process.cwd()): string | null {
-  return operators(cwd)[0] ?? null;
-}
-
-/**
- * Mailboxes `workerId` may read and ack. ANY configured operator also fields
- * `human`-addressed mail. The stored `recipient` is never rewritten.
- * Accepts a single id or a list (backwards compatible).
- */
-export function mailboxesFor(workerId: string, operator: string | string[] | null): string[] {
-  const ops = Array.isArray(operator) ? operator : operator ? [operator] : [];
-  return ops.includes(workerId) ? [workerId, HUMAN_RECIPIENT] : [workerId];
-}
 
 export function sendMessage(
   db: Database,
@@ -75,21 +31,14 @@ export interface InboxItem {
   created_at: number;
 }
 
-export function inboxFor(
-  db: Database,
-  workerId: string,
-  onlyPending = false,
-  extra: string[] = []
-): InboxItem[] {
-  const recipients = [workerId, ...extra];
-  const ph = recipients.map(() => "?").join(",");
+export function inboxFor(db: Database, workerId: string, onlyPending = false): InboxItem[] {
   const rows = db
     .query(
       `SELECT id, sender, recipient, task_id, kind, payload, state, created_at FROM messages
-       WHERE recipient IN (${ph}) ${onlyPending ? "AND state = 'queued'" : "AND state IN ('queued','delivered')"}
+       WHERE recipient = ? ${onlyPending ? "AND state = 'queued'" : "AND state IN ('queued','delivered')"}
        ORDER BY id ASC`
     )
-    .all(...recipients) as InboxItem[];
+    .all(workerId) as InboxItem[];
   // Reading the inbox marks queued messages delivered (durable; survives restarts).
   const t = now();
   for (const m of rows) {
@@ -119,16 +68,11 @@ export function deliverMessage(db: Database, id: number): InboxItem {
   return getMessage(db, id)!;
 }
 
-/** Mark one message acked (recipient consumed it; an operator may ack `human` mail). */
-export function ackMessage(
-  db: Database,
-  id: number,
-  workerId: string,
-  operator: string | string[] | null = null
-): InboxItem {
+/** Mark one message acked (the recipient consumed it). */
+export function ackMessage(db: Database, id: number, workerId: string): InboxItem {
   const m = getMessage(db, id);
   if (!m) throw new Error(`unknown message: ${id}`);
-  if (!mailboxesFor(workerId, operator).includes(m.recipient)) {
+  if (m.recipient !== workerId) {
     throw new Error(`message ${id} belongs to ${m.recipient}, not ${workerId}`);
   }
   const t = now();
@@ -140,13 +84,11 @@ export function ackMessage(
 }
 
 /** Acknowledge (consume) all pending inbox messages. Returns count acked. Kept for CLI compat. */
-export function claimInbox(db: Database, workerId: string, extra: string[] = []): number {
+export function claimInbox(db: Database, workerId: string): number {
   const t = now();
-  const recipients = [workerId, ...extra];
-  const ph = recipients.map(() => "?").join(",");
   const pending = db
-    .query(`SELECT id FROM messages WHERE recipient IN (${ph}) AND state IN ('queued','delivered')`)
-    .all(...recipients) as { id: number }[];
+    .query(`SELECT id FROM messages WHERE recipient = ? AND state IN ('queued','delivered')`)
+    .all(workerId) as { id: number }[];
   for (const m of pending) {
     db.query(
       `UPDATE messages SET state = 'acked', delivered_at = COALESCE(delivered_at, ?), acked_at = ? WHERE id = ?`

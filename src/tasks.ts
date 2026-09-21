@@ -10,7 +10,6 @@ import {
 } from "./workers";
 import type { Task, TaskState } from "./schema";
 import { sendMessage } from "./messages";
-import { notifyTaskDone } from "./notify";
 
 export const STALE_LEASE = "STALE_LEASE";
 
@@ -386,9 +385,9 @@ export function approveTask(db: Database, taskId: string, workerId: string): Tas
   if (!task) throw new Error(`unknown task: ${taskId}`);
   if (task.state !== "review") throw new Error(`cannot approve task in state ${task.state}`);
   const t = now();
-  // Durable state first, in ONE transaction: the child's completion, its parent
-  // notification (note + message) and the operator notice either all commit or
-  // none do — a crash can never leave "child done but parent never told".
+  // Durable state first, in ONE transaction: the child's completion and its
+  // parent notification (note + message) either both commit or neither does — a
+  // crash can never leave "child done but parent never told".
   db.transaction(() => {
     db.query(`UPDATE tasks SET state = 'done', updated_at = ? WHERE id = ?`).run(t, taskId);
     if (task.assignee === workerId) clearCurrentTask(db, workerId);
@@ -400,8 +399,6 @@ export function approveTask(db: Database, taskId: string, workerId: string): Tas
     const done = getTask(db, taskId)!;
     // One-hop completion bubbling to the IMMEDIATE parent (no recursion).
     bubbleChildDone(db, done, workerId, t);
-    // Durable completion notice to the routed operators (opt-in; no-op without).
-    notifyTaskDone(db, done, workerId);
   })();
   return getTask(db, taskId)!;
 }

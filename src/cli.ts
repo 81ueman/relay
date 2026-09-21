@@ -3,7 +3,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { defaultDbPath, initControlPlane, now, openDb, STATE_DIR } from "./db";
 import { formatEvent, listEvents, logEvent } from "./events";
-import { ackMessage, claimInbox, deliverMessage, getMessage, HUMAN_RECIPIENT, inboxFor, mailboxesFor, operators, sendMessage, unreadCounts } from "./messages";
+import { ackMessage, claimInbox, deliverMessage, getMessage, inboxFor, sendMessage, unreadCounts } from "./messages";
 import { runDaemon } from "./daemon";
 import { handleErrorSignal, handleIdleSignal, reconcile } from "./reconciler";
 import { buildRuntime, HerdrRuntime } from "./runtime/herdr";
@@ -75,13 +75,10 @@ Usage:
   relay event record --type <t> [--session <sid>] [--worker <id>] [--task <tid>] [--payload <json>]
 
 Worker identity: --worker flag, $RELAY_WORKER, your Herdr pane, or .relay/worker-id
-Operator: 'human' mail is routed to RELAY_OPERATOR=<id[,id...]> (or .relay/operator)
-Notify: RELAY_NOTIFY_ON=off|task|drain|both (operator notice on task done / grid drained)
-Routes: RELAY_NOTIFY_ROUTES or .relay/notify-routes.json (role glob -> recipients; default always receives)
 DB: $RELAY_DB or the nearest .relay/state.db (searched upward from cwd; WAL mode)
 Env: RELAY_LEASE_MS RELAY_LEASE_LIVENESS_GRACE_MS RELAY_STALL_MS RELAY_LOW_WATER
      RELAY_AUTO_APPROVE RELAY_INTERVAL_MS RELAY_ROLE_STRICT (default true)
-     RELAY_OPERATOR RELAY_MAIL_NUDGE_MS
+     RELAY_MAIL_NUDGE_MS
 Spawn: RELAY_HERDR_WORKSPACE (required to spawn; else $HERDR_WORKSPACE_ID)
 Manual attach: requires a live Herdr agent (use --pane/--tab or $HERDR_PANE_ID/$HERDR_TAB_ID)
 Runtime cleanup: RELAY_RUNTIME_CLEANUP_GRACE_MS RELAY_ATTACH_TIMEOUT_MS RELAY_RESTART_COOLDOWN_MS
@@ -188,8 +185,8 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
     about: "Hand a RUNNING task back to the queue cleanly (no block/reject note): clears assignee + lease, bumps the fencing token. The current assignee or any human/worker may release.",
     usage: ["relay release <task-id> [--worker <id>]"],
   },
-  send: { about: "Send a durable message; the best-effort wake is delivered after the commit. `human` is routed to the configured operator.", usage: ['relay send <worker-id> "message" [--task <tid>] [--kind <k>]'] },
-  inbox: { about: "Read (and optionally claim/ack) the worker's inbox. A configured operator also sees `human`-addressed mail.", usage: ["relay inbox [--worker <id>] [--claim] [--ack <msg-id>]"] },
+  send: { about: "Send a durable peer-to-peer message to another worker; the best-effort wake is delivered after the commit.", usage: ['relay send <worker-id> "message" [--task <tid>] [--kind <k>]'] },
+  inbox: { about: "Read (and optionally claim/ack) the worker's own inbox.", usage: ["relay inbox [--worker <id>] [--claim] [--ack <msg-id>]"] },
   status: { about: "Print workers, task counts, and the supervisor view.", usage: ["relay status"] },
   events: { about: "Print recent events, or follow them (Ctrl-C to stop).", usage: ["relay events [--follow] [--limit N]"] },
   event: {
@@ -257,6 +254,28 @@ function fmtAge(ms: number): string {
   const m = Math.floor(s / 60);
   if (m < 60) return `${m}m`;
   return `${Math.floor(m / 60)}h`;
+}
+
+/** Notes worth surfacing when a worker picks up a task (context, not state). */
+const TASK_CONTEXT_KINDS = new Set([
+  "child_done",
+  "children_done",
+  "blocked_human",
+  "blocked_internal",
+  "reject",
+  "evidence",
+]);
+
+/**
+ * Print the task's relevant notes when it is claimed, so a worker that takes
+ * over a parent (or any task) does not miss a child completion or a prior
+ * block/reject. Appended AFTER the existing output, so stdout parsing of the
+ * first line keeps working. `--json` callers already get all notes.
+ */
+function printTaskContext(db: ReturnType<typeof openDb>, taskId: string): void {
+  for (const n of getNotes(db, taskId).filter((x) => TASK_CONTEXT_KINDS.has(x.kind))) {
+    console.log(`  [${n.kind}] ${n.worker_id ?? "?"}: ${n.body}`);
+  }
 }
 
 async function main(): Promise<void> {
@@ -488,6 +507,7 @@ async function main(): Promise<void> {
           console.log(`title: ${t.title}`);
           if (t.description) console.log(`desc: ${t.description}`);
           if (t.acceptance) console.log(`accept: ${t.acceptance}`);
+          printTaskContext(db, t.id);
         }
         break;
       }
@@ -501,6 +521,7 @@ async function main(): Promise<void> {
           strictRole: hasFlag(argv, "--any-role") ? false : undefined,
         });
         console.log(`${claimed.id} lease=${claimed.lease_token}`);
+        printTaskContext(db, claimed.id);
         break;
       }
 
@@ -579,61 +600,47 @@ async function main(): Promise<void> {
         const recipient = argv[1];
         const payload = argv[2];
         if (!recipient || !payload) throw new Error('usage: relay send <worker-id> "message"');
-        const sender = process.env.RELAY_WORKER ?? "human";
+        const sender = process.env.RELAY_WORKER ?? "cli";
         const id = sendMessage(db, sender, recipient, payload, {
           taskId: flag(argv, "--task") ?? undefined,
           kind: flag(argv, "--kind") ?? undefined,
         });
         // Best-effort wake AFTER durable commit. Failure keeps the message queued.
-        // `human` has no Herdr agent, so it is routed to EVERY configured operator.
-        const ops = operators();
-        const targets = recipient === HUMAN_RECIPIENT ? (ops.length ? ops : [recipient]) : [recipient];
-        const rt = new HerdrRuntime();
-        const delivered: string[] = [];
-        const failed: string[] = [];
-        for (const t of targets) {
-          const existing = getWorker(db, t);
-          const targetRow = existing ?? {
-            id: t, role: "worker", runtime_id: null, cwd: null, command: null,
-            opencode_session_id: null, state: "idle" as const, current_task_id: null,
-            generation: 0, last_seen_at: 0, last_progress_at: 0, nudged_at: null,
-            retired_at: null, retired_reason: null,
-            created_at: 0, updated_at: 0,
-          };
-          try {
-            await rt.wake(targetRow, `You have a new durable message (id ${id}). Run \`relay inbox --claim\` to receive it.`);
-            delivered.push(t);
-          } catch (e) {
-            failed.push(`${t} (${String(e).slice(0, 80)})`);
-          }
-        }
-        if (delivered.length) console.log(`sent msg=${id} (wake delivered: ${delivered.join(", ")})`);
-        if (failed.length) {
-          const hint = recipient === HUMAN_RECIPIENT && ops.length === 0
-            ? " [no operator configured: set RELAY_OPERATOR or .relay/operator; mail stays visible in `relay status`]"
-            : "";
-          console.log(`sent msg=${id} (wake failed for ${failed.join("; ")})${hint}`);
+        // Routing lives in the adapter (worker.runtime_id); the recipient is an
+        // ordinary worker id (peers message each other directly).
+        const existing = getWorker(db, recipient);
+        const targetRow = existing ?? {
+          id: recipient, role: "worker", runtime_id: null, cwd: null, command: null,
+          opencode_session_id: null, state: "idle" as const, current_task_id: null,
+          generation: 0, last_seen_at: 0, last_progress_at: 0, nudged_at: null,
+          retired_at: null, retired_reason: null,
+          created_at: 0, updated_at: 0,
+        };
+        try {
+          const rt = new HerdrRuntime();
+          await rt.wake(targetRow, `You have a new durable message (id ${id}). Run \`relay inbox --claim\` to receive it.`);
+          console.log(`sent msg=${id} (wake delivered)`);
+        } catch (e) {
+          console.log(`sent msg=${id} (wake failed, message remains queued: ${String(e).slice(0, 120)})`);
         }
         break;
       }
 
       case "inbox": {
         const workerId = resolveWorkerId(db, flag(argv, "--worker"));
-        const operator = operators();
-        const extras = mailboxesFor(workerId, operator).filter((r) => r !== workerId);
         const ackId = flag(argv, "--ack");
         if (ackId !== undefined) {
-          const m = ackMessage(db, Number(ackId), workerId, operator);
+          const m = ackMessage(db, Number(ackId), workerId);
           console.log(`acked #${m.id} (state=${m.state})`);
         } else if (hasFlag(argv, "--claim")) {
-          const items = inboxFor(db, workerId, false, extras);
+          const items = inboxFor(db, workerId);
           for (const m of items) {
             console.log(`#${m.id} to=${m.recipient} from=${m.sender} kind=${m.kind} task=${m.task_id ?? "-"}: ${m.payload}`);
           }
-          const n = claimInbox(db, workerId, extras);
+          const n = claimInbox(db, workerId);
           console.log(`acked=${n}`);
         } else {
-          const items = inboxFor(db, workerId, false, extras);
+          const items = inboxFor(db, workerId);
           if (items.length === 0) console.log("INBOX_EMPTY");
           for (const m of items) {
             console.log(`#${m.id} to=${m.recipient} from=${m.sender} kind=${m.kind} task=${m.task_id ?? "-"}: ${m.payload}`);
@@ -679,12 +686,8 @@ async function main(): Promise<void> {
         console.log("Unread mail");
         console.log("-----------");
         if (unread.length === 0) console.log("(none)");
-        const op = operators();
         for (const u of unread) {
-          const route = u.recipient === HUMAN_RECIPIENT
-            ? (op.length ? `  -> operator ${op.join(", ")}` : "  (no operator configured)")
-            : "";
-          console.log(`${u.recipient}  queued=${u.queued}  delivered=${u.delivered}${route}`);
+          console.log(`${u.recipient}  queued=${u.queued}  delivered=${u.delivered}`);
         }
         console.log("");
         console.log("System");

@@ -43,8 +43,6 @@ import {
   unclaimableRunnableTasks,
 } from "./tasks";
 import { getWorker, listWorkers, setWorkerState, touchSeen, type WorkerRow } from "./workers";
-import { HUMAN_RECIPIENT, operatorId } from "./messages";
-import { notifyGridDrained } from "./notify";
 
 // Deterministic reconciler. No LLM: pure DB state + runtime transport.
 // Callers pass full Worker rows; only the Runtime adapter maps to targets.
@@ -522,11 +520,11 @@ async function transportAliveAssignees(
 }
 
 /**
- * Surface undelivered mail. The send-time wake is best-effort and cannot reach
- * a recipient with no Herdr agent (`human`), so a durable unread backlog would
- * otherwise sit silently. Nudge each recipient at most once per mail-nudge
- * window; `human` is routed to the configured operator. Reading the inbox marks
- * messages delivered, which stops the nudge.
+ * Surface undelivered mail. The send-time wake is best-effort and can be missed,
+ * so a durable unread backlog would otherwise sit silently. Nudge each recipient
+ * at most once per mail-nudge window; completion notices (child_done /
+ * children_done) skip the initial delay. Reading the inbox marks messages
+ * delivered, which stops the nudge.
  */
 async function nudgeUnreadMail(
   db: Database, rt: Runtime, actions: string[], at: number
@@ -535,29 +533,26 @@ async function nudgeUnreadMail(
   const rows = db
     .query(
       `SELECT recipient, COUNT(*) AS n, MIN(created_at) AS oldest,
-              SUM(CASE WHEN kind IN ('notify','child_done','children_done') THEN 1 ELSE 0 END) AS immediate
+              SUM(CASE WHEN kind IN ('child_done','children_done') THEN 1 ELSE 0 END) AS immediate
          FROM messages WHERE state = 'queued'
         GROUP BY recipient`
     )
     .all() as { recipient: string; n: number; oldest: number; immediate: number }[];
   if (rows.length === 0) return;
-  const operator = operatorId();
   for (const { recipient, n, oldest, immediate } of rows) {
-    // Relay-generated notices (kind notify/child_done/children_done) never had a
-    // send-time wake, so they skip the "let the wake land first" delay.
+    // Relay-generated completion notices (child_done/children_done) never had a
+    // send-time wake, so they skip the "let the wake land first" delay. Ordinary
+    // peer messages keep the existing send-time wake + retry semantics.
     if (immediate === 0 && at - oldest < window) continue;
-    const target = recipient === HUMAN_RECIPIENT ? operator : recipient;
-    if (!target) continue;
-    const w = getWorker(db, target);
+    const w = getWorker(db, recipient);
     if (!w || w.retired_at !== null) continue;
-    if (recentlyEvent(db, target, "worker.mail_nudged", at, window)) continue;
-    const where = recipient === HUMAN_RECIPIENT ? " for the operator" : "";
+    if (recentlyEvent(db, recipient, "worker.mail_nudged", at, window)) continue;
     try {
-      await rt.wake(w, `You have ${n} unread durable message(s)${where}. Run \`relay inbox --claim\` to receive them.`);
-      logEvent(db, { source: "supervisor", workerId: target, type: "worker.mail_nudged", payload: { recipient, count: n } });
-      actions.push(`mail-nudged:${target}`);
+      await rt.wake(w, `You have ${n} unread durable message(s). Run \`relay inbox --claim\` to receive them.`);
+      logEvent(db, { source: "supervisor", workerId: recipient, type: "worker.mail_nudged", payload: { recipient, count: n } });
+      actions.push(`mail-nudged:${recipient}`);
     } catch (e) {
-      logEvent(db, { source: "supervisor", workerId: target, type: "worker.wake_failed", payload: { reason: "unread-mail", error: String(e).slice(0, 200) } });
+      logEvent(db, { source: "supervisor", workerId: recipient, type: "worker.wake_failed", payload: { reason: "unread-mail", error: String(e).slice(0, 200) } });
     }
   }
 }
@@ -769,29 +764,11 @@ export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<
     }
   }
 
-  // 5. Tell the operator when the WHOLE grid drains (no unfinished work). The
-  //    integrator holds no task, so no other nudge ever reaches it; without this
-  //    it can only poll. Debounced durably by notifyGridDrained (one notice per
-  //    drain), and woken immediately rather than waiting for the mail window.
-  if (view.unfinished === 0) {
-    const noticed = notifyGridDrained(db);
-    if (noticed.length > 0) {
-      for (const id of noticed) {
-        const w = getWorker(db, id);
-        if (!w || w.retired_at !== null) continue;
-        try {
-          await rt.wake(w, "all tasks done; nothing queued/running/review/blocked.");
-        } catch { /* best effort; the durable message remains */ }
-      }
-      actions.push("grid-drained-notified");
-    }
-  }
-
-  // 6. Nudge recipients with undelivered mail (a durable safety net for a missed
-  //    send-time wake, and the only path that can reach `human`).
+  // 5. Nudge recipients with undelivered mail (a durable safety net for a missed
+  //    send-time wake; peer messages and completion notices alike).
   await nudgeUnreadMail(db, rt, actions, at);
 
-  // 7. Reap old generations, isolated from all of the above.
+  // 6. Reap old generations, isolated from all of the above.
   await cleanupOldRuntimes(db, rt, actions, at);
 
   return { view: supervisorView(db), actions };
