@@ -596,6 +596,17 @@ goes to the FIRST route whose `role` matches the TASK's role (exact or glob,
 LIST of ids (comma/space/newline separated); every operator also fields `human`
 mail.
 
+**Completion bubbling (task tree).** Independently of the role routing above,
+`parent_task_id` drives a one-hop roll-up: when a task reaches `done`, its
+IMMEDIATE parent gets a durable `child_done` note (visible in
+`relay task show <parent> --json`), plus `children_done` when ALL direct children
+are done, and — if the parent currently has an assignee — a durable message to
+that worker (`kind=child_done`/`children_done`, woken immediately). The child's
+approval, the parent notes and the message commit in ONE transaction, so a crash
+never leaves "child done but parent never told". There is **no recursion** (the
+parent rolls up only when IT is approved) and **no automatic parent completion**
+— the parent agent decides what to do and submits its own work.
+
 `relay task show <id>` keeps stdout a single parseable JSON document (notes go
 to stderr); `relay task show <id> --json` emits ONE document with the task and
 its notes.

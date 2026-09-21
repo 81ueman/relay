@@ -9,6 +9,7 @@ import {
   touchProgress,
 } from "./workers";
 import type { Task, TaskState } from "./schema";
+import { sendMessage } from "./messages";
 import { notifyTaskDone } from "./notify";
 
 export const STALE_LEASE = "STALE_LEASE";
@@ -385,17 +386,71 @@ export function approveTask(db: Database, taskId: string, workerId: string): Tas
   if (!task) throw new Error(`unknown task: ${taskId}`);
   if (task.state !== "review") throw new Error(`cannot approve task in state ${task.state}`);
   const t = now();
-  db.query(`UPDATE tasks SET state = 'done', updated_at = ? WHERE id = ?`).run(t, taskId);
-  if (task.assignee === workerId) clearCurrentTask(db, workerId);
-  else if (task.assignee) clearCurrentTask(db, task.assignee);
-  normalizeWorkerAfterTaskRelease(db, workerId, t);
-  if (task.assignee && task.assignee !== workerId) normalizeWorkerAfterTaskRelease(db, task.assignee, t);
-  touchProgress(db, workerId, t);
-  logEvent(db, { source: "reviewer", workerId, taskId, type: "task.approved" });
-  const done = getTask(db, taskId)!;
-  // Durable completion notice to the operator (opt-in; no-op without one).
-  notifyTaskDone(db, done, workerId);
-  return done;
+  // Durable state first, in ONE transaction: the child's completion, its parent
+  // notification (note + message) and the operator notice either all commit or
+  // none do — a crash can never leave "child done but parent never told".
+  db.transaction(() => {
+    db.query(`UPDATE tasks SET state = 'done', updated_at = ? WHERE id = ?`).run(t, taskId);
+    if (task.assignee === workerId) clearCurrentTask(db, workerId);
+    else if (task.assignee) clearCurrentTask(db, task.assignee);
+    normalizeWorkerAfterTaskRelease(db, workerId, t);
+    if (task.assignee && task.assignee !== workerId) normalizeWorkerAfterTaskRelease(db, task.assignee, t);
+    touchProgress(db, workerId, t);
+    logEvent(db, { source: "reviewer", workerId, taskId, type: "task.approved" });
+    const done = getTask(db, taskId)!;
+    // One-hop completion bubbling to the IMMEDIATE parent (no recursion).
+    bubbleChildDone(db, done, workerId, t);
+    // Durable completion notice to the routed operators (opt-in; no-op without).
+    notifyTaskDone(db, done, workerId);
+  })();
+  return getTask(db, taskId)!;
+}
+
+/**
+ * Tell the IMMEDIATE parent that a child finished. Durable first: a `child_done`
+ * note on the parent (plus `children_done` when ALL direct children are done),
+ * and a durable message to the parent's current assignee if it has one. Wake is
+ * left to the reconciler's mail nudge. No recursion, no automatic parent done,
+ * no new queue — only `parent_task_id` + `task_notes` + `messages`.
+ */
+function bubbleChildDone(db: Database, child: Task, actor: string, at: number): void {
+  const parentId = child.parent_task_id;
+  if (!parentId) return;
+  const parent = getTask(db, parentId);
+  if (!parent) return; // dangling parent: the child still completes
+  const body = `${child.id} done: ${child.title}`;
+  db.query(
+    `INSERT INTO task_notes (task_id, worker_id, kind, body, created_at) VALUES (?, ?, 'child_done', ?, ?)`
+  ).run(parentId, actor, body, at);
+
+  const counts = db
+    .query(
+      `SELECT COUNT(*) AS total, SUM(CASE WHEN state = 'done' THEN 1 ELSE 0 END) AS done
+         FROM tasks WHERE parent_task_id = ?`
+    )
+    .get(parentId) as { total: number; done: number };
+  const allDone = counts.total > 0 && counts.done === counts.total;
+  if (allDone) {
+    db.query(
+      `INSERT INTO task_notes (task_id, worker_id, kind, body, created_at) VALUES (?, ?, 'children_done', ?, ?)`
+    ).run(parentId, actor, `All direct children of ${parentId} are done (${counts.done}/${counts.total}).`, at);
+  }
+
+  if (parent.assignee) {
+    sendMessage(db, "relay", parent.assignee, body, { kind: "child_done", taskId: parentId });
+    if (allDone) {
+      sendMessage(db, "relay", parent.assignee, `All direct children of ${parentId} are done (${counts.done}/${counts.total}).`, {
+        kind: "children_done",
+        taskId: parentId,
+      });
+    }
+  }
+  logEvent(db, {
+    source: "supervisor",
+    taskId: parentId,
+    type: "task.child_done",
+    payload: { child: child.id, allDone, assignee: parent.assignee ?? null },
+  });
 }
 
 export function rejectTask(db: Database, taskId: string, workerId: string, reason: string): Task {

@@ -156,7 +156,7 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
     ],
   },
   "task add": {
-    about: "Queue a new task. --parent nests it under T1 (the tree is display-side). A --role makes the task claimable only by a worker of that role by default; an unknown role warns (non-fatal). --plan <plan-id> records which agent-status plan.json item this task belongs to.",
+    about: "Queue a new task. --parent nests it under T1; approving a child then tells the immediate parent (one-hop completion bubbling: a child_done note on the parent, children_done when all direct children are done, and a durable message to the parent's current assignee). A --role makes the task claimable only by a worker of that role by default; an unknown role warns (non-fatal). --plan <plan-id> records which agent-status plan.json item this task belongs to.",
     usage: ['relay task add "description" [--title T] [--acceptance A] [--priority N] [--role R] [--parent T1] [--plan <plan-id>]'],
   },
   "task list": { about: "List tasks (id, state, priority, role, assignee, plan, title).", usage: ["relay task list [--state <state>]"] },

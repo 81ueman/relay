@@ -535,17 +535,17 @@ async function nudgeUnreadMail(
   const rows = db
     .query(
       `SELECT recipient, COUNT(*) AS n, MIN(created_at) AS oldest,
-              SUM(CASE WHEN kind = 'notify' THEN 1 ELSE 0 END) AS notifies
+              SUM(CASE WHEN kind IN ('notify','child_done','children_done') THEN 1 ELSE 0 END) AS immediate
          FROM messages WHERE state = 'queued'
         GROUP BY recipient`
     )
-    .all() as { recipient: string; n: number; oldest: number; notifies: number }[];
+    .all() as { recipient: string; n: number; oldest: number; immediate: number }[];
   if (rows.length === 0) return;
   const operator = operatorId();
-  for (const { recipient, n, oldest, notifies } of rows) {
-    // Relay-generated notices never had a send-time wake, so they skip the
-    // "let the wake land first" delay and are nudged on the next tick.
-    if (notifies === 0 && at - oldest < window) continue;
+  for (const { recipient, n, oldest, immediate } of rows) {
+    // Relay-generated notices (kind notify/child_done/children_done) never had a
+    // send-time wake, so they skip the "let the wake land first" delay.
+    if (immediate === 0 && at - oldest < window) continue;
     const target = recipient === HUMAN_RECIPIENT ? operator : recipient;
     if (!target) continue;
     const w = getWorker(db, target);
