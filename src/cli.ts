@@ -13,7 +13,7 @@ import { listRuntimes } from "./runtimes";
 import type { Task } from "./schema";
 import {
   addTask, approveTask, blockTask, claimNext, claimTask, claimableRunnableTasks, getNotes, getTask,
-  listTasks, rejectTask, releaseTask, runnableTasks, submitTask, taskCounts, unblockTask,
+  listTasks, notesClaimingApproval, rejectTask, releaseTask, runnableTasks, submitTask, taskCounts, unblockTask,
   unclaimableRunnableTasks, addNote, setTaskPlan, waitTask,
 } from "./tasks";
 import {
@@ -857,6 +857,20 @@ async function main(): Promise<void> {
         console.log("-----------");
         if (stranded.length === 0) console.log("(none)");
         for (const t of stranded) console.log(`${t.id}  role=${t.role}  ${t.title}`);
+        // A note can claim APPROVE without a transition (T151): the task then
+        // looks unreviewed while the reviewer believes it is finished. Surface
+        // the mismatch; `status` never mutates state.
+        const approveVerdicts = notesClaimingApproval(db);
+        console.log("");
+        console.log("Attention");
+        console.log("---------");
+        if (approveVerdicts.length === 0) console.log("(none)");
+        for (const { task, note } of approveVerdicts) {
+          console.log(
+            `${task.id}  state=${task.state}  assignee=${task.assignee ?? "-"}  ` +
+              `note claims APPROVE but the task was never approved (${note.worker_id ?? "?"})`
+          );
+        }
         const unattached = workers.filter((w) => w.current_task_id && !isOperationalWorker(db, w));
         console.log("");
         console.log("Unattached (holding a task)");

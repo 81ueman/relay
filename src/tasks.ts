@@ -314,6 +314,11 @@ export function unblockTask(db: Database, taskId: string, workerId: string): Tas
   }
   const t = now();
   // Fresh claim gets a new lease token; ensure no stale ownership lingers.
+  // Decision (T151): unblock deliberately clears the owner/lease. A `queued`
+  // task is unowned by invariant, and `block` already released the worker, so
+  // there is no owner to preserve — preserving a lease would hand the next
+  // claim a stale fence. The follow-on `submit` therefore gets STALE_LEASE and
+  // now says to re-claim (see submitTask).
   db.query(`UPDATE tasks SET state = 'queued', assignee = NULL, lease_until = NULL, updated_at = ? WHERE id = ?`).run(t, taskId);
   logEvent(db, { source: "worker", workerId, taskId, type: "task.unblocked" });
   return getTask(db, taskId)!;
@@ -409,6 +414,37 @@ export function getNotes(db: Database, taskId: string): { worker_id: string | nu
   }[];
 }
 
+/**
+ * A note that states an explicit APPROVE verdict. Anchored to the start of a
+ * line (optionally after a `verdict:` label) so prose that merely mentions the
+ * word — "I cannot approve this yet" — is not mistaken for a verdict.
+ */
+const APPROVE_VERDICT = /(?:^|\n)\s*(?:verdict\s*[:=-]\s*)?APPROVE[D]?\b/i;
+
+/**
+ * Read-only advisory: tasks whose notes claim APPROVE but that were never
+ * transitioned to a terminal state. Regression for T151 — a reviewer wrote a
+ * free-form note whose body was an explicit "APPROVE" verdict but did not call
+ * `relay approve`, so the task stayed queued/unowned and looked unreviewed.
+ *
+ * This only surfaces the mismatch (status/dashboard); it never changes state.
+ * We deliberately do NOT let `approve` accept a queued/running task: that would
+ * let one call mark unreviewed work done and bypass the review gate.
+ */
+export function notesClaimingApproval(
+  db: Database
+): { task: Task; note: { worker_id: string | null; kind: string; body: string; created_at: number } }[] {
+  const open = db
+    .query(`SELECT * FROM tasks WHERE state NOT IN ('done','failed') ORDER BY updated_at DESC`)
+    .all() as Task[];
+  const out: { task: Task; note: { worker_id: string | null; kind: string; body: string; created_at: number } }[] = [];
+  for (const task of open) {
+    const note = getNotes(db, task.id).reverse().find((n) => APPROVE_VERDICT.test(n.body));
+    if (note) out.push({ task, note });
+  }
+  return out;
+}
+
 /** Submit work for review. Fencing: assignee must match; explicit lease token must match. */
 export function submitTask(
   db: Database,
@@ -419,7 +455,16 @@ export function submitTask(
   const task = getTask(db, taskId);
   if (!task) throw new Error(`unknown task: ${taskId}`);
   if (task.assignee !== workerId) {
-    throw new Error(`${STALE_LEASE}: task ${taskId} is owned by ${task.assignee ?? "nobody"} (token ${task.lease_token}), not ${workerId}`);
+    // A blocked task that was `unblock`ed comes back as queued and UNOWNED
+    // (queued tasks never carry an assignee/lease), so a re-review cannot just
+    // submit: the caller must re-claim it first. Say so instead of only naming
+    // the absent owner (`owned by nobody`), which reads as a bug.
+    const owner = task.assignee ?? "nobody";
+    const hint =
+      task.state === "queued" && !task.assignee
+        ? ` (task is queued and unowned — claim it first: relay claim ${taskId})`
+        : ` (task is ${task.state})`;
+    throw new Error(`${STALE_LEASE}: task ${taskId} is owned by ${owner} (token ${task.lease_token}), not ${workerId}${hint}`);
   }
   if (opts.leaseToken !== undefined && opts.leaseToken !== task.lease_token) {
     throw new Error(`${STALE_LEASE}: task ${taskId} token mismatch (have ${opts.leaseToken}, want ${task.lease_token})`);
