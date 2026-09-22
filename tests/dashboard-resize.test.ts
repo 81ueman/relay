@@ -7,7 +7,7 @@ import { openDb } from "../src/db";
 import { renderDashboard } from "../src/dashboard/render";
 import { buildDashboardView } from "../src/dashboard/model";
 import { dwidth } from "../src/dashboard/render";
-import { terminalWidth, terminalHeight, windowLines } from "../src/dashboard/command";
+import { terminalWidth, terminalHeight, windowLines, shouldUseAltScreen } from "../src/dashboard/command";
 import type { PaneTelemetry } from "../src/dashboard/herdr";
 import { recordRuntime } from "../src/runtimes";
 import { addTask, claimTask } from "../src/tasks";
@@ -164,8 +164,7 @@ describe("dashboard watch readability (T326)", () => {
     expect(windowLines(lines, 0, 0)).toEqual([]);
   });
 
-  test("the watch frame reserves the bottom row and emits NO trailing newline", () => {
-    // The off-by-one the reviewer found: N lines + a trailing LF is N line-feeds
+  test("the watch frame reserves the bottom row and emits NO trailing newline", () => {    // The off-by-one the reviewer found: N lines + a trailing LF is N line-feeds
     // in an N-row pane, so the pane scrolls one row and loses the TOP line. The
     // loop clips to `height - 1` and writes `view.join("\n")` (no trailing LF),
     // which reuses the windowing helper the loop calls.
@@ -177,6 +176,30 @@ describe("dashboard watch readability (T326)", () => {
     expect(written.split("\n")).toHaveLength(height - 1);
     expect(written.endsWith("\n")).toBe(false); // <-- the fix
     expect(written.split("\n")[0]).toBe("line 0"); // top line survives
+  });
+});
+
+// T340: the alt-screen default hid the dashboard in Herdr panes (herdr pane read
+// reads the NORMAL screen). Inside Herdr, --watch must default to INLINE.
+describe("alt-screen defaults inside Herdr (T340)", () => {
+  test("inside Herdr the default is inline; --alt-screen opts back in", () => {
+    const herdr = { HERDR_ENV: "1" };
+    expect(shouldUseAltScreen([], herdr, true)).toBe(false);
+    expect(shouldUseAltScreen(["--alt-screen"], herdr, true)).toBe(true);
+    expect(shouldUseAltScreen(["--no-alt-screen"], herdr, true)).toBe(false);
+    // HERDR_PANE_ID alone is enough to detect the pane context.
+    expect(shouldUseAltScreen([], { HERDR_PANE_ID: "w6D:p8" }, true)).toBe(false);
+  });
+
+  test("outside Herdr alt-screen stays the default (no regression)", () => {
+    expect(shouldUseAltScreen([], {}, true)).toBe(true);
+    expect(shouldUseAltScreen(["--no-alt-screen"], {}, true)).toBe(false);
+    expect(shouldUseAltScreen(["--alt-screen"], {}, true)).toBe(true);
+  });
+
+  test("a non-interactive stdout is never alt-screened", () => {
+    expect(shouldUseAltScreen(["--alt-screen"], { HERDR_ENV: "1" }, false)).toBe(false);
+    expect(shouldUseAltScreen([], {}, false)).toBe(false);
   });
 });
 

@@ -314,12 +314,16 @@ two columns. Three things keep it readable:
   height **minus one row** (a line that exactly fills the pane width sets the
   terminal's wrap-pending flag, so the next line-feed would scroll) and written
   with **no trailing newline**, so it can never overflow or accumulate.
-- **Alternate screen.** On a TTY the loop draws in the alternate screen buffer
-  (`ESC[?1049h … ESC[?1049l`), so nothing enters your scrollback and quitting
-  restores the screen you had before. `--no-alt-screen` draws inline; that keeps
-  the *visible* frame correct and singular, but past frames remain in your
-  scrollback (a full-screen redraw in a shared buffer always pushes rows), so the
-  alt-screen default is what you want for a fixed view.
+- **Alternate screen is opt-in inside Herdr (T340).** `herdr pane read` reads the
+  *normal* screen, and some Herdr/terminal setups never show the alternate screen
+  buffer — so an alt-screen dashboard looks **blank** in a Herdr pane (where the
+  fleet runs). `--watch` therefore draws **inline** by default when
+  `HERDR_ENV=1`/`HERDR_PANE_ID` is set. `--alt-screen` forces the alternate screen
+  (no scrollback, prior screen restored on quit); `--no-alt-screen` forces inline
+  anywhere. Inline keeps the visible frame correct and singular; past frames
+  remain in scrollback (a full-screen redraw in a shared buffer always pushes
+  rows), with no warning inside Herdr. A non-interactive stdout is never
+  alt-screened.
 - **Pause and scroll (`space`/`p`, then `↑`/`↓`, `j`/`k`, PageUp/Down).** Pausing
   freezes the view with a `PAUSED` banner showing the visible line range
   (`lines 1-11/88`); the arrows/`j`/`k` scroll it so the clipped tail is

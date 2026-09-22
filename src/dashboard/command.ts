@@ -75,6 +75,23 @@ export function windowLines(lines: string[], offset: number, rows: number): stri
   return lines.slice(start, start + rows);
 }
 
+/**
+ * Should `--watch` draw in the alternate screen? (T340)
+ *
+ * Inside a Herdr pane (HERDR_ENV=1 / HERDR_PANE_ID) the default is INLINE,
+ * because `herdr pane read` reads the NORMAL screen and some Herdr/terminal
+ * setups never show the alt-screen — an alt-screen dashboard looks blank to the
+ * operator. `--alt-screen` forces it on anywhere; `--no-alt-screen` forces it
+ * off. A non-interactive stdout is never alt-screened (piping/logging).
+ */
+export function shouldUseAltScreen(args: string[], env: NodeJS.ProcessEnv, interactive: boolean): boolean {
+  if (!interactive) return false;
+  if (args.includes("--no-alt-screen")) return false;
+  if (args.includes("--alt-screen")) return true;
+  const inHerdr = env.HERDR_ENV === "1" || !!env.HERDR_PANE_ID;
+  return !inHerdr;
+}
+
 export async function runDashboard(args: string[]): Promise<number> {
   // OSC8 link handler: Herdr passes the clicked URL in the environment. No DB.
   if (hasFlag(args, "--focus")) {
@@ -162,7 +179,13 @@ export async function runDashboard(args: string[]): Promise<number> {
       let width = terminalWidth();
       const stdout = process.stdout as NodeJS.WriteStream;
       const interactive = !!stdout.isTTY;
-      const altScreen = interactive && !hasFlag(args, "--no-alt-screen");
+      // T340: default to INLINE inside a Herdr pane. `herdr pane read` reads the
+      // NORMAL screen, and some Herdr/terminal setups never show the alt-screen,
+      // so an alt-screen dashboard looks BLANK to the operator (who runs the
+      // whole fleet in Herdr panes). Alt-screen is therefore OPT-IN via
+      // `--alt-screen`; `--no-alt-screen` still forces inline anywhere.
+      const inHerdr = process.env.HERDR_ENV === "1" || !!process.env.HERDR_PANE_ID;
+      const altScreen = interactive && shouldUseAltScreen(args, process.env, interactive);
       // Pause/resume: while paused the view is frozen and a PAUSED banner is
       // shown, so the operator can read the tree at leisure without it being
       // wiped by the next tick. Space or `p` toggles. While paused, ↑/↓ (k/j)
@@ -172,11 +195,12 @@ export async function runDashboard(args: string[]): Promise<number> {
       let scroll = 0;
       let lastFrame: string[] = [];
       const write = (s: string) => stdout.write(s);
-      if (interactive && !altScreen) {
+      if (interactive && !altScreen && !inHerdr) {
         // Be honest: inline mode shares the terminal's scrollback, and a
         // full-screen redraw necessarily pushes rows there. The VISIBLE frame is
-        // correct and singular, but scrolling up will show past frames.
-        console.error("relay dashboard --watch: --no-alt-screen draws inline; past frames remain in your scrollback (use the default alt-screen for a fixed view).");
+        // correct and singular, but scrolling up will show past frames. (Inside
+        // Herdr inline IS the default, so we stay quiet there — T340.)
+        console.error("relay dashboard --watch: --no-alt-screen draws inline; past frames remain in your scrollback (use --alt-screen for a fixed view).");
       }
       const draw = () => {
         width = terminalWidth() ?? width;
