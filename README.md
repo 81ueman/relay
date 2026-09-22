@@ -319,10 +319,10 @@ two columns. Three things keep it readable:
   buffer — so an alt-screen dashboard looks **blank** in a Herdr pane (where the
   fleet runs). `--watch` therefore draws **inline** by default when
   `HERDR_ENV=1`/`HERDR_PANE_ID` is set. `--alt-screen` forces the alternate screen
-  (no scrollback, prior screen restored on quit); `--no-alt-screen` forces inline
-  anywhere. Inline keeps the visible frame correct and singular; past frames
-  remain in scrollback (a full-screen redraw in a shared buffer always pushes
-  rows), with no warning inside Herdr. A non-interactive stdout is never
+  (prior screen restored on quit); `--no-alt-screen` forces inline anywhere. Inline
+  is **scrollback-clean**: the loop homes and clears each line (`ESC[2K`) instead
+  of a full-screen erase (`ESC[0J`/`ESC[2J` both push the erased window into
+  scrollback), so past frames do not accumulate. A non-interactive stdout is never
   alt-screened.
 - **Pause and scroll (`space`/`p`, then `↑`/`↓`, `j`/`k`, PageUp/Down).** Pausing
   freezes the view with a `PAUSED` banner showing the visible line range

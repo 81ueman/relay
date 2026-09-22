@@ -184,7 +184,6 @@ export async function runDashboard(args: string[]): Promise<number> {
       // so an alt-screen dashboard looks BLANK to the operator (who runs the
       // whole fleet in Herdr panes). Alt-screen is therefore OPT-IN via
       // `--alt-screen`; `--no-alt-screen` still forces inline anywhere.
-      const inHerdr = process.env.HERDR_ENV === "1" || !!process.env.HERDR_PANE_ID;
       const altScreen = interactive && shouldUseAltScreen(args, process.env, interactive);
       // Pause/resume: while paused the view is frozen and a PAUSED banner is
       // shown, so the operator can read the tree at leisure without it being
@@ -195,13 +194,8 @@ export async function runDashboard(args: string[]): Promise<number> {
       let scroll = 0;
       let lastFrame: string[] = [];
       const write = (s: string) => stdout.write(s);
-      if (interactive && !altScreen && !inHerdr) {
-        // Be honest: inline mode shares the terminal's scrollback, and a
-        // full-screen redraw necessarily pushes rows there. The VISIBLE frame is
-        // correct and singular, but scrolling up will show past frames. (Inside
-        // Herdr inline IS the default, so we stay quiet there — T340.)
-        console.error("relay dashboard --watch: --no-alt-screen draws inline; past frames remain in your scrollback (use --alt-screen for a fixed view).");
-      }
+      // Inline is now scrollback-clean (per-line erase, no full-screen ED), so
+      // there is nothing to warn about. Kept as a hook for future caveats.
       const draw = () => {
         width = terminalWidth() ?? width;
         const height = terminalHeight();
@@ -212,13 +206,13 @@ export async function runDashboard(args: string[]): Promise<number> {
         // A paused view is FROZEN: keep the frame we already hold so a tick
         // cannot move it under the reader.
         let lines = lastFrame;
-        // CLIP to the pane: an overflowing frame scrolls into the scrollback, and
-        // clearing the screen cannot clear scrollback, so each redraw would append
-        // a stale copy. alt-screen (default) removes scrollback entirely.
-        //
-        // HOME + ERASE-DOWN (`\x1b[H\x1b[0J`), NOT `\x1b[2J`: ED2 (full-screen
-        // erase) makes some emulators push the visible screen into scrollback.
-        write("\x1b[H\x1b[0J");
+        // CLIP to the pane (below) so a frame never overflows. We do NOT emit a
+        // full-screen erase: BOTH `\x1b[2J` (ED2) AND `\x1b[0J` (ED0) make tmux
+        // (and the operator's Herdr pane) push the erased window into SCROLLBACK,
+        // so frames would still accumulate inline (verified: `\x1b[H` alone =>
+        // history 0; `\x1b[H\x1b[0J` => 55). Instead we home and erase each LINE
+        // we are about to overwrite with `\x1b[2K`, which never scrolls.
+        write("\x1b[H");
         // Reserve the bottom row (a full-width line sets the wrap-pending flag,
         // and the following LF scrolls one row — verified in a real tmux).
         const usable = Math.max(1, height - 1);
@@ -228,12 +222,15 @@ export async function runDashboard(args: string[]): Promise<number> {
             `(space resume · ↑/↓ scroll)\n`
           : "";
         const bannerRows = paused ? 1 : 0;
-        if (banner) write(banner);
+        if (banner) write("\x1b[2K" + banner);
         const rows = Math.max(1, usable - bannerRows);
         const maxScroll = Math.max(0, lines.length - rows);
         if (scroll > maxScroll) scroll = maxScroll;
         const view = windowLines(lines, scroll, rows);
-        write(view.join("\n"));
+        // Per-line clear + content, joined with \n (no trailing LF). Every drawn
+        // row is cleared first, so the previous frame cannot bleed through and
+        // the terminal never scrolls (no ED0/ED2).
+        write(view.map((l) => "\x1b[2K" + l).join("\n"));
       };
       const enterAlt = () => { if (altScreen) write("\x1b[?1049h"); };
       const leaveAlt = () => { if (altScreen) write("\x1b[?1049l"); };

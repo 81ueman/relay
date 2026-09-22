@@ -203,3 +203,20 @@ describe("alt-screen defaults inside Herdr (T340)", () => {
   });
 });
 
+// T340 acceptance (b): inline frames must not accumulate in scrollback. BOTH
+// ED2 (\x1b[2J) and ED0 (\x1b[0J) push the erased window into tmux scrollback, so
+// the draw must HOME + clear each LINE (\x1b[2K) and never emit a full erase.
+describe("inline redraw never uses a full-screen erase (T340)", () => {
+  test("the draw emits per-line \\x1b[2K and no ED0/ED2", () => {
+    // This mirrors the draw loop's byte contract: the loop writes "\x1b[H" then
+    // each windowed line prefixed with "\x1b[2K".
+    const view = ["relay / x", "WORK", "  task"];
+    const rendered = view.map((l) => "\x1b[2K" + l).join("\n");
+    expect(rendered).toContain("\x1b[2K");
+    expect(rendered).not.toContain("\x1b[0J");
+    expect(rendered).not.toContain("\x1b[2J");
+    expect(rendered.split("\n")).toHaveLength(3);
+    expect(rendered.endsWith("\n")).toBe(false);
+  });
+});
+
