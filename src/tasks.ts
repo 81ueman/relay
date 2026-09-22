@@ -424,9 +424,21 @@ export function claimNext(db: Database, workerId: string, opts: ClaimOptions = {
   db.run("BEGIN IMMEDIATE");
   try {
     if (worker.role === "reviewer") {
+      // Never steal a review that another reviewer is actively working: two
+      // reviewers being offered (and claiming) the same review is a real
+      // double-claim. Skip any review whose assignee is a DIFFERENT, live,
+      // actively-working reviewer. An alive-but-idle or moved-on assignee must
+      // NOT strand the review (a review claim carries no lease, so it is
+      // defended only while the holder is actually on it).
+      const heldByLiveReviewer = (r: Task): boolean => {
+        if (!r.assignee || r.assignee === workerId) return false;
+        const holder = getWorker(db, r.assignee);
+        if (!holder || holder.state === "dead" || holder.state === "stalled") return false;
+        return holder.state === "working" && holder.current_task_id === r.id;
+      };
       const review = (db
-        .query(`SELECT * FROM tasks WHERE state = 'review' ORDER BY priority DESC, created_at ASC LIMIT 1`)
-        .get() as Task | null) ?? null;
+        .query(`SELECT * FROM tasks WHERE state = 'review' ORDER BY priority DESC, created_at ASC`)
+        .all() as Task[]).find((r) => !heldByLiveReviewer(r)) ?? null;
       if (review) {
         db.query(`UPDATE tasks SET assignee = ?, updated_at = ? WHERE id = ?`).run(workerId, t, review.id);
         db.query(

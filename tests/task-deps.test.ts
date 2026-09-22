@@ -239,3 +239,44 @@ describe("reviewer gate: not runnable before its sibling is submitted (T225)", (
     expect(claimableRunnableTasks(db, "reviewer").map((t) => t.id)).toEqual([gate.id]);
   });
 });
+
+// T343: `relay next` for a reviewer must not offer a review that another
+// reviewer already claimed and is actively working (it used to reassign the
+// highest-priority review to whoever asked, silently stealing it).
+describe("reviewer claimNext does not steal a review held by a live reviewer (T343)", () => {
+  test("a working holder keeps the review; a moved-on holder does not strand it", () => {
+    managed("dev", "worker");
+    managed("reviewer-1", "reviewer");
+    managed("reviewer-2", "reviewer");
+    const impl = addTask(db, { title: "impl" });
+    expect(claimNext(db, "dev")!.id).toBe(impl.id);
+    submitTask(db, impl.id, "dev"); // impl -> review
+
+    // reviewer-1 picks up the review (assignee + working + current task).
+    expect(claimNext(db, "reviewer-1")!.id).toBe(impl.id);
+    expect(getWorker(db, "reviewer-1")!.current_task_id).toBe(impl.id);
+
+    // reviewer-2 must NOT be offered the same review; ownership is unchanged.
+    expect(claimNext(db, "reviewer-2")).toBeNull();
+    expect((db.query(`SELECT assignee FROM tasks WHERE id = ?`).get(impl.id) as { assignee: string }).assignee).toBe("reviewer-1");
+
+    // The holder moving on (idle, no longer on this task) must not strand it:
+    // another reviewer can then take it.
+    db.query(`UPDATE workers SET state = 'idle', current_task_id = NULL WHERE id = 'reviewer-1'`).run();
+    expect(claimNext(db, "reviewer-2")!.id).toBe(impl.id);
+    expect((db.query(`SELECT assignee FROM tasks WHERE id = ?`).get(impl.id) as { assignee: string }).assignee).toBe("reviewer-2");
+  });
+
+  test("a dead/stalled holder does not block a review", () => {
+    managed("dev", "worker");
+    managed("reviewer-1", "reviewer");
+    managed("reviewer-2", "reviewer");
+    const impl = addTask(db, { title: "impl" });
+    claimNext(db, "dev");
+    submitTask(db, impl.id, "dev");
+    expect(claimNext(db, "reviewer-1")!.id).toBe(impl.id);
+
+    db.query(`UPDATE workers SET state = 'stalled' WHERE id = 'reviewer-1'`).run();
+    expect(claimNext(db, "reviewer-2")!.id).toBe(impl.id);
+  });
+});
