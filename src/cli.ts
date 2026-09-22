@@ -95,7 +95,8 @@ DB: $RELAY_DB, else $RELAY_CONFIG/~/.config/relay/config.json {"db":...}, else t
     nearest .relay/state.db (upward from cwd; WAL), else <cwd>/.relay/state.db.
     "relay db path|sources" show which wins; "relay db move" relocates it safely.Env: RELAY_LEASE_MS RELAY_LEASE_LIVENESS_GRACE_MS RELAY_STALL_MS RELAY_LOW_WATER
      RELAY_AUTO_APPROVE RELAY_INTERVAL_MS RELAY_ROLE_STRICT (default true)
-     RELAY_MAIL_NUDGE_MS RELAY_MAIL_STARVATION_MS
+     RELAY_MAIL_NUDGE_MS RELAY_MAIL_STARVATION_MS RELAY_MAIL_ORDINARY_STARVATION_MS
+     RELAY_HUMAN (blocked_human recipient; else nearest assigned ancestor)
 Spawn: RELAY_HERDR_WORKSPACE (required to spawn; else $HERDR_WORKSPACE_ID)
 Manual attach: requires a live Herdr agent (use --pane/--tab or $HERDR_PANE_ID/$HERDR_TAB_ID)
 Runtime cleanup: RELAY_RUNTIME_CLEANUP_GRACE_MS RELAY_ATTACH_TIMEOUT_MS RELAY_RESTART_COOLDOWN_MS
