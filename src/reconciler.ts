@@ -215,22 +215,26 @@ function sessionEventFresh(db: Database, workerId: string, at: number): boolean 
 }
 
 /**
- * The newest successful codex agent poll for this worker (status working/idle/
- * blocked), 0 when none. Codex has no plugin event stream, so its liveness comes
- * from `pollCodexWorker`; a reachable agent must not be declared dead just
- * because a later `isAlive` probe transiently fails.
+ * The single most recent codex agent poll for this worker: its timestamp and
+ * status (0/"" when none). Codex has no plugin event stream, so its liveness
+ * comes from `pollCodexWorker`. CRITICAL: this is the LATEST poll of ANY status
+ * — a newer `dead`/`unknown` verdict must never be overridden by an older
+ * successful one.
  */
-function lastCodexPollAt(db: Database, workerId: string): number {
+function lastCodexPoll(db: Database, workerId: string): { at: number; status: string } {
   const r = db
     .query(
-      `SELECT MAX(timestamp) AS t FROM events
+      `SELECT timestamp AS t, payload_json AS p FROM events
         WHERE worker_id = ? AND type = 'worker.status_polled'
-          AND (payload_json LIKE '%"status":"working"%'
-            OR payload_json LIKE '%"status":"idle"%'
-            OR payload_json LIKE '%"status":"blocked"%')`
+        ORDER BY id DESC LIMIT 1`
     )
-    .get(workerId) as { t: number | null };
-  return r.t ?? 0;
+    .get(workerId) as { t: number; p: string } | null;
+  if (!r) return { at: 0, status: "" };
+  let status = "";
+  try {
+    status = String((JSON.parse(r.p) as { status?: unknown }).status ?? "");
+  } catch { /* malformed payload: treat as unknown */ }
+  return { at: r.t, status };
 }
 
 /**
@@ -240,12 +244,18 @@ function lastCodexPollAt(db: Database, workerId: string): number {
  *   - a live in-flight tool marker (a long benchmark emits `tool.started` and
  *     nothing until it returns; `processInFlightTools` has already reaped markers
  *     past their budget, so a surviving marker is a running tool);
- *   - a recent successful codex agent poll (no event stream).
+ *   - a recent codex agent poll WHOSE LATEST STATUS is reachable (working/idle/
+ *     blocked) — codex has no event stream; a latest `dead`/`unknown` poll is
+ *     authoritative and yields nothing.
  */
 function sessionAliveEvidence(db: Database, w: WorkerRow, at: number): string | null {
   if (sessionEventFresh(db, w.id, at)) return "event";
   if (w.tool_started_at !== null && at - w.tool_started_at <= toolHardCapMs()) return "tool";
-  if (w.agent_kind === "codex" && at - lastCodexPollAt(db, w.id) <= sessionLivenessMs()) return "codex-poll";
+  if (w.agent_kind === "codex") {
+    const poll = lastCodexPoll(db, w.id);
+    const reachable = poll.status === "working" || poll.status === "idle" || poll.status === "blocked";
+    if (reachable && poll.at > 0 && at - poll.at <= sessionLivenessMs()) return "codex-poll";
+  }
   return null;
 }
 

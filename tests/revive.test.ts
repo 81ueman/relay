@@ -208,4 +208,21 @@ describe("T396: liveness evidence beyond the event window", () => {
     expect(actions).toContain("alive-by-event:rev-codex");
     expect(getWorker(db, "rev-codex")!.state).not.toBe("dead");
   });
+
+  test("a latest dead codex poll is never overridden by an older successful poll", async () => {
+    registerWorker(db, "rev-codex2", { role: "worker", agentKind: "codex", runtimeId: "w6D:p8" });
+    attachSession(db, CODEX_ID, {
+      role: "worker", workerId: "rev-codex2", agentKind: "codex", identity: codexIdentity,
+    });
+    rt.setAgentStatus("rev-codex2", "working");
+    await reconcile(db, rt); // records a reachable poll
+
+    rt.setAgentStatus("rev-codex2", "dead"); // the LATEST poll says dead
+    rt.setAlive("rev-codex2", false);
+    const { actions } = await reconcile(db, rt);
+
+    expect(actions).not.toContain("alive-by-event:rev-codex2");
+    expect(actions).not.toContain("revived-by-event:rev-codex2");
+    expect(getWorker(db, "rev-codex2")!.state).toBe("dead");
+  });
 });
