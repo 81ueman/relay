@@ -12,8 +12,14 @@ import type { Worker } from "../schema";
 // marks the old generation stale, best-effort interrupts it, then calls start()
 // for a fresh generation. The adapter therefore has no restart().
 
-/** Result of spawning a fresh generation. Herdr metadata stays out of the workers row. */
-export interface StartedRuntime {
+/**
+ * Polled agent status for runtimes WITHOUT an event stream (codex). Herdr
+ * reports idle|working|blocked|done|unknown; `done` maps to `idle` (the turn
+ * finished) and anything unrecognized to `unknown`.
+ */
+export type AgentStatus = "idle" | "working" | "blocked" | "dead" | "unknown";
+
+/** Result of spawning a fresh generation. Herdr metadata stays out of the workers row. */export interface StartedRuntime {
   runtimeId: string; // Herdr agent name (or pane id when the agent is unnamed)
   tabId?: string;
   paneId?: string;
@@ -64,6 +70,12 @@ export interface HerdrIdentityHint {
   workspaceId?: string;
   /** OpenCode session working directory: identifies/validates the pane. */
   directory?: string;
+  /**
+   * Expected agent kind ("opencode" | "codex"). A codex session has a UUID id
+   * (not `ses...`), so identity resolution must accept a codex agent; when this
+   * is absent the kind is inferred from the session id.
+   */
+  agentKind?: string;
 }
 
 export interface Runtime {
@@ -76,6 +88,12 @@ export interface Runtime {
    * as "stalled".
    */
   isWorking(worker: Worker): Promise<boolean>;
+  /**
+   * Polled agent status for a runtime with NO event stream (codex): relay
+   * derives liveness/idle/blocked from this instead of plugin events. Optional;
+   * the event-driven opencode path does not need it.
+   */
+  agentStatus?(worker: Worker): Promise<AgentStatus>;
   wake(worker: Worker, text: string): Promise<void>;
   interrupt(worker: Worker): Promise<void>;
   /**
@@ -129,6 +147,8 @@ export class MockRuntime implements Runtime {
   identities = new Map<string, HerdrIdentity>();
   /** Every resolveIdentity call (for hint/verification assertions). */
   resolves: { sessionId: string; hint?: HerdrIdentityHint }[] = [];
+  /** workerId -> polled agent status (codex path). */
+  statuses = new Map<string, AgentStatus>();
   /** When set, resolveIdentity throws this (simulated ambiguity/unverifiable). */
   resolveError?: string;
   peekText = "";
@@ -147,6 +167,15 @@ export class MockRuntime implements Runtime {
 
   setWorking(id: string, v: boolean): void {
     this.working.set(id, v);
+  }
+
+  setAgentStatus(id: string, s: AgentStatus): void {
+    this.statuses.set(id, s);
+  }
+
+  async agentStatus(w: Worker): Promise<AgentStatus> {
+    this.targets.push({ op: "agentStatus", target: MockRuntime.targetOf(w) });
+    return this.statuses.get(this.key(w)) ?? "idle";
   }
 
   setIdentity(sessionId: string, identity: HerdrIdentity): void {

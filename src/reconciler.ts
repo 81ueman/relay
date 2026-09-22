@@ -1,7 +1,7 @@
 import type { Database } from "bun:sqlite";
 import { now } from "./db";
 import { countIdleSinceProgress, logEvent } from "./events";
-import type { Runtime, StartedRuntime } from "./runtime/runtime";
+import type { AgentStatus, Runtime, StartedRuntime } from "./runtime/runtime";
 import {
   cleanupCandidates,
   findRuntime,
@@ -748,6 +748,10 @@ export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<
   //     blocking tool so the session can continue.
   await processInFlightTools(db, rt, actions, at);
 
+  // 0b. Codex workers have no plugin event stream: poll Herdr agent status for
+  //     liveness/idle/blocked before the transport-dead walk below.
+  await pollCodexWorkers(db, rt, at);
+
   // 1. Expire lapsed leases first (worker crash recovery). Only a missing or
   //    not-alive assignee is requeued; a live-but-slow worker keeps its lease.
   //    The transport-dead path in step 3 still requeues a crashed worker whose
@@ -1070,6 +1074,50 @@ export async function handleIdleSignal(db: Database, rt: Runtime, workerId: stri
     return "nudged-continue";
   }
   return "noop";
+}
+
+export async function pollCodexWorker(db: Database, rt: Runtime, workerId: string, at = now()): Promise<string> {
+  const w = getWorker(db, workerId);
+  if (!w) return "unknown-worker";
+  if (w.agent_kind !== "codex") return "not-codex";
+  if (typeof rt.agentStatus !== "function") return "unsupported";
+  const status = await rt.agentStatus(w).catch(() => "unknown" as AgentStatus);
+  logEvent(db, { source: "opencode", workerId, type: "worker.status_polled", payload: { status } });
+
+  if (status === "dead") {
+    setWorkerState(db, workerId, "dead");
+    logEvent(db, { source: "supervisor", workerId, type: "worker.dead" });
+    return "dead";
+  }
+  if (status === "working") {
+    touchSeen(db, workerId, at); // executing right now = progress
+    return "working";
+  }
+  if (status === "blocked") {
+    touchSeen(db, workerId, at);
+    if (w.state === "working" || w.state === "idle") setWorkerState(db, workerId, "waiting_input");
+    return "blocked";
+  }
+  if (status === "idle") {
+    touchSeen(db, workerId, at);
+    // The idle transition (clear a stale tool marker, nudge to the next task or
+    // continue a running one) is the same machine an idle event runs. It is
+    // idempotent: a worker that already moved on yields "idle-no-work".
+    return await handleIdleSignal(db, rt, workerId, at);
+  }
+  return "unknown";
+}
+
+/**
+ * Poll every managed codex worker. Codex has no plugin event stream, so this is
+ * its liveness/idle source; opencode workers are untouched.
+ */
+async function pollCodexWorkers(db: Database, rt: Runtime, at: number): Promise<void> {
+  for (const w of listWorkers(db)) {
+    if (w.agent_kind !== "codex") continue;
+    if (!isSupervisedWorker(db, w)) continue;
+    await pollCodexWorker(db, rt, w.id, at).catch(() => "poll-error");
+  }
 }
 
 /** Record session.error: suspect/dead candidate, caller should reconcile immediately. */

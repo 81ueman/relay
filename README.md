@@ -474,6 +474,29 @@ main repo's daemon automatically — no manual `.relay` symlink:
   (`directory` / `worktree`); the control plane itself stays centralized in the
   main checkout, so one ledger serves every lane.
 
+### Codex agents
+
+A worker is not necessarily OpenCode. `workers.agent_kind` records the runtime
+(`opencode` | `codex`); it is set from the resolved Herdr agent kind at attach.
+
+```bash
+relay session attach --session <uuid> --kind codex --worker codex-v4-example --role design-v4
+```
+
+- A **codex session id is a UUID**, not `ses...`. The socket/CLI attach accepts
+  it ONLY when `kind: "codex"` is declared (and it matches the UUID shape), so
+  the OpenCode `ses...` guard is not weakened: an undeclared non-`ses` id is
+  still refused.
+- Codex has **no plugin event stream**, so relay does not wait for
+  `session.idle`. The reconciler polls Herdr `agent_status` each pass and maps it
+  onto the same state machine an idle event runs: `working` = progress (never
+  stall a busy agent), `blocked` = `waiting_input`, unreachable = `dead`, and
+  `idle`/`done` runs the idle transition (nudge to the next task, or continue a
+  running one). Each poll logs `worker.status_polled`.
+- Wake/detach/retire/recovery are unchanged: they go through the same Herdr
+  transport (`agent prompt` / `send-keys`) and the same worker/runtime rows.
+- Existing workers default to `agent_kind = 'opencode'` (idempotent migration).
+
 ## Managed sessions: plain `opencode` stays untouched
 
 Herdr-runtime is mandatory; Relay *management* is optional. Running OpenCode

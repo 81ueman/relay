@@ -8,7 +8,7 @@ export type WorkerRow = Worker;
 export function registerWorker(
   db: Database,
   id: string,
-  opts: { role?: string; runtimeId?: string; sessionId?: string; cwd?: string; command?: string } = {}
+  opts: { role?: string; agentKind?: string; runtimeId?: string; sessionId?: string; cwd?: string; command?: string } = {}
 ): Worker {
   const t = now();
   const existing = db.query(`SELECT * FROM workers WHERE id = ?`).get(id) as Worker | null;
@@ -20,24 +20,25 @@ export function registerWorker(
       logEvent(db, { source: "cli", workerId: id, type: "worker.unretired", payload: { reason: "re-registered" } });
     }
     db.query(
-      `UPDATE workers SET role = COALESCE(?, role), runtime_id = COALESCE(?, runtime_id),
+      `UPDATE workers SET role = COALESCE(?, role), agent_kind = COALESCE(?, agent_kind),
+        runtime_id = COALESCE(?, runtime_id),
         opencode_session_id = COALESCE(?, opencode_session_id),
         cwd = COALESCE(?, cwd), command = COALESCE(?, command), updated_at = ? WHERE id = ?`
     ).run(
-      opts.role ?? null, opts.runtimeId ?? null, opts.sessionId ?? null,
+      opts.role ?? null, opts.agentKind ?? null, opts.runtimeId ?? null, opts.sessionId ?? null,
       opts.cwd ?? null, opts.command ?? null, t, id
     );
     return getWorker(db, id)!;
   }
   db.query(
-    `INSERT INTO workers (id, role, runtime_id, cwd, command, opencode_session_id, state, current_task_id,
+    `INSERT INTO workers (id, role, agent_kind, runtime_id, cwd, command, opencode_session_id, state, current_task_id,
       generation, last_seen_at, last_progress_at, nudged_at, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, 'starting', NULL, 0, ?, ?, NULL, ?, ?)`
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'starting', NULL, 0, ?, ?, NULL, ?, ?)`
   ).run(
-    id, opts.role ?? "worker", opts.runtimeId ?? null, opts.cwd ?? null, opts.command ?? null,
+    id, opts.role ?? "worker", opts.agentKind ?? "opencode", opts.runtimeId ?? null, opts.cwd ?? null, opts.command ?? null,
     opts.sessionId ?? null, t, t, t, t
   );
-  logEvent(db, { source: "cli", workerId: id, type: "worker.registered", payload: { role: opts.role ?? "worker" } });
+  logEvent(db, { source: "cli", workerId: id, type: "worker.registered", payload: { role: opts.role ?? "worker", agentKind: opts.agentKind ?? "opencode" } });
   return getWorker(db, id)!;
 }
 

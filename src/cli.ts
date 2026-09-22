@@ -46,7 +46,7 @@ Usage:
   relay worker retire <id> [--reason <text>]
   relay worker unretire <id>
 
-  relay session attach --session <sid> [--role worker] [--worker <id>] [--dir <d>] [--worktree <w>] [--pane <p>] [--tab <t>]
+  relay session attach --session <sid> [--role worker] [--worker <id>] [--kind opencode|codex] [--dir <d>] [--worktree <w>] [--pane <p>] [--tab <t>]
   relay session detach --session <sid>
   relay session list
   relay session status --session <sid>
@@ -133,15 +133,15 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
   session: {
     about: "Manage OpenCode sessions attached to Herdr agents.",
     usage: [
-      "relay session attach --session <sid> [--role R] [--worker W] [--dir D] [--worktree W] [--pane P] [--tab T]",
+      "relay session attach --session <sid> [--role R] [--worker W] [--kind opencode|codex] [--dir D] [--worktree W] [--pane P] [--tab T]",
       "relay session detach --session <sid>",
       "relay session list",
       "relay session status --session <sid>",
     ],
   },
   "session attach": {
-    about: "Attach a session. The Herdr agent is resolved and verified BEFORE touching the DB (fail-closed).",
-    usage: ["relay session attach --session <sid> [--role R] [--worker W] [--dir D] [--worktree W] [--pane P] [--tab T]"],
+    about: "Attach a session. The Herdr agent is resolved and verified BEFORE touching the DB (fail-closed). An OpenCode session has a `ses...` id; a codex session has a UUID id and MUST pass --kind codex (the opencode guard is not weakened).",
+    usage: ["relay session attach --session <sid> [--role R] [--worker W] [--kind opencode|codex] [--dir D] [--worktree W] [--pane P] [--tab T]"],
   },
   "session detach": { about: "Detach a managed session.", usage: ["relay session detach --session <sid>"] },
   "session list": { about: "List sessions.", usage: ["relay session list"] },
@@ -373,7 +373,7 @@ function printTaskContext(db: ReturnType<typeof openDb>, taskId: string): void {
 const VALUE_FLAGS = new Set([
   "--worker", "--reason", "--evidence", "--lease", "--kind", "--task", "--for",
   "--role", "--state", "--limit", "--interval", "--session", "--runtime", "--cwd",
-  "--command", "--title", "--acceptance", "--priority", "--parent", "--plan",
+  "--command", "--title", "--kind", "--acceptance", "--priority", "--parent", "--plan",
   "--dir", "--worktree", "--pane", "--tab", "--workspace", "--type", "--payload",
   "--ack", "--depends-on", "--older-than",
 ]);
@@ -538,11 +538,15 @@ async function main(): Promise<void> {
               tabId: flag(rest, "--tab") ?? (dir ? undefined : process.env.HERDR_TAB_ID),
               workspaceId: flag(rest, "--workspace") ?? (dir ? undefined : process.env.HERDR_WORKSPACE_ID),
               directory: dir,
+              // A codex session has a UUID id (not `ses...`); declare its kind so
+              // identity resolution accepts the codex agent.
+              agentKind: flag(rest, "--kind") ?? (/^ses/.test(sessionId) ? "opencode" : "codex"),
             },
           });
           const s = attachSession(db, sessionId, {
             role: flag(rest, "--role") ?? undefined,
             workerId: flag(rest, "--worker") ?? undefined,
+            agentKind: flag(rest, "--kind") ?? undefined,
             directory: dir,
             worktree: flag(rest, "--worktree") ?? undefined,
             identity,
@@ -830,7 +834,7 @@ async function main(): Promise<void> {
         // ordinary worker id (peers message each other directly).
         const existing = getWorker(db, recipient);
         const targetRow = existing ?? {
-          id: recipient, role: "worker", runtime_id: null, cwd: null, command: null,
+          id: recipient, role: "worker", agent_kind: "opencode", runtime_id: null, cwd: null, command: null,
           opencode_session_id: null, state: "idle" as const, current_task_id: null,
           generation: 0, last_seen_at: 0, last_progress_at: 0, nudged_at: null,
           retired_at: null, retired_reason: null,

@@ -73,6 +73,12 @@ function migrate(db: Database): void {
     if (!columnExists(db, "workers", "command")) {
       db.exec("ALTER TABLE workers ADD COLUMN command TEXT;");
     }
+    // Which agent runtime the worker is (opencode vs codex): codex has no plugin
+    // event stream, so liveness is polled from Herdr agent status. Existing rows
+    // are opencode.
+    if (!columnExists(db, "workers", "agent_kind")) {
+      db.exec("ALTER TABLE workers ADD COLUMN agent_kind TEXT NOT NULL DEFAULT 'opencode';");
+    }
     // Retirement tombstone: see Worker.retired_at. The index is created here (not
     // in SCHEMA) because SCHEMA runs first on DBs that predate the column.
     if (!columnExists(db, "workers", "retired_at")) {

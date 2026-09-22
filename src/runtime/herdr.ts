@@ -5,6 +5,7 @@ import { resolve as resolvePath } from "node:path";
 import type { Worker } from "../schema";
 import {
   MockRuntime,
+  type AgentStatus,
   type HerdrIdentity,
   type HerdrIdentityHint,
   type Runtime,
@@ -280,17 +281,18 @@ function dirsOverlap(a: string | null | undefined, b: string | null | undefined)
 export function pickIdentityByDirectory(
   agents: HerdrAgentEntry[],
   sessionId: string,
-  directory: string
+  directory: string,
+  kind = "opencode"
 ): HerdrIdentity {
   const matches = agents.filter(
-    (a) => a?.agent === "opencode" && dirsOverlap(directory, a.foreground_cwd ?? a.cwd)
+    (a) => a?.agent === kind && dirsOverlap(directory, a.foreground_cwd ?? a.cwd)
   );
   if (matches.length === 0) {
-    throw new Error(`session ${sessionId} is not running inside Herdr (no opencode agent with cwd ${directory})`);
+    throw new Error(`session ${sessionId} is not running inside Herdr (no ${kind} agent with cwd ${directory})`);
   }
   if (matches.length > 1) {
     throw new Error(
-      `ambiguous Herdr identity for ${sessionId}: ${matches.length} opencode agents run in ${directory}; ` +
+      `ambiguous Herdr identity for ${sessionId}: ${matches.length} ${kind} agents run in ${directory}; ` +
       `supply a pane hint (e.g. pane_id="$HERDR_PANE_ID") to disambiguate`
     );
   }
@@ -342,6 +344,22 @@ export class HerdrRuntime implements Runtime {
     return parsed?.result?.agent?.agent_status === "working";
   }
 
+  /**
+   * Polled agent status for a runtime with NO event stream (codex). `dead` when
+   * the agent is unreachable; otherwise Herdr's agent_status, with `done`
+   * (turn finished) normalized to `idle`.
+   */
+  async agentStatus(w: Worker): Promise<AgentStatus> {
+    const target = this.target(w);
+    const r = runHerdr(["agent", "get", target], 5000);
+    if (!r.ok) return "dead";
+    const parsed = tryParseJson(r.stdout);
+    const s = parsed?.result?.agent?.agent_status;
+    if (s === "idle" || s === "working" || s === "blocked") return s;
+    if (s === "done") return "idle";
+    return "unknown";
+  }
+
   async wake(w: Worker, text: string): Promise<void> {
     // No --wait: the daemon must never block on an agent turn.
     const target = this.target(w);
@@ -384,6 +402,10 @@ export class HerdrRuntime implements Runtime {
   async resolveIdentity(input: { sessionId: string; hint?: HerdrIdentityHint }): Promise<HerdrIdentity> {
     const { sessionId, hint } = input;
     const agents = listAgents();
+    // A codex session carries a UUID id (never `ses...`): infer the expected
+    // agent kind so a codex pane is accepted instead of failing the opencode
+    // checks. An explicit hint wins.
+    const wantKind = hint?.agentKind ?? (/^ses/.test(sessionId) ? "opencode" : "codex");
 
     // 1. Authoritative: Herdr itself maps the session to a pane.
     const reported = agents.filter((a) => a?.agent_session && a.agent_session.value === sessionId);
@@ -398,7 +420,7 @@ export class HerdrRuntime implements Runtime {
     // unique. Zero or many matches is rejected (never guess).
     const paneId = hint?.paneId;
     if (!paneId) {
-      if (hint?.directory) return pickIdentityByDirectory(agents, sessionId, hint.directory);
+      if (hint?.directory) return pickIdentityByDirectory(agents, sessionId, hint.directory, wantKind);
       throw new Error(`session ${sessionId} is not running inside Herdr (no pane mapping and no pane supplied)`);
     }
     const pane = getPaneInfo(paneId);
@@ -409,8 +431,8 @@ export class HerdrRuntime implements Runtime {
     if (hint?.workspaceId && typeof pane.workspace_id === "string" && pane.workspace_id !== hint.workspaceId) {
       throw new Error(`session ${sessionId}: pane ${paneId} is in workspace ${pane.workspace_id}, not ${hint.workspaceId}`);
     }
-    if (typeof pane.agent === "string" && pane.agent !== "opencode") {
-      throw new Error(`session ${sessionId}: pane ${paneId} is running ${pane.agent}, not opencode`);
+    if (typeof pane.agent === "string" && pane.agent !== wantKind) {
+      throw new Error(`session ${sessionId}: pane ${paneId} is running ${pane.agent}, not ${wantKind}`);
     }
     if (pane.agent_session && pane.agent_session.value && pane.agent_session.value !== sessionId) {
       throw new Error(`session ${sessionId}: pane ${paneId} reports a different session`);
@@ -422,8 +444,8 @@ export class HerdrRuntime implements Runtime {
     const entry = agents.find((a) => a?.pane_id === paneId);
     if (!entry) throw new Error(`session ${sessionId}: no live Herdr agent in pane ${paneId}`);
     const identity = identityFromAgent(entry);
-    if (identity.agentKind !== "opencode") {
-      throw new Error(`session ${sessionId}: pane ${paneId} is not an opencode agent`);
+    if (identity.agentKind !== wantKind) {
+      throw new Error(`session ${sessionId}: pane ${paneId} is not a ${wantKind} agent`);
     }
     return identity;
   }

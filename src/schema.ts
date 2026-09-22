@@ -60,6 +60,13 @@ export interface TaskDep {
 export interface Worker {
   id: string;
   role: string;
+  /**
+   * Which agent runtime this worker is: "opencode" (plugin event stream) or
+   * "codex" (no plugin; liveness/idle/blocked are POLLED from Herdr agent
+   * status). Set at attach time from the resolved Herdr agent kind; defaults to
+   * "opencode" so every pre-existing worker row is unchanged.
+   */
+  agent_kind: string;
   runtime_id: string | null;
   cwd: string | null; // [ext] spawn metadata for start()
   command: string | null; // [ext] spawn metadata for start()
@@ -188,6 +195,7 @@ CREATE INDEX IF NOT EXISTS idx_tasks_assignee ON tasks(assignee);
 CREATE TABLE IF NOT EXISTS workers (
   id TEXT PRIMARY KEY,
   role TEXT NOT NULL DEFAULT 'worker',
+  agent_kind TEXT NOT NULL DEFAULT 'opencode',
   runtime_id TEXT,
   opencode_session_id TEXT,
   state TEXT NOT NULL DEFAULT 'starting',

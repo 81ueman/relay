@@ -34,6 +34,12 @@ export interface SocketMessage {
   worktree?: string;
   /** Per-spawn attach secret (relay-spawned generations only). */
   token?: string;
+  /**
+   * Agent runtime kind. OpenCode sessions are attached with a `ses...` id and
+   * need no declaration; a codex session has a UUID id and MUST pass
+   * `kind:"codex"` so the `ses...` guard is not weakened.
+   */
+  kind?: string;
   /** Herdr identity hints (manual attach): directory is authoritative when no pane is given. */
   pane_id?: string;
   tab_id?: string;
@@ -85,10 +91,15 @@ export async function handleSocketMessage(msg: SocketMessage, ctx: SocketContext
 
   if (type === "session.attach") {
     if (!msg.session_id) return { ok: false, reason: "no-session" };
-    // Defense in depth: a session id must look like an OpenCode session
-    // (`ses...`). Shell/command ids (`sh_...`) and other host ids must never
-    // become managed sessions, whatever a plugin version sends.
-    if (!/^ses/.test(msg.session_id)) return { ok: false, reason: "not-a-session-id" };
+    // Defense in depth: an OpenCode session id must look like `ses...`; shell
+    // ids (`sh_...`) must never become managed sessions. A CODEX session has a
+    // UUID id and is accepted ONLY when the client declares kind:"codex" — the
+    // opencode guard is not weakened (an undeclared non-`ses` id is refused).
+    const isOpencode = /^ses/.test(msg.session_id);
+    const isCodex =
+      msg.kind === "codex" &&
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(msg.session_id);
+    if (!isOpencode && !isCodex) return { ok: false, reason: "not-a-session-id" };
 
     // Manual attach (no generation): the session must PROVABLY be running inside
     // a Herdr agent. Resolve + verify BEFORE any DB write so a rejected attach
@@ -103,6 +114,7 @@ export async function handleSocketMessage(msg: SocketMessage, ctx: SocketContext
             tabId: msg.tab_id,
             workspaceId: msg.workspace_id,
             directory: msg.directory,
+            agentKind: isCodex ? "codex" : undefined,
           },
         });
       } catch (e) {

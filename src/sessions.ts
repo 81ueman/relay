@@ -51,6 +51,11 @@ export interface AttachOptions {
    * running inside a Herdr agent (no half-managed state is ever created).
    */
   identity?: HerdrIdentity;
+  /**
+   * Which agent runtime this worker is (opencode/codex). Defaults to the
+   * resolved Herdr identity's kind, then the existing worker, then "opencode".
+   */
+  agentKind?: string;
 }
 
 export function getSession(db: Database, sessionId: string): Session | null {
@@ -113,6 +118,9 @@ export function attachSession(db: Database, sessionId: string, opts: AttachOptio
   // explicitly; otherwise the existing worker/session role is preserved.
   const explicitRole = spawned ? undefined : opts.role;
   const role = explicitRole ?? worker0?.role ?? prev?.role ?? "worker";
+  // Agent runtime kind: an explicit override, else the resolved Herdr identity
+  // (codex/opencode), else the existing worker, else opencode.
+  const agentKind = opts.agentKind ?? opts.identity?.agentKind ?? worker0?.agent_kind ?? "opencode";
 
   // A managed session belongs to exactly one worker. Refuse a cross-worker
   // steal (e.g. a stale plugin on a shared server claiming another session).
@@ -227,7 +235,7 @@ export function attachSession(db: Database, sessionId: string, opts: AttachOptio
     }
   }
 
-  const worker = reviveIfRetired(db, worker0) ?? registerWorker(db, workerId, { role, sessionId });
+  const worker = reviveIfRetired(db, worker0) ?? registerWorker(db, workerId, { role, agentKind, sessionId });
 
   // Supersede the worker's previous session: events from the old generation's
   // session must no longer drive this worker (zombie protection on the way in).
@@ -252,10 +260,11 @@ export function attachSession(db: Database, sessionId: string, opts: AttachOptio
   const stillWorking = !!held && held.state === "running" && held.assignee === worker.id;
   db.query(
     `UPDATE workers
-       SET opencode_session_id = ?, role = COALESCE(?, role), runtime_id = COALESCE(?, runtime_id),
+       SET opencode_session_id = ?, role = COALESCE(?, role), agent_kind = ?,
+           runtime_id = COALESCE(?, runtime_id),
            state = ?, generation = ?, nudged_at = NULL, updated_at = ?
      WHERE id = ?`
-  ).run(sessionId, explicitRole ?? null, runtimeId ?? null, stillWorking ? "working" : "idle", generation, t, worker.id);
+  ).run(sessionId, explicitRole ?? null, agentKind, runtimeId ?? null, stillWorking ? "working" : "idle", generation, t, worker.id);
 
   if (spawned) {
     // Promote the matching freshly spawned runtime row.
