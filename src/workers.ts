@@ -106,6 +106,33 @@ export function setWorkerState(db: Database, id: string, state: WorkerState): vo
   db.query(`UPDATE workers SET state = ?, updated_at = ? WHERE id = ?`).run(state, now(), id);
 }
 
+/**
+ * T393: a worker that emits a MANAGED session event is ALIVE — its session is
+ * running and producing output. Never leave such a worker marked `dead`/
+ * `stalled`: a dead-marked-but-live session keeps running unsupervised (nothing
+ * may wake/interrupt/stall it) and the supervisor may spawn a DUPLICATE
+ * generation for the same worker. Revive it in place — `working` while it still
+ * owns a task, else `idle` — and record `worker.revived` with reason "event".
+ *
+ * Returns the failed state that was replaced (`dead`/`stalled`), or null when
+ * the worker was not in a failed state. Pure DB write: never spawns, never wakes.
+ */
+export function reviveFailedWorkerIfAlive(db: Database, id: string, at = now()): WorkerState | null {
+  const w = getWorker(db, id);
+  if (!w) return null;
+  if (w.state !== "dead" && w.state !== "stalled") return null;
+  const was = w.state;
+  const next: WorkerState = w.current_task_id ? "working" : "idle";
+  db.query(`UPDATE workers SET state = ?, updated_at = ? WHERE id = ? AND state = ?`).run(next, at, id, was);
+  logEvent(db, {
+    source: "supervisor",
+    workerId: id,
+    type: "worker.revived",
+    payload: { was, reason: "event", state: next },
+  });
+  return was;
+}
+
 export function touchSeen(db: Database, id: string, at = now()): void {
   db.query(`UPDATE workers SET last_seen_at = ?, updated_at = ? WHERE id = ?`).run(at, at, id);
 }

@@ -4,10 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Database } from "bun:sqlite";
 import { openDb } from "../src/db";
-import { listEvents } from "../src/events";
+import { listEvents, logEvent } from "../src/events";
 import { reconcile } from "../src/reconciler";
 import { MockRuntime } from "../src/runtime/runtime";
+import { recordRuntime } from "../src/runtimes";
 import { attachSession } from "../src/sessions";
+import { handleSocketMessage, type SocketContext } from "../src/socket";
 import { addTask } from "../src/tasks";
 import { getWorker, registerWorker } from "../src/workers";
 
@@ -76,5 +78,89 @@ describe("revival of an externally-owned worker", () => {
     const { actions } = await reconcile(db, rt);
     expect(actions).toContain("revived:control-rust");
     expect(actions).not.toContain("woken:control-rust");
+  });
+});
+
+// T393: a worker that emits a managed session event is LIVE. A failed liveness
+// probe must never leave it `dead` (its session keeps running unsupervised and
+// the supervisor can spawn a DUPLICATE generation for the same worker).
+
+/** Register a worker with a RELAY-OWNED active runtime + managed session. */
+function seedRelayOwned(id: string, role = "worker", generation = 1): void {
+  registerWorker(db, id, { role });
+  const token = `seed-${id}-g${generation}`;
+  recordRuntime(db, {
+    workerId: id,
+    generation,
+    runtimeId: `${id}-agent`,
+    tabId: `tab-${id}-g${generation}`,
+    state: "starting",
+    relayOwned: 1,
+    attachToken: token,
+  });
+  attachSession(db, `ses_${id}`, { workerId: id, role, generation, attachToken: token });
+  rt.setAlive(id, true);
+}
+
+function socketCtx(): SocketContext {
+  return { db, runtime: rt, wakeReconcile: { value: false } };
+}
+
+describe("T393: an emitting session is never dead", () => {
+  test("a managed event revives a worker left dead by a failed probe", async () => {
+    attachExternal("rev-1", "worker");
+    db.query(`UPDATE workers SET state = 'dead' WHERE id = 'rev-1'`).run();
+
+    const res = await handleSocketMessage(
+      { type: "tool.started", session_id: "ses_rev-1", payload: { tool: "shell", command: "sleep 5" } },
+      socketCtx()
+    );
+
+    expect(res.ok).toBe(true);
+    expect(getWorker(db, "rev-1")!.state).not.toBe("dead");
+    const revived = listEvents(db, { limit: 50 }).filter((e) => e.type === "worker.revived");
+    expect(revived.some((e) => e.worker_id === "rev-1")).toBe(true);
+  });
+
+  test("reconcile does not mark dead while the session emits events (no duplicate spawn)", async () => {
+    attachExternal("rev-2", "worker");
+    db.query(`UPDATE workers SET state = 'working' WHERE id = 'rev-2'`).run();
+    // Emit a fresh session event, then fail the transport probe.
+    await handleSocketMessage(
+      { type: "tool.started", session_id: "ses_rev-2", payload: { tool: "shell", command: "sleep 5" } },
+      socketCtx()
+    );
+    rt.setAlive("rev-2", false);
+
+    const { actions } = await reconcile(db, rt);
+    expect(actions).toContain("alive-by-event:rev-2");
+    expect(actions).not.toContain("dead:rev-2");
+    expect(getWorker(db, "rev-2")!.state).not.toBe("dead");
+    expect(rt.starts).toHaveLength(0); // no duplicate generation
+  });
+
+  test("a dead worker whose session is still emitting is revived, not restarted", async () => {
+    seedRelayOwned("rev-3");
+    db.query(`UPDATE workers SET state = 'dead' WHERE id = 'rev-3'`).run();
+    // A session event exists, but do NOT go through the socket: exercise the
+    // reconciler backstop directly (the event stream is the source of truth).
+    logEvent(db, { source: "opencode", workerId: "rev-3", type: "tool.started", payload: { tool: "shell" } });
+    rt.setAlive("rev-3", false); // stale target: the probe lies
+
+    const { actions } = await reconcile(db, rt);
+    expect(actions).toContain("revived-by-event:rev-3");
+    expect(getWorker(db, "rev-3")!.state).not.toBe("dead");
+    expect(getWorker(db, "rev-3")!.generation).toBe(1); // no duplicate spawn
+    expect(rt.starts).toHaveLength(0);
+  });
+
+  test("a probe failure with NO session output is still a real crash", async () => {
+    attachExternal("rev-4", "worker");
+    db.query(`UPDATE workers SET state = 'working' WHERE id = 'rev-4'`).run();
+    rt.setAlive("rev-4", false);
+    // No session event ever logged for rev-4.
+    const { actions } = await reconcile(db, rt);
+    expect(actions).toContain("dead:rev-4");
+    expect(getWorker(db, "rev-4")!.state).toBe("dead");
   });
 });

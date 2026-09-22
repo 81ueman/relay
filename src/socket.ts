@@ -6,7 +6,7 @@ import { handleErrorSignal, handleIdleSignal, reconcile } from "./reconciler";
 import type { HerdrIdentity, Runtime } from "./runtime/runtime";
 import { attachSession, detachSession, gateEvent, getSession, managedWorkerForSession, releaseUnhostedBinding } from "./sessions";
 import type { DaemonIdentity } from "./singleton";
-import { getWorker, setWorkerState, setWorkerTool, clearWorkerTool, touchSeen } from "./workers";
+import { getWorker, setWorkerState, setWorkerTool, clearWorkerTool, touchSeen, reviveFailedWorkerIfAlive } from "./workers";
 
 // JSON Lines over a Unix domain socket. Small protocol:
 //   {"type":"session.idle","session_id":"ses_xxx","generation":2}
@@ -192,6 +192,12 @@ export async function handleSocketMessage(msg: SocketMessage, ctx: SocketContext
   // agree, or the event belongs to a superseded/foreign session.
   const workerId = managedWorkerForSession(db, session);
   if (!workerId) return { ok: true, ignored: "fenced-out" };
+
+  // T393: a managed event PROVES the session is live. If a failed liveness probe
+  // left this worker `dead`/`stalled`, revive it BEFORE handling the event: a
+  // dead-marked-but-live session would otherwise keep running unsupervised and
+  // the supervisor could spawn a duplicate generation for the same worker.
+  reviveFailedWorkerIfAlive(db, workerId);
 
   if (IDLE_TYPES.has(type)) {
     const outcome = await handleIdleSignal(db, runtime, workerId);
