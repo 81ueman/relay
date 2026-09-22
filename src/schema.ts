@@ -47,6 +47,16 @@ export interface Task {
   updated_at: number;
 }
 
+/**
+ * A declared prerequisite edge: `task_id` must not run until `depends_on` is
+ * `done`. A task may have several (a review gate waiting on its sibling inputs).
+ */
+export interface TaskDep {
+  task_id: string;
+  depends_on: string;
+  created_at: number;
+}
+
 export interface Worker {
   id: string;
   role: string;
@@ -253,6 +263,20 @@ CREATE TABLE IF NOT EXISTS task_notes (
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_task_notes_task ON task_notes(task_id);
+
+-- Declared run-gating prerequisites between tasks (task_id not RUNNABLE until
+-- every row's depends_on is 'done'). A join table (not a single column) because
+-- a real review gate has several sibling inputs: the live CP-W3 gate T153 waited
+-- on T150/T151/T152/T154. Rows are history: deleting a prerequisite is refused
+-- while a non-terminal dependent exists (see gc.ts).
+CREATE TABLE IF NOT EXISTS task_deps (
+  task_id TEXT NOT NULL,
+  depends_on TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (task_id, depends_on)
+);
+CREATE INDEX IF NOT EXISTS idx_task_deps_task ON task_deps(task_id);
+CREATE INDEX IF NOT EXISTS idx_task_deps_dep ON task_deps(depends_on);
 
 -- Runtime generation history. Sessions/runtimes are disposable; tasks durable.
 -- Old generations are marked stale/dead here, then cleaned up ONLY after a

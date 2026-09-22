@@ -13,7 +13,8 @@ import { listRuntimes, adoptRuntimeTarget } from "./runtimes";
 import type { Task } from "./schema";
 import {
   addTask, approveTask, blockTask, claimNext, claimTask, claimableRunnableTasks, getNotes, getTask,
-  listTasks, notesClaimingApproval, rejectTask, releaseTask, runnableTasks, submitTask, taskCounts, unblockTask,
+  listTasks, notesClaimingApproval, notYetRunnableTasks, rejectTask, releaseTask, runnableTasks, setTaskDependencies,
+  submitTask, taskCounts, taskDependencies, unblockTask,
   unclaimableRunnableTasks, addNote, setTaskPlan, waitTask,
 } from "./tasks";
 import {
@@ -51,9 +52,10 @@ Usage:
 
   relay runtime list [--worker <id>] [--state <state>]
 
-  relay task add "description" [--title T] [--acceptance A] [--priority N] [--role R] [--parent T1] [--plan <plan-id>]
+  relay task add "description" [--title T] [--acceptance A] [--priority N] [--role R] [--parent T1] [--plan <plan-id>] [--depends-on T1,T2]
   relay task link <task-id> <plan-id>
   relay task unlink <task-id>
+  relay task depend <task-id> <dep-id...> | --clear
   relay task list [--state <state>]
   relay task show <id> [--json]
 
@@ -149,21 +151,29 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
   task: {
     about: "Manage tasks in the durable ledger.",
     usage: [
-      'relay task add "description" [--title T] [--acceptance A] [--priority N] [--role R] [--parent T1] [--plan <plan-id>]',
+      'relay task add "description" [--title T] [--acceptance A] [--priority N] [--role R] [--parent T1] [--plan <plan-id>] [--depends-on T1,T2]',
       "relay task list [--state <state>]",
       "relay task show <id> [--json]",
       "relay task link <id> <plan-id>",
       "relay task unlink <id>",
+      "relay task depend <id> <dep-id...> | --clear",
     ],
   },
   "task add": {
-    about: "Queue a new task. --parent nests it under T1; approving a child then tells the immediate parent (one-hop completion bubbling: a child_done note on the parent, children_done when all direct children are done, and a durable message to the parent's current assignee). A --role makes the task claimable only by a worker of that role by default; an unknown role warns (non-fatal), and a role no registered worker has is surfaced as Unclaimable in `relay status`. --plan <plan-id> records which agent-status plan.json item this task belongs to.",
-    usage: ['relay task add "description" [--title T] [--acceptance A] [--priority N] [--role R] [--parent T1] [--plan <plan-id>]'],
+    about: "Queue a new task. --parent nests it under T1; approving a child then tells the immediate parent (one-hop completion bubbling: a child_done note on the parent, children_done when all direct children are done, and a durable message to the parent's current assignee). A --role makes the task claimable only by a worker of that role by default; an unknown role warns (non-fatal), and a role no registered worker has is surfaced as Unclaimable in `relay status`. --plan <plan-id> records which agent-status plan.json item this task belongs to. --depends-on T1,T2 declares prerequisites: the task is NOT runnable (never offered by `relay next`, never claimable, never woken) until every one is done.",
+    usage: ['relay task add "description" [--title T] [--acceptance A] [--priority N] [--role R] [--parent T1] [--plan <plan-id>] [--depends-on T1,T2]'],
   },
-  "task list": { about: "List tasks (id, state, priority, role, assignee, plan, title).", usage: ["relay task list [--state <state>]"] },
-  "task show": { about: "Print one task as JSON. Notes go to stderr so stdout stays parseable; --json emits ONE document with the task and its notes.", usage: ["relay task show <id> [--json]"] },
+  "task list": { about: "List tasks (id, state, priority, role, assignee, plan, depends, title).", usage: ["relay task list [--state <state>]"] },
+  "task show": { about: "Print one task as JSON (includes depends_on). Notes go to stderr so stdout stays parseable; --json emits ONE document with the task, its dependencies and its notes.", usage: ["relay task show <id> [--json]"] },
   "task link": { about: "Link a task to a plan.json item (agent-status shows the plan status from relay).", usage: ["relay task link <task-id> <plan-id>"] },
   "task unlink": { about: "Remove a task's plan linkage.", usage: ["relay task unlink <task-id>"] },
+  "task depend": {
+    about: "Set (or clear) a task's run-gating prerequisites. A queued task with an unmet prerequisite is not runnable: `relay next` never offers it, it is never woken, and an explicit `relay claim` refuses it (not bypassable by --any-role). A pre-created review gate MUST declare its inputs this way, or it stays non-runnable until something is in review.",
+    usage: [
+      "relay task depend <task-id> <dep-id...>",
+      "relay task depend <task-id> --clear",
+    ],
+  },
   next: {
     about: "Claim the next queued task the worker's role may take (prints NO_TASK if none). Role matching is STRICT by default: a role-tagged task is only claimable by a worker registered with that role; role-less tasks by anyone.",
     usage: [
@@ -249,6 +259,22 @@ function flag(args: string[], name: string): string | undefined {
 
 function hasFlag(args: string[], name: string): boolean {
   return args.includes(name);
+}
+
+/**
+ * Collect values of a REPEATABLE value flag, each also comma-split, e.g.
+ * `--depends-on T1,T2 --depends-on T3` -> ["T1","T2","T3"]. A flag-like or
+ * missing value is ignored rather than stored as a task id.
+ */
+function flagValues(args: string[], name: string): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] !== name) continue;
+    const v = args[i + 1];
+    if (v !== undefined && !v.startsWith("-")) out.push(...v.split(","));
+    i++;
+  }
+  return out.map((s) => s.trim()).filter((s) => s.length > 0);
 }
 
 function resolveWorkerId(db: ReturnType<typeof openDb>, explicit?: string): string {
@@ -337,7 +363,7 @@ const VALUE_FLAGS = new Set([
   "--role", "--state", "--limit", "--interval", "--session", "--runtime", "--cwd",
   "--command", "--title", "--acceptance", "--priority", "--parent", "--plan",
   "--dir", "--worktree", "--pane", "--tab", "--workspace", "--type", "--payload",
-  "--ack",
+  "--ack", "--depends-on",
 ]);
 
 /** Positional args only, skipping flags and their (known) values, e.g. ["T12","reason"]. */
@@ -577,12 +603,15 @@ async function main(): Promise<void> {
             role,
             parentTaskId: flag(rest, "--parent") ?? undefined,
             planId: flag(rest, "--plan") ?? undefined,
+            dependsOn: flagValues(rest, "--depends-on"),
           });
-          console.log(`${t.id} queued priority=${t.priority}${t.plan_id ? ` plan=${t.plan_id}` : ""}`);
+          const deps = taskDependencies(db, t.id);
+          console.log(`${t.id} queued priority=${t.priority}${t.plan_id ? ` plan=${t.plan_id}` : ""}${deps.length ? ` depends_on=${deps.join(",")}` : ""}`);
         } else if (sub === "list") {
           const state = flag(argv.slice(1), "--state");
           for (const t of listTasks(db, state)) {
-            console.log(`${t.id}\t${t.state}\tprio=${t.priority}\trole=${t.role ?? "-"}\tassignee=${t.assignee ?? "-"}\tplan=${t.plan_id ?? "-"}\t${t.title}`);
+            const deps = taskDependencies(db, t.id);
+            console.log(`${t.id}\t${t.state}\tprio=${t.priority}\trole=${t.role ?? "-"}\tassignee=${t.assignee ?? "-"}\tplan=${t.plan_id ?? "-"}\tdepends=${deps.length ? deps.join(",") : "-"}\t${t.title}`);
           }
         } else if (sub === "link") {
           const [taskId, planId] = [argv[2], argv[3]];
@@ -594,19 +623,35 @@ async function main(): Promise<void> {
           if (!taskId) throw new Error("usage: relay task unlink <task-id>");
           const t = setTaskPlan(db, taskId, null);
           console.log(`${t.id} plan=-`);
+        } else if (sub === "depend") {
+          const taskId = argv[2];
+          if (!taskId) {
+            throw new Error("usage: relay task depend <task-id> <dep-id...> | --clear\n  (a gated task is not runnable until every dep-id is done)");
+          }
+          const rest = argv.slice(2);
+          const clear = hasFlag(rest, "--clear");
+          const deps = clear ? [] : positionals(rest).slice(1);
+          const t = setTaskDependencies(db, taskId, deps);
+          const got = taskDependencies(db, t.id);
+          console.log(`${t.id} depends_on=${got.length ? got.join(",") : "-"}`);
+          if (!clear && got.length === 0) {
+            console.error(`relay: warning: ${t.id} has no prerequisites; it is ungated (pass --clear to be explicit)`);
+          }
         } else if (sub === "show") {
           const id = argv[2];
           if (!id) throw new Error("usage: relay task show <id> [--json]");
           const t = getTask(db, id);
           if (!t) throw new Error(`unknown task: ${id}`);
           const notes = getNotes(db, id);
+          const deps = taskDependencies(db, id);
           if (hasFlag(argv.slice(2), "--json")) {
-            // One self-contained JSON document (task + notes) for agents.
-            console.log(JSON.stringify({ ...t, notes }, null, 2));
+            // One self-contained JSON document (task + notes + deps) for agents.
+            console.log(JSON.stringify({ ...t, depends_on: deps, notes }, null, 2));
           } else {
             // stdout stays a single parseable JSON document; the human-readable
             // notes go to stderr so `relay task show <id> | jq` keeps working.
-            console.log(JSON.stringify(t, null, 2));
+            console.log(JSON.stringify({ ...t, depends_on: deps }, null, 2));
+            if (deps.length) console.error(`  depends_on: ${deps.join(", ")}`);
             for (const n of notes) {
               console.error(`  [${n.kind}] ${n.worker_id ?? "?"}: ${n.body}`);
             }
@@ -880,6 +925,19 @@ async function main(): Promise<void> {
         console.log("-----------");
         if (stranded.length === 0) console.log("(none)");
         for (const t of stranded) console.log(`${t.id}  role=${t.role}  ${t.title}`);
+        // Queued work that is deliberately NOT runnable yet (declared prerequisite
+        // unmet, or a pre-created reviewer gate with nothing in review). Visible
+        // so gated work is never mistaken for a stranded/unclaimable task.
+        const gated = notYetRunnableTasks(db);
+        console.log("");
+        console.log("Waiting (not yet runnable)");
+        console.log("--------------------------");
+        if (gated.length === 0) console.log("(none)");
+        for (const t of gated) {
+          const deps = taskDependencies(db, t.id);
+          const why = deps.length ? `depends_on=${deps.join(",")}` : "reviewer gate (nothing in review)";
+          console.log(`${t.id}  role=${t.role ?? "-"}  ${why}  ${t.title}`);
+        }
         // A note can claim APPROVE without a transition (T151): the task then
         // looks unreviewed while the reviewer believes it is finished. Surface
         // the mismatch; `status` never mutates state.

@@ -112,6 +112,12 @@ describe("wake: queued role-gated task + matching idle worker", () => {
     managedWorker("rev-old", "reviewer");
     managedWorker("coord", "coordinator");
     db.query(`UPDATE workers SET retired_at = ? WHERE id = 'rev-old'`).run(Date.now());
+    // A pre-created reviewer gate is only runnable once something is in review
+    // (T225), so put one task in review to exercise the unclaimable path rather
+    // than the new not-yet-runnable path.
+    const impl = addTask(db, { title: "impl", role: "coordinator" });
+    claimNext(db, "coord");
+    submitTask(db, impl.id, "coord");
     addTask(db, { title: "needs review", role: "reviewer" });
     addTask(db, { title: "coord work", role: "coordinator" });
     claimNext(db, "coord");

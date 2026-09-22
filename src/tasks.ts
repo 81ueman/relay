@@ -15,6 +15,37 @@ import { RELAY_TAG, sendMessage } from "./messages";
 
 export const STALE_LEASE = "STALE_LEASE";
 
+// ---------------------------------------------------------------------------
+// Runnable gating (declared prerequisites + the reviewer gate)
+//
+// A `queued` task is only RUNNABLE when:
+//   1. every `task_deps` prerequisite is `done`; and
+//   2. if it is a queued REVIEWER gate (role='reviewer' with NO declared
+//      prerequisite) something is actually in `review`.
+//
+// (2) exists because a pre-created review task was otherwise runnable the
+// instant it was queued: the scheduler woke an idle reviewer and `relay next`
+// claimed it BEFORE its sibling implementation was submitted — claim/release
+// churn on every nudge (observed live: the standing OSPF review gate T222, and
+// the CP-W3 gate T153). A reviewer's PRIMARY path — claiming a task already in
+// state='review' — is unaffected; this only gates the pre-created queued gate.
+// A gate that declares its inputs as dependencies becomes runnable as soon as
+// they are done, independent of the review queue.
+//
+// `RUNNABLE_TASK_SQL` must stay in sync with `isRunnableNow`.
+// ---------------------------------------------------------------------------
+
+const DEPS_DONE_SQL = `NOT EXISTS (
+  SELECT 1 FROM task_deps dep
+    LEFT JOIN tasks d ON d.id = dep.depends_on
+   WHERE dep.task_id = t.id AND (d.id IS NULL OR d.state != 'done')
+)`;
+const REVIEW_GATE_SQL =
+  `(t.role IS NOT 'reviewer'
+    OR EXISTS (SELECT 1 FROM task_deps dep WHERE dep.task_id = t.id)
+    OR EXISTS (SELECT 1 FROM tasks r WHERE r.state = 'review'))`;
+const RUNNABLE_TASK_SQL = `t.state = 'queued' AND ${DEPS_DONE_SQL} AND ${REVIEW_GATE_SQL}`;
+
 /**
  * Clear a worker's quiet lease after an explicit relay action (note/submit/block/
  * release/claim/approve) or a generation change, logging only when one existed.
@@ -114,29 +145,38 @@ export function addTask(
     role?: string;
     parentTaskId?: string;
     planId?: string;
+    /** Declared prerequisites: not runnable until every one is `done`. */
+    dependsOn?: string[];
   }
 ): Task {
   const t = now();
   const id = nextTaskId(db);
-  db.query(
-    `INSERT INTO tasks (id, title, description, acceptance, state, priority, role, assignee,
-      lease_token, lease_until, parent_task_id, plan_id, created_at, updated_at)
-     VALUES (?, ?, ?, ?, 'queued', ?, ?, NULL, 0, NULL, ?, ?, ?, ?)`
-  ).run(
-    id,
-    input.title,
-    input.description ?? "",
-    input.acceptance ?? "",
-    input.priority ?? 0,
-    input.role ?? null,
-    input.parentTaskId ?? null,
-    input.planId ?? null,
-    t,
-    t
-  );
+  const deps = normalizeDeps(input.dependsOn);
+  assertDependencies(db, id, deps);
+  db.transaction(() => {
+    db.query(
+      `INSERT INTO tasks (id, title, description, acceptance, state, priority, role, assignee,
+        lease_token, lease_until, parent_task_id, plan_id, created_at, updated_at)
+       VALUES (?, ?, ?, ?, 'queued', ?, ?, NULL, 0, NULL, ?, ?, ?, ?)`
+    ).run(
+      id,
+      input.title,
+      input.description ?? "",
+      input.acceptance ?? "",
+      input.priority ?? 0,
+      input.role ?? null,
+      input.parentTaskId ?? null,
+      input.planId ?? null,
+      t,
+      t
+    );
+    for (const dep of deps) {
+      db.query(`INSERT INTO task_deps (task_id, depends_on, created_at) VALUES (?, ?, ?)`).run(id, dep, t);
+    }
+  })();
   logEvent(db, {
     source: "cli", taskId: id, type: "task.created",
-    payload: { title: input.title, plan: input.planId ?? null },
+    payload: { title: input.title, plan: input.planId ?? null, dependsOn: deps },
   });
   return getTask(db, id)!;
 }
@@ -156,6 +196,114 @@ export function setTaskPlan(db: Database, taskId: string, planId: string | null)
     taskId,
     type: planId ? "task.plan_linked" : "task.plan_unlinked",
     payload: { plan: planId ?? null },
+  });
+  return getTask(db, taskId)!;
+}
+
+// ---------------------------------------------------------------------------
+// Declared prerequisites (task_deps): run gating for pre-created work
+// ---------------------------------------------------------------------------
+
+function normalizeDeps(deps?: string[]): string[] {
+  return [...new Set((deps ?? []).map((d) => d.trim()).filter((d) => d.length > 0))];
+}
+
+/**
+ * Reject unknown prerequisites and cycles up front: a cycle (A->B->A) would make
+ * a task permanently un-runnable with no error surfaced at claim time.
+ */
+function assertDependencies(db: Database, taskId: string, deps: string[]): void {
+  for (const dep of deps) {
+    if (dep === taskId) throw new Error(`task ${taskId} cannot depend on itself`);
+    if (!getTask(db, dep)) throw new Error(`unknown dependency task: ${dep}`);
+  }
+  // DFS from the PROPOSED edges; `onStack` catches a cycle back to taskId,
+  // `visited` avoids re-walking a shared ancestor (which is not a cycle).
+  const visited = new Set<string>();
+  const onStack = new Set<string>();
+  const visit = (id: string, children: string[]): void => {
+    if (onStack.has(id)) throw new Error(`dependency cycle involving ${id}`);
+    if (visited.has(id)) return;
+    onStack.add(id);
+    for (const child of children) visit(child, taskDependencies(db, child));
+    onStack.delete(id);
+    visited.add(id);
+  };
+  visit(taskId, deps);
+}
+
+/** The prerequisites of a task, sorted. */
+export function taskDependencies(db: Database, taskId: string): string[] {
+  return (
+    db.query(`SELECT depends_on FROM task_deps WHERE task_id = ? ORDER BY depends_on ASC`).all(taskId) as {
+      depends_on: string;
+    }[]
+  ).map((r) => r.depends_on);
+}
+
+/** True when every declared prerequisite of `task` is `done` (unknown = unmet). */
+export function dependenciesMet(db: Database, task: Task): boolean {
+  const unmet = db
+    .query(
+      `SELECT COUNT(*) AS n FROM task_deps dep
+         LEFT JOIN tasks d ON d.id = dep.depends_on
+        WHERE dep.task_id = ? AND (d.id IS NULL OR d.state != 'done')`
+    )
+    .get(task.id) as { n: number };
+  return unmet.n === 0;
+}
+
+/** Is anything currently in the review queue? (the reviewer-gate precondition) */
+export function reviewPending(db: Database): boolean {
+  return reviewTasks(db).length > 0;
+}
+
+/**
+ * Single-task runnable check, mirroring RUNNABLE_TASK_SQL. `reviewExists` lets a
+ * caller scanning many tasks avoid a review-queue query per task.
+ */
+export function isRunnableNow(db: Database, task: Task, reviewExists?: boolean): boolean {
+  if (task.state !== "queued") return false;
+  if (!dependenciesMet(db, task)) return false;
+  if (task.role === "reviewer" && taskDependencies(db, task.id).length === 0) {
+    return reviewExists ?? reviewPending(db);
+  }
+  return true;
+}
+
+/**
+ * Queued tasks that exist but are NOT runnable yet: an unmet prerequisite, or a
+ * pre-created reviewer gate with nothing in review. Surfaced by `relay status`
+ * so gated work is visible instead of silently stranded.
+ */
+export function notYetRunnableTasks(db: Database): Task[] {
+  const reviewExists = reviewPending(db);
+  return (db.query(`SELECT * FROM tasks WHERE state = 'queued' ORDER BY priority DESC, created_at ASC`).all() as Task[])
+    .filter((t) => !isRunnableNow(db, t, reviewExists));
+}
+
+/**
+ * Replace a task's declared prerequisites in one transaction. An empty list (or
+ * `--clear`) removes the gate. Validates existence and rejects cycles.
+ */
+export function setTaskDependencies(db: Database, taskId: string, deps: string[]): Task {
+  const task = getTask(db, taskId);
+  if (!task) throw new Error(`unknown task: ${taskId}`);
+  const next = normalizeDeps(deps);
+  assertDependencies(db, taskId, next);
+  const t = now();
+  db.transaction(() => {
+    db.query(`DELETE FROM task_deps WHERE task_id = ?`).run(taskId);
+    for (const dep of next) {
+      db.query(`INSERT INTO task_deps (task_id, depends_on, created_at) VALUES (?, ?, ?)`).run(taskId, dep, t);
+    }
+    db.query(`UPDATE tasks SET updated_at = ? WHERE id = ?`).run(t, taskId);
+  })();
+  logEvent(db, {
+    source: "cli",
+    taskId,
+    type: next.length > 0 ? "task.depends_set" : "task.depends_cleared",
+    payload: { dependsOn: next },
   });
   return getTask(db, taskId)!;
 }
@@ -216,11 +364,13 @@ export function claimNext(db: Database, workerId: string, opts: ClaimOptions = {
       // reviewer also claims `role='reviewer'` queued tasks).
     }
 
-    // Apply the role gate in SQL so selection stays atomic. Under strict, only
-    // role IS NULL or role = matchRole qualify.
+    // Apply the runnable gate and the role gate in SQL so selection stays atomic.
+    // A queued task with an unmet prerequisite (or a reviewer gate with nothing
+    // in review) is never selected. Under strict, only role IS NULL or
+    // role = matchRole qualify.
     const queuedSql = strict
-      ? `SELECT * FROM tasks WHERE state = 'queued' AND (role IS NULL OR role = ?) ORDER BY priority DESC, created_at ASC LIMIT 1`
-      : `SELECT * FROM tasks WHERE state = 'queued' ORDER BY priority DESC, created_at ASC LIMIT 1`;
+      ? `SELECT t.* FROM tasks t WHERE ${RUNNABLE_TASK_SQL} AND (t.role IS NULL OR t.role = ?) ORDER BY t.priority DESC, t.created_at ASC LIMIT 1`
+      : `SELECT t.* FROM tasks t WHERE ${RUNNABLE_TASK_SQL} ORDER BY t.priority DESC, t.created_at ASC LIMIT 1`;
     const task = (strict ? db.query(queuedSql).get(matchRole) : db.query(queuedSql).get()) as Task | null;
 
     if (!task) {
@@ -270,6 +420,18 @@ export function claimTask(db: Database, taskId: string, workerId: string, opts: 
     if (!roleMatches(task.role, matchRole, strict)) {
       throw new Error(
         `cannot claim task ${taskId}: role '${task.role}' does not match worker role '${matchRole}' (use --any-role to override)`
+      );
+    }
+    // Run gating is orthogonal to the role gate and NOT bypassable by
+    // --any-role: use `relay task depend` to declare/release the prerequisite.
+    if (!dependenciesMet(db, task)) {
+      throw new Error(
+        `cannot claim task ${taskId}: not yet runnable — prerequisite ${taskDependencies(db, taskId).join(", ")} is not done`
+      );
+    }
+    if (task.role === "reviewer" && taskDependencies(db, taskId).length === 0 && !reviewPending(db)) {
+      throw new Error(
+        `cannot claim task ${taskId}: not yet runnable — a reviewer gate needs something in review (or declared deps)`
       );
     }
     db.query(
@@ -752,7 +914,9 @@ export function expireLeases(
 }
 
 export function runnableTasks(db: Database): Task[] {
-  return db.query(`SELECT * FROM tasks WHERE state = 'queued' ORDER BY priority DESC, created_at ASC`).all() as Task[];
+  return db
+    .query(`SELECT t.* FROM tasks t WHERE ${RUNNABLE_TASK_SQL} ORDER BY t.priority DESC, t.created_at ASC`)
+    .all() as Task[];
 }
 
 export function reviewTasks(db: Database): Task[] {
