@@ -265,7 +265,8 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
     about:
       "Read-only human dashboard: Relay task tree + workers (current runtime overlaid) + attention, with Herdr pane links. Never mutates state; --show/--hide manage only its own UI pane. " +
       "--watch clips each frame to the pane (reserving the bottom row so it cannot scroll/accumulate) and freezes on space/p (PAUSED); while paused, ↑/↓ (j/k, PageUp/Down) scroll so the clipped tail is readable. " +
-      "Inside a Herdr pane it draws INLINE by default (`herdr pane read` reads the normal screen; alt-screen can look blank); --alt-screen forces the alternate screen (nothing in scrollback) and --no-alt-screen forces inline anywhere.",
+      "Inside a Herdr pane it draws INLINE by default (`herdr pane read` reads the normal screen; alt-screen can look blank); --alt-screen forces the alternate screen (nothing in scrollback) and --no-alt-screen forces inline anywhere. " +
+      "The WORKERS section has a column header: STATE is Relay's durable ownership (working/idle/stalled/dead) and EXEC is Herdr's transport/execution telemetry (busy/quiet/!idle).",
     usage: [
       "relay dashboard",
       "relay dashboard --watch [--interval <ms>] [--alt-screen|--no-alt-screen]",

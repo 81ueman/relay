@@ -172,6 +172,26 @@ describe("dashboard renderer", () => {
     expect(iWork).toBeLessThan(iWorkers);
   });
 
+  test("WORKERS has a column header naming state vs exec (T344)", () => {
+    const out = renderDashboard(sample(), { color: false, links: false, width: 100 });
+    const lines = out.split("\n");
+    const iWorkers = lines.findIndex((l) => l === "WORKERS");
+    const header = lines[iWorkers + 1];
+    expect(header).toContain("ID");
+    expect(header).toContain("STATE(relay)");
+    expect(header).toContain("EXEC(herdr)");
+    expect(header).toContain("TASK");
+    expect(dwidth(header)).toBeLessThanOrEqual(100);
+  });
+
+  test("WORKERS header degrades at narrow width without overflowing (T344)", () => {
+    const out = renderDashboard(sample(), { color: false, links: false, width: 44 });
+    const header = out.split("\n").find((l) => l.includes("STATE"))!;
+    expect(header).toBeDefined();
+    expect(header).not.toContain("(relay)"); // the hint is dropped when narrow
+    expect(dwidth(header)).toBeLessThanOrEqual(44);
+  });
+
   test("OSC8 pane link when links are on", () => {
     const out = renderDashboard(sample(), { color: true, links: true, width: 100 });
     expect(out).toContain("\x1b]8;;https://relay.local/pane/w52:p8K");

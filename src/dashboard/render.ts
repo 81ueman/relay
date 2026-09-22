@@ -215,6 +215,10 @@ function renderWorkers(
   const byId = new Map(view.workers.map((w) => [w.id, w]));
   const clusters = view.workerClusters;
 
+  // Column names once, dim, above the rows (the operator could not tell the
+  // relay `state` column from Herdr's `exec` column). Degrades with width.
+  lines.push(c(trim(workerHeader(width), width), "dim"));
+
   clusters.forEach((cluster, ci) => {
     if (cluster.header) {
       if (ci > 0) lines.push("");
@@ -261,6 +265,44 @@ function truncIds(ids: string[], cap = 4): string {
   return extra > 0 ? `${head.join(",")},+${extra} more` : head.join(",");
 }
 
+/**
+ * Column layout for a worker row. Shared by `renderWorker` and the WORKERS
+ * column header so the two cannot drift apart.
+ */
+function workerLayout(width: number): { idW: number; stW: number; exW: number } {
+  const wide = width >= 56;
+  return {
+    idW: wide ? 16 : Math.max(8, Math.min(16, width - 27)),
+    stW: wide ? 13 : 8,
+    exW: wide ? 12 : 8,
+  };
+}
+
+/**
+ * Column names for the WORKERS rows. `STATE` is relay's durable ownership state
+ * and `EXEC` is Herdr's transport/execution telemetry — the two the operator
+ * could not tell apart from their values alone (`working` vs `busy`). The
+ * parentheticals are dropped when the column is too narrow for them, and the
+ * tail columns only appear at the widths the rows themselves show them.
+ */
+function workerHeader(width: number): string {
+  const { idW, stW, exW } = workerLayout(width);
+  const state = stW >= 12 ? "STATE(relay)" : "STATE";
+  const exec = exW >= 11 ? "EXEC(herdr)" : "EXEC";
+  let s = `  ${"ID".padEnd(idW)} ${state.padEnd(stW)} ${exec.padEnd(exW)} ${"TASK".padEnd(5)}`;
+  let used = 2 + idW + 1 + stW + 1 + exW + 1 + 5;
+  const add = (label: string, w: number): void => {
+    if (used + w <= width) {
+      s += label.padEnd(w);
+      used += w;
+    }
+  };
+  if (width >= 64) add("  GEN", 6);
+  if (width >= 72) add("  PANE", 11);
+  add("  AGE", 5);
+  return s;
+}
+
 function renderWorker(
   lines: string[],
   w: DashboardWorker,
@@ -269,10 +311,7 @@ function renderWorker(
   links: boolean,
   indented = true
 ): void {
-  const wide = width >= 56;
-  const idW = wide ? 16 : Math.max(8, Math.min(16, width - 27));
-  const stW = wide ? 13 : 8;
-  const exW = wide ? 12 : 8;
+  const { idW, stW, exW } = workerLayout(width);
   const tag = c(trim(w.state, stW).padEnd(stW), WORKER_COLOR[w.state]);
   const execColor: keyof typeof A = w.exec === "busy" ? "green"
     : w.exec === "!idle" ? "red" : w.exec === "quiet" ? "cyan" : "gray";
