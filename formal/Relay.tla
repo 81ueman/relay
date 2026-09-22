@@ -3,322 +3,196 @@
 (* Relay control-plane model.                                              *)
 (*                                                                         *)
 (* This is NOT a transcription of src/.  It is the design intent of Relay  *)
-(* written so TLC can BREAK it: the model exists to produce counterexamples *)
-(* against the properties in formal/README.md ("What Relay must guarantee").*)
+(* written so that TLC can BREAK it: the model exists to produce           *)
+(* counterexamples against the properties in formal/README.md ("What Relay *)
+(* must guarantee").  Read that file first.                                *)
 (*                                                                         *)
 (* The two properties the whole model is organised around:                  *)
 (*                                                                         *)
-(*   1. REACH.  Relay must never waste progress capacity it knows how to    *)
-(*      use: at a reconcile boundary an operational idle worker that can    *)
-(*      take claimable durable work, and has no legitimate temporary        *)
-(*      excuse, MUST have been woken -- regardless of who else is working.  *)
+(*   1. REACH.  If an OPERATIONAL idle worker can take useful durable work  *)
+(*      now, a reconcile pass must not ignore that capacity merely because  *)
+(*      some unrelated worker is busy.                                      *)
 (*                                                                         *)
-(*   2. FENCE.  Making progress must never trade away ownership: a stale    *)
-(*      lease, session or generation must never mutate the current task     *)
-(*      after ownership has moved on.                                       *)
+(*   2. FENCE.  Only the current ownership epoch may advance a task.  The   *)
+(*      task LEASE, the worker/runtime GENERATION and the managed-SESSION   *)
+(*      generation are DISTINCT fences; a stale value from any of them must *)
+(*      be unable to mutate current work.                                   *)
 (*                                                                         *)
-(* Shape: a two-stage tick.  The environment moves first (Environment,      *)
-(* including worker transitions and crashes), then the supervisor takes     *)
-(* exactly one Reconcile pass.  The obligation is read off the state at the *)
-(* reconcile boundary -- see NoAvoidableIdleAtReconcileBoundary.            *)
+(* Shape: a two-stage tick.  The environment moves (Environment), then the  *)
+(* supervisor takes one atomic Reconcile pass.  The REACH obligation is read *)
+(* off the state at the reconcile boundary (stage = 1).                     *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets, Sequences
 
 CONSTANTS
-  Tasks,            \* finite task ids, e.g. {t1,t2}
-  Workers,          \* finite worker ids, e.g. {w1,w2}
+  Tasks,            \* finite task ids, e.g. {"t1","t2"}
+  Workers,          \* finite worker ids, e.g. {"w1","w2"}
   Roots,            \* parent-less task ids (the forest); a SUBSET of Tasks
   Edges,            \* task-tree edges as "parent:child" strings, e.g. {"t1:t2"}
                     \* (a set of strings because TLC configs cannot hold tuples)
   MaxGeneration,    \* bound on the per-worker fencing generation
-  AllowFailure,     \* TRUE => the environment may crash / stall / detach
+  AllowFailure,     \* TRUE => the environment may crash / stall / adopt / detach
   AllowCooldown,    \* TRUE => a wake may be rate-limited (suppressed)
   ReleasesAllowed,  \* FALSE = strong env assumption: workers never abandon a task
-  RejectsAllowed,   \* FALSE = the strong environment assumption used by the
-                    \* AllTasksDone demonstration (reviews are never rejected)
+  RejectsAllowed,   \* FALSE = strong env assumption: reviews are never rejected
+  ReviewerWorkers,  \* the workers that have REVIEW capability (a SUBSET of Workers)
   RoleTask,         \* optional role tag: the task that is role-restricted, or None
   RoleWorker        \* the ONLY worker eligible for RoleTask (or None)
 
 None == "none"
+
+(* --------------------------------------------------------------------- *)
+(* Enumerated domains                                                      *)
+(* --------------------------------------------------------------------- *)
+TaskStates == {"queued", "running", "review", "done", "blocked_internal", "blocked_human"}
+WorkerStates == {"starting", "idle", "working", "waiting_input", "dead", "stalled"}
+Generations  == 0..MaxGeneration
+RealGenerations == 1..MaxGeneration
 
 Edge(p, c) == (p \o ":" \o c) \in Edges
 ChildrenOf(p) == { c \in Tasks : Edge(p, c) }
 ParentTask(t) == IF t \in Roots THEN None ELSE (CHOOSE p \in Tasks : Edge(p, t))
 
 (* --------------------------------------------------------------------- *)
-(* Enumerated domains                                                      *)
-(* --------------------------------------------------------------------- *)
-TaskStates == {"queued", "running", "review", "done", "blocked_internal", "blocked_human"}
-WorkerStates == {"starting", "idle", "working", "waiting_input", "dead"}
-Generations  == 0..MaxGeneration               \* 0 = worker has no generation yet
-RealGenerations == 1..MaxGeneration
-
-(* --------------------------------------------------------------------- *)
 (* Variables                                                               *)
 (* --------------------------------------------------------------------- *)
-VARIABLE stage,
-         taskState,
-         taskOwner,
-         taskVersion,
-         parent,
-         workerState,
-         workerTask,
-         generation,
-         genOwner,
-         relayOwned,
-         sessionGen,
-         sessionManaged,
-         everAdopted,
-         hasMail,
-         quietUntil,
-         quietActive,
-         stallSeen,
-         pendingWake,
-         wakeSuppressed,
-         retryWake,
-         wakeTried,
-         wakeEligible,
-         parentDone,
-         parentBlocked,
-         activeRT,
-         rtDurable,
-         rtCleaned,
-         reviewed
+VARIABLE
+  stage,          \* 0 = environment, 1 = a reconcile pass just completed
+  taskState,      \* [Tasks -> TaskStates]
+  taskOwner,      \* [Tasks -> Workers \cup {None}]
+  taskLease,      \* [Tasks -> Nat]  monotone per-task LEASE token (bumped on every change)
+  taskGen,        \* [Tasks -> Generations]  runtime generation that won the claim
+  lastLease,      \* [Tasks -> Nat]  the lease under which the task last entered running/review
+  parent,         \* [Tasks -> Tasks \cup {None}]  the tree
+  workerState,    \* [Workers -> WorkerStates]
+  workerTask,     \* [Workers -> Tasks \cup {None}]
+  workerLease,    \* [Workers -> Nat]  lease the worker's CURRENT session holds (0 = none)
+  staleLease,     \* [Workers -> Nat]  lease a LEFTOVER session holds (0 = none)
+  generation,     \* [Workers -> Generations]  current durable generation
+  genOwner,       \* [Workers -> Generations]  generation allowed to mutate (0 = none)
+  genWatermark,   \* [Workers -> Generations]  highest generation ever allocated
+  relayOwned,     \* [Workers -> BOOLEAN]  Relay created the runtime (FALSE = adopted)
+  sessionGen,     \* [Workers -> Generations]  generation the current session presents
+  sessionManaged, \* [Workers -> BOOLEAN]
+  everAdopted,    \* [Workers -> BOOLEAN]
+  detached,       \* [Workers -> BOOLEAN]  left the supervised set for good
+  retired,        \* [Workers -> BOOLEAN]  history only, never supervised
+  transportAlive, \* [Workers -> BOOLEAN]  the runtime transport is alive
+  hasMail,        \* [Workers -> SUBSET Workers]  unread durable signals
+  quietUntil,     \* [Workers -> Tasks \cup {None}]  quiet lease, scoped to a task
+  quietActive,    \* [Workers -> BOOLEAN]
+  stallSeen,      \* [Workers -> BOOLEAN]
+  pendingWake,    \* [Workers -> SUBSET Workers]  durable signal w is owed a wake for
+  wakeSuppressed, \* [Workers -> BOOLEAN]  a wake is legitimately rate-limited now
+  retryWake,      \* [Workers -> BOOLEAN]  a delivery failed; owed a retry (durable)
+  wakeTried,      \* [Workers -> BOOLEAN]  this reconcile pass attempted a wake
+  wakeEligible,   \* [Workers -> BOOLEAN]  eligibility snapshot taken when Wake ran
+  parentDone,     \* [Tasks -> SUBSET Tasks]
+  parentBlocked,  \* [Tasks -> SUBSET Tasks]
+  activeRT,       \* [Workers -> BOOLEAN]
+  rtDurable,      \* [Workers -> BOOLEAN]
+  rtCleaned,      \* [Workers -> SUBSET Generations]
+  approved,       \* SUBSET Tasks: tasks that were APPROVED (done only by approve)
+  reviewed,       \* SUBSET Tasks: tasks that have EVER entered review
+  prevTaskState,  \* [Tasks -> TaskStates]  history: taskState in the previous state
+  prevGeneration, \* [Workers -> Generations]  history: generation in the previous state
+  prevPendingWake, \* [Workers -> SUBSET Workers]  history: pendingWake in the previous state
+  prevWakeTried   \* [Workers -> BOOLEAN]  history: wakeTried in the previous state
 
-vars == << stage, taskState, taskOwner, taskVersion, parent, workerState, workerTask, generation, genOwner, relayOwned, sessionGen, sessionManaged, everAdopted, hasMail, quietUntil, quietActive, stallSeen, pendingWake, wakeSuppressed, retryWake, wakeTried, wakeEligible, parentDone, parentBlocked, activeRT, rtDurable, rtCleaned, reviewed >>
+baseVars == << stage, taskState, taskOwner, taskLease, taskGen, lastLease, parent,
+           workerState, workerTask, workerLease, staleLease, generation, genOwner,
+           genWatermark, relayOwned, sessionGen, sessionManaged, everAdopted, detached,
+           retired, transportAlive, hasMail, quietUntil, quietActive, stallSeen,
+           pendingWake, wakeSuppressed, retryWake, wakeTried, wakeEligible, parentDone,
+           parentBlocked, activeRT, rtDurable, rtCleaned, approved, reviewed >>
 
+(* History variables are updated ONLY by the Tick wrapper, so fairness is        *)
+(* expressed over `baseVars` (the actions fully specify those).                  *)
+vars == << baseVars, prevPendingWake, prevWakeTried >>
 
 (* --------------------------------------------------------------------- *)
 (* Derived predicates -- the vocabulary of the guarantee.                  *)
 (* --------------------------------------------------------------------- *)
-
-(* Runnable != claimable.  Runnable is a durable queued task.                *)
 Runnable(t) == taskState[t] = "queued"
 
-(* A worker can accept NEW work: idle, holds no task. waiting_input is        *)
-(* explicitly NOT here -- it still owns its task.                              *)
+(* Role gating is for CLAIMING a queued task.  Review is a separate capability. *)
+CanReview(w) == w \in ReviewerWorkers
+RoleEligible(t, w) ==
+  \/ RoleTask = None
+  \/ t # RoleTask
+  \/ w = RoleWorker
+
+(* --- supervision predicates, mirroring scheduler.ts --------------------- *)
+(* Operational: a live managed session, or a relay-owned starting runtime.   *)
+Operational(w) ==
+  /\ ~detached[w]
+  /\ ~retired[w]
+  /\ (sessionManaged[w] \/ (workerState[w] = "starting" /\ relayOwned[w]))
+
+(* Recoverable: a relay-owned generation that failed and must be replaced.   *)
+Recoverable(w) ==
+  /\ ~detached[w]
+  /\ ~retired[w]
+  /\ ~Operational(w)
+  /\ relayOwned[w]
+  /\ (workerState[w] = "dead" \/ workerState[w] = "stalled")
+
+Supervised(w) == Operational(w) \/ Recoverable(w)
+
+(* A worker that can accept NEW work right now. *)
 IdleOperational(w) ==
+  /\ Operational(w)
   /\ workerState[w] = "idle"
   /\ workerTask[w] = None
-
-RoleEligible(t, w) ==
-  \/ RoleTask = None            \* no task is role-restricted
-  \/ t # RoleTask               \* this task is untagged => any worker
-  \/ w = RoleWorker             \* the tagged task's one eligible worker
 
 ClaimableBy(w) ==
   { t \in { x \in Tasks : Runnable(x) } : IdleOperational(w) /\ RoleEligible(t, w) }
 
 HasClaimableWork(w) == ClaimableBy(w) # {}
-
 ActionableWork == { t \in Tasks : \E w \in Workers: t \in ClaimableBy(w) }
 
-(* A legitimate TEMPORARY excuse to skip a worker: an active wake cooldown,    *)
-(* or a delivery that just failed and will be retried next pass. It must       *)
-(* never become permanent -- see NoPermanentCooldown (Level C).               *)
 LegitSuppressed(w) == wakeSuppressed[w] \/ retryWake[w]
-
-(* The reconcile boundary is a real STAGE, not a derived flag: after a          *)
-(* Reconcile step the system is Stable until the environment moves again.      *)
 Stable == stage = 1
 
-(* Level-S legality ---------------------------------------------------------- *)
-AtMostOneOwner ==
-  \A w1, w2 \in Workers:
-    (w1 # w2 /\ workerTask[w1] # None /\ workerTask[w2] # None
-     /\ workerTask[w1] = workerTask[w2]) => FALSE
+(* --- the fence guards, in one place ------------------------------------- *)
+(* A normal PROGRESS mutation by w on t requires ALL THREE fences to agree:  *)
+(*   ownership:  w owns t and holds it                                       *)
+(*   lease:      the session's lease is the task's current lease             *)
+(*   generation: the session generation is the one that won the task's claim *)
+CanProgress(t, w) ==
+  /\ taskOwner[t] = w
+  /\ workerTask[w] = t
+  /\ taskState[t] = "running"
+  /\ workerLease[w] = taskLease[t]
+  /\ taskGen[t] = generation[w]
+  /\ sessionGen[w] = generation[w]
+  /\ sessionManaged[w]
 
-OwnerConsistent ==
-  \A w \in Workers:
-    (workerTask[w] # None) =>
-      (taskState[workerTask[w]] \in {"running", "review"}
-       /\ taskOwner[workerTask[w]] = w)
-
-(* A queued/done/blocked task has NO owner: ownership is cleared on every       *)
-(* transition out of running/review.  This is the invariant that catches a       *)
-(* "release without a new fence" that leaves a stale owner pointer behind.       *)
-QueuedHasNoOwner ==
-  \A t \in Tasks:
-    (taskState[t] \in {"queued", "done", "blocked_internal", "blocked_human"})
-      => taskOwner[t] = None
-
-(* Role gating is not advisory: a worker may only own a task it is eligible for  *)
-(* under the strict-default policy.  Manual recovery (--any-role) is a separate  *)
-(* operator escape hatch, NOT part of this automatic property.                  *)
-NoRoleViolation ==
-  \A t \in Tasks:
-    (taskOwner[t] # None) => RoleEligible(t, taskOwner[t])
-
-NoIdleHoldsTask ==
-  \A w \in Workers: (workerState[w] = "idle") => workerTask[w] = None
-
-NoWaitingInputClaim ==
-  \A w \in Workers:
-    (workerState[w] = "waiting_input") =>
-      /\ workerTask[w] # None
-      /\ ClaimableBy(w) = {}
-
-WaitingInputOccupied ==
-  \A w \in Workers:
-    (workerState[w] = "waiting_input") =>
-      (workerTask[w] # None /\ taskOwner[workerTask[w]] = w)
-
-RunningTaskHasOwner ==
-  \A t \in Tasks: (taskState[t] = "running") => taskOwner[t] # None
-ReviewTaskHasOwner ==
-  \A t \in Tasks: (taskState[t] = "review") => taskOwner[t] # None
-
-(* S3 -- stale-actor isolation for a RUNNING task.  A running task always has a  *)
-(* live owner: crash / restart / detach requeue it (releaseTaskOfDeadWorker only  *)
-(* touches `running`), so the owner must still hold it and its current session    *)
-(* must carry the generation that won the task's fence.  A stale lease, session   *)
-(* or generation therefore can never mutate current state.                       *)
-(*                                                                              *)
-(* `review` is deliberately NOT covered here: a dead reviewer's pointer is        *)
-(* reassigned lazily (claimNext re-assigns review tasks), so the pointer may      *)
-(* outlive its owner.  Mutation of a review task is fenced by Approve/Reject's    *)
-(* guards instead -- see NoStaleSession and FenceAgreement.                      *)
-NoStaleMutation ==
-  \A t \in Tasks:
-    (taskState[t] = "running") =>
-      \E w \in Workers:
-        /\ taskOwner[t] = w
-        /\ workerTask[w] = t
-        /\ genOwner[w] = generation[w]
-        /\ genOwner[w] = taskVersion[t]
-
-(* S2 -- the fence on the SESSION, mirroring src/sessions.ts gateEvent: a managed *)
-(* session always carries the worker's CURRENT generation.  A relay-spawned      *)
-(* attach whose generation is older than the worker's is rejected outright        *)
-(* ("attach rejected: generation N is older than worker gM"), so a stale session  *)
-(* can never become the mutator of current state.                                 *)
-NoStaleSession ==
-  \A w \in Workers:
-    (sessionManaged[w] /\ sessionGen[w] # 0) => sessionGen[w] = generation[w]
-
-(* S2b -- a RUNNING task is owned by a worker whose live session carries the     *)
-(* generation that won the task's fence.  Together with NoStaleSession this is    *)
-(* the full fencing story: ownership + generation + session generation agree.     *)
-FenceAgreement ==
-  \A t \in Tasks:
-    (taskState[t] = "running") =>
-      \E w \in Workers:
-        /\ taskOwner[t] = w
-        /\ taskVersion[t] = generation[w]
-        /\ sessionGen[w] = generation[w]
-
-GenerationMonotonicity ==
-  \A w \in Workers: genOwner[w] <= generation[w]
-
-(* S6 -- quiet is task-scoped, temporary, and never survives a task change.   *)
-QuietScoped ==
-  \A w \in Workers:
-    quietActive[w] =>
-      /\ workerTask[w] # None
-      /\ taskState[workerTask[w]] = "running"
-      /\ quietUntil[w] = workerTask[w]
-
-(* S7 -- waiting_input occupancy *)
-WaitingInputOccupancy ==
-  \A w \in Workers:
-    (workerState[w] = "waiting_input") => taskOwner[workerTask[w]] = w
-
-(* S4 -- nothing is activated or started before its durable row exists.       *)
-DurableBeforeDelivery ==
-  \A w \in Workers:
-    (activeRT[w] \/ workerState[w] # "starting") => rtDurable[w]
-
-(* S5 -- Relay cleans only its OWN, non-current, positively-reaped runtimes.  *)
-CleanupIsRelayOwned ==
-  \A w \in Workers:
-    /\ (\A g \in rtCleaned[w]: relayOwned[w] = TRUE)
-    /\ (\A g \in rtCleaned[w]: g < generation[w])
-
-(* S8 -- parent signals: present iff the child reached the state, one hop.    *)
-ParentDoneMeansChildDone ==
-  \A p \in Tasks: \A c \in parentDone[p]: taskState[c] = "done"
-ParentBlockedMeansChildBlocked ==
-  \A p \in Tasks: \A c \in parentBlocked[p]: taskState[c] \in {"blocked_internal", "blocked_human"}
-
-(* One-hop only: a parent signal concerns a DIRECT child.                      *)
-ParentSignalsOneHop ==
-  \A p \in Tasks: \A c \in parentDone[p] \cup parentBlocked[p]: parent[c] = p
-
-(* S5b -- an adopted (externally-owned) runtime is NEVER taken over by Relay.    *)
-(* Relay may revive it, but it may never become relay-owned (the tab belongs to   *)
-(* the operator).  Once adopted, always adopted.                                 *)
-AdoptedNeverReplaced ==
-  \A w \in Workers: everAdopted[w] => relayOwned[w] = FALSE
-
-(* S8b -- the durable one-hop signal is ATOMIC with the child's completion: a    *)
-(* done child with a parent is ALWAYS recorded in the parent's parentDone set.   *)
-(* Splitting the child state change from the parent signal (M10) breaks this.     *)
-ChildDoneSignalled ==
-  \A c \in Tasks:
-    (taskState[c] = "done" /\ parent[c] # None) => c \in parentDone[parent[c]]
-
-(* S8c -- block bubbling is one-hop and atomic too.                              *)
-ChildBlockedSignalled ==
-  \A c \in Tasks:
-    (taskState[c] \in {"blocked_internal", "blocked_human"} /\ parent[c] # None)
-      => c \in parentBlocked[parent[c]]
-
-(* No automatic parent transition: a parent with a done child is never queued  *)
-(* by that fact alone (the parent owner decides).                              *)
-NoAutomaticParentTransition ==
-  \A p \in Tasks:
-    (\E c \in Tasks: parent[c] = p /\ taskState[c] = "done") => taskState[p] # "queued"
-
-(* S1 -- done is reachable ONLY through review.  A worker cannot self-approve:  *)
-(* session.idle != done, quiet != done, a crash != done, children_done != the   *)
-(* parent being done.  Expressed as a HISTORY property: `reviewed` records      *)
-(* every task that ever entered "review", and a task may only be "done" if it   *)
-(* is in that evergreen set.  A mutation that writes "done" directly from       *)
-(* "running" sets a done task that was never reviewed and is refuted.           *)
-DoneRequiresReview ==
-  \A t \in Tasks: (taskState[t] = "done") => t \in reviewed
-
-ReviewedNow(t) == t \in { x \in Tasks : taskState[x] = "review" }
-
-(* R -- the CORE responsiveness property, at the reconcile boundary.            *)
-(* Stable (this pass completed) AND operational idle AND claimable work AND    *)
-(* no legitimate temporary excuse  =>  the pass must have tried to wake it.    *)
-NoAvoidableIdleAtReconcileBoundary ==
-  \A w \in Workers:
-    (Stable /\ IdleOperational(w) /\ HasClaimableWork(w) /\ ~LegitSuppressed(w))
-      => wakeTried[w]
-
-(* A woken worker that the transport failed to reach stays owed a wake.        *)
-WakeFailureOwed ==
-  \A w \in Workers: (retryWake[w] => pendingWake[w] # {})
-
-(* The supervisor never CREATES a wake for work the woken worker cannot        *)
-(* claim.  `wakeEligible` snapshots the eligibility AT the moment Wake ran, so *)
-(* an attempt later overtaken by the world is still legitimate.                 *)
-NoWakeForUnclaimableWork ==
-  \A w \in Workers: (wakeTried[w] => wakeEligible[w])
-
-(* Quiet suppresses a STALL, never a crash.                              *)
-QuietDoesNotSuppressCrash ==
-  \A w \in Workers: (quietActive[w] => workerState[w] = "working")
-
-(* Quiet is bounded: a quiet lease that survives into a new task is illegal.   *)
-QuietIsBounded == QuietScoped
-
+(* --------------------------------------------------------------------- *)
+(* Invariants                                                              *)
+(* --------------------------------------------------------------------- *)
 TypeOK ==
   /\ stage \in {0, 1}
   /\ taskState \in [Tasks -> TaskStates]
   /\ taskOwner \in [Tasks -> Workers \cup {None}]
-  /\ taskVersion \in [Tasks -> Generations]
+  /\ taskLease \in [Tasks -> Nat]
+  /\ taskGen \in [Tasks -> Generations]
+  /\ lastLease \in [Tasks -> Nat]
   /\ parent \in [Tasks -> Tasks \cup {None}]
   /\ workerState \in [Workers -> WorkerStates]
   /\ workerTask \in [Workers -> Tasks \cup {None}]
+  /\ workerLease \in [Workers -> Nat]
+  /\ staleLease \in [Workers -> Nat]
   /\ generation \in [Workers -> Generations]
   /\ genOwner \in [Workers -> Generations]
+  /\ genWatermark \in [Workers -> Generations]
   /\ relayOwned \in [Workers -> BOOLEAN]
   /\ sessionGen \in [Workers -> Generations]
   /\ sessionManaged \in [Workers -> BOOLEAN]
   /\ everAdopted \in [Workers -> BOOLEAN]
+  /\ detached \in [Workers -> BOOLEAN]
+  /\ retired \in [Workers -> BOOLEAN]
+  /\ transportAlive \in [Workers -> BOOLEAN]
   /\ hasMail \in [Workers -> SUBSET Workers]
   /\ quietUntil \in [Workers -> Tasks \cup {None}]
   /\ quietActive \in [Workers -> BOOLEAN]
@@ -333,454 +207,743 @@ TypeOK ==
   /\ activeRT \in [Workers -> BOOLEAN]
   /\ rtDurable \in [Workers -> BOOLEAN]
   /\ rtCleaned \in [Workers -> SUBSET RealGenerations]
+  /\ approved \in SUBSET Tasks
   /\ reviewed \in SUBSET Tasks
+  /\ prevTaskState \in [Tasks -> TaskStates]
+  /\ prevGeneration \in [Workers -> Generations]
+  /\ prevPendingWake \in [Workers -> SUBSET Workers]
+  /\ prevWakeTried \in [Workers -> BOOLEAN]
+
+(* A1 -- ownership --------------------------------------------------------- *)
+AtMostOneOwner ==
+  \A w1, w2 \in Workers:
+    (w1 # w2 /\ workerTask[w1] # None /\ workerTask[w2] # None
+     /\ workerTask[w1] = workerTask[w2]) => FALSE
+
+OwnerConsistent ==
+  \A w \in Workers:
+    (workerTask[w] # None) =>
+      (taskState[workerTask[w]] \in {"running", "review"}
+       /\ taskOwner[workerTask[w]] = w)
+
+QueuedHasNoOwner ==
+  \A t \in Tasks:
+    (taskState[t] \in {"queued", "done", "blocked_internal", "blocked_human"})
+      => taskOwner[t] = None
+
+RunningTaskHasOwner ==
+  \A t \in Tasks: (taskState[t] = "running") => taskOwner[t] # None
+ReviewTaskHasOwner ==
+  \A t \in Tasks: (taskState[t] = "review") => taskOwner[t] # None
+
+(* A2 -- role gating is for CLAIMING; review is a separate capability -------- *)
+NoClaimRoleViolation ==
+  \A t \in Tasks: (taskState[t] = "running") => RoleEligible(t, taskOwner[t])
+
+(* A review task's assignee is the SUBMITTER until a reviewer adopts it, so the  *)
+(* pointer may be a non-reviewer.  What must hold is that whoever HOLDS a review  *)
+(* task is a reviewer.                                                          *)
+ReviewOwnerIsReviewer ==
+  \A w \in Workers:
+    (workerTask[w] # None /\ taskState[workerTask[w]] = "review") => CanReview(w)
+
+(* A3 -- the three fences, separated ---------------------------------------- *)
+(* Lease: the task's current lease is the one its owner last presented.       *)
+LeaseFenceAgreement ==
+  \A t \in Tasks:
+    (taskState[t] \in {"running", "review"}) => lastLease[t] = taskLease[t]
+
+(* Generation: the task's claim generation is the owner's current generation.  *)
+GenerationFenceAgreement ==
+  \A t \in Tasks:
+    (taskState[t] \in {"running", "review"}) => taskGen[t] = generation[taskOwner[t]]
+
+(* Session: a managed session always carries the worker's CURRENT generation.  *)
+SessionFenceAgreement ==
+  \A w \in Workers:
+    (sessionManaged[w] /\ sessionGen[w] # 0) => sessionGen[w] = generation[w]
+
+(* A4 -- a running task's owner is live and holds it ------------------------ *)
+NoStaleMutation ==
+  \A t \in Tasks:
+    (taskState[t] = "running") =>
+      \E w \in Workers:
+        /\ taskOwner[t] = w
+        /\ workerTask[w] = t
+        /\ Operational(w)
+        /\ workerLease[w] = taskLease[t]
+        /\ sessionGen[w] = generation[w]
+
+(* A5 -- generation never moves backwards or is reused --------------------- *)
+GenerationMonotonicity ==
+  /\ \A w \in Workers: generation[w] >= prevGeneration[w]
+  /\ \A w \in Workers: generation[w] <= genWatermark[w]
+  /\ \A w \in Workers: genWatermark[w] >= prevGeneration[w]
+
+(* A6 -- done is reachable ONLY through Approve ---------------------------- *)
+DoneOnlyByApprove ==
+  \A t \in Tasks: (taskState[t] = "done") => t \in approved
+
+(* A7 -- quiet is task-scoped, bounded, and the worker is working ------------ *)
+QuietScoped ==
+  \A w \in Workers:
+    quietActive[w] =>
+      /\ workerState[w] = "working"
+      /\ workerTask[w] # None
+      /\ taskState[workerTask[w]] = "running"
+      /\ quietUntil[w] = workerTask[w]
+
+(* A8 -- waiting_input occupancy ------------------------------------------- *)
+NoWaitingInputClaim ==
+  \A w \in Workers:
+    (workerState[w] = "waiting_input") => (workerTask[w] # None /\ ClaimableBy(w) = {})
+
+WaitingInputOccupancy ==
+  \A w \in Workers:
+    (workerState[w] = "waiting_input") => (workerTask[w] # None /\ taskOwner[workerTask[w]] = w)
+
+NoIdleHoldsTask ==
+  \A w \in Workers: (workerState[w] = "idle") => workerTask[w] = None
+
+(* A9 -- nothing is activated or started before its durable row exists ------ *)
+DurableBeforeDelivery ==
+  \A w \in Workers:
+    (activeRT[w] \/ workerState[w] # "starting") => rtDurable[w]
+
+(* A10/A11 -- cleanup and adoption ------------------------------------------ *)
+CleanupIsRelayOwned ==
+  \A w \in Workers:
+    /\ (\A g \in rtCleaned[w]: relayOwned[w] = TRUE)
+    /\ (\A g \in rtCleaned[w]: g < generation[w])
+
+AdoptedNeverReplaced ==
+  \A w \in Workers: everAdopted[w] => relayOwned[w] = FALSE
+
+(* A12 -- parent signals: present iff the child reached the state, one hop --- *)
+ParentSignalsOneHop ==
+  \A p \in Tasks: \A c \in parentDone[p] \cup parentBlocked[p]: parent[c] = p
+
+ChildDoneSignalled ==
+  \A c \in Tasks:
+    (taskState[c] = "done" /\ parent[c] # None) => c \in parentDone[parent[c]]
+
+ChildBlockedSignalled ==
+  \A c \in Tasks:
+    (taskState[c] \in {"blocked_internal", "blocked_human"} /\ parent[c] # None)
+      => c \in parentBlocked[parent[c]]
+
+ParentDoneMeansChildDone ==
+  \A p \in Tasks: \A c \in parentDone[p]: taskState[c] = "done"
+ParentBlockedMeansChildBlocked ==
+  \A p \in Tasks: \A c \in parentBlocked[p]: taskState[c] \in {"blocked_internal", "blocked_human"}
+
+(* A12b -- NO AUTOMATIC PARENT TRANSITION, as ACTION semantics.               *)
+(* If a child's state changed in the last step, its parent's state did NOT.    *)
+ParentStateStableByChildTransition ==
+  \A c \in Tasks:
+    (parent[c] # None /\ taskState[c] # prevTaskState[c])
+      => taskState[parent[c]] = prevTaskState[parent[c]]
+
+(* A12c -- a dead/retired worker is never operational (no wake obligation).  *)
+DetachedNotOperational ==
+  \A w \in Workers: (detached[w] \/ retired[w]) => ~Operational(w) /\ ~IdleOperational(w)
+
+(* C4 -- a wake FAILURE never erases the durable pending signal.  If the       *)
+(* pending signal was non-empty and became empty in a step, that step was not  *)
+(* a wake attempt (it must have been an explicit Detach).                      *)
+WakeFailureKeepsSignal ==
+  \A w \in Workers:
+    (prevPendingWake[w] # {} /\ pendingWake[w] = {} /\ ~detached[w]) => ~prevWakeTried[w]
+
+(* A13 -- at a reconcile boundary, a dead transport is classified dead, even  *)
+(* for a QUIET worker: quiet suppresses STALL suspicion, never transport death.*)
+DeadTransportClassified ==
+  Stable =>
+    \A w \in Workers:
+      (~transportAlive[w] /\ ~detached[w] /\ ~retired[w]) => workerState[w] = "dead"
+
+(* B -- the CORE responsiveness property, at the reconcile boundary --------- *)
+NoAvoidableIdleAtReconcileBoundary ==
+  \A w \in Workers:
+    (Stable /\ IdleOperational(w) /\ HasClaimableWork(w) /\ ~LegitSuppressed(w))
+      => wakeTried[w]
+
+NoWakeForUnclaimableWork ==
+  \A w \in Workers: (wakeTried[w] => wakeEligible[w])
 
 (* --------------------------------------------------------------------- *)
-(* Encapsulated updates, so the actions below stay readable.                *)
+(* Helpers                                                                 *)
 (* --------------------------------------------------------------------- *)
 Requeue(t) ==
   /\ taskState' = [taskState EXCEPT ![t] = "queued"]
   /\ taskOwner' = [taskOwner EXCEPT ![t] = None]
-  /\ taskVersion' = [taskVersion EXCEPT ![t] = 0]      \* invalidates every prior owner
+  /\ taskLease' = [taskLease EXCEPT ![t] = taskLease[t] + 1]
 
-(* Fully release a worker: ownership returns to the queue, fence bumped.      *)
-ReleaseWorker(w) ==
-  \E t \in Tasks:
-    /\ workerTask[w] = t
-    /\ taskState[t] = "running"
-    /\ Requeue(t)
-    /\ workerTask' = [workerTask EXCEPT ![w] = None]
-    /\ workerState' = [workerState EXCEPT ![w] = "idle"]
-    /\ quietActive' = [quietActive EXCEPT ![w] = FALSE]
-    /\ quietUntil' = [quietUntil EXCEPT ![w] = None]
-    /\ stallSeen' = [stallSeen EXCEPT ![w] = FALSE]
-    /\ stage' = 0
-    /\ UNCHANGED << parent, generation, genOwner, relayOwned, everAdopted, sessionGen,
-                    sessionManaged, hasMail, pendingWake, wakeSuppressed, retryWake, wakeTried,
-                    wakeEligible, parentDone, parentBlocked, activeRT, rtDurable, rtCleaned,
-                    reviewed >>
-(* ===================================================================== *)
+(* --------------------------------------------------------------------- *)
 (* ENVIRONMENT actions                                                     *)
-(* ===================================================================== *)
+(* --------------------------------------------------------------------- *)
 
-(* A worker asks for the next runnable task and claims one it may take.       *)
-(* Atomic: pick + claim.  Ties between equally eligible workers are resolved  *)
-(* by TLC's interleaving, not by Relay -- so several workers may be woken for *)
-(* the same task and only one ends up owning it.                        *)
+(* A worker claims a queued task it is eligible for.  Atomic: pick + claim.  *)
 Claim(w) ==
   \E t \in Tasks:
     /\ IdleOperational(w)
     /\ Runnable(t)
     /\ RoleEligible(t, w)
     /\ taskOwner[t] = None
+    /\ stage' = 0
     /\ taskState' = [taskState EXCEPT ![t] = "running"]
     /\ taskOwner' = [taskOwner EXCEPT ![t] = w]
-    /\ taskVersion' = [taskVersion EXCEPT ![t] = (IF generation[w] = 0 THEN 1 ELSE generation[w])]
+    /\ taskLease' = [taskLease EXCEPT ![t] = taskLease[t] + 1]
+    /\ taskGen' = [taskGen EXCEPT ![t] = (IF generation[w] = 0 THEN 1 ELSE generation[w])]
+    /\ lastLease' = [lastLease EXCEPT ![t] = (taskLease[t] + 1)]
     /\ workerTask' = [workerTask EXCEPT ![w] = t]
     /\ workerState' = [workerState EXCEPT ![w] = "working"]
+    /\ workerLease' = [workerLease EXCEPT ![w] = (taskLease[t] + 1)]
     /\ generation' = [generation EXCEPT ![w] = (IF generation[w] = 0 THEN 1 ELSE generation[w])]
     /\ genOwner' = [genOwner EXCEPT ![w] = (IF generation[w] = 0 THEN 1 ELSE generation[w])]
+    /\ genWatermark' = [genWatermark EXCEPT ![w] =
+         (IF generation[w] = 0 THEN 1 ELSE generation[w])]
     /\ sessionGen' = [sessionGen EXCEPT ![w] = (IF generation[w] = 0 THEN 1 ELSE generation[w])]
     /\ sessionManaged' = [sessionManaged EXCEPT ![w] = TRUE]
+    /\ transportAlive' = [transportAlive EXCEPT ![w] = TRUE]
     /\ activeRT' = [activeRT EXCEPT ![w] = TRUE]
     /\ rtDurable' = [rtDurable EXCEPT ![w] = TRUE]
     /\ stallSeen' = [stallSeen EXCEPT ![w] = FALSE]
     /\ quietActive' = [quietActive EXCEPT ![w] = FALSE]
     /\ quietUntil' = [quietUntil EXCEPT ![w] = None]
-    /\ stage' = 0
-    /\ UNCHANGED << parent, relayOwned, hasMail, pendingWake, wakeSuppressed, retryWake, wakeTried,
-                    wakeEligible, parentDone, parentBlocked, rtCleaned, reviewed, everAdopted >>
-(* running -> review.  The owner keeps the task; a reviewer takes it over.     *)
-Submit(w) ==
-  /\ workerTask[w] # None
-  /\ taskState[workerTask[w]] = "running"
-  /\ genOwner[w] = generation[w]
-  /\ genOwner[w] = taskVersion[workerTask[w]]
-  /\ sessionGen[w] = taskVersion[workerTask[w]]    \* the session fence (gateEvent)
-  /\ taskState' = [taskState EXCEPT ![workerTask[w]] = "review"]
-  /\ reviewed' = reviewed \cup {workerTask[w]}
-  \* submitTask keeps the assignee but clears the worker's current_task_id, so the
-  \* review task now has an owner (the submitter) but no worker holding it until a
-  \* reviewer adopts it.
+    /\ UNCHANGED << parent, relayOwned, everAdopted, detached, retired, hasMail, pendingWake,
+                   wakeSuppressed, retryWake, wakeTried, wakeEligible, parentDone, parentBlocked,
+                   rtCleaned, approved, reviewed, staleLease >>
+
+(* A normal submit: running -> review, by the CURRENT owner through all fences. *)
+Submit(t, w) ==
+  /\ CanProgress(t, w)
+  /\ stage' = 0
+  /\ taskState' = [taskState EXCEPT ![t] = "review"]
+  /\ lastLease' = [lastLease EXCEPT ![t] = workerLease[w]]
   /\ workerTask' = [workerTask EXCEPT ![w] = None]
   /\ workerState' = [workerState EXCEPT ![w] = "idle"]
   /\ quietActive' = [quietActive EXCEPT ![w] = FALSE]
   /\ quietUntil' = [quietUntil EXCEPT ![w] = None]
-  /\ stage' = 0
-  /\ UNCHANGED << taskOwner, taskVersion, parent, generation, genOwner,
-                  relayOwned, everAdopted, sessionGen, sessionManaged, hasMail, stallSeen,
-                  pendingWake, wakeSuppressed, retryWake, wakeTried, wakeEligible, parentDone,
-                  parentBlocked, activeRT, rtDurable, rtCleaned >>
-(* A reviewer adopts a review task: this is `claimNext`'s reviewer path, which
-   REASSIGNS the task's assignee to the reviewer (the previous assignee, the
-   submitter, no longer holds it). *)
-AdoptReview(t, w) ==
-  /\ taskState[t] = "review"
-  /\ IdleOperational(w)
-  /\ (\A x \in Workers: workerTask[x] # t)    \* one writer per task
-  /\ taskOwner' = [taskOwner EXCEPT ![t] = w]
-  /\ taskVersion' = [taskVersion EXCEPT ![t] = (IF generation[w] = 0 THEN 1 ELSE generation[w])]
-  /\ workerTask' = [workerTask EXCEPT ![w] = t]
-  /\ workerState' = [workerState EXCEPT ![w] = "working"]
-  /\ generation' = [generation EXCEPT ![w] = (IF generation[w] = 0 THEN 1 ELSE generation[w])]
-  /\ genOwner' = [genOwner EXCEPT ![w] = (IF generation[w] = 0 THEN 1 ELSE generation[w])]
-  /\ sessionGen' = [sessionGen EXCEPT ![w] = (IF generation[w] = 0 THEN 1 ELSE generation[w])]
-  /\ sessionManaged' = [sessionManaged EXCEPT ![w] = TRUE]
-  /\ activeRT' = [activeRT EXCEPT ![w] = TRUE]
-  /\ rtDurable' = [rtDurable EXCEPT ![w] = TRUE]
-  /\ stage' = 0
-  /\ UNCHANGED << taskState, parent, relayOwned, hasMail, quietUntil, quietActive, stallSeen,
-                  pendingWake, wakeSuppressed, retryWake, wakeTried, wakeEligible, parentDone,
-                  parentBlocked, rtCleaned, reviewed, everAdopted >>
-(* review -> done.  THE ONLY PATH TO done.  Child completion and the      *)
-(* one-hop parent signal are ONE atomic transaction (Level A12).                     *)
-Approve(t, w) ==
-  /\ stage' = 0
-  /\ taskState[t] = "review"
+  /\ reviewed' = reviewed \cup {t}
+  /\ UNCHANGED << taskOwner, taskLease, taskGen, parent, workerLease, staleLease, generation,
+                  genOwner, genWatermark, relayOwned, sessionGen, sessionManaged, everAdopted,
+                  detached, retired, transportAlive, hasMail, stallSeen, pendingWake,
+                  wakeSuppressed, retryWake, wakeTried, wakeEligible, parentDone, parentBlocked,
+                  activeRT, rtDurable, rtCleaned, approved >>
+
+(* A STALE session submits: it presents the lease of a LEFTOVER session.  A     *)
+(* correct Relay rejects this because staleLease # taskLease after any reclaim; *)
+(* the guard below is the fence, and mutation M13 removes it.                   *)
+StaleSubmit(t, w) ==
   /\ taskOwner[t] = w
   /\ workerTask[w] = t
-  /\ taskState' = [taskState EXCEPT ![t] = "done"]
-  /\ taskOwner' = [taskOwner EXCEPT ![t] = None]
+  /\ taskState[t] = "running"
+  /\ staleLease[w] = taskLease[t]                 \* the lease fence
+  /\ stage' = 0
+  /\ taskState' = [taskState EXCEPT ![t] = "review"]
+  /\ lastLease' = [lastLease EXCEPT ![t] = staleLease[w]]
   /\ workerTask' = [workerTask EXCEPT ![w] = None]
   /\ workerState' = [workerState EXCEPT ![w] = "idle"]
-  /\ quietActive' = [quietActive EXCEPT ![w] = FALSE]
-  /\ quietUntil' = [quietUntil EXCEPT ![w] = None]
+  /\ reviewed' = reviewed \cup {t}
+  /\ UNCHANGED << taskOwner, taskLease, taskGen, parent, workerLease, staleLease, generation,
+                  genOwner, genWatermark, relayOwned, sessionGen, sessionManaged, everAdopted,
+                  detached, retired, transportAlive, hasMail, quietUntil, quietActive, stallSeen,
+                  pendingWake, wakeSuppressed, retryWake, wakeTried, wakeEligible, parentDone,
+                  parentBlocked, activeRT, rtDurable, rtCleaned, approved >>
+
+(* A REVIEWER adopts a review task (claimNext's reviewer path).  Review is a     *)
+(* capability, NOT the task's claim role.  One writer per task.                 *)
+AdoptReview(t, w) ==
+  /\ taskState[t] = "review"
+  /\ CanReview(w)
+  /\ IdleOperational(w)
+  /\ (\A x \in Workers: workerTask[x] # t)
+  /\ stage' = 0
+  /\ taskOwner' = [taskOwner EXCEPT ![t] = w]
+  /\ taskLease' = [taskLease EXCEPT ![t] = taskLease[t] + 1]
+  /\ taskGen' = [taskGen EXCEPT ![t] = (IF generation[w] = 0 THEN 1 ELSE generation[w])]
+  /\ lastLease' = [lastLease EXCEPT ![t] = (taskLease[t] + 1)]
+  /\ workerTask' = [workerTask EXCEPT ![w] = t]
+  /\ workerState' = [workerState EXCEPT ![w] = "working"]
+  /\ workerLease' = [workerLease EXCEPT ![w] = (taskLease[t] + 1)]
+  /\ generation' = [generation EXCEPT ![w] = (IF generation[w] = 0 THEN 1 ELSE generation[w])]
+  /\ genOwner' = [genOwner EXCEPT ![w] = (IF generation[w] = 0 THEN 1 ELSE generation[w])]
+  /\ genWatermark' = [genWatermark EXCEPT ![w] = (IF generation[w] = 0 THEN 1 ELSE generation[w])]
+  /\ sessionGen' = [sessionGen EXCEPT ![w] = (IF generation[w] = 0 THEN 1 ELSE generation[w])]
+  /\ sessionManaged' = [sessionManaged EXCEPT ![w] = TRUE]
+  /\ transportAlive' = [transportAlive EXCEPT ![w] = TRUE]
+  /\ activeRT' = [activeRT EXCEPT ![w] = TRUE]
+  /\ rtDurable' = [rtDurable EXCEPT ![w] = TRUE]
+  /\ UNCHANGED << taskState, parent, staleLease, relayOwned, everAdopted, detached, retired,
+                  hasMail, quietUntil, quietActive, stallSeen, pendingWake, wakeSuppressed,
+                  retryWake, wakeTried, wakeEligible, parentDone, parentBlocked, rtCleaned,
+                  approved, reviewed >>
+
+(* review -> done.  THE ONLY PATH TO done.  Operator-permitted (approveTask does *)
+(* not fence on owner), but the lease is invalidated and the one-hop parent      *)
+(* signal commits atomically.                                                   *)
+Approve(t, actor) ==
+  /\ taskState[t] = "review"
+  /\ actor \in Workers
+  /\ stage' = 0
+  /\ taskState' = [taskState EXCEPT ![t] = "done"]
+  /\ taskOwner' = [taskOwner EXCEPT ![t] = None]
+  /\ taskLease' = [taskLease EXCEPT ![t] = taskLease[t] + 1]
+  /\ LET o == taskOwner[t] IN
+       IF o = None THEN UNCHANGED << workerTask, staleLease, workerLease >>
+       ELSE /\ workerTask' = [workerTask EXCEPT ![o] = None]
+            /\ workerState' = [workerState EXCEPT ![o] = "idle"]
+            /\ staleLease' = [staleLease EXCEPT ![o] = workerLease[o]]
+            /\ workerLease' = [workerLease EXCEPT ![o] = 0]
+  /\ quietActive' = [w \in Workers |->
+       IF w = actor \/ (taskOwner[t] # None /\ w = taskOwner[t]) THEN FALSE ELSE quietActive[w]]
+  /\ quietUntil' = [w \in Workers |->
+       IF w = actor \/ (taskOwner[t] # None /\ w = taskOwner[t]) THEN None ELSE quietUntil[w]]
+  /\ approved' = approved \cup {t}
   /\ LET p == parent[t] IN
        IF p = None
        THEN UNCHANGED << parentDone, parentBlocked >>
        ELSE /\ parentDone' = [parentDone EXCEPT ![p] = parentDone[p] \cup {t}]
             /\ parentBlocked' = [parentBlocked EXCEPT ![p] = parentBlocked[p] \ {t}]
-  /\ UNCHANGED << taskVersion, parent, generation, genOwner, relayOwned, everAdopted, sessionGen,
-                  sessionManaged, hasMail, stallSeen, pendingWake, wakeSuppressed, retryWake,
-                  wakeTried, wakeEligible, activeRT, rtDurable, rtCleaned, reviewed >>
+  /\ UNCHANGED << taskGen, lastLease, parent, generation, genOwner, genWatermark, relayOwned,
+                  sessionGen, sessionManaged, everAdopted, detached, retired, transportAlive,
+                  hasMail, stallSeen, pendingWake, wakeSuppressed, retryWake, wakeTried,
+                  wakeEligible, activeRT, rtDurable, rtCleaned, reviewed >>
 
-(* review -> queued.  Ownership cleared, fence bumped.                         *)
-Reject(t, w) ==
+(* review -> queued.  Operator-permitted; the lease is invalidated.             *)
+Reject(t, actor) ==
   /\ RejectsAllowed
   /\ taskState[t] = "review"
-  /\ taskOwner[t] = w
-  /\ workerTask[w] = t
+  /\ actor \in Workers
+  /\ stage' = 0
+  /\ Requeue(t)
+  /\ LET o == taskOwner[t] IN
+       IF o = None THEN UNCHANGED << workerTask, staleLease, workerLease, workerState, quietActive, quietUntil >>
+       ELSE /\ workerTask' = [workerTask EXCEPT ![o] = None]
+            /\ workerState' = [workerState EXCEPT ![o] = "idle"]
+            /\ staleLease' = [staleLease EXCEPT ![o] = workerLease[o]]
+            /\ workerLease' = [workerLease EXCEPT ![o] = 0]
+            /\ quietActive' = [quietActive EXCEPT ![o] = FALSE]
+            /\ quietUntil' = [quietUntil EXCEPT ![o] = None]
+  /\ UNCHANGED << taskGen, lastLease, parent, generation, genOwner, genWatermark, relayOwned,
+                  sessionGen, sessionManaged, everAdopted, detached, retired, transportAlive,
+                  hasMail, stallSeen, pendingWake, wakeSuppressed,
+                  retryWake, wakeTried, wakeEligible, parentDone, parentBlocked, activeRT,
+                  rtDurable, rtCleaned, approved, reviewed >>
+
+(* NORMAL owner release: running -> queued, by the current owner.               *)
+OwnerRelease(w, t) ==
+  /\ ReleasesAllowed
+  /\ CanProgress(t, w)
+  /\ stage' = 0
   /\ Requeue(t)
   /\ workerTask' = [workerTask EXCEPT ![w] = None]
   /\ workerState' = [workerState EXCEPT ![w] = "idle"]
+  /\ staleLease' = [staleLease EXCEPT ![w] = workerLease[w]]
+  /\ workerLease' = [workerLease EXCEPT ![w] = 0]
   /\ quietActive' = [quietActive EXCEPT ![w] = FALSE]
   /\ quietUntil' = [quietUntil EXCEPT ![w] = None]
-  /\ stage' = 0
-  /\ UNCHANGED << parent, generation, genOwner, relayOwned, everAdopted, sessionGen,
-                  sessionManaged, hasMail, stallSeen, pendingWake, wakeSuppressed, retryWake,
-                  wakeTried, wakeEligible, parentDone, parentBlocked, activeRT, rtDurable,
-                  rtCleaned, reviewed >>
-(* The owner releases;  running -> queued.  Gated by ReleasesAllowed: the
-   AllTasksDone demonstration assumes workers do not abandon a task forever. *)
-Release(w) ==
-  /\ ReleasesAllowed
-  /\ ReleaseWorker(w)
+  /\ stallSeen' = [stallSeen EXCEPT ![w] = FALSE]
+  /\ UNCHANGED << taskGen, lastLease, parent, generation, genOwner, genWatermark, relayOwned,
+                  sessionGen, sessionManaged, everAdopted, detached, retired, transportAlive,
+                  hasMail, pendingWake, wakeSuppressed, retryWake, wakeTried, wakeEligible,
+                  parentDone, parentBlocked, activeRT, rtDurable, rtCleaned, approved, reviewed,
+                  prevPendingWake, prevWakeTried >>
 
-(* running -> blocked_*.  One atomic transaction with the one-hop signal.      *)
-Block(t, w, human) ==
+(* RECOVERY release: an external actor (operator / supervisor) revokes a running  *)
+(* task.  It may ONLY invalidate ownership and requeue -- it can never advance    *)
+(* the task to review/done/blocked.                                             *)
+RecoveryRelease(actor, t) ==
+  /\ ReleasesAllowed
+  /\ actor \in Workers
+  /\ taskState[t] = "running"
+  /\ taskOwner[t] # actor
   /\ stage' = 0
+  /\ Requeue(t)
+  /\ LET o == taskOwner[t] IN
+       IF o = None THEN UNCHANGED << workerTask, staleLease, workerLease, workerState, quietActive, quietUntil >>
+       ELSE /\ workerTask' = [workerTask EXCEPT ![o] = None]
+            /\ workerState' = [workerState EXCEPT ![o] = "idle"]
+            /\ staleLease' = [staleLease EXCEPT ![o] = workerLease[o]]
+            /\ workerLease' = [workerLease EXCEPT ![o] = 0]
+            /\ quietActive' = [quietActive EXCEPT ![o] = FALSE]
+            /\ quietUntil' = [quietUntil EXCEPT ![o] = None]
+  /\ UNCHANGED << taskGen, lastLease, parent, generation, genOwner, genWatermark, relayOwned,
+                  sessionGen, sessionManaged, everAdopted, detached, retired, transportAlive,
+                  hasMail, stallSeen, pendingWake, wakeSuppressed,
+                  retryWake, wakeTried, wakeEligible, parentDone, parentBlocked, activeRT,
+                  rtDurable, rtCleaned, approved, reviewed >>
+
+(* running -> blocked_*.  Operator-permitted (blockTask does not fence on owner). *)
+Block(t, actor, human) ==
   /\ AllowFailure
   /\ taskState[t] = "running"
-  /\ taskOwner[t] = w
-  /\ workerTask[w] = t
-  /\ ~quietActive[w]
+  /\ actor \in Workers
+  /\ ~quietActive[actor]
+  /\ stage' = 0
   /\ taskState' = [taskState EXCEPT ![t] = (IF human THEN "blocked_human" ELSE "blocked_internal")]
   /\ taskOwner' = [taskOwner EXCEPT ![t] = None]
-  /\ taskVersion' = [taskVersion EXCEPT ![t] = 0]
-  /\ workerTask' = [workerTask EXCEPT ![w] = None]
-  /\ workerState' = [workerState EXCEPT ![w] = "idle"]
+  /\ taskLease' = [taskLease EXCEPT ![t] = taskLease[t] + 1]
+  /\ LET o == taskOwner[t] IN
+       IF o = None THEN UNCHANGED << workerTask, staleLease, workerLease, workerState >>
+       ELSE /\ workerTask' = [workerTask EXCEPT ![o] = None]
+            /\ workerState' = [workerState EXCEPT ![o] = "idle"]
+            /\ staleLease' = [staleLease EXCEPT ![o] = workerLease[o]]
+            /\ workerLease' = [workerLease EXCEPT ![o] = 0]
+            /\ quietActive' = [quietActive EXCEPT ![o] = FALSE]
+            /\ quietUntil' = [quietUntil EXCEPT ![o] = None]
   /\ LET p == parent[t] IN
        IF p = None
        THEN UNCHANGED << parentDone, parentBlocked >>
        ELSE /\ parentBlocked' = [parentBlocked EXCEPT ![p] = parentBlocked[p] \cup {t}]
             /\ parentDone' = [parentDone EXCEPT ![p] = parentDone[p] \ {t}]
-  /\ UNCHANGED << parent, generation, genOwner, relayOwned, everAdopted, sessionGen,
-                  sessionManaged, hasMail, quietUntil, quietActive, stallSeen, pendingWake,
-                  wakeSuppressed, retryWake, wakeTried, wakeEligible, activeRT, rtDurable,
-                  rtCleaned, reviewed >>
+  /\ UNCHANGED << taskGen, lastLease, parent, generation, genOwner, genWatermark, relayOwned,
+                  sessionGen, sessionManaged, everAdopted, detached, retired, transportAlive,
+                  hasMail, stallSeen, pendingWake, wakeSuppressed,
+                  retryWake, wakeTried, wakeEligible, activeRT, rtDurable, rtCleaned, approved,
+                  reviewed >>
 
 (* blocked_* -> queued (human or operator).                                    *)
 Unblock(t) ==
   /\ AllowFailure
   /\ taskState[t] \in {"blocked_internal", "blocked_human"}
-  /\ taskState' = [taskState EXCEPT ![t] = "queued"]
   /\ stage' = 0
-  /\ UNCHANGED << taskOwner, taskVersion, parent, workerState, workerTask, generation, genOwner,
-                  relayOwned, everAdopted, sessionGen, sessionManaged, hasMail, quietUntil,
-                  quietActive, stallSeen, pendingWake, wakeSuppressed, retryWake, wakeTried,
-                  wakeEligible, parentDone, parentBlocked, activeRT, rtDurable, rtCleaned, reviewed >>
-(* working -> waiting_input.  Task KEPT.  Asking for input supersedes a   *)
-(* quiet lease: a worker cannot be both "quiet" (deliberately idle on a bounded  *)
-(* lease) and "waiting_input" (blocked on the human) at once.                    *)
+  /\ taskState' = [taskState EXCEPT ![t] = "queued"]
+  /\ UNCHANGED << taskOwner, taskLease, taskGen, lastLease, parent, workerState, workerTask,
+                  workerLease, staleLease, generation, genOwner, genWatermark, relayOwned,
+                  sessionGen, sessionManaged, everAdopted, detached, retired, transportAlive,
+                  hasMail, quietUntil, quietActive, stallSeen, pendingWake, wakeSuppressed,
+                  retryWake, wakeTried, wakeEligible, parentDone, parentBlocked, activeRT,
+                  rtDurable, rtCleaned, approved, reviewed >>
+
+(* working -> waiting_input.  Task KEPT.  Asking for input supersedes quiet.    *)
 WaitInput(w) ==
   /\ workerState[w] = "working"
   /\ workerTask[w] # None
+  /\ stage' = 0
   /\ workerState' = [workerState EXCEPT ![w] = "waiting_input"]
   /\ quietActive' = [quietActive EXCEPT ![w] = FALSE]
   /\ quietUntil' = [quietUntil EXCEPT ![w] = None]
-  /\ stage' = 0
-  /\ UNCHANGED << taskState, taskOwner, taskVersion, parent, workerTask, generation, genOwner,
-                  relayOwned, everAdopted, sessionGen, sessionManaged, hasMail, stallSeen,
-                  pendingWake, wakeSuppressed, retryWake, wakeTried, wakeEligible, parentDone,
-                  parentBlocked, activeRT, rtDurable, rtCleaned, reviewed >>
+  /\ UNCHANGED << taskState, taskOwner, taskLease, taskGen, lastLease, parent, workerTask,
+                  workerLease, staleLease, generation, genOwner, genWatermark, relayOwned,
+                  sessionGen, sessionManaged, everAdopted, detached, retired, transportAlive,
+                  hasMail, stallSeen, pendingWake, wakeSuppressed, retryWake, wakeTried,
+                  wakeEligible, parentDone, parentBlocked, activeRT, rtDurable, rtCleaned,
+                  approved, reviewed >>
+
 (* waiting_input -> working.                                                   *)
 TakeInput(w) ==
   /\ workerState[w] = "waiting_input"
-  /\ workerState' = [workerState EXCEPT ![w] = "working"]
   /\ stage' = 0
-  /\ UNCHANGED << taskState, taskOwner, taskVersion, parent, workerTask, generation, genOwner,
-                  relayOwned, everAdopted, sessionGen, sessionManaged, hasMail, quietUntil,
-                  quietActive, stallSeen, pendingWake, wakeSuppressed, retryWake, wakeTried,
-                  wakeEligible, parentDone, parentBlocked, activeRT, rtDurable, rtCleaned, reviewed >>
+  /\ workerState' = [workerState EXCEPT ![w] = "working"]
+  /\ UNCHANGED << taskState, taskOwner, taskLease, taskGen, lastLease, parent, workerTask,
+                  workerLease, staleLease, generation, genOwner, genWatermark, relayOwned,
+                  sessionGen, sessionManaged, everAdopted, detached, retired, transportAlive,
+                  hasMail, quietUntil, quietActive, stallSeen, pendingWake, wakeSuppressed,
+                  retryWake, wakeTried, wakeEligible, parentDone, parentBlocked, activeRT,
+                  rtDurable, rtCleaned, approved, reviewed >>
+
 (* A working task-owner declares a bounded session-idle.                       *)
 QuietStart(w) ==
   /\ workerState[w] = "working"
   /\ workerTask[w] # None
   /\ taskState[workerTask[w]] = "running"
+  /\ stage' = 0
   /\ quietActive' = [quietActive EXCEPT ![w] = TRUE]
   /\ quietUntil' = [quietUntil EXCEPT ![w] = workerTask[w]]
-  /\ stage' = 0
-  /\ UNCHANGED << taskState, taskOwner, taskVersion, parent, workerState, workerTask, generation,
-                  genOwner, relayOwned, everAdopted, sessionGen, sessionManaged, hasMail,
-                  stallSeen, pendingWake, wakeSuppressed, retryWake, wakeTried, wakeEligible,
-                  parentDone, parentBlocked, activeRT, rtDurable, rtCleaned, reviewed >>
-(* The quiet deadline lapses.                                                  *)
+  /\ UNCHANGED << taskState, taskOwner, taskLease, taskGen, lastLease, parent, workerState,
+                  workerTask, workerLease, staleLease, generation, genOwner, genWatermark,
+                  relayOwned, sessionGen, sessionManaged, everAdopted, detached, retired,
+                  transportAlive, hasMail, stallSeen, pendingWake, wakeSuppressed, retryWake,
+                  wakeTried, wakeEligible, parentDone, parentBlocked, activeRT, rtDurable,
+                  rtCleaned, approved, reviewed >>
+
+(* The quiet deadline lapses (M4 disables this).                               *)
 QuietExpire(w) ==
   /\ quietActive[w]
+  /\ stage' = 0
   /\ quietActive' = [quietActive EXCEPT ![w] = FALSE]
   /\ quietUntil' = [quietUntil EXCEPT ![w] = None]
-  /\ stage' = 0
-  /\ UNCHANGED << taskState, taskOwner, taskVersion, parent, workerState, workerTask, generation,
-                  genOwner, relayOwned, everAdopted, sessionGen, sessionManaged, hasMail,
-                  stallSeen, pendingWake, wakeSuppressed, retryWake, wakeTried, wakeEligible,
-                  parentDone, parentBlocked, activeRT, rtDurable, rtCleaned, reviewed >>
-(* A peer sends a durable signal -- any worker state, quiet included.    *)
+  /\ UNCHANGED << taskState, taskOwner, taskLease, taskGen, lastLease, parent, workerState,
+                  workerTask, workerLease, staleLease, generation, genOwner, genWatermark,
+                  relayOwned, sessionGen, sessionManaged, everAdopted, detached, retired,
+                  transportAlive, hasMail, stallSeen, pendingWake, wakeSuppressed, retryWake,
+                  wakeTried, wakeEligible, parentDone, parentBlocked, activeRT, rtDurable,
+                  rtCleaned, approved, reviewed >>
+
+(* A peer sends a durable signal -- any worker state, quiet included.          *)
 Deliver(w, p) ==
   /\ p # w
+  /\ stage' = 0
   /\ hasMail' = [hasMail EXCEPT ![w] = hasMail[w] \cup {p}]
   /\ pendingWake' = [pendingWake EXCEPT ![w] = pendingWake[w] \cup {p}]
-  /\ stage' = 0
-  /\ UNCHANGED << taskState, taskOwner, taskVersion, parent, workerState, workerTask, generation,
-                  genOwner, relayOwned, everAdopted, sessionGen, sessionManaged, quietUntil,
-                  quietActive, stallSeen, wakeSuppressed, retryWake, wakeTried, wakeEligible,
-                  parentDone, parentBlocked, activeRT, rtDurable, rtCleaned, reviewed >>
-(* The woken worker reads its mail.                                            *)
+  /\ UNCHANGED << taskState, taskOwner, taskLease, taskGen, lastLease, parent, workerState,
+                  workerTask, workerLease, staleLease, generation, genOwner, genWatermark,
+                  relayOwned, sessionGen, sessionManaged, everAdopted, detached, retired,
+                  transportAlive, quietUntil, quietActive, stallSeen, wakeSuppressed, retryWake,
+                  wakeTried, wakeEligible, parentDone, parentBlocked, activeRT, rtDurable,
+                  rtCleaned, approved, reviewed >>
+
 AckMail(w, p) ==
   /\ p \in hasMail[w]
-  /\ hasMail' = [hasMail EXCEPT ![w] = hasMail[w] \ {p}]
   /\ stage' = 0
-  /\ UNCHANGED << taskState, taskOwner, taskVersion, parent, workerState, workerTask, generation,
-                  genOwner, relayOwned, everAdopted, sessionGen, sessionManaged, quietUntil,
-                  quietActive, stallSeen, pendingWake, wakeSuppressed, retryWake, wakeTried,
-                  wakeEligible, parentDone, parentBlocked, activeRT, rtDurable, rtCleaned, reviewed >>
+  /\ hasMail' = [hasMail EXCEPT ![w] = hasMail[w] \ {p}]
+  /\ UNCHANGED << taskState, taskOwner, taskLease, taskGen, lastLease, parent, workerState,
+                  workerTask, workerLease, staleLease, generation, genOwner, genWatermark,
+                  relayOwned, sessionGen, sessionManaged, everAdopted, detached, retired,
+                  transportAlive, quietUntil, quietActive, stallSeen, pendingWake, wakeSuppressed,
+                  retryWake, wakeTried, wakeEligible, parentDone, parentBlocked, activeRT,
+                  rtDurable, rtCleaned, approved, reviewed >>
+
 (* The transport delivers the prompt the supervisor asked for.                 *)
 WakeDelivered(w) ==
   /\ wakeTried[w]
+  /\ stage' = 0
   /\ wakeTried' = [wakeTried EXCEPT ![w] = FALSE]
   /\ retryWake' = [retryWake EXCEPT ![w] = FALSE]
   /\ wakeSuppressed' = [wakeSuppressed EXCEPT ![w] = AllowCooldown]
-  /\ stage' = 0
-  /\ UNCHANGED << taskState, taskOwner, taskVersion, parent, workerState, workerTask, generation,
-                  genOwner, relayOwned, everAdopted, sessionGen, sessionManaged, hasMail,
-                  quietUntil, quietActive, stallSeen, pendingWake, wakeEligible, parentDone,
-                  parentBlocked, activeRT, rtDurable, rtCleaned, reviewed >>
-(* The transport fails;  the durable signal survives (a failed wake is retried).               *)
+  /\ UNCHANGED << taskState, taskOwner, taskLease, taskGen, lastLease, parent, workerState,
+                  workerTask, workerLease, staleLease, generation, genOwner, genWatermark,
+                  relayOwned, sessionGen, sessionManaged, everAdopted, detached, retired,
+                  transportAlive, hasMail, quietUntil, quietActive, stallSeen, pendingWake,
+                  wakeEligible, parentDone, parentBlocked, activeRT, rtDurable, rtCleaned,
+                  approved, reviewed >>
+
+(* The transport fails;  the durable signal survives (M18 erases it).          *)
 WakeFails(w) ==
   /\ wakeTried[w]
+  /\ stage' = 0
   /\ wakeTried' = [wakeTried EXCEPT ![w] = FALSE]
   /\ retryWake' = [retryWake EXCEPT ![w] = TRUE]
-  /\ stage' = 0
-  /\ UNCHANGED << taskState, taskOwner, taskVersion, parent, workerState, workerTask, generation,
-                  genOwner, relayOwned, everAdopted, sessionGen, sessionManaged, hasMail,
-                  quietUntil, quietActive, stallSeen, pendingWake, wakeEligible, wakeSuppressed,
-                  parentDone, parentBlocked, activeRT, rtDurable, rtCleaned, reviewed >>
-(* A failed delivery is retried.                                               *)
+  /\ UNCHANGED << taskState, taskOwner, taskLease, taskGen, lastLease, parent, workerState,
+                  workerTask, workerLease, staleLease, generation, genOwner, genWatermark,
+                  relayOwned, sessionGen, sessionManaged, everAdopted, detached, retired,
+                  transportAlive, hasMail, quietUntil, quietActive, stallSeen, pendingWake,
+                  wakeSuppressed, wakeEligible, parentDone, parentBlocked, activeRT, rtDurable,
+                  rtCleaned, approved, reviewed >>
+
 RetryWake(w) ==
   /\ retryWake[w]
+  /\ stage' = 0
   /\ retryWake' = [retryWake EXCEPT ![w] = FALSE]
   /\ wakeTried' = [wakeTried EXCEPT ![w] = TRUE]
+  /\ UNCHANGED << taskState, taskOwner, taskLease, taskGen, lastLease, parent, workerState,
+                  workerTask, workerLease, staleLease, generation, genOwner, genWatermark,
+                  relayOwned, sessionGen, sessionManaged, everAdopted, detached, retired,
+                  transportAlive, hasMail, quietUntil, quietActive, stallSeen, pendingWake,
+                  wakeSuppressed, wakeEligible, parentDone, parentBlocked, activeRT, rtDurable,
+                  rtCleaned, approved, reviewed >>
+
+(* The runtime transport dies.  Relay must CLASSIFY it dead (Reconcile), even   *)
+(* while the worker is quiet.                                                  *)
+TransportDies(w) ==
+  /\ AllowFailure
+  /\ transportAlive[w]
   /\ stage' = 0
-  /\ UNCHANGED << taskState, taskOwner, taskVersion, parent, workerState, workerTask, generation,
-                  genOwner, relayOwned, everAdopted, sessionGen, sessionManaged, hasMail,
-                  quietUntil, quietActive, stallSeen, pendingWake, wakeEligible, wakeSuppressed,
-                  parentDone, parentBlocked, activeRT, rtDurable, rtCleaned, reviewed >>
-(* A new generation is allocated: strictly newer, and it becomes the only      *)
-(* generation allowed to mutate.  Any owned running task is requeued with a    *)
-(* bumped fence, so the prior owner can never submit it.            *)
+  /\ transportAlive' = [transportAlive EXCEPT ![w] = FALSE]
+  /\ UNCHANGED << taskState, taskOwner, taskLease, taskGen, lastLease, parent, workerState,
+                  workerTask, workerLease, staleLease, generation, genOwner, genWatermark,
+                  relayOwned, sessionGen, sessionManaged, everAdopted, detached, retired,
+                  hasMail, quietUntil, quietActive, stallSeen, pendingWake, wakeSuppressed,
+                  retryWake, wakeTried, wakeEligible, parentDone, parentBlocked, activeRT,
+                  rtDurable, rtCleaned, approved, reviewed >>
+
+(* The transport comes back (a revive path or a fresh spawn).                  *)
+TransportRevives(w) ==
+  /\ AllowFailure
+  /\ ~transportAlive[w]
+  /\ stage' = 0
+  /\ transportAlive' = [transportAlive EXCEPT ![w] = TRUE]
+  /\ UNCHANGED << taskState, taskOwner, taskLease, taskGen, lastLease, parent, workerState,
+                  workerTask, workerLease, staleLease, generation, genOwner, genWatermark,
+                  relayOwned, sessionGen, sessionManaged, everAdopted, detached, retired,
+                  hasMail, quietUntil, quietActive, stallSeen, pendingWake, wakeSuppressed,
+                  retryWake, wakeTried, wakeEligible, parentDone, parentBlocked, activeRT,
+                  rtDurable, rtCleaned, approved, reviewed >>
+
+(* A new generation is allocated: strictly newer (genWatermark + 1), and it     *)
+(* becomes the only generation allowed to mutate.  M15 reuses/rewinds it.       *)
 RestartOwned(w) ==
   /\ AllowFailure
   /\ relayOwned[w] = TRUE
+  /\ workerState[w] = "dead"
   /\ generation[w] < MaxGeneration
-  /\ LET g2 == generation[w] + 1 IN
-     /\ generation' = [generation EXCEPT ![w] = g2]
-     /\ genOwner' = [genOwner EXCEPT ![w] = (IF activeRT[w] THEN 0 ELSE g2)]
-     /\ activeRT' = [activeRT EXCEPT ![w] = TRUE]
-     /\ rtDurable' = [rtDurable EXCEPT ![w] = TRUE]
-     /\ quietActive' = [quietActive EXCEPT ![w] = FALSE]
-     /\ quietUntil' = [quietUntil EXCEPT ![w] = None]
-     /\ stallSeen' = [stallSeen EXCEPT ![w] = FALSE]
-     /\ workerState' = [workerState EXCEPT ![w] = "starting"]
-     /\ workerTask' = [workerTask EXCEPT ![w] = None]
-     \* The old session is fenced out: it is no longer managed until the fresh
-     \* generation attaches (which sets sessionGen = generation).
-     /\ sessionManaged' = [sessionManaged EXCEPT ![w] = FALSE]
-     \* Requeue the owned running task (if any), so the old generation can never
-     \* submit it.  Written as total updates so every variable is always assigned.
-     /\ LET owned == (\E t \in Tasks: workerTask[w] = t /\ taskState[t] = "running")
-            ot == (CHOOSE t \in Tasks: workerTask[w] = t /\ taskState[t] = "running")
-        IN
-        /\ taskState' = [t \in Tasks |->
-             IF owned /\ t = ot THEN "queued" ELSE taskState[t]]
-        /\ taskOwner' = [t \in Tasks |->
-             IF owned /\ t = ot THEN None ELSE taskOwner[t]]
-        /\ taskVersion' = [t \in Tasks |->
-             IF owned /\ t = ot THEN 0 ELSE taskVersion[t]]
   /\ stage' = 0
-  /\ UNCHANGED << parent, relayOwned, sessionGen, hasMail, pendingWake, wakeSuppressed, retryWake,
-                  wakeTried, wakeEligible, parentDone, parentBlocked, rtCleaned, reviewed,
-                  everAdopted >>
-(* The fresh generation finishes attaching:  starting -> idle.  The session     *)
-(* carries the current generation, which is what makes it non-stale.           *)
+  /\ LET g2 == genWatermark[w] + 1 IN
+     /\ generation' = [generation EXCEPT ![w] = g2]
+     /\ genWatermark' = [genWatermark EXCEPT ![w] = g2]
+     /\ genOwner' = [genOwner EXCEPT ![w] = g2]
+  /\ workerState' = [workerState EXCEPT ![w] = "starting"]
+  /\ workerTask' = [workerTask EXCEPT ![w] = None]
+  /\ sessionManaged' = [sessionManaged EXCEPT ![w] = FALSE]
+  /\ activeRT' = [activeRT EXCEPT ![w] = TRUE]
+  /\ rtDurable' = [rtDurable EXCEPT ![w] = TRUE]
+  /\ quietActive' = [quietActive EXCEPT ![w] = FALSE]
+  /\ quietUntil' = [quietUntil EXCEPT ![w] = None]
+  /\ stallSeen' = [stallSeen EXCEPT ![w] = FALSE]
+  /\ UNCHANGED << taskState, taskOwner, taskLease, taskGen, lastLease, parent, workerLease,
+                  staleLease, relayOwned, sessionGen, everAdopted, detached, retired,
+                  transportAlive, hasMail, pendingWake, wakeSuppressed, retryWake, wakeTried,
+                  wakeEligible, parentDone, parentBlocked, rtCleaned, approved, reviewed,
+                  prevPendingWake, prevWakeTried >>
+
+(* The fresh generation finishes attaching: starting -> idle.                  *)
 Attach(w) ==
   /\ workerState[w] = "starting"
-  /\ genOwner[w] = generation[w]
   /\ rtDurable[w]
+  /\ stage' = 0
   /\ workerState' = [workerState EXCEPT ![w] = "idle"]
   /\ sessionGen' = [sessionGen EXCEPT ![w] = generation[w]]
   /\ sessionManaged' = [sessionManaged EXCEPT ![w] = TRUE]
-  /\ stage' = 0
-  /\ UNCHANGED << taskState, taskOwner, taskVersion, parent, workerTask, generation, genOwner,
-                  relayOwned, hasMail, quietUntil, quietActive, stallSeen, pendingWake,
-                  wakeSuppressed, retryWake, wakeTried, wakeEligible, parentDone, parentBlocked,
-                  activeRT, rtDurable, rtCleaned, reviewed, everAdopted >>
-(* The gateEvent fence (src/sessions.ts): an attach that presents a generation    *)
-(* STRICTLY OLDER than the worker's is rejected.  A correct Relay only lets the  *)
-(* current generation attach, so the guard below is `g = generation[w]`; the      *)
-(* mutation M7 removes it, letting a stale generation become the live session and *)
-(* breaking NoStaleSession.                                                      *)
+  /\ UNCHANGED << taskState, taskOwner, taskLease, taskGen, lastLease, parent, workerTask,
+                  workerLease, staleLease, generation, genOwner, genWatermark, relayOwned,
+                  everAdopted, detached, retired, transportAlive, hasMail, quietUntil,
+                  quietActive, stallSeen, pendingWake, wakeSuppressed, retryWake, wakeTried,
+                  wakeEligible, parentDone, parentBlocked, activeRT, rtDurable, rtCleaned,
+                  approved, reviewed >>
+
+(* The gateEvent fence: an attach presenting a generation OLDER than the        *)
+(* worker's is rejected.  M7 removes the fence (`<=`), letting a stale          *)
+(* generation become the live session.                                         *)
 StaleAttach(w, g) ==
   /\ AllowFailure
   /\ g \in Generations
   /\ g = generation[w]                    \* the gateEvent fence
+  /\ stage' = 0
   /\ sessionGen' = [sessionGen EXCEPT ![w] = g]
   /\ sessionManaged' = [sessionManaged EXCEPT ![w] = TRUE]
+  /\ UNCHANGED << taskState, taskOwner, taskLease, taskGen, lastLease, parent, workerState,
+                  workerTask, workerLease, staleLease, generation, genOwner, genWatermark,
+                  relayOwned, everAdopted, detached, retired, transportAlive, hasMail,
+                  quietUntil, quietActive, stallSeen, pendingWake, wakeSuppressed, retryWake,
+                  wakeTried, wakeEligible, parentDone, parentBlocked, activeRT, rtDurable,
+                  rtCleaned, approved, reviewed >>
+
+(* Relay begins supervising an EXTERNAL runtime it does not own.               *)
+Adopt(w) ==
+  /\ AllowFailure
+  /\ relayOwned[w] = TRUE
   /\ stage' = 0
-  /\ UNCHANGED << taskState, taskOwner, taskVersion, parent, workerState, workerTask, generation,
-                  genOwner, relayOwned, hasMail, quietUntil, quietActive, stallSeen, pendingWake,
-                  wakeSuppressed, retryWake, wakeTried, wakeEligible, parentDone, parentBlocked,
-                  activeRT, rtDurable, rtCleaned, reviewed, everAdopted >>
-(* An ADOPTED worker that is actually alive but was misclassified dead/stalled *)
-(* is REVIVED, not replaced (M9).                                        *)
+  /\ relayOwned' = [relayOwned EXCEPT ![w] = FALSE]
+  /\ everAdopted' = [everAdopted EXCEPT ![w] = TRUE]
+  /\ UNCHANGED << taskState, taskOwner, taskLease, taskGen, lastLease, parent, workerState,
+                  workerTask, workerLease, staleLease, generation, genOwner, genWatermark,
+                  sessionGen, sessionManaged, detached, retired, transportAlive, hasMail,
+                  quietUntil, quietActive, stallSeen, pendingWake, wakeSuppressed, retryWake,
+                  wakeTried, wakeEligible, parentDone, parentBlocked, activeRT, rtDurable,
+                  rtCleaned, approved, reviewed >>
+
+(* An adopted worker that is ALIVE but was misclassified dead is REVIVED.       *)
+(* A truly dead adopted runtime is NOT replaced by Relay (M9 takes it over).    *)
 ReviveAdopted(w) ==
   /\ AllowFailure
   /\ relayOwned[w] = FALSE
   /\ workerState[w] = "dead"
+  /\ transportAlive[w]
+  /\ stage' = 0
   /\ workerState' = [workerState EXCEPT ![w] = "idle"]
   /\ stallSeen' = [stallSeen EXCEPT ![w] = FALSE]
   /\ sessionGen' = [sessionGen EXCEPT ![w] = generation[w]]
   /\ sessionManaged' = [sessionManaged EXCEPT ![w] = TRUE]
-  /\ stage' = 0
-  /\ UNCHANGED << taskState, taskOwner, taskVersion, parent, workerTask, generation, genOwner,
-                  relayOwned, hasMail, quietUntil, quietActive, pendingWake, wakeSuppressed,
-                  retryWake, wakeTried, wakeEligible, parentDone, parentBlocked, activeRT,
-                  rtDurable, rtCleaned, reviewed, everAdopted >>
-(* Relay begins supervising an EXTERNAL runtime it does not own (an adopted tab,
-   `relay session attach`).  The worker stays supervised; `relayOwned` becomes
-   FALSE and can never flip back (AdoptedNeverReplaced).  Its transport can still
-   die (Crash), and Relay recovers it by REVIVING, never by replacing the tab. *)
-Adopt(w) ==
-  /\ AllowFailure
-  /\ relayOwned[w] = TRUE
-  /\ relayOwned' = [relayOwned EXCEPT ![w] = FALSE]
-  /\ everAdopted' = [everAdopted EXCEPT ![w] = TRUE]
-  /\ stage' = 0
-  /\ UNCHANGED << taskState, taskOwner, taskVersion, parent, workerState, workerTask, generation,
-                  genOwner, sessionGen, sessionManaged, hasMail, quietUntil, quietActive,
-                  stallSeen, pendingWake, wakeSuppressed, retryWake, wakeTried, wakeEligible,
-                  parentDone, parentBlocked, activeRT, rtDurable, rtCleaned, reviewed >>
-(* A stall: an owned running task stops progressing.  Quiet suppresses it.     *)
+  /\ UNCHANGED << taskState, taskOwner, taskLease, taskGen, lastLease, parent, workerTask,
+                  workerLease, staleLease, generation, genOwner, genWatermark, relayOwned,
+                  everAdopted, detached, retired, transportAlive, hasMail, quietUntil,
+                  quietActive, pendingWake, wakeSuppressed, retryWake, wakeTried, wakeEligible,
+                  parentDone, parentBlocked, activeRT, rtDurable, rtCleaned, approved, reviewed,
+                  prevPendingWake, prevWakeTried >>
+
+(* A stall: an owned running task stops progressing.  Quiet SUPPRESSES it.     *)
 Stall(w) ==
   /\ AllowFailure
   /\ workerState[w] = "working"
   /\ workerTask[w] # None
   /\ taskState[workerTask[w]] = "running"
   /\ ~quietActive[w]
-  /\ stallSeen' = [stallSeen EXCEPT ![w] = TRUE]
   /\ stage' = 0
-  /\ UNCHANGED << taskState, taskOwner, taskVersion, parent, workerState, workerTask, generation,
-                  genOwner, relayOwned, everAdopted, sessionGen, sessionManaged, hasMail,
-                  quietUntil, quietActive, pendingWake, wakeSuppressed, retryWake, wakeTried,
-                  wakeEligible, parentDone, parentBlocked, activeRT, rtDurable, rtCleaned, reviewed >>
-(* A crash: the runtime dies, the worker is classed dead, its task requeued     *)
-(* with a bumped fence.  Quiet does NOT prevent this (M5).               *)
-Crash(w) ==
-  /\ AllowFailure
-  /\ workerState[w] \in {"working", "idle", "waiting_input"}
-  /\ workerState' = [workerState EXCEPT ![w] = "dead"]
-  /\ LET owned == (\E t \in Tasks: workerTask[w] = t /\ taskState[t] = "running")
-            ot == (CHOOSE t \in Tasks: workerTask[w] = t /\ taskState[t] = "running")
-     IN
-     /\ taskState' = [t \in Tasks |->
-          IF owned /\ t = ot THEN "queued" ELSE taskState[t]]
-     /\ taskOwner' = [t \in Tasks |->
-          IF owned /\ t = ot THEN None ELSE taskOwner[t]]
-     /\ taskVersion' = [t \in Tasks |->
-          IF owned /\ t = ot THEN 0 ELSE taskVersion[t]]
+  /\ stallSeen' = [stallSeen EXCEPT ![w] = TRUE]
+  /\ UNCHANGED << taskState, taskOwner, taskLease, taskGen, lastLease, parent, workerState,
+                  workerTask, workerLease, staleLease, generation, genOwner, genWatermark,
+                  relayOwned, sessionGen, sessionManaged, everAdopted, detached, retired,
+                  transportAlive, hasMail, quietUntil, quietActive, pendingWake, wakeSuppressed,
+                  retryWake, wakeTried, wakeEligible, parentDone, parentBlocked, activeRT,
+                  rtDurable, rtCleaned, approved, reviewed >>
+
+(* A stall that was nudged and did not recover: requeue with a bumped lease.    *)
+ReleaseStalled(w) ==
+  /\ stallSeen[w]
+  /\ workerState[w] = "working"
+  /\ workerTask[w] # None
+  /\ stage' = 0
+  /\ Requeue(workerTask[w])
   /\ workerTask' = [workerTask EXCEPT ![w] = None]
+  /\ workerState' = [workerState EXCEPT ![w] = "idle"]
+  /\ staleLease' = [staleLease EXCEPT ![w] = workerLease[w]]
+  /\ workerLease' = [workerLease EXCEPT ![w] = 0]
+  /\ stallSeen' = [stallSeen EXCEPT ![w] = FALSE]
   /\ quietActive' = [quietActive EXCEPT ![w] = FALSE]
   /\ quietUntil' = [quietUntil EXCEPT ![w] = None]
-  /\ stallSeen' = [stallSeen EXCEPT ![w] = FALSE]
-  /\ sessionManaged' = [sessionManaged EXCEPT ![w] = FALSE]
-  /\ stage' = 0
-  /\ UNCHANGED << parent, generation, genOwner, relayOwned, everAdopted, sessionGen, hasMail,
-                  pendingWake, wakeSuppressed, retryWake, wakeTried, wakeEligible, parentDone,
-                  parentBlocked, activeRT, rtDurable, rtCleaned, reviewed >>
-(* The cooldown lapses (M4).                                                   *)
+  /\ UNCHANGED << taskGen, lastLease, parent, generation, genOwner, genWatermark, relayOwned,
+                  sessionGen, sessionManaged, everAdopted, detached, retired, transportAlive,
+                  hasMail, pendingWake, wakeSuppressed, retryWake,
+                  wakeTried, wakeEligible, parentDone, parentBlocked, activeRT, rtDurable,
+                  rtCleaned, approved, reviewed >>
+
+(* The cooldown lapses (M4' disables this).                                    *)
 CooldownExpire(w) ==
   /\ AllowCooldown
   /\ wakeSuppressed[w]
-  /\ wakeSuppressed' = [wakeSuppressed EXCEPT ![w] = FALSE]
   /\ stage' = 0
-  /\ UNCHANGED << taskState, taskOwner, taskVersion, parent, workerState, workerTask, generation,
-                  genOwner, relayOwned, everAdopted, sessionGen, sessionManaged, hasMail,
-                  quietUntil, quietActive, stallSeen, pendingWake, retryWake, wakeTried,
-                  wakeEligible, parentDone, parentBlocked, activeRT, rtDurable, rtCleaned, reviewed >>
-(* The environment detaches a worker for good;  it leaves the supervised set.  *)
+  /\ wakeSuppressed' = [wakeSuppressed EXCEPT ![w] = FALSE]
+  /\ UNCHANGED << taskState, taskOwner, taskLease, taskGen, lastLease, parent, workerState,
+                  workerTask, workerLease, staleLease, generation, genOwner, genWatermark,
+                  relayOwned, sessionGen, sessionManaged, everAdopted, detached, retired,
+                  transportAlive, hasMail, quietUntil, quietActive, stallSeen, pendingWake,
+                  retryWake, wakeTried, wakeEligible, parentDone, parentBlocked, activeRT,
+                  rtDurable, rtCleaned, approved, reviewed >>
+
+(* The environment detaches a worker for good; it leaves the supervised set.    *)
 Detach(w) ==
   /\ AllowFailure
-  /\ workerState[w] # "dead"
-  /\ workerState' = [workerState EXCEPT ![w] = "idle"]
+  /\ ~detached[w]
+  /\ stage' = 0
+  /\ detached' = [detached EXCEPT ![w] = TRUE]
+  /\ sessionManaged' = [sessionManaged EXCEPT ![w] = FALSE]
   /\ relayOwned' = [relayOwned EXCEPT ![w] = FALSE]
-  /\ workerTask' = [workerTask EXCEPT ![w] = None]
-  \* A detached worker must not orphan a running task: requeue it with an
-  \* invalidated fence, exactly like a crash.  Detach is not an escape from
-  \* ownership.
-  /\ LET owned == (\E t \in Tasks: workerTask[w] = t /\ taskState[t] = "running")
-            ot == (CHOOSE t \in Tasks: workerTask[w] = t /\ taskState[t] = "running")
-     IN
-     /\ taskState' = [t \in Tasks |->
-          IF owned /\ t = ot THEN "queued" ELSE taskState[t]]
-     /\ taskOwner' = [t \in Tasks |->
-          IF owned /\ t = ot THEN None ELSE taskOwner[t]]
-     /\ taskVersion' = [t \in Tasks |->
-          IF owned /\ t = ot THEN 0 ELSE taskVersion[t]]
+  /\ everAdopted' = [everAdopted EXCEPT ![w] = TRUE]
+  /\ pendingWake' = [pendingWake EXCEPT ![w] = {}]
   /\ quietActive' = [quietActive EXCEPT ![w] = FALSE]
   /\ quietUntil' = [quietUntil EXCEPT ![w] = None]
-  /\ pendingWake' = [pendingWake EXCEPT ![w] = {}]
-  /\ sessionManaged' = [sessionManaged EXCEPT ![w] = FALSE]
-  /\ everAdopted' = [everAdopted EXCEPT ![w] = TRUE]
-  /\ stage' = 0
-  /\ UNCHANGED << parent, generation, genOwner, sessionGen, hasMail, stallSeen, wakeSuppressed,
+  /\ UNCHANGED << taskState, taskOwner, taskLease, taskGen, lastLease, parent, workerState,
+                  workerTask, workerLease, staleLease, generation, genOwner, genWatermark,
+                  retired, sessionGen, transportAlive, hasMail, stallSeen, wakeSuppressed,
                   retryWake, wakeTried, wakeEligible, parentDone, parentBlocked, activeRT,
-                  rtDurable, rtCleaned, reviewed >>
+                  rtDurable, rtCleaned, approved, reviewed >>
+
+(* A worker is retired: history only, never supervised.                        *)
+Retire(w) ==
+  /\ AllowFailure
+  /\ ~retired[w]
+  /\ stage' = 0
+  /\ retired' = [retired EXCEPT ![w] = TRUE]
+  /\ sessionManaged' = [sessionManaged EXCEPT ![w] = FALSE]
+  /\ UNCHANGED << taskState, taskOwner, taskLease, taskGen, lastLease, parent, workerState,
+                  workerTask, workerLease, staleLease, generation, genOwner, genWatermark,
+                  relayOwned, sessionGen, everAdopted, detached, transportAlive, hasMail,
+                  quietUntil, quietActive, stallSeen, pendingWake, wakeSuppressed, retryWake,
+                  wakeTried, wakeEligible, parentDone, parentBlocked, activeRT, rtDurable,
+                  rtCleaned, approved, reviewed >>
+
 Environment ==
+  \/ \E w \in Workers: \E t \in Tasks: Submit(t, w)
+  \/ \E w \in Workers: \E t \in Tasks: StaleSubmit(t, w)
   \/ \E w \in Workers: Claim(w)
-  \/ \E w \in Workers: Submit(w)
   \/ \E t \in Tasks: \E w \in Workers: AdoptReview(t, w)
-  \/ \E t \in Tasks: \E w \in Workers: Approve(t, w)
-  \/ \E t \in Tasks: \E w \in Workers: Reject(t, w)
-  \/ \E w \in Workers: Release(w)
-  \/ \E t \in Tasks: \E w \in Workers: \E human \in BOOLEAN: Block(t, w, human)
+  \/ \E t \in Tasks: \E a \in Workers: Approve(t, a)
+  \/ \E t \in Tasks: \E a \in Workers: Reject(t, a)
+  \/ \E w \in Workers: \E t \in Tasks: OwnerRelease(w, t)
+  \/ \E a \in Workers: \E t \in Tasks: RecoveryRelease(a, t)
+  \/ \E t \in Tasks: \E a \in Workers: \E human \in BOOLEAN: Block(t, a, human)
   \/ \E t \in Tasks: Unblock(t)
   \/ \E w \in Workers: WaitInput(w)
   \/ \E w \in Workers: TakeInput(w)
@@ -791,74 +954,80 @@ Environment ==
   \/ \E w \in Workers: WakeDelivered(w)
   \/ \E w \in Workers: WakeFails(w)
   \/ \E w \in Workers: RetryWake(w)
+  \/ \E w \in Workers: TransportDies(w)
+  \/ \E w \in Workers: TransportRevives(w)
   \/ \E w \in Workers: RestartOwned(w)
   \/ \E w \in Workers: Attach(w)
   \/ \E w \in Workers: \E g \in Generations: StaleAttach(w, g)
   \/ \E w \in Workers: Adopt(w)
   \/ \E w \in Workers: ReviveAdopted(w)
   \/ \E w \in Workers: Stall(w)
-  \/ \E w \in Workers: Crash(w)
+  \/ \E w \in Workers: ReleaseStalled(w)
   \/ \E w \in Workers: CooldownExpire(w)
   \/ \E w \in Workers: Detach(w)
+  \/ \E w \in Workers: Retire(w)
 
 (* ===================================================================== *)
-(* SUPERVISOR actions -- one reconcile pass per tick.                      *)
+(* SUPERVISOR -- one reconcile pass per tick.                              *)
 (* ===================================================================== *)
 
-(* --------------------------------------------------------------------- *)
-(* The reconcile pass.  ONE atomic supervisor step, entered in stage "env"    *)
-(* "env" and leaving the system Stable.  It decides, for THIS pass, the set *)
-(* of workers it attempts to wake.  A correct Relay attempts every worker   *)
-(* that has claimable work or an owed signal; the model does NOT force      *)
-(* that -- it is the property under test                                *)
-(* (NoAvoidableIdleAtReconcileBoundary).                                    *)
-(*                                                                          *)
-(* `W` is the supervisor's CHOICE of whom to wake.  Wake is advisory: it     *)
-(* never picks a task, so a task is still claimed by exactly one worker even *)
-(* if several were woken for it.                                      *)
-(* --------------------------------------------------------------------- *)
-(* The set of workers a CORRECT supervisor attempts to wake this pass: every    *)
-(* worker with an owed signal or claimable work, minus the legitimately        *)
-(* suppressed.  Relay's implemented semantics (the reconciler wake loop) is this. *)
+(* Every worker a CORRECT supervisor attempts to wake this pass.               *)
 EligibleWakees ==
   { w \in Workers :
-      (   pendingWake[w] # {}
-       \/ (\E t \in Tasks: t \in ClaimableBy(w) /\ taskOwner[t] = None))
+      Operational(w)
+      /\ (   pendingWake[w] # {}
+           \/ (\E t \in Tasks: t \in ClaimableBy(w) /\ taskOwner[t] = None))
       /\ ~wakeSuppressed[w] /\ ~retryWake[w] }
 
 WakeSet(W) ==
   /\ W \subseteq Workers
   /\ \A w \in W:
-       (   (pendingWake[w] # {} \/ (\E t \in Tasks: t \in ClaimableBy(w) /\ taskOwner[t] = None))
+       (   Operational(w)
+        /\ (pendingWake[w] # {} \/ (\E t \in Tasks: t \in ClaimableBy(w) /\ taskOwner[t] = None))
         /\ ~wakeSuppressed[w] /\ ~retryWake[w])
   /\ wakeTried' = [w \in Workers |-> (w \in W)]
   /\ wakeEligible' = [w \in Workers |->
        IF w \in W THEN (pendingWake[w] # {} \/ HasClaimableWork(w)) ELSE wakeEligible[w]]
 
+(* Transport-death classification happens IN the reconcile pass, so it is       *)
+(* quiet-AGNOSTIC and checkable as a boundary safety property.  M17 makes the    *)
+(* classification conditional on ~quietActive.                                  *)
+DeadSet == { w \in Workers : ~transportAlive[w] /\ Operational(w) }
+
+TaskHeldByDead(t) == \E w \in DeadSet: workerTask[w] = t /\ taskState[t] = "running"
+
 Reconcile ==
   /\ stage' = 1
   /\ WakeSet(EligibleWakees)
-  \* Quiet leases are NOT cleared here: a lease lapses only through QuietExpire
-  \* (its deadline).  The supervisor does not get to clear a live lease.
-  \* Reap runtimes: Relay reaps ONLY its own, non-current, positively-reaped
-  \* generations.  `ToReap` is a per-worker set of generation numbers; the guard
-  \* is the whole content of NonRelayOwnedNeverCleaned / CurrentRuntimeNeverCleaned.
-  \* M8 removes the relayOwned guard, M-current removes the `g < generation` guard.
+  /\ LET Dead == DeadSet IN
+     /\ workerState' = [w \in Workers |-> IF w \in Dead THEN "dead" ELSE workerState[w]]
+     /\ workerTask' = [w \in Workers |-> IF w \in Dead THEN None ELSE workerTask[w]]
+     /\ sessionManaged' = [w \in Workers |-> IF w \in Dead THEN FALSE ELSE sessionManaged[w]]
+     /\ quietActive' = [w \in Workers |-> IF w \in Dead THEN FALSE ELSE quietActive[w]]
+     /\ quietUntil' = [w \in Workers |-> IF w \in Dead THEN None ELSE quietUntil[w]]
+     /\ stallSeen' = [w \in Workers |-> IF w \in Dead THEN FALSE ELSE stallSeen[w]]
+     /\ staleLease' = [w \in Workers |-> IF w \in Dead THEN workerLease[w] ELSE staleLease[w]]
+     /\ workerLease' = [w \in Workers |-> IF w \in Dead THEN 0 ELSE workerLease[w]]
+     /\ taskState' = [t \in Tasks |-> IF TaskHeldByDead(t) THEN "queued" ELSE taskState[t]]
+     /\ taskOwner' = [t \in Tasks |-> IF TaskHeldByDead(t) THEN None ELSE taskOwner[t]]
+     /\ taskLease' = [t \in Tasks |-> IF TaskHeldByDead(t) THEN taskLease[t] + 1 ELSE taskLease[t]]
   /\ \E ToReap \in [Workers -> SUBSET RealGenerations]:
         /\ \A w \in Workers: \A g \in ToReap[w]:
-             /\ relayOwned[w] = TRUE        \* never reap an adopted runtime
-             /\ g < generation[w]           \* never reap the current generation
-             /\ g < genOwner[w]             \* never reap the live mutator
+             /\ relayOwned[w] = TRUE
+             /\ g < generation[w]
+             /\ g < genOwner[w]
         /\ rtCleaned' = [w \in Workers |-> rtCleaned[w] \cup ToReap[w]]
-  /\ UNCHANGED << taskState, taskOwner, taskVersion, parent, workerState, workerTask, generation,
-                  genOwner, relayOwned, everAdopted, sessionGen, sessionManaged, hasMail,
-                  quietUntil, quietActive, pendingWake, wakeSuppressed, retryWake, stallSeen,
-                  parentDone, parentBlocked, activeRT, rtDurable, reviewed >>
+  /\ UNCHANGED << taskGen, lastLease, parent, generation, genOwner, genWatermark, relayOwned,
+                  everAdopted, detached, retired, transportAlive, sessionGen, hasMail,
+                  pendingWake, wakeSuppressed, retryWake, parentDone, parentBlocked, activeRT,
+                  rtDurable, approved, reviewed >>
 
-(* A full tick: one environment step, or one reconcile pass.                    *)
 Tick ==
-  \/ Environment
-  \/ Reconcile
+  /\ (Environment \/ Reconcile)
+  /\ prevTaskState' = taskState
+  /\ prevGeneration' = generation
+  /\ prevPendingWake' = pendingWake
+  /\ prevWakeTried' = wakeTried
 
 (* --------------------------------------------------------------------- *)
 (* Initial state                                                           *)
@@ -867,16 +1036,24 @@ Init ==
   /\ stage = 0
   /\ taskState = [t \in Tasks |-> "queued"]
   /\ taskOwner = [t \in Tasks |-> None]
-  /\ taskVersion = [t \in Tasks |-> 0]
+  /\ taskLease = [t \in Tasks |-> 0]
+  /\ taskGen = [t \in Tasks |-> 0]
+  /\ lastLease = [t \in Tasks |-> 0]
   /\ parent = [t \in Tasks |-> ParentTask(t)]
   /\ workerState = [w \in Workers |-> "idle"]
   /\ workerTask = [w \in Workers |-> None]
+  /\ workerLease = [w \in Workers |-> 0]
+  /\ staleLease = [w \in Workers |-> 0]
   /\ generation = [w \in Workers |-> 0]
   /\ genOwner = [w \in Workers |-> 0]
+  /\ genWatermark = [w \in Workers |-> 0]
   /\ relayOwned = [w \in Workers |-> TRUE]
   /\ sessionGen = [w \in Workers |-> 0]
   /\ sessionManaged = [w \in Workers |-> TRUE]
   /\ everAdopted = [w \in Workers |-> FALSE]
+  /\ detached = [w \in Workers |-> FALSE]
+  /\ retired = [w \in Workers |-> FALSE]
+  /\ transportAlive = [w \in Workers |-> TRUE]
   /\ hasMail = [w \in Workers |-> {}]
   /\ quietUntil = [w \in Workers |-> None]
   /\ quietActive = [w \in Workers |-> FALSE]
@@ -884,67 +1061,58 @@ Init ==
   /\ pendingWake = [w \in Workers |-> {}]
   /\ wakeSuppressed = [w \in Workers |-> FALSE]
   /\ retryWake = [w \in Workers |-> FALSE]
-  /\ wakeTried = [w \in Workers |-> FALSE]   \* no reconcile pass has run yet
+  /\ wakeTried = [w \in Workers |-> FALSE]
   /\ wakeEligible = [w \in Workers |-> FALSE]
   /\ parentDone = [t \in Tasks |-> {}]
   /\ parentBlocked = [t \in Tasks |-> {}]
   /\ activeRT = [w \in Workers |-> FALSE]
   /\ rtDurable = [w \in Workers |-> TRUE]
   /\ rtCleaned = [w \in Workers |-> {}]
+  /\ approved = {}
   /\ reviewed = {}
+  /\ prevTaskState = [t \in Tasks |-> "queued"]
+  /\ prevGeneration = [w \in Workers |-> 0]
+  /\ prevPendingWake = [w \in Workers |-> {}]
+  /\ prevWakeTried = [w \in Workers |-> FALSE]
+
 (* --------------------------------------------------------------------- *)
-(* Fairness.  Deliberately minimal: only the liveness that the              *)
-(* environment itself owes.  An implementation defect must NOT be hidden    *)
+(* Fairness.  Minimal: only what Relay itself owes (the supervisor loop and *)
+(* its bounded deadlines).  An implementation defect must not be hidden     *)
 (* behind a fairness conjunct.                                             *)
 (* --------------------------------------------------------------------- *)
 LivenessFairness ==
-  \* The ONLY fairness Relay itself owes: the supervisor loop keeps running and
-  \* its own bounded-suppression deadlines lapse.  An implementation defect must
-  \* NOT be hidden behind a fairness conjunct -- never add WF/SF here to make a
-  \* Relay guarantee come out true.
-  /\ WF_vars(Reconcile)
-  /\ \A w \in Workers: WF_vars(CooldownExpire(w))
-  /\ \A w \in Workers: WF_vars(QuietExpire(w))
-  /\ \A w \in Workers: WF_vars(RetryWake(w))
+  /\ WF_baseVars(Reconcile)
+  /\ \A w \in Workers: WF_baseVars(CooldownExpire(w))
+  /\ \A w \in Workers: WF_baseVars(QuietExpire(w))
+  /\ \A w \in Workers: WF_baseVars(RetryWake(w))
 
-(* Environment-assumption fairness: the workers themselves eventually act.      *)
-(* This is Level D -- it is an assumption on the world, NOT a Relay guarantee.  *)
+(* Environment-assumption fairness (Level D).                              *)
 EnvFairness ==
-  /\ \A w \in Workers: WF_vars(Claim(w))
-  /\ \A w \in Workers: WF_vars(Submit(w))
-  /\ \A t \in Tasks: \A w \in Workers: WF_vars(AdoptReview(t, w))
-  /\ \A t \in Tasks: \A w \in Workers: WF_vars(Approve(t, w))
-  /\ \A w \in Workers: WF_vars(TakeInput(w))      \* a permission wait is answered
+  /\ \A w \in Workers: WF_baseVars(Claim(w))
+  /\ \A w \in Workers: \A t \in Tasks: WF_baseVars(Submit(t, w))
+  /\ \A t \in Tasks: \A w \in Workers: WF_baseVars(AdoptReview(t, w))
+  /\ \A t \in Tasks: \A a \in Workers: WF_baseVars(Approve(t, a))
+  /\ \A w \in Workers: WF_baseVars(TakeInput(w))
 
 Spec == Init /\ [][Tick]_vars
 FairSpec == Init /\ [][Tick]_vars /\ LivenessFairness
 CompletionSpec == FairSpec /\ EnvFairness
 
-(* ===================================================================== *)
-(* Level-R and Level-L temporal properties.                                *)
-(* ===================================================================== *)
-
-(* R (temporal form): claimable work cannot stay unclaimed forever.  This is   *)
-(* the honest replacement for the old, too-weak `RunnableExists => <> some      *)
-(* WorkerWorking` -- see formal/README.md "What Relay must guarantee".          *)
+(* --------------------------------------------------------------------- *)
+(* Temporal properties                                                     *)
+(* --------------------------------------------------------------------- *)
 NoPermanentStranding ==
   (ActionableWork # {}) ~> (ActionableWork = {})
 
-(* L3: a wake cooldown is bounded -- every cooldown eventually lapses.         *)
 NoPermanentCooldown ==
   \A w \in Workers: wakeSuppressed[w] ~> ~wakeSuppressed[w]
 
-(* L4: a quiet lease is bounded -- every quiet lease eventually lapses.         *)
 NoPermanentQuiet ==
   \A w \in Workers: quietActive[w] ~> ~quietActive[w]
 
-(* L2: a deliverable wake is never lost -- if a worker is owed a wake it        *)
-(* eventually has wakeTried again.                                             *)
 NoLostWake ==
   \A w \in Workers: (pendingWake[w] # {}) ~> wakeTried[w]
 
-(* Level D -- demonstration only, under the strong environment assumptions in  *)
-(* the README.  NOT a Relay guarantee.                                         *)
 AllTasksDone ==
   <>( \A t \in Tasks: taskState[t] = "done" )
 
