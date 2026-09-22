@@ -260,7 +260,8 @@ by re-reading the SQLite schema.
 
 ```bash
 relay dashboard                     # one render to the current terminal
-relay dashboard --watch             # redraw in a loop (Ctrl-C to stop)
+relay dashboard --watch             # redraw in a loop (Ctrl-C/q to stop)
+relay dashboard --watch --no-alt-screen  # draw inline instead (for piping/logging)
 relay dashboard --show              # open/reuse a Herdr pane next to this one
 relay dashboard --show --tab        # ...in its own tab
 relay dashboard --hide              # close the tracked dashboard pane
@@ -273,10 +274,23 @@ It is **read-only**: it never creates tasks, mutates workers, sends messages or
 starts/stops runtimes. The one pane it manages is its own UI pane (tracked in
 `.relay/dashboard.pane`), and that pane is not a worker.
 
-`--watch` follows the pane as it is resized: width is re-read on every redraw
-(and a `resize` event triggers an immediate redraw, rather than waiting for the
-next tick), so dragging the pane drops `progress -> generation -> pane` in that
-order and never overflows. Full-width (CJK) characters count as two columns.
+`--watch` follows the pane as it is resized: width **and height** are re-read on
+every redraw (and a `resize` event triggers an immediate redraw, rather than
+waiting for the next tick), so dragging the pane drops `progress -> generation
+-> pane` in that order and never overflows. Full-width (CJK) characters count as
+two columns. Three things keep it readable:
+
+- **Clipped to the pane height.** A frame taller than the pane would scroll into
+  the scrollback, and `ESC[2J` clears only the *visible* screen — so every redraw
+  appended another stale copy. Each frame is now clipped to the pane height (a
+  `… N more line(s) hidden` marker replaces the last row), so it can never
+  overflow or accumulate.
+- **Alternate screen.** On a TTY the loop draws in the alternate screen buffer
+  (`ESC[?1049h … ESC[?1049l`), so nothing enters your scrollback and quitting
+  restores the screen you had before. Use `--no-alt-screen` to draw inline.
+- **Pause (`space` or `p`).** The view freezes with a `PAUSED` banner, so a
+  frame is never wiped mid-read; any key resumes. `Ctrl-C`/`q` exits and restores
+  the terminal (cursor, screen).
 
 Worker and Runtime stay distinct. A worker row is:
 
@@ -1016,7 +1030,10 @@ hidden · no runtime pane → `unavailable` + ATTENTION · unread ATTENTION carr
 the `relay wait`-policy next-nudge countdown · narrow widths never overflow (CJK
 counts 2) · `--json` preserves the worker/runtime split · `relay dashboard
 --json` / `--doctor` run end to end · `--watch` re-reads the terminal width on
-resize instead of caching the startup value (columns drop, then come back).
+resize instead of caching the startup value (columns drop, then come back) ·
+`--watch` re-reads the terminal height and CLIPS every frame to it (never
+overflows/accumulates) with a `… N more hidden` marker, and `--no-alt-screen`
+draws inline.
 
 ## Layout
 

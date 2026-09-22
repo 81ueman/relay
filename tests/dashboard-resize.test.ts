@@ -7,7 +7,7 @@ import { openDb } from "../src/db";
 import { renderDashboard } from "../src/dashboard/render";
 import { buildDashboardView } from "../src/dashboard/model";
 import { dwidth } from "../src/dashboard/render";
-import { terminalWidth } from "../src/dashboard/command";
+import { terminalWidth, terminalHeight, clipToHeight } from "../src/dashboard/command";
 import type { PaneTelemetry } from "../src/dashboard/herdr";
 import { recordRuntime } from "../src/runtimes";
 import { addTask, claimTask } from "../src/tasks";
@@ -114,6 +114,78 @@ describe("dashboard resize", () => {
       if (saved !== undefined) stdout.columns = saved;
       if (savedEnv !== undefined) process.env.COLUMNS = savedEnv;
     }
+  });
+});
+
+// T326: a --watch frame taller than the pane scrolled into scrollback, so every
+// redraw appended another copy (\x1b[2J clears only the visible screen). The fix
+// CLIPS each frame to the pane height, renders in the ALTERNATE screen, and can
+// freeze (PAUSED). A frame must therefore NEVER exceed the pane height.
+describe("dashboard watch readability (T326)", () => {
+  test("terminalHeight re-reads each call and falls back to LINES", () => {
+    const stdout = process.stdout as NodeJS.WriteStream & { rows?: number };
+    const saved = stdout.rows;
+    const savedEnv = process.env.LINES;
+    try {
+      delete process.env.LINES;
+      stdout.rows = 50;
+      expect(terminalHeight()).toBe(50);
+      stdout.rows = 24; // a shorter pane
+      expect(terminalHeight()).toBe(24);
+      delete (stdout as { rows?: number }).rows;
+      process.env.LINES = "18";
+      expect(terminalHeight()).toBe(18);
+      delete process.env.LINES;
+      expect(terminalHeight()).toBe(40); // documented default
+    } finally {
+      if (saved === undefined) delete (stdout as { rows?: number }).rows;
+      else stdout.rows = saved;
+      if (savedEnv === undefined) delete process.env.LINES;
+      else process.env.LINES = savedEnv;
+    }
+  });
+
+  test("clipToHeight never returns more than `height` lines", () => {
+    const frame = Array.from({ length: 40 }, (_, i) => `line ${i}`).join("\n");
+    for (const h of [1, 5, 24, 40]) {
+      expect(clipToHeight(frame, h).split("\n").length).toBeLessThanOrEqual(h);
+    }
+    // A frame that fits is returned UNCHANGED (no marker, no truncation).
+    expect(clipToHeight("a\nb\nc", 10)).toBe("a\nb\nc");
+  });
+
+  test("a clipped frame says how much was hidden instead of silently dropping it", () => {
+    const frame = Array.from({ length: 30 }, (_, i) => `line ${i}`).join("\n");
+    const clipped = clipToHeight(frame, 10);
+    const lines = clipped.split("\n");
+    expect(lines).toHaveLength(10);
+    expect(lines[0]).toBe("line 0");
+    expect(lines[8]).toBe("line 8");
+    expect(lines[9]).toMatch(/more line\(s\) hidden/);
+    // The marker reports the exact number of rows that did not fit.
+    expect(lines[9]).toContain("21 more"); // 30 - 9 kept = 21
+  });
+
+  test("clipping is ANSI-safe (SGR sequences have no newlines) and height<=0 yields empty", () => {
+    const colored = "\x1b[1mWORK\x1b[0m\n  task\n  worker\n\x1b[2m(tail)\x1b[0m";
+    const clipped = clipToHeight(colored, 3);
+    expect(clipped.split("\n")).toHaveLength(3);
+    expect(clipped).toContain("WORK");
+    expect(clipToHeight("anything", 0)).toBe("");
+    expect(clipToHeight("anything", -5)).toBe("");
+  });
+
+  test("a real dashboard view is clipped to a short pane (the accumulation repro)", () => {
+    const v = view();
+    const frame = renderDashboard(v, { color: false, width: 80 });
+    // The un-clipped view is taller than a short pane would allow.
+    const paneHeight = 8;
+    expect(frame.split("\n").length).toBeGreaterThan(paneHeight);
+    const clipped = clipToHeight(frame, paneHeight);
+    expect(clipped.split("\n").length).toBeLessThanOrEqual(paneHeight);
+    // Content is still readable: the header and the WORK tree survive.
+    expect(clipped).toContain("relay /");
+    expect(clipped).toContain("WORK");
   });
 });
 
