@@ -48,7 +48,7 @@ import {
 } from "./tasks";
 import { getWorker, listWorkers, setWorkerState, touchSeen, clearQuiet, clearWorkerTool, quietActive, type WorkerRow } from "./workers";
 import { RELAY_TAG } from "./messages";
-import { immediateKindSql, mailNudgeMs, starvationCapMs } from "./mail-policy";
+import { immediateKindSql, mailNudgeMs, ordinaryStarvationCapMs, starvationCapMs } from "./mail-policy";
 
 // Deterministic reconciler. No LLM: pure DB state + runtime transport.
 // Callers pass full Worker rows; only the Runtime adapter maps to targets.
@@ -561,20 +561,26 @@ async function transportAliveAssignees(
 }
 
 /**
- * Surface undelivered mail — WITHOUT interrupting active work (T329).
+ * Surface undelivered mail — WITHOUT interrupting active work (T329/T339).
  *
  * Policy:
- *   - IMMEDIATE kinds (child_done/children_done/child_blocked/children_blocked,
- *     and `relay send --urgent`) are actionable: they may nudge as soon as the
- *     worker is not mid-turn. Ordinary peer mail is PULL-ONLY — it surfaces at
- *     the recipient's next `relay inbox` and never nudges.
  *   - A worker that is MID-TURN is never interrupted: `state='working'`, a live
  *     tool (`tool_started_at`), or a live transport saying `isWorking()` all
- *     defer the nudge. The message stays durable in the queue; it is delivered
- *     at the next idle/turn boundary. A bounded QUIET lease is the worker's
- *     explicit "resume me" signal, so a quiet worker is NOT deferred.
- *   - STARVATION CAP: a continuously busy worker is nudged once anyway after
- *     `starvationCapMs()` of deferral, so mail can never be starved forever.
+ *     defer the nudge (logged as `worker.mail_nudge_deferred`, cooldown-limited).
+ *     A bounded QUIET lease is the worker's explicit "resume me" signal, so a
+ *     quiet worker is NOT deferred.
+ *   - When the worker is IDLE (turn boundary) EVERY kind is delivered: ordinary
+ *     peer mail is woken with the "not urgent" text, `--urgent`/completion
+ *     notices with theirs. Ordinary mail is NOT never-nudged — deferring it
+ *     while busy and delivering it at idle is the whole contract (T339
+ *     corrected the earlier over-fix where ordinary mail was dropped entirely).
+ *   - STARVATION CAP: a continuously busy worker is nudged once anyway after the
+ *     cap, so mail can never be starved by a very long turn. Ordinary mail gets a
+ *     LONGER cap than actionable mail (it may legitimately wait a whole turn).
+ *
+ * The clocks are per-class: `oldest_immediate` / `oldest_ordinary`. A stale
+ * ordinary message must never set the IMMEDIATE clock (that re-enabled mid-turn
+ * interrupts), and vice-versa.
  *
  * The nudge is cooldown-limited (one per window per recipient).
  */
@@ -583,35 +589,29 @@ async function nudgeUnreadMail(
 ): Promise<void> {
   const window = mailNudgeMs();
   const cap = starvationCapMs();
+  const ordinaryCap = ordinaryStarvationCapMs();
   const rows = db
     .query(
       `SELECT recipient, COUNT(*) AS n,
-              MIN(CASE WHEN kind IN (${immediateKindSql()}) THEN created_at END) AS oldest,
+              MIN(CASE WHEN kind IN (${immediateKindSql()}) THEN created_at END) AS oldest_immediate,
+              MIN(CASE WHEN kind NOT IN (${immediateKindSql()}) THEN created_at END) AS oldest_ordinary,
               SUM(CASE WHEN kind IN (${immediateKindSql()}) THEN 1 ELSE 0 END) AS immediate
          FROM messages WHERE state = 'queued'
         GROUP BY recipient`
     )
-    .all() as { recipient: string; n: number; oldest: number | null; immediate: number }[];
+    .all() as { recipient: string; n: number; oldest_immediate: number | null; oldest_ordinary: number | null; immediate: number }[];
   if (rows.length === 0) return;
-  for (const { recipient, n, oldest, immediate } of rows) {
-    // PULL-ONLY: ordinary mail never nudges. Only actionable (immediate) kinds
-    // are surfaced proactively.
-    if (immediate === 0) continue;
+  for (const { recipient, n, oldest_immediate, oldest_ordinary, immediate } of rows) {
     const w = getWorker(db, recipient);
     if (!w || w.retired_at !== null) continue;
     if (recentlyEvent(db, recipient, "worker.mail_nudged", at, window)) continue;
 
-    // Never interrupt active work — UNLESS the worker deliberately paused with a
-    // bounded quiet lease, which is exactly the "resume me for something useful"
-    // signal (child_done must still wake a quiet parent). `state='working'` and a
-    // live tool are the durable busy signals; `rt.isWorking` covers a busy
-    // transport whose worker row is not yet touched. A STALE turn is nudged once
-    // anyway so durable mail is not starved.
-    //
-    // `oldest` is the oldest IMMEDIATE message only: a stale PULL-ONLY message
-    // must never make `stale` permanently true and re-enable mid-turn interrupts
-    // (that was the bug where ordinary mail poisoned the starvation clock).
-    const stale = oldest !== null && at - oldest >= cap;
+    // Per-class starvation: the older of the two classes decides `stale`, each
+    // against its own cap. (An idle worker nudges regardless of `stale`.)
+    const staleImmediate = oldest_immediate !== null && at - oldest_immediate >= cap;
+    const staleOrdinary = oldest_ordinary !== null && at - oldest_ordinary >= ordinaryCap;
+    const stale = staleImmediate || staleOrdinary;
+
     const quiet = quietActive(w, at);
     const busy =
       !quiet &&
@@ -624,7 +624,7 @@ async function nudgeUnreadMail(
       if (!recentlyEvent(db, recipient, "worker.mail_nudge_deferred", at, window)) {
         logEvent(db, {
           source: "supervisor", workerId: recipient, type: "worker.mail_nudge_deferred",
-          payload: { recipient, count: n, reason: w.state === "working" ? "working" : w.tool_started_at !== null ? "tool" : "busy" },
+          payload: { recipient, count: n, immediate, reason: w.state === "working" ? "working" : w.tool_started_at !== null ? "tool" : "busy" },
         });
       }
       continue;

@@ -275,6 +275,11 @@ describe("9. all work complete stays quiet", () => {
     approveTask(db, t.id, "supervisor");
     expect(getTask(db, t.id)!.state).toBe("done");
 
+    // Drain any delivery mail from the completion path: this scenario is about
+    // "no WORK left", and T339 delivers ordinary mail at idle (so unread mail
+    // would legitimately wake w1). Mark it delivered to isolate the intent.
+    db.query(`UPDATE messages SET state = 'delivered'`).run();
+
     rt.wakes.length = 0;
     const { actions } = await reconcile(db, rt);
     expect(actions).not.toContain("planner-woken:plan");

@@ -20,6 +20,7 @@ let db: Database;
 let rt: MockRuntime;
 const savedWindow = process.env.RELAY_MAIL_NUDGE_MS;
 const savedCap = process.env.RELAY_MAIL_STARVATION_MS;
+const savedOrd = process.env.RELAY_MAIL_ORDINARY_STARVATION_MS;
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "relay-mail-"));
@@ -27,6 +28,7 @@ beforeEach(() => {
   rt = new MockRuntime();
   process.env.RELAY_MAIL_NUDGE_MS = "1"; // window passes immediately
   delete process.env.RELAY_MAIL_STARVATION_MS;
+  delete process.env.RELAY_MAIL_ORDINARY_STARVATION_MS;
 });
 
 afterEach(() => {
@@ -36,6 +38,8 @@ afterEach(() => {
   else process.env.RELAY_MAIL_NUDGE_MS = savedWindow;
   if (savedCap === undefined) delete process.env.RELAY_MAIL_STARVATION_MS;
   else process.env.RELAY_MAIL_STARVATION_MS = savedCap;
+  if (savedOrd === undefined) delete process.env.RELAY_MAIL_ORDINARY_STARVATION_MS;
+  else process.env.RELAY_MAIL_ORDINARY_STARVATION_MS = savedOrd;
 });
 
 /** Send a message and backdate it so the nudge window has elapsed. */
@@ -46,14 +50,32 @@ function staleMessage(recipient: string, body = "hello", kind?: string): number 
 }
 
 describe("periodic unread-mail nudge", () => {
-  test("ordinary peer mail is PULL-ONLY: it never nudges (T329)", async () => {
+  test("ordinary peer mail is DEFERRED while busy and delivered at idle (T339)", async () => {
     registerWorker(db, "worker-b", { role: "worker" });
     staleMessage("worker-b"); // kind defaults to "note"
-    const { actions } = await reconcile(db, rt);
-    expect(actions).not.toContain("mail-nudged:worker-b");
-    expect(rt.wakes.map((w) => w.workerId)).not.toContain("worker-b");
-    // Still durable: it surfaces at the recipient's next inbox read.
+    // Busy: an ordinary message must NOT interrupt.
+    db.query(`UPDATE workers SET state='working' WHERE id='worker-b'`).run();
+    process.env.RELAY_MAIL_STARVATION_MS = "600000";
+    process.env.RELAY_MAIL_ORDINARY_STARVATION_MS = "600000";
+    let r = await reconcile(db, rt);
+    expect(r.actions).not.toContain("mail-nudged:worker-b");
+    expect(listEvents(db, { limit: 50 }).some((e) => e.type === "worker.mail_nudge_deferred")).toBe(true);
+
+    // Idle: the SAME ordinary message is delivered at the turn boundary.
+    db.query(`UPDATE workers SET state='idle' WHERE id='worker-b'`).run();
+    r = await reconcile(db, rt);
+    expect(r.actions).toContain("mail-nudged:worker-b");
+    // Still durable until read (reading it marks it delivered).
     expect(db.query(`SELECT COUNT(*) AS n FROM messages WHERE recipient='worker-b' AND state='queued'`).get()).toMatchObject({ n: 1 });
+  });
+
+  test("an ordinary (non-urgent) nudge uses the 'not urgent' text", async () => {
+    registerWorker(db, "worker-b", { role: "worker" }); // idle
+    staleMessage("worker-b", "an assignment");
+    await reconcile(db, rt);
+    const text = rt.wakes.find((w) => w.workerId === "worker-b")!.text;
+    expect(text).toContain("Not urgent");
+    expect(text).not.toContain("URGENT:");
   });
 
   test("an URGENT message (immediate kind) does nudge", async () => {
@@ -201,18 +223,33 @@ describe("mid-work deferral (T329)", () => {
 
 // T329 follow-up (reviewer-4): three defects in the first cut.
 describe("starvation clock, deferred-log cooldown, urgent text (T329 follow-up)", () => {
-  test("a stale PULL-ONLY message does NOT poison the starvation clock", async () => {
+  test("a stale ORDINARY message does NOT set the IMMEDIATE starvation clock", async () => {
     process.env.RELAY_MAIL_NUDGE_MS = "600000";
-    process.env.RELAY_MAIL_STARVATION_MS = "600000";
+    process.env.RELAY_MAIL_STARVATION_MS = "600000";       // immediate cap
+    process.env.RELAY_MAIL_ORDINARY_STARVATION_MS = "7200000"; // ordinary cap (2h)
     registerWorker(db, "worker-b", { role: "worker" });
     db.query(`UPDATE workers SET state='working' WHERE id='worker-b'`).run();
-    // An OLD ordinary (pull-only) message: it must not make `stale` true.
+    // Ordinary message OLDER than the immediate cap but YOUNGER than its own cap:
+    // it must NOT make the immediate clock stale and nudge a mid-turn worker.
     const old = sendMessage(db, "worker-a", "worker-b", "ancient fyi", { kind: "note" });
     db.query(`UPDATE messages SET created_at=? WHERE id=?`).run(Date.now() - 3_600_000, old);
     staleMessage("worker-b", "interrupt!", "urgent");
 
     const { actions } = await reconcile(db, rt);
     expect(actions).not.toContain("mail-nudged:worker-b"); // stays deferred
+  });
+
+  test("a stale ORDINARY message eventually nudges on its own (longer) cap", async () => {
+    process.env.RELAY_MAIL_NUDGE_MS = "600000";
+    process.env.RELAY_MAIL_STARVATION_MS = "600000";
+    process.env.RELAY_MAIL_ORDINARY_STARVATION_MS = "600000";
+    registerWorker(db, "worker-b", { role: "worker" });
+    db.query(`UPDATE workers SET state='working' WHERE id='worker-b'`).run();
+    const old = sendMessage(db, "worker-a", "worker-b", "very old fyi", { kind: "note" });
+    db.query(`UPDATE messages SET created_at=? WHERE id=?`).run(Date.now() - 3_600_000, old);
+
+    const { actions } = await reconcile(db, rt);
+    expect(actions).toContain("mail-nudged:worker-b"); // starvation, not poisoning
   });
 
   test("a stale IMMEDIATE message past the cap DOES nudge (starvation still works)", async () => {

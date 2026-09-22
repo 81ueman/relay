@@ -19,10 +19,15 @@ Detaching (`agent_detach`) returns you to a normal standalone session.
 ## The loop (no waiting)
 
 ```text
-relay next -> claim -> work -> relay note -> work -> relay submit|block -> relay next ...
+relay next -> claim -> work -> relay note -> work -> relay submit|block -> relay inbox --claim -> relay next ...
 ```
 
 Never wait for instructions or for another agent to finish. If your task is gone, run `relay next` to recover.
+
+**Read your inbox at every stopping point.** Ordinary peer mail (assignments,
+FYIs, review requests) is delivered at your next idle/turn boundary, but the pull
+path is authoritative: run `relay inbox --claim` after each `submit`/`block` and
+before taking the next task, so nothing is missed even if a wake was deferred.
 
 ## Rules
 

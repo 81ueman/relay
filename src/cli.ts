@@ -252,7 +252,7 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
   },
   send: {
     about:
-      "Send a durable peer-to-peer message to another worker. Ordinary mail is PULL-ONLY: the recipient sees it at its next `relay inbox` stopping point and is NEVER interrupted mid-work. --urgent (or --kind urgent) marks a genuine interrupt: it sends an immediate wake and may nudge a busy worker. --kind sets the message kind (child_done/…-style kinds are also immediate).",
+      "Send a durable peer-to-peer message to another worker. It is delivered at the recipient's next idle/turn boundary and DEFERS while the worker is mid-turn (never interrupts). --urgent (kind=urgent) is the only way to force a genuine mid-work wake; completion kinds (child_done/...) may also pre-empt via the starvation cap. --kind sets the message kind.",
     usage: [
       'relay send <worker-id> "message" [--task <tid>] [--kind <k>]',
       'relay send <worker-id> "message" --urgent   # interrupt a busy worker',
@@ -1058,7 +1058,7 @@ async function main(): Promise<void> {
           created_at: 0, updated_at: 0,
         };
         if (!isImmediateKind(kind)) {
-          console.log(`sent msg=${id} (queued; pull-only — your recipient sees it at its next \`relay inbox\`; use --urgent to interrupt)`);
+          console.log(`sent msg=${id} (queued; delivered at the recipient's next idle; use --urgent to interrupt)`);
           break;
         }
         try {

@@ -944,29 +944,33 @@ durable. `relay status` reports unread counts per recipient. There is **no
 built-in human/operator mailbox** and no agent hierarchy: relay has no special
 "human" recipient, no operator alias, and no role-based coordinator routing.
 
-**Mail does not interrupt active work (T329).** Ordinary peer mail is
-**pull-only**: `relay send <worker> "..."` is delivered durably and surfaces at
-the recipient's next `relay inbox` — it never nudges, so it cannot break a turn.
-Only *actionable* kinds nudge proactively:
+**Mail never interrupts active work, but it is never silently dropped either
+(T329/T339).** `relay send <worker> "..."` is durable. Every kind is delivered at
+the recipient's next **idle/turn boundary**; while the worker is mid-turn the
+nudge **defers** (logged as `worker.mail_nudge_deferred`), so it cannot break a
+turn. Only *actionable* kinds may pre-empt that idle wait via starvation:
+`child_done` / `children_done` / `child_blocked` / `children_blocked`
+(relay-generated completion notices) and `relay send --urgent`
+(`kind=urgent`). Ordinary peer mail is delivered at idle like everything else —
+the `relay inbox --claim` pull path (in the `agent-worker` lifecycle) is the
+belt-and-braces for a worker that ends a turn without reading.
 
-- `child_done` / `children_done` / `child_blocked` / `children_blocked`
-  (relay-generated completion notices), and
-- `relay send --urgent` (a genuine interrupt; stored as `kind=urgent`).
+Deferral lifts in three cases:
 
-Even an actionable nudge **defers while the worker is mid-turn** — `state=working`,
-a live tool (`tool_started_at`), or a live transport reporting `isWorking()` — and
-is delivered at the next idle/turn boundary (logged as
-`worker.mail_nudge_deferred`). Two escape hatches:
+- the worker goes **idle** (or its bounded **quiet lease** — the explicit
+  "resume me" signal — is active, so `child_done` still wakes a quiet parent);
+- the **starvation cap** passes for that message class
+  (`RELAY_MAIL_STARVATION_MS`, default `4 ×` the nudge window, for actionable
+  mail; `RELAY_MAIL_ORDINARY_STARVATION_MS`, default `2 ×` that, for ordinary
+  mail, which may legitimately wait a whole turn).
 
-- a bounded **quiet lease** is the worker's explicit "resume me" signal, so a
-  quiet worker *is* nudged (this is how `child_done` still wakes a quiet parent);
-- a **starvation cap** (`RELAY_MAIL_STARVATION_MS`, default `4 ×`
-  `RELAY_MAIL_NUDGE_MS`) nudges a continuously busy worker once anyway, so durable
-  mail can never be starved by a very long run.
+Each class has its own clock: a stale ordinary message can never make an urgent
+message nudge a busy worker early (and vice-versa). `relay send --urgent` is the
+only way to force a genuine mid-work wake.
 
-Cooldown is unchanged: at most one nudge per `RELAY_MAIL_NUDGE_MS` (default 3 min)
-per recipient, and reading the inbox marks messages delivered, stopping the nudge.
-`relay status` shows `(nudge now)` for actionable mail and nothing for pull-only.
+Cooldown: at most one nudge per `RELAY_MAIL_NUDGE_MS` (default 3 min) per
+recipient, and reading the inbox marks messages delivered, stopping the nudge.
+`relay status` shows `(nudge now)` when an actionable message is ready to fire.
 
 **Task hierarchy (optional).** A task may have `parent_task_id`. This expresses
 **work decomposition**, not authority between workers: the same worker may own a
