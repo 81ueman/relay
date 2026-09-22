@@ -14,22 +14,29 @@ bun test            # all suites
 
 ### When TLC formal checks are run
 
-Run the formal suites **only when you change the TLA+ model itself** — i.e. when
-you write or edit `formal/Relay.tla`, `formal/*.cfg`, or
-`formal/run-mutations.sh`. The model is design intent for the control plane, not
-a mirror of `src/`, so it is **not** re-run for ordinary implementation changes.
-A formal run is **heavy**: it is not part of the routine loop.
+For **every control-plane semantic change, review whether the formal design
+intent changed.** A formal *run* is heavy, so it is not part of the routine
+loop; the *review* is mandatory.
 
-Read `formal/README.md` first — it states what Relay must guarantee (Levels A–D)
-before any TLA action. Then run the suite that matches the model change:
+- If the change alters no formal property or abstraction: `typecheck` + `bun
+  test` only. (This is the common case: the model is design intent, not a
+  mirror of `src/`.)
+- If the intended property or abstraction changed: update `formal/` **in the
+  same change** and run the matching suite.
+- Presentation-only changes need no formal review.
+
+Read `formal/README.md` first — it states what Relay must guarantee (Levels
+A–D) before any TLA action. Then run the suite that matches the change:
 
 ```bash
-bun run formal:safety       # ownership, role gating, fencing, quiet, parent signals
+bun run formal:safety       # ownership, role, the three fences, quiet, parent signals
 bun run formal:scheduling   # the reconcile-boundary responsiveness obligation
-bun run formal:recovery     # crash/restart/detach, generation + session fence
+bun run formal:roles        # claim-role gating vs review capability
+bun run formal:tree         # one-hop parent signalling, no auto parent transition
+bun run formal:recovery     # crash/restart/adopt, generation + session + lease fences
 bun run formal:liveness     # bounded wake cooldown / quiet lease (FairSpec)
 bun run formal:completion   # AllTasksDone demonstration (NOT a Relay guarantee)
-bun run formal:mutations    # M1–M12: every mutant must be refuted
+bun run formal:mutations    # baseline PASS + mutant refuted by the EXPECTED property
 ```
 
 If the intended property and the TypeScript disagree, decide from the property
@@ -38,20 +45,21 @@ edit `Relay.tla` to make a code change look correct.
 
 ### When TLC formal checks are NOT required
 
-**Everything that does not change the TLA model.** For ordinary `src/` changes —
-including a new state transition, a supervisor decision, a durable write, a new
-event, or a new column — `bun run typecheck` + `bun test` are the gate; no formal
-run. The model is not a mirror of `src/`, so an implementation change never
-obliges a model change. Examples:
+**Everything that does not change the TLA model or the control-plane intent.**
+For ordinary `src/` changes that keep the design intent intact — a refactor, a
+new read-only projection, help text, a test — `bun run typecheck` + `bun test`
+are the gate; no formal run. Examples:
 
-- any `src/` state transition, supervisor decision, or durable write
 - `relay status` / `relay dashboard` formatting, columns, colors, widths
 - new read-only projections or annotations
 - help text, usage strings, README/reference docs
 - new tests
 
-Rule of thumb: **run formal only if `git diff` touches `formal/`.** Otherwise
-skip it (and say so in the change description).
+Rule of thumb: **run the formal suite only if `git diff` touches `formal/`;
+otherwise, still ask whether the change alters a documented property** (a state
+transition, a supervisor decision, a durable write ordering, an ownership
+fence). If it does, update `formal/` in the same change. If it does not, say so
+in the change description.
 
 ### TLA vs. code: record the divergence, don't paper over it
 

@@ -9,4 +9,5 @@ dist/
 # TLA+ tools + model-check output
 formal/.tools/
 formal/states/
+formal/.mut-*.tla
 /states/
