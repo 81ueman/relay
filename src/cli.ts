@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { defaultDbPath, initControlPlane, now, openDb, STATE_DIR } from "./db";
 import { formatEvent, listEvents, logEvent } from "./events";
 import { ackMessage, claimInbox, deliverMessage, getMessage, inboxFor, RELAY_TAG, sendMessage, unreadCounts } from "./messages";
+import { isImmediateKind } from "./mail-policy";
 import { runDaemon } from "./daemon";
 import { handleErrorSignal, handleIdleSignal, reconcile } from "./reconciler";
 import { buildRuntime, HerdrRuntime } from "./runtime/herdr";
@@ -228,7 +229,14 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
     about: "Declare a BOUNDED quiet lease on a running task you own: you may be runtime-idle (session idle) until the deadline without being treated as stalled. Does not change worker/task state or ownership; cleared by note/submit/block/release/claim, and by expiry.",
     usage: ['relay wait <task-id> --for <30s|2m|1h> "reason" [--worker <id>]'],
   },
-  send: { about: "Send a durable peer-to-peer message to another worker; the best-effort wake is delivered after the commit.", usage: ['relay send <worker-id> "message" [--task <tid>] [--kind <k>]'] },
+  send: {
+    about:
+      "Send a durable peer-to-peer message to another worker. Ordinary mail is PULL-ONLY: the recipient sees it at its next `relay inbox` stopping point and is NEVER interrupted mid-work. --urgent (or --kind urgent) marks a genuine interrupt: it sends an immediate wake and may nudge a busy worker. --kind sets the message kind (child_done/…-style kinds are also immediate).",
+    usage: [
+      'relay send <worker-id> "message" [--task <tid>] [--kind <k>]',
+      'relay send <worker-id> "message" --urgent   # interrupt a busy worker',
+    ],
+  },
   inbox: { about: "Read (and optionally claim/ack) the worker's own inbox.", usage: ["relay inbox [--worker <id>] [--claim] [--ack <msg-id>]"] },
   status: { about: "Print workers, task counts, and the supervisor view (lightweight inspection).", usage: ["relay status"] },
   dashboard: {
@@ -951,13 +959,17 @@ async function main(): Promise<void> {
           );
         }
         const sender = process.env.RELAY_WORKER ?? "cli";
+        // `--urgent` marks genuine interrupts (kind=urgent => an immediate kind):
+        // they MAY wake a busy worker. Ordinary peer mail is PULL-ONLY — it does
+        // NOT wake, it surfaces at the recipient's next `relay inbox` (T329).
+        const urgent = hasFlag(argv, "--urgent");
+        const kind = urgent ? "urgent" : (flag(argv, "--kind") ?? undefined);
         const id = sendMessage(db, sender, recipient, payload, {
           taskId: flag(argv, "--task") ?? undefined,
-          kind: flag(argv, "--kind") ?? undefined,
+          kind,
         });
-        // Best-effort wake AFTER durable commit. Failure keeps the message queued.
-        // Routing lives in the adapter (worker.runtime_id); the recipient is an
-        // ordinary worker id (peers message each other directly).
+        // Best-effort wake AFTER durable commit, and ONLY for actionable mail:
+        // an ordinary message never interrupts the recipient mid-work.
         const existing = getWorker(db, recipient);
         const targetRow = existing ?? {
           id: recipient, role: "worker", agent_kind: "opencode", runtime_id: null, cwd: null, command: null,
@@ -968,6 +980,10 @@ async function main(): Promise<void> {
           tool_name: null, tool_command: null, tool_started_at: null, tool_timeout_ms: null,
           created_at: 0, updated_at: 0,
         };
+        if (!isImmediateKind(kind)) {
+          console.log(`sent msg=${id} (queued; pull-only — your recipient sees it at its next \`relay inbox\`; use --urgent to interrupt)`);
+          break;
+        }
         try {
           const rt = new HerdrRuntime();
           await rt.wake(targetRow, `${RELAY_TAG}A durable message arrived (id ${id}). Not urgent — finish what you are doing, then run \`relay inbox --claim\` when you reach a stopping point. It is stored and will not be lost.`);

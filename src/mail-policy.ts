@@ -12,12 +12,33 @@ export const IMMEDIATE_MAIL_KINDS = [
   "children_done",
   "child_blocked",
   "children_blocked",
+  /** `relay send --urgent`: a genuine interrupt that MAY wake a busy worker. */
+  "urgent",
 ] as const;
+
+/**
+ * Kinds that may nudge a worker even while it is mid-turn. Everything else is
+ * PULL-ONLY: it surfaces at the worker's next `relay inbox` stopping point and is
+ * never allowed to interrupt active work (T329).
+ */
+export function isImmediateKind(kind: string | null | undefined): boolean {
+  return !!kind && (IMMEDIATE_MAIL_KINDS as readonly string[]).includes(kind);
+}
 
 /** How long an undelivered message waits before its recipient is nudged, and the nudge cooldown. */
 export function mailNudgeMs(): number {
   const v = Number(process.env.RELAY_MAIL_NUDGE_MS ?? "180000");
   return Number.isFinite(v) && v > 0 ? v : 180000;
+}
+
+/**
+ * Hard upper bound on how long a busy worker may defer a nudge: after
+ * `starvationCapMs()` of CONTINUOUS work the worker is nudged once anyway, so
+ * durable mail can never be starved indefinitely by a very long turn (T329).
+ */
+export function starvationCapMs(): number {
+  const v = Number(process.env.RELAY_MAIL_STARVATION_MS ?? String(4 * mailNudgeMs()));
+  return Number.isFinite(v) && v > 0 ? v : 4 * mailNudgeMs();
 }
 
 export function immediateKindSql(): string {
@@ -26,8 +47,9 @@ export function immediateKindSql(): string {
 
 /**
  * Milliseconds until the recipient's queued mail is next nudged, or null when
- * there is none. 0 means an immediate notice (child_done/child_blocked/...)
- * will be delivered on the next supervisor tick.
+ * there is none. Immediate notices (child_done/child_blocked/urgent/...) are
+ * nudged on the next supervisor tick (0) subject to the working check; ordinary
+ * mail is PULL-ONLY and reports null (it is never nudged).
  */
 export function nextMailNudgeIn(db: Database, recipient: string, at = now()): number | null {
   const q = db
@@ -38,11 +60,13 @@ export function nextMailNudgeIn(db: Database, recipient: string, at = now()): nu
     )
     .get(recipient) as { oldest: number | null; immediate: number | null };
   if (q?.oldest == null) return null;
-  if ((q.immediate ?? 0) > 0) return 0;
+  // PULL-ONLY: ordinary mail is never nudged, so it has no next nudge.
+  if ((q.immediate ?? 0) === 0) return null;
   const last = (db
     .query(`SELECT MAX(timestamp) AS t FROM events WHERE worker_id = ? AND type = 'worker.mail_nudged'`)
     .get(recipient) as { t: number | null }).t ?? 0;
   const window = mailNudgeMs();
-  // Mirrors nudgeUnreadMail: the nudge fires at max(oldest + window, lastNudge + window).
+  // Mirrors nudgeUnreadMail's schedule. A busy worker DEFERS the nudge (the
+  // supervisor logs worker.mail_nudge_deferred); this is the un-deferred time.
   return Math.max(0, Math.max(q.oldest + window, last + window) - at);
 }

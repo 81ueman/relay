@@ -4,26 +4,29 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Database } from "bun:sqlite";
 import { openDb } from "../src/db";
+import { listEvents } from "../src/events";
 import { sendMessage } from "../src/messages";
 import { reconcile } from "../src/reconciler";
 import { MockRuntime } from "../src/runtime/runtime";
-import { addTask, approveTask, blockTask, claimTask, submitTask } from "../src/tasks";
+import { addTask, approveTask, blockTask, claimTask, submitTask, waitTask } from "../src/tasks";
 import { registerWorker } from "../src/workers";
 
-// The send-time wake is best-effort, so the daemon nudges any durable unread
-// backlog. Ordinary peer mail keeps the send-time/retry semantics; completion
-// notices (child_done/children_done) are nudged without the initial delay.
+// The send-time wake is best-effort, so the daemon nudges durable unread mail —
+// but T329 changed the policy: ONLY actionable kinds (child_done/…/urgent) are
+// nudged, and even those never interrupt a worker that is mid-turn.
 
 let dir = "";
 let db: Database;
 let rt: MockRuntime;
 const savedWindow = process.env.RELAY_MAIL_NUDGE_MS;
+const savedCap = process.env.RELAY_MAIL_STARVATION_MS;
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "relay-mail-"));
   db = openDb(join(dir, "state.db"));
   rt = new MockRuntime();
   process.env.RELAY_MAIL_NUDGE_MS = "1"; // window passes immediately
+  delete process.env.RELAY_MAIL_STARVATION_MS;
 });
 
 afterEach(() => {
@@ -31,37 +34,48 @@ afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
   if (savedWindow === undefined) delete process.env.RELAY_MAIL_NUDGE_MS;
   else process.env.RELAY_MAIL_NUDGE_MS = savedWindow;
+  if (savedCap === undefined) delete process.env.RELAY_MAIL_STARVATION_MS;
+  else process.env.RELAY_MAIL_STARVATION_MS = savedCap;
 });
 
 /** Send a message and backdate it so the nudge window has elapsed. */
-function staleMessage(recipient: string, body = "hello"): number {
-  const id = sendMessage(db, "worker-a", recipient, body);
+function staleMessage(recipient: string, body = "hello", kind?: string): number {
+  const id = sendMessage(db, "worker-a", recipient, body, { kind });
   db.query(`UPDATE messages SET created_at = ? WHERE id = ?`).run(Date.now() - 60_000, id);
   return id;
 }
 
 describe("periodic unread-mail nudge", () => {
-  test("a stale peer backlog nudges the recipient", async () => {
+  test("ordinary peer mail is PULL-ONLY: it never nudges (T329)", async () => {
     registerWorker(db, "worker-b", { role: "worker" });
-    staleMessage("worker-b");
+    staleMessage("worker-b"); // kind defaults to "note"
+    const { actions } = await reconcile(db, rt);
+    expect(actions).not.toContain("mail-nudged:worker-b");
+    expect(rt.wakes.map((w) => w.workerId)).not.toContain("worker-b");
+    // Still durable: it surfaces at the recipient's next inbox read.
+    expect(db.query(`SELECT COUNT(*) AS n FROM messages WHERE recipient='worker-b' AND state='queued'`).get()).toMatchObject({ n: 1 });
+  });
+
+  test("an URGENT message (immediate kind) does nudge", async () => {
+    registerWorker(db, "worker-b", { role: "worker" });
+    staleMessage("worker-b", "interrupt!", "urgent");
     const { actions } = await reconcile(db, rt);
     expect(actions).toContain("mail-nudged:worker-b");
-    expect(rt.wakes.some((w) => w.workerId === "worker-b")).toBe(true);
     // Tagged as relay-originated, not a human/peer message.
     expect(rt.wakes.find((w) => w.workerId === "worker-b")!.text.startsWith("relay: ")).toBe(true);
   });
 
-  test("a fresh peer message is left to the send-time wake (no early nudge)", async () => {
+  test("a fresh URGENT message nudges immediately (immediate kind, no initial delay)", async () => {
     process.env.RELAY_MAIL_NUDGE_MS = "600000"; // large window
-    registerWorker(db, "worker-b", { role: "worker" });
-    sendMessage(db, "worker-a", "worker-b", "just sent"); // fresh
+    registerWorker(db, "worker-b", { role: "worker" }); // idle
+    sendMessage(db, "worker-a", "worker-b", "just sent", { kind: "urgent" }); // fresh
     const { actions } = await reconcile(db, rt);
-    expect(actions).not.toContain("mail-nudged:worker-b");
+    expect(actions).toContain("mail-nudged:worker-b");
   });
 
-  test("completion notices (child_done) skip the initial delay", async () => {
+  test("a completion notice to a BUSY parent owner is DEFERRED (never interrupts) (T329)", async () => {
     process.env.RELAY_MAIL_NUDGE_MS = "600000"; // large window
-    registerWorker(db, "worker-b", { role: "worker" }); // parent owner
+    registerWorker(db, "worker-b", { role: "worker" }); // parent owner (becomes working)
     registerWorker(db, "worker-c", { role: "worker" }); // child owner
     const parent = addTask(db, { title: "parent" });
     claimTask(db, parent.id, "worker-b");
@@ -71,19 +85,115 @@ describe("periodic unread-mail nudge", () => {
     approveTask(db, child.id, "reviewer"); // fresh child_done message to worker-b
 
     const { actions } = await reconcile(db, rt);
-    expect(actions).toContain("mail-nudged:worker-b");
+    expect(actions).not.toContain("mail-nudged:worker-b");
+    expect(listEvents(db, { limit: 50 }).some((e) => e.type === "worker.mail_nudge_deferred")).toBe(true);
   });
 
-  test("block notices (child_blocked) skip the initial delay", async () => {
+  test("a completion notice to an IDLE parent owner nudges immediately (no initial delay)", async () => {
     process.env.RELAY_MAIL_NUDGE_MS = "600000"; // large window
     registerWorker(db, "worker-b", { role: "worker" }); // parent owner
     registerWorker(db, "worker-c", { role: "worker" }); // child owner
     const parent = addTask(db, { title: "parent" });
-    claimTask(db, parent.id, "worker-b");
     const child = addTask(db, { title: "child", parentTaskId: parent.id });
+    // Parent is ASSIGNED to worker-b but worker-b is IDLE (not mid-turn).
+    db.query(`UPDATE tasks SET assignee='worker-b' WHERE id=?`).run(parent.id);
+    db.query(`UPDATE workers SET state='idle', current_task_id=? WHERE id='worker-b'`).run(parent.id);
+    claimTask(db, child.id, "worker-c");
+    submitTask(db, child.id, "worker-c", { evidence: "x" });
+    approveTask(db, child.id, "reviewer"); // child_done message to worker-b
+
+    const { actions } = await reconcile(db, rt);
+    expect(actions).toContain("mail-nudged:worker-b");
+  });
+
+  test("a blocked notice to an IDLE parent owner nudges immediately (no initial delay)", async () => {
+    process.env.RELAY_MAIL_NUDGE_MS = "600000"; // large window
+    registerWorker(db, "worker-b", { role: "worker" }); // parent owner
+    registerWorker(db, "worker-c", { role: "worker" }); // child owner
+    const parent = addTask(db, { title: "parent" });
+    const child = addTask(db, { title: "child", parentTaskId: parent.id });
+    db.query(`UPDATE tasks SET assignee='worker-b' WHERE id=?`).run(parent.id);
+    db.query(`UPDATE workers SET state='idle' WHERE id='worker-b'`).run();
     claimTask(db, child.id, "worker-c");
     blockTask(db, child.id, "worker-c", "stuck", false);
 
+    const { actions } = await reconcile(db, rt);
+    expect(actions).toContain("mail-nudged:worker-b");
+  });
+});
+
+// T329: the nudge must NOT interrupt a worker that is mid-turn.
+describe("mid-work deferral (T329)", () => {
+  test("a WORKING worker is not nudged; the nudge is DEFERRED and logged", async () => {
+    process.env.RELAY_MAIL_STARVATION_MS = "600000"; // keep the cap out of the way
+    registerWorker(db, "worker-b", { role: "worker" });
+    db.query(`UPDATE workers SET state='working' WHERE id='worker-b'`).run();
+    staleMessage("worker-b", "interrupt!", "urgent");
+    const { actions } = await reconcile(db, rt);
+    expect(actions).not.toContain("mail-nudged:worker-b");
+    expect(rt.wakes.map((w) => w.workerId)).not.toContain("worker-b");
+    const deferred = listEvents(db, { limit: 50 }).find((e) => e.type === "worker.mail_nudge_deferred");
+    expect(deferred).toBeTruthy();
+    expect(JSON.parse(deferred!.payload_json ?? "{}").reason).toBe("working");
+  });
+
+  test("a worker running a live TOOL is not nudged", async () => {
+    process.env.RELAY_MAIL_STARVATION_MS = "600000"; // keep the cap out of the way
+    registerWorker(db, "worker-b", { role: "worker" });
+    db.query(`UPDATE workers SET state='idle', tool_name='bash', tool_started_at=? WHERE id='worker-b'`).run(Date.now());
+    staleMessage("worker-b", "interrupt!", "urgent");
+    const { actions } = await reconcile(db, rt);
+    expect(actions).not.toContain("mail-nudged:worker-b");
+    const deferred = listEvents(db, { limit: 50 }).find((e) => e.type === "worker.mail_nudge_deferred");
+    expect(JSON.parse(deferred!.payload_json ?? "{}").reason).toBe("tool");
+  });
+
+  test("the transport saying isWorking() also defers (Hermes-busy worker row untouched)", async () => {
+    process.env.RELAY_MAIL_STARVATION_MS = "600000"; // keep the cap out of the way
+    registerWorker(db, "worker-b", { role: "worker" }); // state='idle', no tool
+    rt.setWorking("worker-b", true);
+    staleMessage("worker-b", "interrupt!", "urgent");
+    const { actions } = await reconcile(db, rt);
+    expect(actions).not.toContain("mail-nudged:worker-b");
+    const deferred = listEvents(db, { limit: 50 }).find((e) => e.type === "worker.mail_nudge_deferred");
+    expect(JSON.parse(deferred!.payload_json ?? "{}").reason).toBe("busy");
+  });
+
+  test("STARVATION CAP: a continuously busy worker is nudged once past the cap", async () => {
+    process.env.RELAY_MAIL_NUDGE_MS = "600000";  // long window
+    process.env.RELAY_MAIL_STARVATION_MS = "1000"; // short cap
+    registerWorker(db, "worker-b", { role: "worker" });
+    db.query(`UPDATE workers SET state='working' WHERE id='worker-b'`).run();
+    const id = sendMessage(db, "worker-a", "worker-b", "interrupt!", { kind: "urgent" });
+    db.query(`UPDATE messages SET created_at = ? WHERE id = ?`).run(Date.now() - 5000, id); // past the cap
+
+    const { actions } = await reconcile(db, rt);
+    expect(actions).toContain("mail-nudged:worker-b");
+    const nudged = listEvents(db, { limit: 50 }).find((e) => e.type === "worker.mail_nudged");
+    expect(JSON.parse(nudged!.payload_json ?? "{}").starvation).toBe(true);
+  });
+
+  test("the deferred nudge fires once the worker goes idle", async () => {
+    process.env.RELAY_MAIL_STARVATION_MS = "600000"; // keep the cap out of the way
+    registerWorker(db, "worker-b", { role: "worker" });
+    db.query(`UPDATE workers SET state='working' WHERE id='worker-b'`).run();
+    staleMessage("worker-b", "interrupt!", "urgent");
+    expect((await reconcile(db, rt)).actions).not.toContain("mail-nudged:worker-b");
+
+    // The worker ends its turn.
+    db.query(`UPDATE workers SET state='idle', tool_started_at=NULL WHERE id='worker-b'`).run();
+    expect((await reconcile(db, rt)).actions).toContain("mail-nudged:worker-b");
+  });
+
+  test("a QUIET worker is NOT deferred: quiet is the explicit 'resume me' signal", async () => {
+    process.env.RELAY_MAIL_STARVATION_MS = "600000"; // keep the cap out of the way
+    registerWorker(db, "worker-b", { role: "worker" });
+    // working + a bounded quiet lease on its current task = deliberately paused.
+    const held = addTask(db, { title: "held" });
+    claimTask(db, held.id, "worker-b");
+    waitTask(db, held.id, "worker-b", 3_600_000, "await children");
+    db.query(`UPDATE workers SET state='working' WHERE id='worker-b'`).run();
+    staleMessage("worker-b", "interrupt!", "urgent");
     const { actions } = await reconcile(db, rt);
     expect(actions).toContain("mail-nudged:worker-b");
   });

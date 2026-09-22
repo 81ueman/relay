@@ -879,12 +879,33 @@ worker registered before its pane was recorded is still woken instead of
 failing with `agent_not_found` (the message stays queued either way).
 
 **Workers are peers.** Messages are addressed to ordinary worker ids, always
-durable. The daemon nudges any recipient with **undelivered** mail once per
-`RELAY_MAIL_NUDGE_MS` (default 3 min), so a missed send-time wake cannot leave a
-backlog invisible; reading the inbox marks messages delivered and stops the
-nudge. `relay status` reports unread counts per recipient. There is **no built-in
-human/operator mailbox** and no agent hierarchy: relay has no special "human"
-recipient, no operator alias, and no role-based coordinator routing.
+durable. `relay status` reports unread counts per recipient. There is **no
+built-in human/operator mailbox** and no agent hierarchy: relay has no special
+"human" recipient, no operator alias, and no role-based coordinator routing.
+
+**Mail does not interrupt active work (T329).** Ordinary peer mail is
+**pull-only**: `relay send <worker> "..."` is delivered durably and surfaces at
+the recipient's next `relay inbox` — it never nudges, so it cannot break a turn.
+Only *actionable* kinds nudge proactively:
+
+- `child_done` / `children_done` / `child_blocked` / `children_blocked`
+  (relay-generated completion notices), and
+- `relay send --urgent` (a genuine interrupt; stored as `kind=urgent`).
+
+Even an actionable nudge **defers while the worker is mid-turn** — `state=working`,
+a live tool (`tool_started_at`), or a live transport reporting `isWorking()` — and
+is delivered at the next idle/turn boundary (logged as
+`worker.mail_nudge_deferred`). Two escape hatches:
+
+- a bounded **quiet lease** is the worker's explicit "resume me" signal, so a
+  quiet worker *is* nudged (this is how `child_done` still wakes a quiet parent);
+- a **starvation cap** (`RELAY_MAIL_STARVATION_MS`, default `4 ×`
+  `RELAY_MAIL_NUDGE_MS`) nudges a continuously busy worker once anyway, so durable
+  mail can never be starved by a very long run.
+
+Cooldown is unchanged: at most one nudge per `RELAY_MAIL_NUDGE_MS` (default 3 min)
+per recipient, and reading the inbox marks messages delivered, stopping the nudge.
+`relay status` shows `(nudge now)` for actionable mail and nothing for pull-only.
 
 **Task hierarchy (optional).** A task may have `parent_task_id`. This expresses
 **work decomposition**, not authority between workers: the same worker may own a

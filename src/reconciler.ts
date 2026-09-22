@@ -48,7 +48,7 @@ import {
 } from "./tasks";
 import { getWorker, listWorkers, setWorkerState, touchSeen, clearQuiet, clearWorkerTool, quietActive, type WorkerRow } from "./workers";
 import { RELAY_TAG } from "./messages";
-import { immediateKindSql, mailNudgeMs } from "./mail-policy";
+import { immediateKindSql, mailNudgeMs, starvationCapMs } from "./mail-policy";
 
 // Deterministic reconciler. No LLM: pure DB state + runtime transport.
 // Callers pass full Worker rows; only the Runtime adapter maps to targets.
@@ -561,16 +561,28 @@ async function transportAliveAssignees(
 }
 
 /**
- * Surface undelivered mail. The send-time wake is best-effort and can be missed,
- * so a durable unread backlog would otherwise sit silently. Nudge each recipient
- * at most once per mail-nudge window; completion notices (child_done /
- * children_done) skip the initial delay. Reading the inbox marks messages
- * delivered, which stops the nudge.
+ * Surface undelivered mail — WITHOUT interrupting active work (T329).
+ *
+ * Policy:
+ *   - IMMEDIATE kinds (child_done/children_done/child_blocked/children_blocked,
+ *     and `relay send --urgent`) are actionable: they may nudge as soon as the
+ *     worker is not mid-turn. Ordinary peer mail is PULL-ONLY — it surfaces at
+ *     the recipient's next `relay inbox` and never nudges.
+ *   - A worker that is MID-TURN is never interrupted: `state='working'`, a live
+ *     tool (`tool_started_at`), or a live transport saying `isWorking()` all
+ *     defer the nudge. The message stays durable in the queue; it is delivered
+ *     at the next idle/turn boundary. A bounded QUIET lease is the worker's
+ *     explicit "resume me" signal, so a quiet worker is NOT deferred.
+ *   - STARVATION CAP: a continuously busy worker is nudged once anyway after
+ *     `starvationCapMs()` of deferral, so mail can never be starved forever.
+ *
+ * The nudge is cooldown-limited (one per window per recipient).
  */
 async function nudgeUnreadMail(
   db: Database, rt: Runtime, actions: string[], at: number
 ): Promise<void> {
   const window = mailNudgeMs();
+  const cap = starvationCapMs();
   const rows = db
     .query(
       `SELECT recipient, COUNT(*) AS n, MIN(created_at) AS oldest,
@@ -581,16 +593,36 @@ async function nudgeUnreadMail(
     .all() as { recipient: string; n: number; oldest: number; immediate: number }[];
   if (rows.length === 0) return;
   for (const { recipient, n, oldest, immediate } of rows) {
-    // Relay-generated completion notices (child_done/children_done) never had a
-    // send-time wake, so they skip the "let the wake land first" delay. Ordinary
-    // peer messages keep the existing send-time wake + retry semantics.
-    if (immediate === 0 && at - oldest < window) continue;
+    // PULL-ONLY: ordinary mail never nudges. Only actionable (immediate) kinds
+    // are surfaced proactively.
+    if (immediate === 0) continue;
     const w = getWorker(db, recipient);
     if (!w || w.retired_at !== null) continue;
     if (recentlyEvent(db, recipient, "worker.mail_nudged", at, window)) continue;
+
+    // Never interrupt active work — UNLESS the worker deliberately paused with a
+    // bounded quiet lease, which is exactly the "resume me for something useful"
+    // signal (child_done must still wake a quiet parent). `state='working'` and a
+    // live tool are the durable busy signals; `rt.isWorking` covers a busy
+    // transport whose worker row is not yet touched. A STALE turn (past the
+    // starvation cap) is nudged once anyway so durable mail is not starved.
+    const stale = at - oldest >= cap;
+    const quiet = quietActive(w, at);
+    const busy =
+      !quiet &&
+      (w.state === "working" ||
+        w.tool_started_at !== null ||
+        (typeof rt.isWorking === "function" && (await rt.isWorking(w).catch(() => false))));
+    if (busy && !stale) {
+      logEvent(db, {
+        source: "supervisor", workerId: recipient, type: "worker.mail_nudge_deferred",
+        payload: { recipient, count: n, reason: w.state === "working" ? "working" : w.tool_started_at !== null ? "tool" : "busy" },
+      });
+      continue;
+    }
     try {
       await rt.wake(w, `${RELAY_TAG}You have ${n} unread durable message(s). Not urgent — finish your current step, then run \`relay inbox --claim\` at a stopping point. Relay keeps reminding you until you read it.`);
-      logEvent(db, { source: "supervisor", workerId: recipient, type: "worker.mail_nudged", payload: { recipient, count: n } });
+      logEvent(db, { source: "supervisor", workerId: recipient, type: "worker.mail_nudged", payload: { recipient, count: n, starvation: busy && stale } });
       actions.push(`mail-nudged:${recipient}`);
     } catch (e) {
       logEvent(db, { source: "supervisor", workerId: recipient, type: "worker.wake_failed", payload: { reason: "unread-mail", error: String(e).slice(0, 200) } });
