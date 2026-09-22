@@ -1,7 +1,9 @@
 import { Database } from "bun:sqlite";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { SCHEMA } from "./schema";
 
 export const STATE_DIR = ".relay";
@@ -50,7 +52,84 @@ export function defaultDbPath(cwd = process.cwd()): string {
   if (root && existsSync(join(root, STATE_DIR))) {
     return join(root, STATE_DIR, "state.db");
   }
+  // T332: no in-repo control plane found. Backward compatible default: the cwd
+  // `.relay` (unchanged). An EXPLICIT config `db` (or RELAY_DB, handled above)
+  // can point the CLI at a shared control plane outside the repo; the XDG
+  // location is reachable via `relay db`/`outsideRepoDefault` but is NOT imposed
+  // on a directory that previously used `<cwd>/.relay`.
+  const cfgDb = explicitConfigDb();
+  if (cfgDb) return cfgDb;
   return join(cwd, STATE_DIR, "state.db");
+}
+
+/** An explicit `db` from ~/.config/relay/config.json, or null. */
+function explicitConfigDb(): string | null {
+  const cfgPath = relayConfigPath();
+  if (!existsSync(cfgPath)) return null;
+  try {
+    const cfg = JSON.parse(readFileSync(cfgPath, "utf-8")) as { db?: string };
+    if (cfg && typeof cfg.db === "string" && cfg.db) return resolve(cfg.db);
+  } catch (e) {
+    throw new Error(`relay config ${cfgPath} is not valid JSON: ${String(e).slice(0, 120)}`);
+  }
+  return null;
+}
+
+/** `~/.config/relay/config.json` (or $RELAY_CONFIG / $XDG_CONFIG_HOME). */
+function relayConfigPath(env: NodeJS.ProcessEnv = process.env, home = homedir()): string {
+  if (env.RELAY_CONFIG) return resolve(env.RELAY_CONFIG);
+  const xdg = env.XDG_CONFIG_HOME && isAbsolute(env.XDG_CONFIG_HOME) ? env.XDG_CONFIG_HOME : join(home, ".config");
+  return join(xdg, "relay", "config.json");
+}
+
+/**
+ * The T332 out-of-repo default: an explicit config `db` wins, else the fixed XDG
+ * state location `~/.local/state/relay/<project-id>/state.db`, where the project
+ * id is a stable slug of the git MAIN worktree root (NOT the cwd), so the same
+ * project resolves identically from any subdirectory or linked worktree.
+ *
+ * `env`/`home` are injectable so tests can drive the resolution without touching
+ * the real user environment.
+ */
+export function outsideRepoDefault(cwd = process.cwd(), env: NodeJS.ProcessEnv = process.env, home = homedir()): string {
+  if (env.RELAY_DB) return resolve(env.RELAY_DB);
+  const cfgPath = relayConfigPath(env, home);
+  if (existsSync(cfgPath)) {
+    try {
+      const cfg = JSON.parse(readFileSync(cfgPath, "utf-8")) as { db?: string };
+      if (cfg && typeof cfg.db === "string" && cfg.db) return resolve(cfg.db);
+    } catch (e) {
+      throw new Error(`relay config ${cfgPath} is not valid JSON: ${String(e).slice(0, 120)}`);
+    }
+  }
+  const root = projectRoot(cwd);
+  const name = root.split("/").filter(Boolean).pop() ?? "project";
+  const slug = name.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40) || "project";
+  const hash = createHash("sha256").update(resolve(root)).digest("hex").slice(0, 12);
+  const xdgState = env.XDG_STATE_HOME && isAbsolute(env.XDG_STATE_HOME)
+    ? env.XDG_STATE_HOME
+    : join(home, ".local", "state");
+  return join(xdgState, "relay", `${slug}-${hash}`, "state.db");
+}
+
+/**
+ * The project anchor for a directory: the git main worktree root, else the
+ * nearest ancestor carrying `.git` or `.relay`, else `dir`. Mirrored in
+ * db-location.ts `controlPlaneRoot` (db.ts cannot import it: that module imports
+ * db.ts). The ancestor walk is what keeps a subdirectory from hashing to its own
+ * project id and splitting the ledger.
+ */
+export function projectRoot(dir = process.cwd()): string {
+  const git = gitRepoRoot(dir);
+  if (git) return git;
+  let cur = resolve(dir);
+  for (;;) {
+    if (existsSync(join(cur, ".git")) || existsSync(join(cur, STATE_DIR))) return cur;
+    const parent = dirname(cur);
+    if (parent === cur) break;
+    cur = parent;
+  }
+  return resolve(dir);
 }
 
 export function defaultSockPath(cwd = process.cwd()): string {

@@ -1,7 +1,10 @@
 #!/usr/bin/env bun
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
-import { defaultDbPath, initControlPlane, now, openDb, STATE_DIR } from "./db";
+import { join, resolve } from "node:path";
+import { defaultDbPath, initControlPlane, now, openDb, outsideRepoDefault, STATE_DIR } from "./db";
+import {
+  applyDbMove, configPath, describeDb, findLegacyDb, planDbMove, readConfig, resolveDb,
+} from "./db-location";
 import { formatEvent, listEvents, logEvent } from "./events";
 import { ackMessage, claimInbox, deliverMessage, getMessage, inboxFor, RELAY_TAG, sendMessage, unreadCounts } from "./messages";
 import { isImmediateKind } from "./mail-policy";
@@ -80,15 +83,18 @@ Usage:
   relay dashboard [--watch] [--show [--tab]] [--hide] [--doctor] [--json] [--runtime-history]
   relay events [--follow] [--limit N]
   relay gc [--apply] [--with-history] [--older-than <30s|2m|1h>] [--json]
+  relay db path | sources | move <path> [--apply]
+  relay config
 
   # Debug entrypoint (the OpenCode plugin normally talks to the daemon socket)
   relay event record --type <t> [--session <sid>] [--worker <id>] [--task <tid>] [--payload <json>]
 
 Worker identity: --worker flag, $RELAY_WORKER, your Herdr pane, or .relay/worker-id
-DB: $RELAY_DB or the nearest .relay/state.db (searched upward from cwd; WAL mode)
-Env: RELAY_LEASE_MS RELAY_LEASE_LIVENESS_GRACE_MS RELAY_STALL_MS RELAY_LOW_WATER
+DB: $RELAY_DB, else $RELAY_CONFIG/~/.config/relay/config.json {"db":...}, else the
+    nearest .relay/state.db (upward from cwd; WAL), else <cwd>/.relay/state.db.
+    "relay db path|sources" show which wins; "relay db move" relocates it safely.Env: RELAY_LEASE_MS RELAY_LEASE_LIVENESS_GRACE_MS RELAY_STALL_MS RELAY_LOW_WATER
      RELAY_AUTO_APPROVE RELAY_INTERVAL_MS RELAY_ROLE_STRICT (default true)
-     RELAY_MAIL_NUDGE_MS
+     RELAY_MAIL_NUDGE_MS RELAY_MAIL_STARVATION_MS
 Spawn: RELAY_HERDR_WORKSPACE (required to spawn; else $HERDR_WORKSPACE_ID)
 Manual attach: requires a live Herdr agent (use --pane/--tab or $HERDR_PANE_ID/$HERDR_TAB_ID)
 Runtime cleanup: RELAY_RUNTIME_CLEANUP_GRACE_MS RELAY_ATTACH_TIMEOUT_MS RELAY_RESTART_COOLDOWN_MS
@@ -104,6 +110,19 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
   init: {
     about: "Create .relay/state.db (WAL) and the control-plane schema in the current directory.",
     usage: ["relay init"],
+  },
+  db: {
+    about:
+      "Inspect and move the control-plane DB. Resolution order: RELAY_DB > ~/.config/relay/config.json {\"db\":\"...\"} > legacy <repo>/.relay/state.db if present > XDG default ~/.local/state/relay/<project>/state.db. The socket always sits NEXT TO the db. `move` is dry-run by default, refuses to overwrite an existing DB, and refuses while a socket is present (a daemon may be live).",
+    usage: [
+      "relay db path",
+      "relay db sources",
+      "relay db move <path-to-state.db> [--apply] [--force]",
+    ],
+  },
+  config: {
+    about: "Print the relay config file path and its contents ({\"db\": \"<state.db>\"} points the CLI at a shared control plane outside the repo).",
+    usage: ["relay config"],
   },
   daemon: {
     about: "Run the supervisor loop (reconcile + lease/stall handling).",
@@ -464,6 +483,56 @@ async function main(): Promise<void> {
 
   if (cmd === "init") {
     console.log(initControlPlane(process.cwd()));
+    return;
+  }
+
+  if (cmd === "db") {
+    const sub = argv[1];
+    const resolved = resolveDb();
+    if (!sub || sub === "path") {
+      console.log(describeDb(resolved));
+      return;
+    }
+    if (sub === "sources") {
+      // Show the whole resolution order with which one wins, for debugging a
+      // split ledger (a stale RELAY_DB or config is the usual culprit).
+      const cfg = configPath();
+      console.log(`RELAY_DB      ${process.env.RELAY_DB ? resolve(process.env.RELAY_DB) : "-"}`);
+      console.log(`config        ${existsSync(cfg) ? `${cfg} -> ${readConfig(cfg).db ?? "-"}` : `${cfg} (absent)`}`);
+      console.log(`legacy        ${findLegacyDb() ?? "-"}`);
+      console.log(`xdg default   ${outsideRepoDefault()}`);
+      console.log(`=> resolved   ${resolved.path} (${resolved.source})`);
+      return;
+    }
+    if (sub === "move") {
+      const dest = argv[2] ? resolve(argv[2]) : resolveDb().path === outsideRepoDefault() ? "" : outsideRepoDefault();
+      if (!dest) throw new Error("usage: relay db move <path-to-state.db> [--apply] [--force]\n  (dry-run by default; target must be a state.db path)");
+      const plan = planDbMove(resolved.path, dest);
+      console.log(`from:   ${plan.from}${plan.sourceExists ? "" : "  (MISSING)"}`);
+      console.log(`to:     ${plan.to}${plan.destinationExists ? "  (EXISTS — would be refused)" : ""}`);
+      console.log(`files:  ${plan.files.length ? plan.files.join(", ") : "(none)"}`);
+      if (!hasFlag(argv, "--apply")) {
+        console.log("dry-run: nothing moved. Re-run with --apply (and stop the daemon first).");
+        return;
+      }
+      const moved = applyDbMove(plan, { force: hasFlag(argv, "--force") });
+      console.log(`moved ${moved.length} file(s): ${moved.join(", ")}`);
+      console.log(`NOTE: point the fleet at it with RELAY_DB=${plan.to} or {"db":"${plan.to}"} in ${configPath()}; the daemon still needs a restart.`);
+      return;
+    }
+    throw new Error(`unknown db subcommand: ${sub} (try: relay db path | sources | move)`);
+  }
+
+  if (cmd === "config") {
+    // Read-only: printing the config path/value helps set RELAY_DB correctly.
+    const cfg = configPath();
+    if (!existsSync(cfg)) {
+      console.log(`${cfg} (absent)`);
+      console.log(`create it with: {"db": "<path-to-state.db>"}`);
+      return;
+    }
+    console.log(`${cfg}`);
+    console.log(JSON.stringify(readConfig(cfg), null, 2));
     return;
   }
 

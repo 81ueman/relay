@@ -469,6 +469,34 @@ relay init           # creates .relay/state.db (WAL)
 relay daemon         # reconcile loop + Unix socket .relay/relay.sock
 ```
 
+### Where the control plane lives (`relay db`)
+
+By default the control plane is **in the repo** (`<repo>/.relay/state.db` + the
+socket beside it). That is all a worktree of the *same* repo needs — the git
+common dir resolves it (below). To share ONE control plane across **different**
+repos (e.g. the relay tool's worktree coordinating the nv-papers fleet) without a
+`.relay` symlink, specify the location explicitly:
+
+```bash
+relay db path      # which DB wins, and why (env / config / legacy / xdg)
+relay db sources   # every candidate in the resolution order
+relay db move <path-to-state.db>          # dry-run plan (no writes)
+relay db move <path-to-state.db> --apply  # move DB + WAL/SHM out of the repo
+```
+
+Resolution order (first match wins):
+
+1. `RELAY_DB`
+2. `~/.config/relay/config.json` (`{"db": "<path>"}`; see `relay config`)
+3. legacy `<repo>/.relay/state.db` **if it exists** (backward compatible)
+4. `<cwd>/.relay/state.db` (the historical default)
+
+The socket always lives **next to** the resolved DB, so a shared control plane
+shares its socket. `relay db move` refuses to overwrite an existing DB, refuses
+while a socket is present (a daemon may be live), and moves `state.db` **and** its
+`-wal`/`-shm` sidecars (a partial move would lose recent commits). Existing repos
+are unaffected: a legacy `state.db` always wins over any external default.
+
 The OpenCode plugin (`.opencode/plugins/relay.ts`) and Skills
 (`skills/agent-worker/SKILL.md` and `skills/parallel-worktrees/SKILL.md`,
 symlinked from `.opencode/skills/`) are auto-discovered under this repo:
