@@ -432,15 +432,22 @@ See `integrations/herdr/README.md`. The handler is `relay dashboard --focus`
 ## Install
 
 ```bash
-bun install
-bun link   # global `relay`; or export RELAY_BIN="bun $PWD/src/cli.ts"
+scripts/install.sh   # build + install the artifact (recommended, see Setup)
 ```
 
-No build step: the `bin` is `src/cli.ts`, which Bun executes directly — so
-`bun run build` is optional (bundling only). Install straight from git with:
+The installed `relay` is the **built bundle** (`dist/cli.js`), not `src/cli.ts`,
+so an uncommitted edit to `src/` cannot break the live CLI (T338). For a quick
+hack without installing globally, run the source directly:
 
 ```bash
-bun install -g github:81ueman/relay
+bun "$PWD/src/cli.ts" status        # or: export RELAY_BIN="bun $PWD/src/cli.ts"
+```
+
+Build only (no install): `bun run build` → `dist/cli.js`. Install straight from
+git with:
+
+```bash
+bun install -g github:81ueman/relay   # installs the package; run scripts/install.sh to pin the artifact
 ```
 
 Requires: Bun ≥ 1.1, `herdr` on PATH, OpenCode v2.
@@ -464,10 +471,30 @@ Every command and subcommand accepts `-h` / `--help`.
 ## Setup
 
 ```bash
-scripts/install.sh   # bun install + build + `bun link` + OpenCode plugin symlink
+scripts/install.sh   # bun install + build + install the BUILT artifact + plugin symlink
 relay init           # creates .relay/state.db (WAL)
 relay daemon         # reconcile loop + Unix socket .relay/relay.sock
 ```
+
+**The installed CLI is a BUILD ARTIFACT, not the repo source (T338).**
+`scripts/install.sh` runs `bun run build`, copies `dist/cli.js` to a stable path
+outside the repo (`~/.local/share/relay/cli.js`) and writes a launcher
+(`~/.bun/bin/relay` or `~/.bin/relay`) that `exec`s it. It does **not** `bun link`
+and never symlinks the bin to source, so an in-progress edit to `src/` can no
+longer break the fleet's `relay` command. The consequence:
+
+```bash
+# editing src/ does NOT change the live CLI until you rebuild+reinstall:
+bun run build && cp dist/cli.js ~/.local/share/relay/cli.js
+# (or re-run scripts/install.sh)
+```
+
+`relay --version` reports the embedded source commit
+(`relay 0.1.0 (build 772e107)`); run from inside a relay checkout it warns when
+the installed build is behind repo HEAD. The build injects the commit/version via
+`scripts/build.ts` (`--define`), so a bundle is self-identifying. **The daemon
+must be (re)started from the installed build** (`~/.bun/bin/relay daemon` or
+`bun ~/.local/share/relay/cli.js daemon`) so a restart runs what is installed.
 
 ### Where the control plane lives (`relay db`)
 
@@ -512,10 +539,10 @@ The `agent-worker` and `parallel-worktrees` skills are also published through AP
 apm install -g --target agent-skills 81ueman/relay
 ```
 
-APM deploys skills only. Install the `relay` CLI itself and symlink the
-plugin with `scripts/install.sh` (runs `bun install`, `bun run build`,
-`bun link`, and links `.opencode/plugins/relay.ts` into
-`~/.config/opencode/plugins/relay.ts`).
+APM deploys skills only. Install the `relay` CLI itself with `scripts/install.sh`
+(runs `bun install`, `bun run build`, installs the built artifact to
+`~/.local/share/relay/cli.js` behind a launcher, and symlinks
+`.opencode/plugins/relay.ts` into `~/.config/opencode/plugins/relay.ts`).
 
 Identity / paths / tuning:
 

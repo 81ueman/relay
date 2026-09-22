@@ -8,6 +8,7 @@ import {
 import { formatEvent, listEvents, logEvent } from "./events";
 import { ackMessage, claimInbox, deliverMessage, getMessage, inboxFor, RELAY_TAG, sendMessage, unreadCounts } from "./messages";
 import { isImmediateKind } from "./mail-policy";
+import { staleBuildWarning, versionLine } from "./version";
 import { runDaemon } from "./daemon";
 import { handleErrorSignal, handleIdleSignal, reconcile } from "./reconciler";
 import { buildRuntime, HerdrRuntime } from "./runtime/herdr";
@@ -101,6 +102,7 @@ Runtime cleanup: RELAY_RUNTIME_CLEANUP_GRACE_MS RELAY_ATTACH_TIMEOUT_MS RELAY_RE
 Restart cap: RELAY_RESTART_CAP (default 3) RELAY_RESTART_CAP_WINDOW_MS (default 1800000)
 Herdr is required. RELAY_RUNTIME=mock is test-only.
 Help: relay <command> [subcommand] --help
+Version: relay --version   (installed build; rebuild with: bun run build && cp dist/cli.js ~/.local/share/relay/cli.js)
 `;
 }
 
@@ -474,6 +476,12 @@ function resolveText(args: string[], usageLine: string, flagName?: string): stri
 
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
+  if (argv[0] === "--version" || argv[0] === "-V" || argv[0] === "version") {
+    console.log(versionLine());
+    const warn = staleBuildWarning();
+    if (warn) console.error(warn);
+    return;
+  }
   if (argv.length === 0 || argv[0] === "help" || argv.some((a) => a === "--help" || a === "-h")) {
     const path = argv.filter((a) => a !== "help" && a !== "--help" && a !== "-h");
     console.log(commandUsage(path));

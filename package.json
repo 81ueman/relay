@@ -4,16 +4,19 @@
   "description": "Lightweight deterministic supervisor that keeps Herdr + OpenCode agents moving while SQLite stays the source of truth.",
   "type": "module",
   "bin": {
-    "relay": "./src/cli.ts"
+    "relay": "./dist/cli.js"
   },
   "scripts": {
-    "build": "bun build src/cli.ts --outdir dist --target bun",
+    "build": "bun scripts/build.ts",
+    "install:local": "bun scripts/install.sh",
     "test": "bun test",
     "typecheck": "tsc --noEmit",
     "daemon": "bun src/cli.ts daemon",
     "formal": "formal/run-tlc.sh Relay",
     "formal:safety": "formal/run-tlc.sh RelaySafety",
     "formal:scheduling": "formal/run-tlc.sh RelayScheduling",
+    "formal:roles": "formal/run-tlc.sh RelayRoles",
+    "formal:tree": "formal/run-tlc.sh RelayTree",
     "formal:recovery": "formal/run-tlc.sh RelayRecovery",
     "formal:liveness": "formal/run-tlc.sh RelayLiveness",
     "formal:completion": "formal/run-tlc.sh RelayCompletion",
