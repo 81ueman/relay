@@ -11,8 +11,9 @@ import {
   nextGeneration,
   recordRuntime,
 } from "./runtimes";
-import { getWorker, registerWorker } from "./workers";
+import { getWorker, isRetired, registerWorker, unretireWorker } from "./workers";
 import { getTask } from "./tasks";
+import type { Worker } from "./schema";
 
 export interface Session {
   session_id: string;
@@ -68,6 +69,23 @@ export function isManaged(db: Database, sessionId: string): boolean {
 function slugSession(sessionId: string): string {
   const short = sessionId.replace(/^ses_?/, "").replace(/[^a-zA-Z0-9]/g, "").slice(0, 8) || "x";
   return `sess-${short.toLowerCase()}`;
+}
+
+/**
+ * Attaching a LIVE session to a worker id is the same intent as registering it.
+ * If the id is a RETIRED tombstone, revive it (clear retired_at/reason, log
+ * `worker.unretired`) exactly like registerWorker's re-register path, instead of
+ * silently leaving the worker hidden and its role's tasks unclaimable. This is
+ * the bug hit live: a new agent attached to the old retired `reviewer` id, the
+ * attach "succeeded", but the worker stayed retired (hidden from listWorkers,
+ * `unclaimable role=reviewer`), and only `relay worker unretire` recovered it.
+ *
+ * Called ONLY on attach SUCCESS paths, so a rejected attach leaves the tombstone
+ * untouched and the attach stays atomic.
+ */
+function reviveIfRetired(db: Database, w: Worker | null): Worker | null {
+  if (w && isRetired(w)) return unretireWorker(db, w.id);
+  return w;
 }
 
 /**
@@ -150,7 +168,10 @@ export function attachSession(db: Database, sessionId: string, opts: AttachOptio
         prev.managed === 1 &&
         prev.worker_id === workerId &&
         prev.generation === generation;
-      if (idempotent) return prev!;
+      if (idempotent) {
+        reviveIfRetired(db, worker0); // a retired tombstone must not stay retired under a live session
+        return prev!;
+      }
       throw new Error(
         `attach rejected: ${workerId} g${generation} is already active on ${runtimeRow.session_id ?? "another session"}`
       );
@@ -200,12 +221,13 @@ export function attachSession(db: Database, sessionId: string, opts: AttachOptio
         active.tab_id === opts.identity!.tabId &&
         active.pane_id === opts.identity!.paneId
       ) {
+        reviveIfRetired(db, worker0); // a retired tombstone must not stay retired under a live session
         return prev;
       }
     }
   }
 
-  const worker = worker0 ?? registerWorker(db, workerId, { role, sessionId });
+  const worker = reviveIfRetired(db, worker0) ?? registerWorker(db, workerId, { role, sessionId });
 
   // Supersede the worker's previous session: events from the old generation's
   // session must no longer drive this worker (zombie protection on the way in).
