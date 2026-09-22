@@ -6,13 +6,16 @@ import { handleErrorSignal, handleIdleSignal, reconcile } from "./reconciler";
 import type { HerdrIdentity, Runtime } from "./runtime/runtime";
 import { attachSession, detachSession, gateEvent, managedWorkerForSession } from "./sessions";
 import type { DaemonIdentity } from "./singleton";
-import { getWorker, setWorkerState, setWorkerTool, clearWorkerTool, touchSeen } from "./workers";
+import { getWorker, setWorkerState, setWorkerTool, clearWorkerTool, setWorkerContext, touchSeen } from "./workers";
 
 // JSON Lines over a Unix domain socket. Small protocol:
 //   {"type":"session.idle","session_id":"ses_xxx","generation":2}
 //     (also accepted raw as session.execution.succeeded / .interrupted)
 //   {"type":"session.error",...,"payload":{...}}
 //   {"type":"permission.asked" | "permission.replied" | "tool.started" | "tool.execute.after" | "session.status" | ..., ...}
+//   {"type":"session.context","session_id":...,"payload":{"used_tokens":N,"model":"..."}}
+//     (context-window telemetry: `input + cache.read` of the latest assistant
+//      message; drives the cooperative-handoff rotation policy)
 //   {"type":"session.attach","session_id":...,"role":...,"worker_id":...,"generation":N,...}
 //     (generation present = relay-spawned session; absent = manual attach, then
 //      the daemon resolves the Herdr identity from the session `directory`
@@ -236,6 +239,24 @@ export async function handleSocketMessage(msg: SocketMessage, ctx: SocketContext
     clearWorkerTool(db, workerId);
     touchSeen(db, workerId);
     logEvent(db, { source: "opencode", workerId, type, payload: msg.payload ?? {} });
+    return { ok: true };
+  }
+
+  // Context-window telemetry from the plugin (a nested object in the host's
+  // assistant-message `tokens`). Like the tool marker it is TELEMETRY: no state
+  // change, no `touchSeen`. The reconciler's cooperative-handoff policy reads
+  // the persisted metric on a later pass. A non-positive/non-finite value is
+  // ignored (a defensive parse of host data, never a crash).
+  if (type === "session.context") {
+    const p = (msg.payload ?? {}) as { used_tokens?: unknown; model?: unknown };
+    const used =
+      typeof p.used_tokens === "number" && Number.isFinite(p.used_tokens) && p.used_tokens > 0
+        ? p.used_tokens
+        : null;
+    if (used === null) return { ok: true, ignored: "bad-context" };
+    const model = typeof p.model === "string" && p.model ? p.model : undefined;
+    logEvent(db, { source: "opencode", workerId, type, payload: { used_tokens: used, model: model ?? null } });
+    setWorkerContext(db, workerId, used);
     return { ok: true };
   }
 

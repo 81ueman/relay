@@ -18,9 +18,12 @@ import {
   runtimeCleanupGraceMs,
 } from "./runtimes";
 import {
+  contextPercent,
+  contextRotateGraceMs,
   idleWorkers,
   isOperationalWorker,
   isSupervisedWorker,
+  needsContextRotation,
   needsPlanner,
   needsReviewer,
   needsWorkerWakeup,
@@ -44,13 +47,25 @@ import {
   claimableRunnableTasks,
   defaultLeaseAlive,
   expireLeases,
+  getNotes,
   getTask,
   hasClaimableReview,
   reviewTasks,
   unclaimableRunnableTasks,
 } from "./tasks";
-import { getWorker, listWorkers, setWorkerState, touchSeen, clearQuiet, clearWorkerTool, quietActive, type WorkerRow } from "./workers";
-import { RELAY_TAG } from "./messages";
+import {
+  getWorker,
+  listWorkers,
+  setWorkerState,
+  setWorkerContextRotateRequested,
+  setWorkerContextRotated,
+  touchSeen,
+  clearQuiet,
+  clearWorkerTool,
+  quietActive,
+  type WorkerRow,
+} from "./workers";
+import { RELAY_TAG, sendMessage } from "./messages";
 import { immediateKindSql, mailNudgeMs, ordinaryStarvationCapMs, starvationCapMs } from "./mail-policy";
 
 // Deterministic reconciler. No LLM: pure DB state + runtime transport.
@@ -101,6 +116,16 @@ export const BACKGROUND_NUDGE = (tool: string, taskId: string | null) => {
 };
 export const PLANNER_NUDGE =
   "relay: Task queue is running low. Decompose the next objective into small tasks with acceptance criteria (relay task add), then go idle. Do not monitor other workers.";
+/**
+ * Cooperative context handoff. Sent to a worker whose context window has passed
+ * the rotation threshold: the worker's session is about to be replaced, so it
+ * must persist everything a successor needs BEFORE the turn ends. The handoff is
+ * read back by `gatherHandoff` and appended to the fresh generation's bootstrap.
+ */
+export const CONTEXT_ROTATE_NUDGE = (percent: number) =>
+  `CONTEXT HIGH (${Math.round(percent)}%): checkpoint now. ` +
+  `Write \`relay note <task> "HANDOFF: <state, files, next steps, blockers>"\`, then END YOUR TURN. ` +
+  `relay will rotate you to a fresh session and pass the handoff to your successor.`;
 
 function wakeCooldownMs(): number {
   const v = Number(process.env.RELAY_WAKE_COOLDOWN_MS ?? "30000");
@@ -235,7 +260,13 @@ const restartingWorkers = new Set<string>();
  * number and leave two runtime rows for it (a plugin holding the losing token
  * could then never attach). A re-entrant pass is a no-op.
  */
-async function restartWorker(db: Database, rt: Runtime, w: WorkerRow, at: number): Promise<boolean> {
+async function restartWorker(
+  db: Database,
+  rt: Runtime,
+  w: WorkerRow,
+  at: number,
+  opts: { handoff?: string } = {}
+): Promise<boolean> {
   if (restartingWorkers.has(w.id)) return false;
   const cooldown = restartCooldownMs();
   // Back off both after a successful spawn and after a failure: otherwise a
@@ -266,14 +297,20 @@ async function restartWorker(db: Database, rt: Runtime, w: WorkerRow, at: number
   }
   restartingWorkers.add(w.id);
   try {
-    return await spawnFreshGeneration(db, rt, w, at);
+    return await spawnFreshGeneration(db, rt, w, at, opts);
   } finally {
     restartingWorkers.delete(w.id);
   }
 }
 
 /** The generation-allocating body of `restartWorker`; callers must hold its guard. */
-async function spawnFreshGeneration(db: Database, rt: Runtime, w: WorkerRow, at: number): Promise<boolean> {
+async function spawnFreshGeneration(
+  db: Database,
+  rt: Runtime,
+  w: WorkerRow,
+  at: number,
+  opts: { handoff?: string } = {}
+): Promise<boolean> {
   // 0. Only a relay-OWNED current generation may be replaced. An adopted
   //    (manual, relay_owned=0) runtime can never be closed by relay, so spawning
   //    a replacement would leave TWO live agents on the same task — the old one
@@ -372,6 +409,7 @@ async function spawnFreshGeneration(db: Database, rt: Runtime, w: WorkerRow, at:
       `UPDATE workers SET generation = ?, runtime_id = ?, opencode_session_id = NULL,
          state = 'starting', current_task_id = NULL, nudged_at = NULL,
          tool_name = NULL, tool_command = NULL, tool_started_at = NULL, tool_timeout_ms = NULL,
+         context_rotate_requested_at = NULL, context_used_tokens = NULL,
          updated_at = ? WHERE id = ?`
     ).run(generation, started.runtimeId, at, w.id);
     // A generation change is a resumed-work signal: a quiet lease never crosses it.
@@ -411,8 +449,15 @@ async function spawnFreshGeneration(db: Database, rt: Runtime, w: WorkerRow, at:
   }
 
   // 5. Bootstrap AFTER the commit. A delivery failure must not abandon the
-  //    generation; activatePendingRuntimes retries it after a cooldown.
-  await deliverBootstrap(db, rt, w.id, generation, runtimeRow, at);
+  //    generation; activatePendingRuntimes retries it after a cooldown. A
+  //    cooperative-handoff rotation ALSO records the predecessor's checkpoint as
+  //    a durable message, so a failed/retried bootstrap can never lose it.
+  if (opts.handoff && opts.handoff.trim()) {
+    sendMessage(db, "relay", w.id, `${RELAY_TAG}HANDOFF from your predecessor (context rotation):\n${opts.handoff.trim()}`, {
+      kind: "handoff",
+    });
+  }
+  await deliverBootstrap(db, rt, w.id, generation, runtimeRow, at, opts.handoff);
   return true;
 }
 
@@ -422,7 +467,13 @@ async function spawnFreshGeneration(db: Database, rt: Runtime, w: WorkerRow, at:
  * later; it never deletes the runtime or desupervises the worker.
  */
 async function deliverBootstrap(
-  db: Database, rt: Runtime, workerId: string, generation: number, row: WorkerRuntime, at: number
+  db: Database,
+  rt: Runtime,
+  workerId: string,
+  generation: number,
+  row: WorkerRuntime,
+  at: number,
+  handoff?: string
 ): Promise<boolean> {
   // A tokenless generation is never attachable, so prompting it is pointless.
   if (!row.attach_token) return false;
@@ -431,7 +482,7 @@ async function deliverBootstrap(
   try {
     await rt.wake(
       { ...worker, runtime_id: row.runtime_id ?? worker.runtime_id },
-      BOOTSTRAP_PROMPT(workerId, generation, row.attach_token)
+      BOOTSTRAP_PROMPT(workerId, generation, row.attach_token, handoff)
     );
     markBootstrapSent(db, row.id, at);
     return true;
@@ -535,6 +586,216 @@ async function cleanupOldRuntimes(db: Database, rt: Runtime, actions: string[], 
       actions.push(`cleanup-failed:${c.worker_id}:g${c.generation}`);
       // Leave it stale/dead so the next pass retries.
     }
+  }
+}
+
+/**
+ * Requeue a task a worker owns before its session is replaced by a context
+ * rotation. `spawnFreshGeneration` nulls `current_task_id`, so a running task
+ * left in place would become a RUNNING task owned by a worker that no longer
+ * points at it — stranded. Requeue it (bump the fencing token, unqueue) exactly
+ * like crash recovery, then the successor can re-claim it.
+ *
+ * Returns the requeued task id (to name in the handoff), or null.
+ */
+function requeueOwnedTaskForRotation(db: Database, w: WorkerRow, at: number): string | null {
+  const taskId = w.current_task_id;
+  if (!taskId) return null;
+  const task = getTask(db, taskId);
+  if (!task) {
+    db.query(`UPDATE workers SET current_task_id = NULL, updated_at = ? WHERE id = ?`).run(at, w.id);
+    return null;
+  }
+  // Only a RUNNING task we own is stranded by the session swap. A review task
+  // stays in the review queue regardless of who is assigned, so it is not lost.
+  if (task.state !== "running" || task.assignee !== w.id) return null;
+  db.query(
+    `UPDATE tasks SET state = 'queued', assignee = NULL, lease_token = lease_token + 1,
+       lease_until = NULL, updated_at = ? WHERE id = ?`
+  ).run(at, task.id);
+  db.query(`UPDATE workers SET current_task_id = NULL, nudged_at = NULL, updated_at = ? WHERE id = ?`).run(at, w.id);
+  logEvent(db, {
+    source: "supervisor",
+    workerId: w.id,
+    taskId: task.id,
+    type: "task.requeued_context_rotate",
+    payload: { leaseToken: task.lease_token + 1 },
+  });
+  return task.id;
+}
+
+/**
+ * Gather the checkpoint text a rotated-out worker left behind, to seed the
+ * successor's bootstrap. Preference: the latest note on the worker's CURRENT
+ * task whose body is a `HANDOFF:` checkpoint, then the latest note on that task,
+ * then empty (the rotation still proceeds — a missing handoff must never strand
+ * the worker or block the rotation).
+ */
+function gatherHandoff(db: Database, w: WorkerRow): string {
+  const taskId = w.current_task_id;
+  if (!taskId) return "";
+  const notes = getNotes(db, taskId);
+  if (notes.length === 0) return "";
+  const reversed = [...notes].reverse();
+  const explicit = reversed.find((n) => /HANDOFF/i.test(n.body));
+  return (explicit ?? reversed[0]).body.trim();
+}
+
+/**
+ * Cooperative context rotation: replace a worker's over-full generation with a
+ * fresh one, reusing the managed-generation path (`restartWorker`). It is a
+ * thin policy layer over that path so all its invariants are preserved:
+ *   - only a relay-owned active generation may be replaced (an adopted lane is
+ *     never closed — refuse and surface instead);
+ *   - re-entrancy is single-writer (`restartingWorkers`), the restart cap and
+ *     restart backoff still apply;
+ *   - the old generation is marked stale and its session superseded by the
+ *     commit-time transaction;
+ *   - an owned running task is REQUEUED before the spawn (never stranded) and
+ *     named in the handoff;
+ *   - the handoff is appended to the successor's bootstrap AND recorded durably.
+ *
+ * Callers must have already confirmed `needsContextRotation`; the context
+ * cooldown is enforced there (and re-read here via the passed metric).
+ */
+async function rotateWorker(
+  db: Database,
+  rt: Runtime,
+  w: WorkerRow,
+  at: number,
+  opts: { reason: string; handoff: string }
+): Promise<boolean> {
+  if (restartingWorkers.has(w.id)) return false;
+
+  // An adopted (manual, relay_owned=0) runtime can never be closed by relay;
+  // spawning a replacement would leave TWO live agents on the same files.
+  const current = findRuntime(db, w.id, w.generation) ?? getActiveRuntime(db, w.id);
+  if (!current || current.relay_owned !== 1) {
+    if (!recentlyEvent(db, w.id, "worker.context_rotate_refused", at, restartCooldownMs())) {
+      logEvent(db, {
+        source: "supervisor",
+        workerId: w.id,
+        type: "worker.context_rotate_refused",
+        payload: {
+          generation: w.generation,
+          relayOwned: current?.relay_owned ?? null,
+          reason: "current generation is not relay-owned (adopted); relay cannot retire it",
+        },
+      });
+    }
+    return false;
+  }
+
+  // Requeue before the spawn so the commit cannot strand a running task, then
+  // name the requeue in the handoff so the successor knows to re-claim it.
+  const requeued = requeueOwnedTaskForRotation(db, w, at);
+  const checkpoint = opts.handoff.trim();
+  const handoff = [
+    checkpoint,
+    requeued ? `task ${requeued} was requeued; re-claim it with \`relay claim ${requeued}\`.` : "",
+  ]
+    .filter((s) => s.length > 0)
+    .join("\n");
+
+  const full = getWorker(db, w.id)!;
+  const before = full.generation;
+  const ok = await restartWorker(db, rt, full, at, { handoff });
+  if (!ok) {
+    // The managed-generation path refused (re-entrancy / cap / backoff / spawn
+    // failure). Keep the pending request so a later pass retries after backoff.
+    return false;
+  }
+  setWorkerContextRotated(db, w.id, at);
+  logEvent(db, {
+    source: "supervisor",
+    workerId: w.id,
+    type: "worker.context_rotate",
+    payload: {
+      reason: opts.reason,
+      fromGeneration: before,
+      toGeneration: before + 1,
+      percent: Math.round(contextPercent(w)),
+      usedTokens: w.context_used_tokens,
+      requeuedTask: requeued,
+    },
+  });
+  return true;
+}
+
+/**
+ * Cooperative-handoff rotation pass.
+ *
+ * Phase 1 (request): once a managed relay-owned worker's context passes the
+ * threshold, send ONE durable checkpoint directive and push it. We do not rotate
+ * on the same pass — the worker needs the chance to write its handoff and reach a
+ * turn boundary.
+ *
+ * Phase 2 (rotate): on a later pass, once the worker is idle OR the grace has
+ * elapsed, replace the generation. The grace is essential: a worker that owns a
+ * running task may never report `idle` (the supervisor keeps it `working`), so
+ * without it a high-context worker could loop forever past the threshold.
+ *
+ * An adopted (relay_owned=0) lane is REFUSED, never spawned (see rotateWorker).
+ */
+async function processContextRotation(db: Database, rt: Runtime, actions: string[], at: number): Promise<void> {
+  const grace = contextRotateGraceMs();
+  for (const w of listWorkers(db)) {
+    if (!isOperationalWorker(db, w)) continue;
+    // A mid-spawn generation is not running yet; the previous session's metric
+    // (if any) belongs to a generation already being replaced.
+    if (w.state === "starting") continue;
+    if (!w.opencode_session_id) continue; // must be a live managed session
+    if (!needsContextRotation(w, at)) continue;
+
+    const active = findRuntime(db, w.id, w.generation) ?? getActiveRuntime(db, w.id);
+    if (!active || active.relay_owned !== 1) {
+      // We cannot rotate an adopted lane. Do not send a directive we cannot
+      // honour; surface the condition at most once per backoff window.
+      if (!recentlyEvent(db, w.id, "worker.context_rotate_refused", at, restartCooldownMs())) {
+        logEvent(db, {
+          source: "supervisor",
+          workerId: w.id,
+          type: "worker.context_rotate_refused",
+          payload: {
+            generation: w.generation,
+            relayOwned: active?.relay_owned ?? null,
+            reason: "current generation is not relay-owned (adopted); relay cannot retire it",
+          },
+        });
+      }
+      actions.push(`context-refused:${w.id}`);
+      continue;
+    }
+
+    // Phase 1: request.
+    if (w.context_rotate_requested_at === null) {
+      const text = CONTEXT_ROTATE_NUDGE(contextPercent(w));
+      sendMessage(db, "relay", w.id, `${RELAY_TAG}${text}`, {
+        kind: "handoff",
+        taskId: w.current_task_id ?? undefined,
+      });
+      setWorkerContextRotateRequested(db, w.id, at);
+      logEvent(db, {
+        source: "supervisor",
+        workerId: w.id,
+        taskId: w.current_task_id,
+        type: "worker.context_rotate_requested",
+        payload: { percent: Math.round(contextPercent(w)), usedTokens: w.context_used_tokens },
+      });
+      actions.push(`context-requested:${w.id}`);
+      // Push it now; nudgeUnreadMail is the durable safety net if this wake is
+      // missed (the message row already exists).
+      await tryWake(rt, db, w, `${RELAY_TAG}${text}`, "context-rotate", at);
+      continue;
+    }
+
+    // Phase 2: rotate at a turn boundary, or once the grace has elapsed.
+    const requestedAt = w.context_rotate_requested_at;
+    if (w.state !== "idle" && at - requestedAt < grace) continue;
+
+    const handoff = gatherHandoff(db, w);
+    const rotated = await rotateWorker(db, rt, w, at, { reason: "context", handoff });
+    actions.push(rotated ? `context-rotated:${w.id}` : `context-rotate-skipped:${w.id}`);
   }
 }
 
@@ -1102,6 +1363,17 @@ export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<
   // 5. Nudge recipients with undelivered mail (a durable safety net for a missed
   //    send-time wake; peer messages and completion notices alike).
   await nudgeUnreadMail(db, rt, actions, at);
+
+  // 5b. Cooperative context rotation: a managed worker whose context window
+  //     passed the threshold is asked to checkpoint, then rotated to a fresh
+  //     generation. Runs AFTER the worker walk (so a dead/stalled generation is
+  //     recovered first) and BEFORE cleanup (the superseded generation is then
+  //     reaped through the normal grace path).
+  // TODO(formal): model a `RotateContext(worker)` action in formal/Relay.tla with
+  // the invariant that a rotation preserves task ownership (a running task is
+  // requeued, never stranded) and generation monotonicity, plus a no-storm
+  // fairness bound (a cooldown/grace between rotations).
+  await processContextRotation(db, rt, actions, at);
 
   // 6. Reap old generations, isolated from all of the above.
   await cleanupOldRuntimes(db, rt, actions, at);

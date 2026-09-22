@@ -170,6 +170,42 @@ export function setWorkerTool(
   ).run(tool.name, tool.command ?? null, at, tool.timeoutMs ?? null, at, workerId);
 }
 
+/**
+ * Record the latest context-window occupancy for a worker (`session.context`
+ * from the plugin: `input + cache.read` of the latest assistant message). Like
+ * `setWorkerTool` this is transport telemetry — it never changes the worker's
+ * state, task ownership or lease. `at` is stored as `context_updated_at` so the
+ * rotation policy can require a FRESH metric after a rotation.
+ */
+export function setWorkerContext(db: Database, workerId: string, usedTokens: number, at = now()): void {
+  db.query(
+    `UPDATE workers SET context_used_tokens = ?, context_updated_at = ?, updated_at = ? WHERE id = ?`
+  ).run(usedTokens, at, at, workerId);
+}
+
+/**
+ * Record that a checkpoint directive was sent for the current high-context
+ * episode (at most one per episode, so the worker is never nagged). Cleared by
+ * a generation change and by a successful rotation.
+ */
+export function setWorkerContextRotateRequested(db: Database, workerId: string, at = now()): void {
+  db.query(`UPDATE workers SET context_rotate_requested_at = ?, updated_at = ? WHERE id = ?`).run(at, at, workerId);
+}
+
+/**
+ * Record a completed cooperative rotation. Also consumes the pending request
+ * and clears the (now meaningless) metric: the fresh generation starts with an
+ * empty context, so a stale high value must not immediately re-trigger the
+ * policy. `context_updated_at` is deliberately kept as the OLD timestamp so the
+ * policy can require a metric newer than `context_rotated_at`.
+ */
+export function setWorkerContextRotated(db: Database, workerId: string, at = now()): void {
+  db.query(
+    `UPDATE workers SET context_rotated_at = ?, context_rotate_requested_at = NULL,
+       context_used_tokens = NULL, updated_at = ? WHERE id = ?`
+  ).run(at, at, workerId);
+}
+
 /** Clear the in-flight tool marker; true when one was actually set. */
 export function clearWorkerTool(db: Database, workerId: string): boolean {
   const w = getWorker(db, workerId);

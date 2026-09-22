@@ -70,6 +70,10 @@ interface RelayPluginState {
   attachAttemptAt: Map<string, number>;
   /** sessionID -> per-spawn identity seen in a marker, awaiting a successful attach. */
   pendingAttach: Map<string, { workerId?: string; generation: number; token?: string }>;
+  /** sessionID -> last context value forwarded (dedupe unchanged readings). */
+  contextLast: Map<string, number>;
+  /** sessionID -> time the last context reading was forwarded (per-session throttle). */
+  contextSentAt: Map<string, number>;
   /** The live forwarder's controller (aborted when a reload takes over). */
   controller?: AbortController;
 }
@@ -84,6 +88,8 @@ const G: RelayPluginState = ((globalThis as any).__relayPlugin ??= {
   autoAttached: new Set(),
   attachAttemptAt: new Map(),
   pendingAttach: new Map(),
+  contextLast: new Map(),
+  contextSentAt: new Map(),
 }) as RelayPluginState;
 
 // A hot reload can adopt a globalThis state object created by an older load that
@@ -96,6 +102,8 @@ G.repoRootCache ??= new Map();
 G.autoAttached ??= new Set();
 G.attachAttemptAt ??= new Map();
 G.pendingAttach ??= new Map();
+G.contextLast ??= new Map();
+G.contextSentAt ??= new Map();
 
 // Env-only auto attach is OFF by default: a shared server's process env names
 // at most one worker, so it cannot identify a session. Opt in only for
@@ -479,6 +487,20 @@ const TOOL_AFTER = "tool.execute.after";
 // Herdr reports `working` the whole time).
 const TOOL_STARTED = "tool.started";
 
+// Context-window telemetry. The V2 SDK confirms two token-bearing events:
+// `EventMessageUpdated` (properties.info is an AssistantMessage whose `tokens`
+// is `{input, output, reasoning, cache:{read,write}}`) and `EventSessionUpdated`
+// (properties.info is a Session with the same `tokens` shape, plus `model`).
+//
+// We deliberately do NOT gate detection on these names: `maybeForwardContext`
+// scans ANY event for assistant token usage, so a host event-name change or a
+// new token-bearing event cannot silently disable context detection. The set
+// below only documents the confirmed host names.
+export const CONTEXT_USAGE_TYPES = new Set(["message.updated", "session.updated"]);
+// At most one `session.context` per session per window: the stream is
+// high-frequency and the metric barely moves within a few seconds.
+const CONTEXT_THROTTLE_MS = 5000;
+
 /**
  * Transport telemetry extracted from a tool hook event. `tool` identifies the
  * tool; for `shell` the command and timeout tell relay WHAT is running and how
@@ -498,6 +520,105 @@ export function toolTelemetry(event: any): Record<string, unknown> {
   return out;
 }
 
+/**
+ * Defensive recursive finder for an assistant token-usage object: a nested
+ * object with a numeric `input` and a numeric `cache.read` (schema
+ * `TokenUsage.Info` / `AssistantMessage.tokens`). Bounded depth, never throws —
+ * the event payload is host data and may be any shape, including a future one.
+ */
+export function tokenUsageOf(data: unknown, depth = 0): { input: number; cacheRead: number } | null {
+  if (depth > 6 || !data || typeof data !== "object") return null;
+  try {
+    const obj = data as Record<string, unknown>;
+    const input = obj.input;
+    const cache = obj.cache as Record<string, unknown> | undefined;
+    const cacheRead =
+      cache && typeof cache === "object" ? (cache as Record<string, unknown>).read : undefined;
+    if (
+      typeof input === "number" &&
+      Number.isFinite(input) &&
+      typeof cacheRead === "number" &&
+      Number.isFinite(cacheRead)
+    ) {
+      return { input, cacheRead };
+    }
+    for (const value of Object.values(obj)) {
+      const found = tokenUsageOf(value, depth + 1);
+      if (found) return found;
+    }
+  } catch {
+    // Never throw out of a best-effort telemetry scan.
+  }
+  return null;
+}
+
+/** Bounded recursive search for a model id anywhere nearby (`modelID`, `model.id`). */
+function findModelID(value: unknown, depth = 0): string | undefined {
+  if (depth > 6 || !value || typeof value !== "object") return undefined;
+  try {
+    const obj = value as Record<string, unknown>;
+    if (typeof obj.modelID === "string" && obj.modelID) return obj.modelID;
+    if (typeof obj.model === "string" && obj.model) return obj.model;
+    const model = obj.model;
+    if (model && typeof model === "object") {
+      const id = (model as Record<string, unknown>).id ?? (model as Record<string, unknown>).modelID;
+      if (typeof id === "string" && id) return id;
+    }
+    for (const child of Object.values(obj)) {
+      const found = findModelID(child, depth + 1);
+      if (found) return found;
+    }
+  } catch {
+    // ignore
+  }
+  return undefined;
+}
+
+/**
+ * Current context occupancy of the latest assistant message: `input +
+ * cache.read` (the prompt/context tokens in play), or undefined when no token
+ * usage is present in the event.
+ */
+export function contextUsedTokens(data: unknown): { used: number; model?: string } | undefined {
+  const usage = tokenUsageOf(data);
+  if (!usage) return undefined;
+  const used = usage.input + usage.cacheRead;
+  if (!Number.isFinite(used) || used <= 0) return undefined;
+  return { used, model: findModelID(data) };
+}
+
+/**
+ * Forward `session.context` when an event carries assistant token usage.
+ * Best-effort (never throws); throttled per session (at most one per
+ * `CONTEXT_THROTTLE_MS`) and deduped (an unchanged reading is never re-sent).
+ * The daemon treats the event as telemetry only — no state change, no wake.
+ */
+function maybeForwardContext(sessionID: string | undefined, data: unknown, directory?: string): void {
+  try {
+    if (!sessionID) return;
+    const reading = contextUsedTokens(data);
+    if (!reading) return;
+    const at = Date.now();
+    const last = G.contextLast.get(sessionID);
+    if (last !== undefined && last === reading.used) return; // nothing new
+    const sentAt = G.contextSentAt.get(sessionID) ?? 0;
+    if (at - sentAt < CONTEXT_THROTTLE_MS) return; // rate limit
+    G.contextLast.set(sessionID, reading.used);
+    G.contextSentAt.set(sessionID, at);
+    sendEvent(
+      {
+        type: "session.context",
+        ...withGeneration(sessionID, {
+          payload: { used_tokens: reading.used, ...(reading.model ? { model: reading.model } : {}) },
+        }),
+      },
+      directory
+    );
+  } catch {
+    // Telemetry must never break a session.
+  }
+}
+
 async function forwardEvent(
   ctx: any,
   type: string,
@@ -511,6 +632,11 @@ async function forwardEvent(
   // A marker was seen but the attach had not (yet) succeeded: any later event is
   // a retry trigger (rate-limited by the per-session cooldown).
   retryPendingAttach(sessionID, directory);
+
+  // Context-window telemetry is scanned from EVERY event, not gated on a
+  // hard-coded name (see CONTEXT_USAGE_TYPES): any event carrying assistant
+  // token usage must be able to trigger `session.context`.
+  maybeForwardContext(sessionID, data, directory);
 
   if (IDLE_TYPES.has(type)) {
     // Always forwarded; the daemon gates on managed + generation. Normalized to

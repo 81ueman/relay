@@ -78,6 +78,72 @@ export function toolNoOutputMs(): number {
   return Number.isFinite(v) && v >= 0 ? v : 600000;
 }
 
+/**
+ * Model context-window size used to turn `context_used_tokens` into a percent.
+ * The managed model (`deepseek-v4.1-flash`) tops out at 1,000,000 tokens.
+ * Overridable so a different model's limit does not require a code change.
+ */
+export function contextLimitTokens(): number {
+  const v = Number(process.env.RELAY_CONTEXT_LIMIT_TOKENS ?? "1000000");
+  return Number.isFinite(v) && v > 0 ? v : 1000000;
+}
+
+/**
+ * Cooperative-handoff threshold as a percentage of the context limit. Past this
+ * the worker is asked to checkpoint and is rotated to a fresh generation at a
+ * task boundary. 80% leaves headroom before the ~91% degeneration observed live.
+ */
+export function contextRotatePercent(): number {
+  const v = Number(process.env.RELAY_CONTEXT_ROTATE_PCT ?? "80");
+  return Number.isFinite(v) && v > 0 && v <= 100 ? v : 80;
+}
+
+/**
+ * Minimum spacing between cooperative rotations of the same worker. Guards
+ * against a rotation storm if the fresh generation's first context reading is
+ * somehow already high (e.g. a resumed/compacted prompt).
+ */
+export function contextRotateCooldownMs(): number {
+  const v = Number(process.env.RELAY_CONTEXT_ROTATE_COOLDOWN_MS ?? "900000");
+  return Number.isFinite(v) && v >= 0 ? v : 900000;
+}
+
+/**
+ * How long to wait after the checkpoint directive for the worker to reach a turn
+ * boundary before rotating anyway. A worker that owns a running task may never
+ * report idle, so the grace is the fallback that guarantees the handoff happens.
+ */
+export function contextRotateGraceMs(): number {
+  const v = Number(process.env.RELAY_CONTEXT_ROTATE_GRACE_MS ?? "180000");
+  return Number.isFinite(v) && v >= 0 ? v : 180000;
+}
+
+/** Context occupancy of a worker as a percentage of the model limit (0 when unknown). */
+export function contextPercent(w: WorkerRow): number {
+  const used = w.context_used_tokens;
+  if (used === null || used === undefined || !Number.isFinite(used) || used <= 0) return 0;
+  return (used / contextLimitTokens()) * 100;
+}
+
+/**
+ * Pure cooperative-handoff predicate: is this worker's context over the
+ * threshold AND not inside a rotation cooldown, AND has a FRESH metric arrived
+ * since the last rotation?
+ *
+ * The "fresh metric" condition is what stops an immediate re-request after a
+ * rotation: the metric that triggered the rotation is cleared by
+ * `setWorkerContextRotated`, and `context_rotated_at` fences any older reading
+ * that might still be flushed by the superseded session.
+ */
+export function needsContextRotation(w: WorkerRow, at = Date.now()): boolean {
+  if (contextPercent(w) < contextRotatePercent()) return false;
+  if (w.context_rotated_at !== null) {
+    if (at - w.context_rotated_at < contextRotateCooldownMs()) return false;
+    if ((w.context_updated_at ?? 0) <= w.context_rotated_at) return false;
+  }
+  return true;
+}
+
 export function lowWaterMark(): number {
   const v = Number(process.env.RELAY_LOW_WATER ?? "3");
   return Number.isFinite(v) && v >= 0 ? v : 3;

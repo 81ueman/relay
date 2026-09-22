@@ -190,6 +190,20 @@ function migrate(db: Database): void {
     if (!columnExists(db, "workers", "tool_timeout_ms")) {
       db.exec("ALTER TABLE workers ADD COLUMN tool_timeout_ms INTEGER;");
     }
+    // Context-window telemetry + cooperative-handoff rotation bookkeeping
+    // (`session.context` from the plugin; see Worker.context_used_tokens).
+    if (!columnExists(db, "workers", "context_used_tokens")) {
+      db.exec("ALTER TABLE workers ADD COLUMN context_used_tokens INTEGER;");
+    }
+    if (!columnExists(db, "workers", "context_updated_at")) {
+      db.exec("ALTER TABLE workers ADD COLUMN context_updated_at INTEGER;");
+    }
+    if (!columnExists(db, "workers", "context_rotate_requested_at")) {
+      db.exec("ALTER TABLE workers ADD COLUMN context_rotate_requested_at INTEGER;");
+    }
+    if (!columnExists(db, "workers", "context_rotated_at")) {
+      db.exec("ALTER TABLE workers ADD COLUMN context_rotated_at INTEGER;");
+    }
   }
   // `claimed` task state was removed: anything left there is runnable work.
   try {

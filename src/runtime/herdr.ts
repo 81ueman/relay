@@ -230,7 +230,16 @@ function closeRelayTab(workerId: string, generation: number, tabId: string): voi
   } catch { /* best effort */ }
 }
 
-export const BOOTSTRAP_PROMPT = (workerId: string, generation: number, attachToken?: string) =>
+export const BOOTSTRAP_PROMPT = (
+  workerId: string,
+  generation: number,
+  attachToken?: string,
+  // Cooperative-handoff text: when a context rotation spawns this generation,
+  // the predecessor's checkpoint (relay note HANDOFF) is appended here so the
+  // successor starts already knowing the state, files and next steps. It is
+  // optional and never affects the first-line machine-readable marker.
+  handoff?: string
+) =>
   // The first line is a machine-readable marker the relay plugin reads out of
   // this session's own prompt text to auto-attach the RIGHT session. A shared
   // OpenCode server has no per-session env, and may host sessions from several
@@ -240,7 +249,10 @@ export const BOOTSTRAP_PROMPT = (workerId: string, generation: number, attachTok
   `RELAY-ATTACH worker=${workerId} gen=${generation}${attachToken ? ` token=${attachToken}` : ""}\n` +
   `You are managed by the relay supervisor as worker ${workerId} (generation ${generation}). ` +
   `Load the agent-worker skill, then run \`relay next\` to claim work. ` +
-  `Never wait for instructions; after each submit/block run \`relay next\` again.`;
+  `Never wait for instructions; after each submit/block run \`relay next\` again.` +
+  (handoff && handoff.trim()
+    ? `\n\nHANDOFF FROM YOUR PREDECESSOR (context rotation):\n${handoff.trim()}`
+    : "");
 
 /** Best-effort normalization of a directory for comparison (symlinks, trailing slash). */
 function normalizeDir(p: string | null | undefined): string | null {

@@ -104,6 +104,23 @@ export interface Worker {
   tool_started_at: number | null;
   tool_timeout_ms: number | null;
   /**
+   * [ext] Context-window telemetry. The OpenCode plugin forwards
+   * `session.context` carrying the latest assistant message's
+   * `input + cache.read` (the current prompt/context occupancy). The daemon
+   * stores it and the reconciler applies a COOPERATIVE HANDOFF policy at
+   * `RELAY_CONTEXT_ROTATE_PCT` of the model limit: ask the worker to checkpoint,
+   * then rotate it to a fresh generation. Like the tool marker this is telemetry
+   * — it never changes the worker's state, task ownership or lease.
+   *
+   * `context_rotate_requested_at` is the last time we told the worker to
+   * checkpoint (one directive per high-context episode); `context_rotated_at` is
+   * the last cooperative rotation (cooldown + "fresh metric" fencing).
+   */
+  context_used_tokens: number | null;
+  context_updated_at: number | null;
+  context_rotate_requested_at: number | null;
+  context_rotated_at: number | null;
+  /**
    * [ext] Retirement tombstone. A retired worker is history only: it is excluded
    * from the operational/supervised sets, from role discovery and from all
    * listings, but its row (and events) survive so earlier references stay
@@ -213,6 +230,10 @@ CREATE TABLE IF NOT EXISTS workers (
   tool_command TEXT,
   tool_started_at INTEGER,
   tool_timeout_ms INTEGER,
+  context_used_tokens INTEGER,
+  context_updated_at INTEGER,
+  context_rotate_requested_at INTEGER,
+  context_rotated_at INTEGER,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );

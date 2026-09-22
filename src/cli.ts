@@ -1057,6 +1057,8 @@ async function main(): Promise<void> {
           retired_at: null, retired_reason: null,
           quiet_until: null, quiet_reason: null, quiet_task_id: null,
           tool_name: null, tool_command: null, tool_started_at: null, tool_timeout_ms: null,
+          context_used_tokens: null, context_updated_at: null,
+          context_rotate_requested_at: null, context_rotated_at: null,
           created_at: 0, updated_at: 0,
         };
         if (!isImmediateKind(kind)) {
