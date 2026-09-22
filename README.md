@@ -1005,6 +1005,25 @@ further only when the PARENT itself is approved — and there is **no automatic
 parent completion**: `children_done` is a signal, the parent agent decides what
 to do and submits its own work.
 
+**Blocked roll-up and the human interface (T337).** Blocking a child records a
+durable `child_blocked` note on its IMMEDIATE parent (`children_blocked` when ALL
+direct children are blocked) and messages the parent's assignee when it has one —
+one hop only, same as completion. A `blocked_human` task additionally reaches a
+**human**, so a decision can never sit unseen:
+
+- the recipient is `RELAY_HUMAN` if set, else the nearest **assigned ancestor**
+  (walking up `parent_task_id` — the coordinator / program-root is just the
+  topmost assigned ancestor);
+- the message is `kind=blocked_human` (an immediate kind) and carries the task id
+  **and** the decision-needed reason, so the human can act without digging;
+- if **no** ancestor is assigned, relay records a prominent
+  `blocked_human_unrouted` note on the task and a `task.blocked_human_unrouted`
+  event instead of parking it silently.
+
+`blocked_internal` keeps the parent roll-up only and never pings the human.
+Because even immediate kinds defer while a worker is mid-turn, this surfaces at
+the recipient's next idle/turn boundary (or immediately for an idle human).
+
 **Runtime idle is not task idle (bounded quiet lease).** A worker may hold a
 RUNNING task and still end its turn (session idle). Normally that is an anomaly;
 to make a *deliberate* short wait explicit and bounded, declare a quiet lease:

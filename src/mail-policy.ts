@@ -12,6 +12,8 @@ export const IMMEDIATE_MAIL_KINDS = [
   "children_done",
   "child_blocked",
   "children_blocked",
+  /** T337: a task entered blocked_human — surface it to the human interface. */
+  "blocked_human",
   /** `relay send --urgent`: a genuine interrupt that MAY wake a busy worker. */
   "urgent",
 ] as const;

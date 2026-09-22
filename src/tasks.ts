@@ -846,6 +846,65 @@ function notifySubmitter(
  * direct children are blocked/failed) and send a durable message to the parent's
  * current assignee. No recursion; no automatic parent state change.
  */
+/**
+ * Resolve the HUMAN-INTERFACE recipient for a task (T337):
+ *   1. RELAY_HUMAN (explicit operator/conductor alias), else
+ *   2. the nearest ASSIGNED ancestor (walk up `parent_task_id`), else
+ *   3. null (no one to address — the caller logs a prominent attention event).
+ *
+ * The coordinator / program-root is just the topmost assigned ancestor, so the
+ * walk covers it without a special case.
+ */
+export function resolveHumanInterface(db: Database, task: Task): string | null {
+  const explicit = process.env.RELAY_HUMAN?.trim();
+  if (explicit) return explicit;
+  const seen = new Set<string>([task.id]);
+  for (let cur: string | null = task.parent_task_id; cur; ) {
+    if (seen.has(cur)) break; // malformed cycle: stop, never hang
+    seen.add(cur);
+    const anc = getTask(db, cur);
+    if (!anc) break;
+    if (anc.assignee) return anc.assignee;
+    cur = anc.parent_task_id;
+  }
+  return null;
+}
+
+/**
+ * T337: a task entering blocked_human must reach a HUMAN promptly, not just the
+ * parent's assignee (which may not exist). Sends an IMMEDIATE
+ * `blocked_human` message carrying the task id + the decision-needed reason to
+ * the human interface, and — when NO assignee exists anywhere on the ancestor
+ * chain — logs a prominent `task.blocked_human_unrouted` attention event so the
+ * block is never parked silently. `blocked_internal` never calls this.
+ */
+function notifyHumanBlocked(db: Database, task: Task, actor: string, reason: string, at: number): void {
+  const body =
+    `${RELAY_TAG}${task.id} is BLOCKED ON A HUMAN DECISION${reason ? `: ${reason}` : ""}. ` +
+    `Run \`relay task show ${task.id}\`, decide, then \`relay unblock ${task.id}\`.`;
+  const recipient = resolveHumanInterface(db, task);
+  if (recipient) {
+    // `blocked_human` is an immediate kind: it does not wait the nudge window.
+    sendMessage(db, "relay", recipient, body, { kind: "blocked_human", taskId: task.id });
+  } else {
+    // No human interface resolvable anywhere up the chain: make it LOUD.
+    db.query(
+      `INSERT INTO task_notes (task_id, worker_id, kind, body, created_at) VALUES (?, ?, 'blocked_human_unrouted', ?, ?)`
+    ).run(task.id, actor, body, at);
+  }
+  logEvent(db, {
+    source: "supervisor",
+    taskId: task.id,
+    type: recipient ? "task.blocked_human_notified" : "task.blocked_human_unrouted",
+    payload: { recipient: recipient ?? null, reason },
+  });
+}
+
+/**
+ * Blocked-child roll-up (one hop only): the immediate parent gets a durable
+ * `child_blocked` note (+ `children_blocked` when ALL direct children are
+ * blocked) and, when it has an assignee, an immediate message to that worker.
+ */
 function bubbleChildBlocked(db: Database, child: Task, actor: string, reason: string, at: number): void {
   const parentId = child.parent_task_id;
   if (!parentId) return;
@@ -940,6 +999,9 @@ export function blockTask(db: Database, taskId: string, workerId: string, reason
     logEvent(db, { source: "worker", workerId, taskId, type: human ? "task.blocked_human" : "task.blocked_internal", payload: { reason } });
     // One-hop roll-up: the immediate parent assignee must learn a child is stuck.
     bubbleChildBlocked(db, getTask(db, taskId)!, workerId, reason, t);
+    // T337: a HUMAN block also reaches the human interface (or shouts if none
+    // resolves). blocked_internal never pings the human.
+    if (human) notifyHumanBlocked(db, getTask(db, taskId)!, workerId, reason, t);
   })();
   return getTask(db, taskId)!;
 }

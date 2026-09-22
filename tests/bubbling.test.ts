@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Database } from "bun:sqlite";
 import { openDb } from "../src/db";
+import { listEvents } from "../src/events";
 import { inboxFor, sendMessage } from "../src/messages";
 import { addTask, approveTask, claimTask, getNotes, getTask, releaseTask, submitTask, blockTask, setTaskParent, taskChildren } from "../src/tasks";
 import { registerWorker } from "../src/workers";
@@ -219,6 +220,65 @@ describe("one-hop completion bubbling", () => {
   });
 });
 
+// T337: a blocked_human task must reach the human interface, never park silently.
+describe("blocked_human human notification (T337)", () => {
+  const savedHuman = process.env.RELAY_HUMAN;
+  afterEach(() => {
+    if (savedHuman === undefined) delete process.env.RELAY_HUMAN;
+    else process.env.RELAY_HUMAN = savedHuman;
+  });
+
+  test("RELAY_HUMAN receives an immediate blocked_human message with id + reason", () => {
+    process.env.RELAY_HUMAN = "operator-inbox";
+    const t = addTask(db, { title: "needs a decision" });
+    blockTask(db, t.id, "w1", "which NOS first?", true);
+    const msgs = inboxFor(db, "operator-inbox");
+    const m = msgs.find((x) => x.kind === "blocked_human")!;
+    expect(m).toBeTruthy();
+    expect(m.task_id).toBe(t.id);
+    expect(m.payload).toContain(t.id);
+    expect(m.payload).toContain("which NOS first?");
+  });
+
+  test("with no RELAY_HUMAN, the nearest ASSIGNED ancestor is the human interface", () => {
+    delete process.env.RELAY_HUMAN;
+    registerWorker(db, "coord", { role: "worker" });
+    const root = addTask(db, { title: "program root" });
+    db.query(`UPDATE tasks SET assignee='coord' WHERE id=?`).run(root.id);
+    const mid = addTask(db, { title: "mid", parentTaskId: root.id }); // unassigned
+    const leaf = addTask(db, { title: "leaf", parentTaskId: mid.id });
+    blockTask(db, leaf.id, "w1", "need a person", true);
+    expect(inboxFor(db, "coord").some((m) => m.kind === "blocked_human" && m.task_id === leaf.id)).toBe(true);
+  });
+
+  test("when NO ancestor is assigned, a prominent attention note + event is recorded", () => {
+    delete process.env.RELAY_HUMAN;
+    const orphan = addTask(db, { title: "orphan" }); // no parent, no assignee
+    blockTask(db, orphan.id, "w1", "stuck", true);
+    expect(getNotes(db, orphan.id).some((n) => n.kind === "blocked_human_unrouted")).toBe(true);
+    const ev = listEvents(db, { limit: 50 }).find((e) => e.type === "task.blocked_human_unrouted");
+    expect(ev).toBeTruthy();
+  });
+
+  test("blocked_internal never pings the human interface", () => {
+    process.env.RELAY_HUMAN = "operator-inbox";
+    const t = addTask(db, { title: "internal" });
+    blockTask(db, t.id, "w1", "engine bug", false);
+    expect(inboxFor(db, "operator-inbox").some((m) => m.kind === "blocked_human")).toBe(false);
+    expect(getNotes(db, t.id).some((n) => n.kind === "blocked_human_unrouted")).toBe(false);
+  });
+
+  test("the one-hop parent roll-up still fires for blocked_human (b)", () => {
+    delete process.env.RELAY_HUMAN;
+    registerWorker(db, "p", { role: "worker" });
+    const parent = addTask(db, { title: "parent" });
+    db.query(`UPDATE tasks SET assignee='p' WHERE id=?`).run(parent.id);
+    const child = addTask(db, { title: "child", parentTaskId: parent.id });
+    blockTask(db, child.id, "w1", "blocked", true);
+    expect(getNotes(db, parent.id).some((n) => n.kind === "child_blocked")).toBe(true);
+    expect(inboxFor(db, "p").some((m) => m.kind === "child_blocked")).toBe(true);
+  });
+});
 // T324: parent_task_id was creation-only, so a subtree created without --parent
 // was orphaned (no bubbling, wrong tree). `setTaskParent` is the supported fix.
 describe("task reparenting (T324)", () => {

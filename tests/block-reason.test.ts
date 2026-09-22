@@ -105,7 +105,9 @@ describe("relay block: the reason is never a flag token", () => {
 
     expect(r.code).toBe(0);
     expect(taskRow(id).state).toBe("blocked_human");
-    expect(notes(id).at(-1)!.body).toBe("needs a person");
+    // The reason note is the blocked_human note (T337 appends a separate
+    // blocked_human_unrouted attention note when no human interface resolves).
+    expect(notes(id).find((n) => n.kind === "blocked_human")!.body).toBe("needs a person");
   });
 
   test("a missing reason fails closed and writes no block note", async () => {
