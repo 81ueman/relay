@@ -185,6 +185,7 @@ const SESSION_LIVENESS_TYPES = [
   "tool.execute.after",
   "session.idle",
   "session.status",
+  "session.created",
   "session.error",
   "session.viewed",
   "session.heartbeat",
@@ -211,6 +212,41 @@ function lastSessionEventAt(db: Database, workerId: string): number {
 /** True when the worker's SESSION emitted an event within the liveness window. */
 function sessionEventFresh(db: Database, workerId: string, at: number): boolean {
   return at - lastSessionEventAt(db, workerId) <= sessionLivenessMs();
+}
+
+/**
+ * The newest successful codex agent poll for this worker (status working/idle/
+ * blocked), 0 when none. Codex has no plugin event stream, so its liveness comes
+ * from `pollCodexWorker`; a reachable agent must not be declared dead just
+ * because a later `isAlive` probe transiently fails.
+ */
+function lastCodexPollAt(db: Database, workerId: string): number {
+  const r = db
+    .query(
+      `SELECT MAX(timestamp) AS t FROM events
+        WHERE worker_id = ? AND type = 'worker.status_polled'
+          AND (payload_json LIKE '%"status":"working"%'
+            OR payload_json LIKE '%"status":"idle"%'
+            OR payload_json LIKE '%"status":"blocked"%')`
+    )
+    .get(workerId) as { t: number | null };
+  return r.t ?? 0;
+}
+
+/**
+ * Evidence that the worker's session is ALIVE even when `rt.isAlive` reports it
+ * gone, or null when there is none. Ordered strongest-first:
+ *   - a genuine managed-session event (opencode plugin stream);
+ *   - a live in-flight tool marker (a long benchmark emits `tool.started` and
+ *     nothing until it returns; `processInFlightTools` has already reaped markers
+ *     past their budget, so a surviving marker is a running tool);
+ *   - a recent successful codex agent poll (no event stream).
+ */
+function sessionAliveEvidence(db: Database, w: WorkerRow, at: number): string | null {
+  if (sessionEventFresh(db, w.id, at)) return "event";
+  if (w.tool_started_at !== null && at - w.tool_started_at <= toolHardCapMs()) return "tool";
+  if (w.agent_kind === "codex" && at - lastCodexPollAt(db, w.id) <= sessionLivenessMs()) return "codex-poll";
+  return null;
 }
 
 function recentlyWoken(db: Database, workerId: string, at: number): boolean {
@@ -940,10 +976,11 @@ export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<
     // restartWorker marks it stale and cleanup reaps it after the grace period.
     if (fresh.state === "dead" || fresh.state === "stalled") {
       // T393: a failed-state worker whose session is still emitting managed
-      // events is ALIVE (the state is a stale verdict). Revive it in place —
-      // restarting would spawn a DUPLICATE generation while the live session
-      // keeps running unsupervised.
-      if (sessionEventFresh(db, w.id, at)) {
+      // events (or holding a live in-flight tool) is ALIVE (the state is a stale
+      // verdict). Revive it in place — restarting would spawn a DUPLICATE
+      // generation while the live session keeps running unsupervised.
+      const evidence = sessionAliveEvidence(db, fresh, at);
+      if (evidence) {
         reviveFailedWorkerIfAlive(db, w.id, at);
         actions.push(`revived-by-event:${w.id}`);
         continue;
@@ -995,19 +1032,19 @@ export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<
     const alive = await rt.isAlive(fresh).catch(() => false);
 
     if (!alive) {
-      // T393: never declare dead while the SESSION is still emitting managed
-      // events. After an OpenCode/Herdr restart the transport probe can fail on
-      // a stale target while the session keeps running and producing output;
-      // treating that as a crash orphans its running compute AND spawns a
-      // DUPLICATE generation for the same worker. Only a probe failure with NO
-      // recent session output is a real crash.
-      if (sessionEventFresh(db, w.id, at)) {
+      // T393: never declare dead while the SESSION is still demonstrably alive.
+      // After an OpenCode/Herdr restart the transport probe can fail on a stale
+      // target while the session keeps running; treating that as a crash orphans
+      // its running compute AND spawns a DUPLICATE generation for the same
+      // worker. Only a probe failure with NO liveness evidence is a real crash.
+      const evidence = sessionAliveEvidence(db, fresh, at);
+      if (evidence) {
         if (!recentlyEvent(db, w.id, "worker.alive_by_event", at, sessionLivenessMs())) {
           logEvent(db, {
             source: "supervisor",
             workerId: w.id,
             type: "worker.alive_by_event",
-            payload: { probe: "isAlive=false", taskId: fresh.current_task_id },
+            payload: { probe: "isAlive=false", evidence, taskId: fresh.current_task_id },
           });
         }
         actions.push(`alive-by-event:${w.id}`);

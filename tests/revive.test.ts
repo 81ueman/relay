@@ -6,12 +6,12 @@ import type { Database } from "bun:sqlite";
 import { openDb } from "../src/db";
 import { listEvents, logEvent } from "../src/events";
 import { reconcile } from "../src/reconciler";
-import { MockRuntime } from "../src/runtime/runtime";
+import { MockRuntime, type HerdrIdentity } from "../src/runtime/runtime";
 import { recordRuntime } from "../src/runtimes";
 import { attachSession } from "../src/sessions";
 import { handleSocketMessage, type SocketContext } from "../src/socket";
 import { addTask } from "../src/tasks";
-import { getWorker, registerWorker } from "../src/workers";
+import { getWorker, registerWorker, setWorkerTool } from "../src/workers";
 
 // External (manually attached, relay_owned=0) workers have NO restart path: a
 // worker misclassified `dead` (transient isAlive failure, or a stale binding at
@@ -162,5 +162,50 @@ describe("T393: an emitting session is never dead", () => {
     const { actions } = await reconcile(db, rt);
     expect(actions).toContain("dead:rev-4");
     expect(getWorker(db, "rev-4")!.state).toBe("dead");
+  });
+});
+
+// T396: liveness evidence beyond the raw event window.
+const CODEX_ID = "01a0c405-70ba-7bf0-8522-98eba9dd5299";
+const codexIdentity: HerdrIdentity = {
+  agent: "codex-x", tabId: "t", paneId: "p", workspaceId: "w", agentKind: "codex",
+};
+
+describe("T396: liveness evidence beyond the event window", () => {
+  test("an in-flight tool keeps a worker alive past the session-liveness window", async () => {
+    attachExternal("rev-5", "worker");
+    db.query(`UPDATE workers SET state = 'working' WHERE id = 'rev-5'`).run();
+    setWorkerTool(db, "rev-5", { name: "shell", command: "cargo test" });
+    rt.setAlive("rev-5", false); // stale probe: a long benchmark emits no events
+
+    const { actions } = await reconcile(db, rt);
+    expect(actions).toContain("alive-by-event:rev-5");
+    expect(actions).not.toContain("dead:rev-5");
+    expect(getWorker(db, "rev-5")!.state).not.toBe("dead");
+    expect(rt.starts).toHaveLength(0);
+  });
+
+  test("session.created counts as a session-liveness event", async () => {
+    attachExternal("rev-6", "worker");
+    db.query(`UPDATE workers SET state = 'working' WHERE id = 'rev-6'`).run();
+    logEvent(db, { source: "opencode", workerId: "rev-6", type: "session.created", payload: {} });
+    rt.setAlive("rev-6", false);
+
+    const { actions } = await reconcile(db, rt);
+    expect(actions).toContain("alive-by-event:rev-6");
+    expect(getWorker(db, "rev-6")!.state).not.toBe("dead");
+  });
+
+  test("a recent successful codex poll keeps a codex worker alive", async () => {
+    registerWorker(db, "rev-codex", { role: "worker", agentKind: "codex", runtimeId: "w6D:p8" });
+    attachSession(db, CODEX_ID, {
+      role: "worker", workerId: "rev-codex", agentKind: "codex", identity: codexIdentity,
+    });
+    rt.setAgentStatus("rev-codex", "working");
+    rt.setAlive("rev-codex", false); // the direct probe lies; the poll was healthy
+
+    const { actions } = await reconcile(db, rt);
+    expect(actions).toContain("alive-by-event:rev-codex");
+    expect(getWorker(db, "rev-codex")!.state).not.toBe("dead");
   });
 });
