@@ -1,4 +1,6 @@
 import { execFileSync } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 
 /**
  * T338: report which revision the RUNNING artifact is.
@@ -43,10 +45,27 @@ export function buildCommit(): string | null {
   }
 }
 
-/** Repo HEAD of the checkout the CLI is running from, or null (installed build). */
-export function repoHead(): string | null {
+/**
+ * Repo HEAD of the RELAY checkout the CLI is running inside, or null.
+ *
+ * It MUST be null when the CWD is some other git repo (e.g. the nv-papers
+ * worktrees every worker runs `relay` from): comparing the embedded build commit
+ * against an unrelated project's HEAD produced a false "build is behind" warning
+ * naming the wrong repo. We therefore verify the repo is relay before returning
+ * anything — the root package.json `name` must be "relay".
+ */
+export function repoHead(cwd = process.cwd()): string | null {
   try {
-    return execFileSync("git", ["rev-parse", "--short", "HEAD"], {
+    const root = execFileSync("git", ["-C", cwd, "rev-parse", "--show-toplevel"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    if (!root) return null;
+    const pkgPath = join(root, "package.json");
+    if (!existsSync(pkgPath)) return null;
+    const pkg = JSON.parse(readFileSync(pkgPath, "utf8")) as { name?: string };
+    if (pkg?.name !== "relay") return null; // not the relay repo: never compare
+    return execFileSync("git", ["-C", root, "rev-parse", "--short", "HEAD"], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
     }).trim() || null;
