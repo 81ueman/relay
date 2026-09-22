@@ -22,6 +22,7 @@ import {
   quietActive, registerWorker, retireWorker, setWorkerState, touchSeen, unretireWorker,
 } from "./workers";
 import { resolveWorkerIdentity } from "./identity";
+import { attachPrompt, createLane, realHerdrRunner, reapLane } from "./spawn";
 import { runDashboard } from "./dashboard/command";
 import { runGc } from "./gc";
 
@@ -111,12 +112,26 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
     about: "Manage worker identities (the assignees in the durable task ledger).",
     usage: [
       "relay worker register <id> [--role worker] [--runtime <herdr-target>] [--session <sid>] [--cwd <dir>] [--command <cmd>]",
+      "relay worker spawn <id> --role <R> [--kind opencode|codex] [--base <ref>] [--label <L>] [--cwd <dir>] [--no-attach]",
+      "relay worker reap <id> [--worktree <path>] [--pane <pane>]",
       "relay worker list [--all]",
       "relay worker status <id>",
       "relay worker bind <id> --session <sid>",
       "relay worker retire <id> [--reason <text>]",
       "relay worker unretire <id>",
     ],
+  },
+  "worker spawn": {
+    about:
+      "One-command lane setup: create the Herdr worktree (+workspace), start the agent in its root pane, register the worker (adopted, not a managed generation) and prompt the agent to call agent_attach (the session id only exists after the first turn, so attach is agent-driven). Prints the worktree path + pane/workspace. --no-attach skips the prompt; --cwd reuses an existing directory instead of creating a worktree.",
+    usage: [
+      "relay worker spawn <id> --role <R> [--kind opencode|codex] [--base <ref>] [--label <L>] [--cwd <dir>] [--pane <pane>] [--no-attach]",
+    ],
+  },
+  "worker reap": {
+    about:
+      "One-command lane teardown (inverse of spawn): retire the worker (so no work is routed), close its Herdr pane and remove the worktree. Best-effort and idempotent — an already-gone pane/worktree is reported, not an error. Paths are read from the worker row unless --worktree/--pane override.",
+    usage: ["relay worker reap <id> [--worktree <path>] [--pane <pane>] [--reason <text>]"],
   },
   "worker register": {
     about: "Register a worker. Also writes .relay/worker-id, a SHARED-checkout default used only when --worker/$RELAY_WORKER/the caller's pane cannot name a worker.",
@@ -386,7 +401,7 @@ const VALUE_FLAGS = new Set([
   "--role", "--state", "--limit", "--interval", "--session", "--runtime", "--cwd",
   "--command", "--title", "--kind", "--acceptance", "--priority", "--parent", "--plan",
   "--dir", "--worktree", "--pane", "--tab", "--workspace", "--type", "--payload",
-  "--ack", "--depends-on", "--older-than",
+  "--ack", "--depends-on", "--older-than", "--base", "--label",
 ]);
 
 /** Positional args only, skipping flags and their (known) values, e.g. ["T12","reason"]. */
@@ -501,6 +516,82 @@ async function main(): Promise<void> {
           if (!id) throw new Error("usage: relay worker retire <id> [--reason <text>]");
           const w = retireWorker(db, id, flag(argv.slice(2), "--reason") ?? undefined);
           console.log(`retired ${w.id} role=${w.role}${w.retired_reason ? ` reason=${w.retired_reason}` : ""}`);
+        } else if (sub === "spawn") {
+          const id = argv[2];
+          if (!id) {
+            throw new Error(
+              "usage: relay worker spawn <id> --role <R> [--kind opencode|codex] [--base <ref>] [--label <L>] " +
+              "[--cwd <existing-dir>] [--pane <pane>] [--no-attach]"
+            );
+          }
+          const rest = argv.slice(2);
+          const role = flag(rest, "--role") ?? "worker";
+          const kind = flag(rest, "--kind") ?? "opencode";
+          const wantAttach = !hasFlag(rest, "--no-attach");
+          if (!knownRole(db, role)) {
+            console.error(
+              `relay: warning: role '${role}' matches no registered worker and is not a known special role ` +
+                `(worker/planner/reviewer); the lane's tasks may be unclaimable.`
+            );
+          }
+          // Fail closed before doing anything external: a duplicate id would
+          // otherwise create a worktree/agent we cannot register.
+          const existing = getWorker(db, id);
+          if (existing && existing.retired_at === null && existing.opencode_session_id) {
+            throw new Error(`worker ${id} already exists and is attached; use 'relay worker reap ${id}' to tear it down first`);
+          }
+          const created = createLane({
+            id,
+            role,
+            kind,
+            base: flag(rest, "--base") ?? undefined,
+            label: flag(rest, "--label") ?? undefined,
+            cwd: flag(rest, "--cwd") ?? undefined,
+            pane: flag(rest, "--pane") ?? undefined,
+          });
+          for (const s of created.steps) console.log(`  ${s}`);
+          // Register exactly like `relay worker register --runtime`, so the lane
+          // worker is an ADOPTED (relay_owned=0) worker, not a managed generation.
+          const w = registerWorker(db, id, {
+            role,
+            agentKind: kind === "codex" ? "codex" : "opencode",
+            runtimeId: created.paneId ?? undefined,
+            cwd: created.worktreePath,
+          });
+          if (!existing) setWorkerState(db, id, "idle");
+          if (created.paneId) {
+            adoptRuntimeTarget(db, { workerId: id, generation: w.generation, target: created.paneId });
+          }
+          let attachPrompted = false;
+          if (wantAttach) {
+            const prompt = attachPrompt(id, created.paneId);
+            const r = (realHerdrRunner())(["agent", "prompt", created.agentName, prompt], 60000);
+            attachPrompted = r.ok;
+            if (!r.ok) {
+              console.error(`relay: warning: could not prompt ${id} to attach: ${(r.stderr || r.stdout).trim().slice(0, 160)}`);
+              console.error(`relay: run: herdr agent prompt ${id} '${prompt}'`);
+            } else {
+              console.log(`  prompted ${id} to attach`);
+            }
+          }
+          console.log(`spawned ${w.id} role=${w.role} kind=${kind}`);
+          console.log(`  worktree: ${created.worktreePath}`);
+          console.log(`  pane:     ${created.paneId ?? "-"}${created.workspaceId ? `  workspace: ${created.workspaceId}` : ""}`);
+          if (!wantAttach) console.log(`  attach skipped (--no-attach); prompt it later: relay worker status ${w.id}`);
+        } else if (sub === "reap") {
+          const id = argv[2];
+          if (!id) throw new Error("usage: relay worker reap <id> [--worktree <path>] [--pane <pane>]");
+          const rest = argv.slice(2);
+          const w = getWorker(db, id);
+          if (!w) throw new Error(`unknown worker: ${id}`);
+          const paneId = flag(rest, "--pane") ?? w.runtime_id ?? null;
+          const worktreePath = flag(rest, "--worktree") ?? w.cwd ?? null;
+          // Retire FIRST so no further work is routed to the lane.
+          const retired = retireWorker(db, id, flag(rest, "--reason") ?? "reaped");
+          console.log(`retired ${retired.id}`);
+          const steps = reapLane({ workerId: id, paneId, worktreePath });
+          for (const s of steps) console.log(`  ${s}`);
+          console.log(`reaped ${id}${paneId ? ` pane=${paneId}` : ""}${worktreePath ? ` worktree=${worktreePath}` : ""}`);
         } else if (sub === "unretire") {
           const id = argv[2];
           if (!id) throw new Error("usage: relay worker unretire <id>");

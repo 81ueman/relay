@@ -55,6 +55,13 @@ herdr worktree create --branch <lane> --base main --label <LANE> --no-focus
 # 返り値の worktree path と workspace id / root pane id を使う
 ```
 
+**手順 1–2 は `relay worker spawn` で 1 コマンドにまとまる**（worktree 作成 →
+agent 起動 → register → attach prompt）。個別に制御したい場合だけ手で行う:
+
+```sh
+relay worker spawn <worker-name> --role <role> --base <lane-base> --label <LANE>
+relay worker reap  <worker-name>   # retire + pane close + worktree remove（teardown）
+
 既存 worktree を開き直す場合:
 
 ```sh

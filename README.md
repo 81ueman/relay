@@ -135,6 +135,34 @@ tombstone instead and takes it out of every operational surface:
   the tombstone and logs `worker.unretired`. Only a *successful* attach revives;
   a rejected one leaves the tombstone untouched.
 
+### One-command lane setup: `relay worker spawn` / `relay worker reap`
+
+Spawning a managed worker is a repeated 4-step sequence (worktree → agent start
+→ register → prompt to attach). `relay worker spawn` does all four:
+
+```bash
+relay worker spawn dsl-v4-w1 --role dsl-v4 --base dsl-v4 [--label DSL-V4-W1]
+relay worker spawn reviewer-6 --role reviewer --cwd /existing/dir --pane w75:p1
+relay worker spawn w7 --role worker --kind codex --no-attach
+relay worker reap dsl-v4-w1            # retire + close pane + remove worktree
+```
+
+- It runs exactly the documented primitives, in order:
+  `herdr worktree create --branch <id> --base <ref> --label <L> --no-focus`
+  (unless `--cwd` reuses an existing directory), then finds the lane workspace's
+  root pane, then `herdr agent start <id> --kind <k> --pane <p> --timeout 90000`,
+  then `relay worker register` (as an **adopted** worker, `relay_owned=0` — not a
+  managed generation) and finally prompts the agent to call `agent_attach`. The
+  session id does not exist until the first turn, so **attach stays
+  agent-driven**: spawn only sends the prompt.
+- It is **fail-closed**: a failed `worktree create` / `agent start`, or a create
+  that returns no path, aborts with Herdr's reason instead of registering a
+  worker with no pane. `--no-attach` skips the prompt (prompt it later yourself).
+- `relay worker reap <id>` is the inverse: it **retires** the worker first (so no
+  further work is routed), then closes the Herdr pane and removes the worktree.
+  It is **idempotent** — a pane/worktree that is already gone is reported, not an
+  error. Paths come from the worker row unless `--worktree`/`--pane` override.
+
 ### Run gating: declared prerequisites (`relay task depend`)
 
 A queued task is **not runnable** — never offered by `relay next`, never
