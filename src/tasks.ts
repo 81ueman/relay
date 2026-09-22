@@ -430,15 +430,9 @@ export function claimNext(db: Database, workerId: string, opts: ClaimOptions = {
       // actively-working reviewer. An alive-but-idle or moved-on assignee must
       // NOT strand the review (a review claim carries no lease, so it is
       // defended only while the holder is actually on it).
-      const heldByLiveReviewer = (r: Task): boolean => {
-        if (!r.assignee || r.assignee === workerId) return false;
-        const holder = getWorker(db, r.assignee);
-        if (!holder || holder.state === "dead" || holder.state === "stalled") return false;
-        return holder.state === "working" && holder.current_task_id === r.id;
-      };
-      const review = (db
-        .query(`SELECT * FROM tasks WHERE state = 'review' ORDER BY priority DESC, created_at ASC`)
-        .all() as Task[]).find((r) => !heldByLiveReviewer(r)) ?? null;
+      const review = reviewTasks(db).find(
+        (r) => r.assignee === workerId || !reviewHeldByLiveReviewer(db, r)
+      ) ?? null;
       if (review) {
         db.query(`UPDATE tasks SET assignee = ?, updated_at = ? WHERE id = ?`).run(workerId, t, review.id);
         db.query(
@@ -1078,6 +1072,30 @@ export function runnableTasks(db: Database): Task[] {
 
 export function reviewTasks(db: Database): Task[] {
   return db.query(`SELECT * FROM tasks WHERE state = 'review' ORDER BY priority DESC, created_at ASC`).all() as Task[];
+}
+
+/**
+ * A review is HELD when a DIFFERENT, live, actively-working reviewer owns it.
+ * A review claim carries no lease, so it is defended only while the holder is
+ * actually on it: an alive-but-idle or moved-on assignee does NOT hold it, and
+ * a dead/stalled holder does not either. Shared by `relay next` (claimNext),
+ * the review NUDGE, and the `relay status` next-annotation so all three agree
+ * about what a reviewer can actually take.
+ */
+export function reviewHeldByLiveReviewer(db: Database, r: Task): boolean {
+  if (!r.assignee) return false;
+  const holder = getWorker(db, r.assignee);
+  if (!holder || holder.state === "dead" || holder.state === "stalled") return false;
+  return holder.state === "working" && holder.current_task_id === r.id;
+}
+
+/** Reviews a reviewer could actually claim right now (not held by a live reviewer). */
+export function claimableReviews(db: Database): Task[] {
+  return reviewTasks(db).filter((r) => !reviewHeldByLiveReviewer(db, r));
+}
+
+export function hasClaimableReview(db: Database): boolean {
+  return claimableReviews(db).length > 0;
 }
 
 export function unfinishedCount(db: Database): number {

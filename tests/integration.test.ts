@@ -332,6 +332,28 @@ describe("planner / reviewer automation", () => {
     expect(getTask(db, t.id)!.state).toBe("review");
   });
 
+  test("an idle reviewer is not nudged for a review a live reviewer is working (T346)", async () => {
+    worker("w1");
+    managedWorker("rev-held", "reviewer");
+    managedWorker("rev-free", "reviewer");
+    const t = addTask(db, { title: "to review" });
+    claimNext(db, "w1");
+    submitTask(db, t.id, "w1", { evidence: "e" });
+
+    // rev-held takes the review: held by a live, actively-working reviewer.
+    expect(claimNext(db, "rev-held")!.id).toBe(t.id);
+    expect(getWorker(db, "rev-held")!.state).toBe("working");
+
+    const held = await reconcile(db, rt);
+    expect(held.actions).not.toContain("reviewer-woken:rev-free");
+    expect(held.actions).not.toContain("reviewer-woken:rev-held"); // working, not idle
+
+    // Holder moves on -> the review is claimable again and idle reviewers are nudged.
+    db.query(`UPDATE workers SET state = 'idle', current_task_id = NULL WHERE id = 'rev-held'`).run();
+    const freed = await reconcile(db, rt);
+    expect(freed.actions).toContain("reviewer-woken:rev-free");
+  });
+
   test("RELAY_AUTO_APPROVE drains review queue", async () => {
     process.env.RELAY_AUTO_APPROVE = "true";
     worker("w1");

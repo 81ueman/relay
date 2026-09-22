@@ -1,7 +1,7 @@
 import type { Database } from "bun:sqlite";
 import { findRuntime, getStartingRuntime } from "./runtimes";
 import { getSession } from "./sessions";
-import { reviewTasks, runnableTasks, taskCounts, unclaimableRunnableTasks, unfinishedCount } from "./tasks";
+import { claimableReviews, reviewTasks, runnableTasks, taskCounts, unclaimableRunnableTasks, unfinishedCount } from "./tasks";
 import { listWorkers, type WorkerRow } from "./workers";
 
 export function stallMs(): number {
@@ -205,6 +205,8 @@ export function planners(db: Database): { id: string; state: string }[] {
 export interface SupervisorView {
   runnable: number;
   review: number;
+  /** Reviews a reviewer could actually take (not held by a live reviewer). */
+  claimableReview: number;
   unfinished: number;
   working: number;
   status: SystemStatus;
@@ -216,6 +218,7 @@ export function supervisorView(db: Database): SupervisorView {
   return {
     runnable: runnableTasks(db).length,
     review: reviewTasks(db).length,
+    claimableReview: claimableReviews(db).length,
     unfinished: unfinishedCount(db),
     working: workingWorkers(db).length,
     status: systemStatus(db),
@@ -255,5 +258,8 @@ export function needsPlanner(v: SupervisorView, plannerCount = 1): boolean {
 }
 
 export function needsReviewer(v: SupervisorView): boolean {
-  return v.review > 0;
+  // Eligibility-aware (T346): only nudge when a reviewer could ACTUALLY claim a
+  // review. A review held by a live, actively-working reviewer is not up for
+  // grabs, so waking idle reviewers for it is churn (they get NO_TASK).
+  return v.claimableReview > 0;
 }

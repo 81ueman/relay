@@ -194,7 +194,7 @@ describe("wake: queued role-gated task + matching idle worker", () => {
 
 describe("needsWorkerWakeup", () => {
   test("runnable work is enough; a busy fleet no longer suppresses it", () => {
-    const base = { review: 0, unfinished: 1, working: 0, status: "RUNNING" as const, unclaimable: 0 };
+    const base = { review: 0, claimableReview: 0, unfinished: 1, working: 0, status: "RUNNING" as const, unclaimable: 0 };
     expect(needsWorkerWakeup({ ...base, runnable: 1, working: 0 })).toBe(true);
     expect(needsWorkerWakeup({ ...base, runnable: 1, working: 6 })).toBe(true); // the fix
     expect(needsWorkerWakeup({ ...base, runnable: 0, working: 0 })).toBe(false);

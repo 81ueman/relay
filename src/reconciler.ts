@@ -45,6 +45,7 @@ import {
   defaultLeaseAlive,
   expireLeases,
   getTask,
+  hasClaimableReview,
   reviewTasks,
   unclaimableRunnableTasks,
 } from "./tasks";
@@ -1133,7 +1134,7 @@ export async function handleIdleSignal(db: Database, rt: Runtime, workerId: stri
       await tryWake(rt, db, w, NEXT_NUDGE, "idle-no-task", at);
       return "woke-next";
     }
-    if (reviewTasks(db).length > 0 && w.role === "reviewer") {
+    if (hasClaimableReview(db) && w.role === "reviewer") {
       await tryWake(rt, db, w, REVIEW_NUDGE, "idle-no-task-review", at);
       return "woke-review";
     }
@@ -1160,7 +1161,7 @@ export async function handleIdleSignal(db: Database, rt: Runtime, workerId: stri
     // A human-blocked task never parks the worker: release + move on.
     db.query(`UPDATE workers SET current_task_id = NULL, state = 'idle', updated_at = ? WHERE id = ?`).run(at, workerId);
     const fresh = getWorker(db, workerId)!;
-    if (claimableRunnableTasks(db, workerId).length > 0 || (reviewTasks(db).length > 0 && w.role === "reviewer")) {
+    if (claimableRunnableTasks(db, workerId).length > 0 || (hasClaimableReview(db) && w.role === "reviewer")) {
       await tryWake(rt, db, fresh, NEXT_NUDGE, "idle-terminal-task", at);
       return "woke-next";
     }

@@ -18,7 +18,7 @@ import { listRuntimes, adoptRuntimeTarget } from "./runtimes";
 import type { Task } from "./schema";
 import {
   addTask, approveTask, blockTask, claimNext, claimTask, claimableRunnableTasks, getNotes, getTask,
-  listTasks, notesClaimingApproval, notYetRunnableTasks, rejectTask, releaseTask, runnableTasks, setTaskDependencies,
+  listTasks, notesClaimingApproval, notYetRunnableTasks, rejectTask, releaseTask, reviewHeldByLiveReviewer, runnableTasks, setTaskDependencies,
   submitTask, taskCounts, taskDependencies, taskChildren, setTaskParent, unblockTask,
   unclaimableRunnableTasks, addNote, setTaskPlan, waitTask,
 } from "./tasks";
@@ -1136,7 +1136,10 @@ async function main(): Promise<void> {
         // (review tasks for a reviewer), from the same ordered runnable list, so
         // the two never disagree. No scheduling behaviour changes.
         const claimable = new Map<string, Task[]>();
-        const reviews = tasksInState(db, "review");
+        // T346: only reviews a reviewer could actually take are "next" — a
+        // review held by a live, working reviewer is not up for grabs, so it
+        // must not be advertised (mirrors `relay next`/claimNext).
+        const reviews = tasksInState(db, "review").filter((r) => !reviewHeldByLiveReviewer(db, r));
         for (const w of workers) {
           const rows = w.role === "reviewer" ? reviews : claimableRunnableTasks(db, w.id);
           // Never list the task the worker is already holding: it is not "next",
