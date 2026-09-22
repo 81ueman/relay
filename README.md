@@ -562,6 +562,7 @@ RELAY_RESTART_COOLDOWN_MS=30000 RELAY_CLEANUP_LOG_WINDOW_MS=60000
 RELAY_BOOTSTRAP_RETRY_MS=5000 RELAY_BOOTSTRAP_LOG_WINDOW_MS=60000
 RELAY_TOOL_WARN_MS=60000 RELAY_TOOL_BACKGROUND_MS=180000
 RELAY_TOOL_MAX_MS=3600000 RELAY_TOOL_STALE_GRACE_MS=60000
+RELAY_TOOL_HARD_CAP_MS=900000 RELAY_TOOL_NO_OUTPUT_MS=600000
 RELAY_BACKGROUND_KEY=ctrl+b
 RELAY_DEDICATED=1            # opt-in: allow $RELAY_SOCK when no session dir is known
 ```
@@ -1111,6 +1112,19 @@ worker, and borrowing a file default that lives in another live pane is
   running tool), and `RELAY_TOOL_BACKGROUND_MS=0` disables it. A lost finish
   event cannot pin a marker forever: it is cleared as stale past its budget
   (`worker.tool_stale`), and any explicit relay command clears it too.
+- **A long declared budget is not evidence of progress (T345).** A command that
+  asked for a 40-minute `timeout` but is wedged (no output, no finish) is
+  surfaced as `worker.tool_overdue` in ATTENTION once it passes
+  `RELAY_TOOL_NO_OUTPUT_MS` (default 10 min) — it does **not** wait out the whole
+  budget to become visible. It is also backgrounded at the absolute
+  `RELAY_TOOL_HARD_CAP_MS` (default 15 min) regardless of the declared budget, so
+  a hung call cannot hold a worker (and the task behind it) for its full budget.
+  Both are `0`-disableable. After Ctrl-B the tool marker is **cleared** and a
+  worker left with no task returns to `idle`, so state and the marker agree (the
+  background shell is intentionally untracked — poll its output yourself).
+- **Review-pending wake is change-limited (T345).** An idle reviewer is woken
+  when review work CHANGES (`review-pending`), not re-woken every wake cooldown
+  for the same unchanged review queue.
 - **All work done**: the system goes quiet. The planner is not woken to invent
   new work unless unfinished work still exists and the queue is below low-water.
 

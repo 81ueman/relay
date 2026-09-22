@@ -94,8 +94,26 @@ describe("dashboard model", () => {
       .some((a) => a.text.includes("runtime idle"))).toBe(true);
   });
 
-  test("an active quiet lease renders as quiet and suppresses !idle", () => {
-    registerWorker(db, "w", { role: "worker" });
+  test("a wedged long-budget tool surfaces as overdue in ATTENTION (T345)", () => {
+    const saved = process.env.RELAY_TOOL_NO_OUTPUT_MS;
+    process.env.RELAY_TOOL_NO_OUTPUT_MS = "600000";
+    try {
+      registerWorker(db, "w", { role: "worker" });
+      const t = addTask(db, { title: "work" });
+      claimTask(db, t.id, "w");
+      // 40-minute declared budget, ~12 minutes in: past the no-output window.
+      db.query(`UPDATE workers SET tool_name='bash', tool_command='sleep 999', tool_started_at=?, tool_timeout_ms=2400000 WHERE id='w'`)
+        .run(at - 700_000);
+      const texts = view().attention.map((a) => a.text).join(" | ");
+      expect(texts).toContain("tool bash overdue");
+      expect(texts).toContain("timeout 2400s");
+    } finally {
+      if (saved === undefined) delete process.env.RELAY_TOOL_NO_OUTPUT_MS;
+      else process.env.RELAY_TOOL_NO_OUTPUT_MS = saved;
+    }
+  });
+
+  test("an active quiet lease renders as quiet and suppresses !idle", () => {    registerWorker(db, "w", { role: "worker" });
     const t = addTask(db, { title: "work" });
     claimTask(db, t.id, "w");
     recordRuntime(db, { workerId: "w", generation: 1, runtimeId: "x", paneId: "w1:p1", state: "active", relayOwned: 0 });

@@ -56,6 +56,28 @@ export function toolBackgroundMs(): number {
   return Number.isFinite(v) && v >= 0 ? v : 180000;
 }
 
+/**
+ * HARD CAP (T345): the absolute longest a foreground tool may block a turn,
+ * regardless of the budget it declared. A tool that declared a long timeout but
+ * is wedged (no output, no finish) is backgrounded once it reaches this, so a
+ * blocking call cannot hold a worker (and the task behind it) for its whole
+ * declared budget. `0` disables the cap.
+ */
+export function toolHardCapMs(): number {
+  const v = Number(process.env.RELAY_TOOL_HARD_CAP_MS ?? "900000");
+  return Number.isFinite(v) && v >= 0 ? v : 900000;
+}
+
+/**
+ * A long-budget tool that has produced NO output for this long is treated as
+ * WEDGED and surfaced as overdue (ATTENTION) even before the hard cap — a
+ * budget is an intent, not evidence of progress. `0` disables the signal.
+ */
+export function toolNoOutputMs(): number {
+  const v = Number(process.env.RELAY_TOOL_NO_OUTPUT_MS ?? "600000");
+  return Number.isFinite(v) && v >= 0 ? v : 600000;
+}
+
 export function lowWaterMark(): number {
   const v = Number(process.env.RELAY_LOW_WATER ?? "3");
   return Number.isFinite(v) && v >= 0 ? v : 3;

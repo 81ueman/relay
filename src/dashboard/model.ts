@@ -4,7 +4,7 @@ import { now } from "../db";
 import { unreadCounts } from "../messages";
 import { findRuntime, listRuntimes } from "../runtimes";
 import { getNotes, listTasks, taskCounts, unclaimableRunnableTasks } from "../tasks";
-import { toolMaxMs } from "../scheduler";
+import { toolHardCapMs, toolMaxMs, toolNoOutputMs, toolWarnMs } from "../scheduler";
 import { listWorkers, quietActive, type WorkerRow } from "../workers";
 import type { Task, WorkerRuntime } from "../schema";
 import { readPanes, relayWorkspaces, type PaneTelemetry } from "./herdr";
@@ -325,12 +325,17 @@ function deriveAttention(
       out.push({ kind: "worker", id: w.id, ageMs: w.progressAgeMs,
                  text: `${w.taskId ?? "-"} working but runtime idle, no quiet lease` });
     }
-    // Tools are STATUS on the WORKERS row (`tool:<name> <age>`). They only rise
-    // to ATTENTION when they are ACTIONABLE: overdue (past their own timeout) or
-    // stale (no finish event was ever seen). A tool merely running past the
-    // surfacing threshold is not attention.
+    // Tools are STATUS on the WORKERS row (`tool:<name> <age>`). They rise to
+    // ATTENTION when they are ACTIONABLE: past their own timeout, past the HARD
+    // CAP, past the no-output window (a wedged long-budget tool must not wait out
+    // its whole budget — T345), or stale (no finish event was ever seen).
     if (w.tool) {
-      const overdue = w.tool.timeoutMs != null && w.tool.ageMs > w.tool.timeoutMs;
+      const cap = toolHardCapMs();
+      const noOut = toolNoOutputMs();
+      const pastBudget = w.tool.timeoutMs != null && w.tool.ageMs > w.tool.timeoutMs;
+      const pastCap = cap > 0 && w.tool.ageMs > cap && w.tool.ageMs > toolWarnMs();
+      const noOutput = noOut > 0 && w.tool.ageMs > noOut;
+      const overdue = pastBudget || pastCap || noOutput;
       const stale = w.tool.ageMs > toolMaxMs();
       if (overdue || stale) {
         const budget = w.tool.timeoutMs != null ? `, timeout ${Math.round(w.tool.timeoutMs / 1000)}s` : "";

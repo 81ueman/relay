@@ -30,7 +30,9 @@ import {
   supervisedWorkers,
   supervisorView,
   toolBackgroundMs,
+  toolHardCapMs,
   toolMaxMs,
+  toolNoOutputMs,
   toolStaleGraceMs,
   toolWarnMs,
 } from "./scheduler";
@@ -161,6 +163,18 @@ function recentlyEvent(db: Database, workerId: string, type: string, at: number,
 
 function recentlyWoken(db: Database, workerId: string, at: number): boolean {
   return recentlyEvent(db, workerId, "worker.woken", at, wakeCooldownMs());
+}
+
+/**
+ * The newest `worker.woken` timestamp for this worker + reason (0 if never).
+ * Used to wake only for CHANGES since the last wake of that reason (T345(c)),
+ * instead of re-waking an idle reviewer every cooldown for unchanged work.
+ */
+function lastWakeAt(db: Database, workerId: string, reason: string): number {
+  const r = db
+    .query(`SELECT MAX(timestamp) AS t FROM events WHERE worker_id = ? AND type = 'worker.woken' AND payload_json LIKE ?`)
+    .get(workerId, `%"reason":"${reason}"%`) as { t: number | null };
+  return r.t ?? 0;
 }
 
 async function tryWake(
@@ -709,8 +723,27 @@ function toolEventLogged(db: Database, workerId: string, type: string, since: nu
 /** Past its declared budget, or past the fallback threshold when it declared none. */
 function shouldBackgroundTool(w: WorkerRow, age: number): boolean {
   if (toolBackgroundMs() <= 0) return false;
+  // HARD CAP (T345): never let a declared budget keep a wedged tool blocking a
+  // turn longer than the cap. `cap=0` disables the cap (legacy behaviour).
+  const cap = toolHardCapMs();
+  if (cap > 0 && age > cap) return true;
   if (w.tool_timeout_ms != null) return age > w.tool_timeout_ms + toolStaleGraceMs();
   return age > toolBackgroundMs();
+}
+
+/**
+ * A tool is OVERDUE (surface it) when it is past the warn window AND either past
+ * the HARD CAP or past the no-output window while declaring a long budget. This
+ * is what makes a wedged long-budget tool visible in ATTENTION instead of only
+ * being recovered when its full budget elapses (T345).
+ */
+function toolOverdue(w: WorkerRow, age: number): boolean {
+  if (age <= toolWarnMs()) return false;
+  const cap = toolHardCapMs();
+  if (cap > 0 && age > cap) return true;
+  const noOut = toolNoOutputMs();
+  if (noOut > 0 && age > noOut) return true;
+  return false;
 }
 
 async function processInFlightTools(db: Database, rt: Runtime, actions: string[], at: number): Promise<void> {
@@ -747,6 +780,19 @@ async function processInFlightTools(db: Database, rt: Runtime, actions: string[]
       });
       actions.push(`tool-long:${row.id}`);
     }
+    // T345: an overdue tool (past the hard cap or the no-output window) is
+    // surfaced for ATTENTION even if its declared budget has not elapsed, so a
+    // wedged long-budget tool is visible instead of silently blocking a task.
+    if (toolOverdue(row, age) && !toolEventLogged(db, row.id, "worker.tool_overdue", startedAt)) {
+      logEvent(db, {
+        source: "supervisor",
+        workerId: row.id,
+        taskId: row.current_task_id,
+        type: "worker.tool_overdue",
+        payload: { tool: row.tool_name, command: row.tool_command, ageMs: age, timeoutMs: row.tool_timeout_ms, hardCapMs: toolHardCapMs() },
+      });
+      actions.push(`tool-overdue:${row.id}`);
+    }
 
     // Recovery: background the blocking tool so the turn can continue. Only for
     // supervised workers, and never while blocked on a permission prompt (that
@@ -778,6 +824,16 @@ async function processInFlightTools(db: Database, rt: Runtime, actions: string[]
       payload: { tool: w.tool_name, command: w.tool_command, ageMs: age, timeoutMs: w.tool_timeout_ms },
     });
     actions.push(`tool-backgrounded:${w.id}`);
+    // T345(a): after Ctrl-B the tool no longer BLOCKS the turn, but the marker
+    // would keep `tool_started_at` set forever and mask the worker as busy (so
+    // idleWorkers() never treats it as available and the overdue/no-output
+    // signals keep firing). Clear the marker so state and the marker AGREE — the
+    // background shell is intentionally untracked (there is no finish event for
+    // it); its output is the worker's own responsibility to poll.
+    clearWorkerTool(db, w.id);
+    // A worker left with no task is genuinely idle now: normalize it so it is
+    // schedulable instead of stuck "working" with no marker.
+    if (w.current_task_id === null && w.state === "working") setWorkerState(db, w.id, "idle");
     if (await tryWake(rt, db, w, BACKGROUND_NUDGE(w.tool_name ?? "tool", w.current_task_id), "tool-backgrounded", at)) {
       actions.push(`woken:${w.id}`);
     }
@@ -1021,8 +1077,15 @@ export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<
         actions.push(`auto-approved:${t.id}`);
       }
     } else {
+      // T345(c): wake an idle reviewer only when there is review work it has NOT
+      // been woken about yet. Without this, an idle reviewer is re-woken every
+      // wake-cooldown (30s) for as long as anything sits in review — pure churn.
+      // We compare the newest review-task change against the last review wake.
+      const newestReviewAt = reviewTasks(db).reduce((max, t) => Math.max(max, t.updated_at), 0);
       for (const r of idleWorkers(db).filter((x) => x.role === "reviewer")) {
         const full = getWorker(db, r.id)!;
+        const lastWake = lastWakeAt(db, r.id, "review-pending");
+        if (newestReviewAt <= lastWake) continue; // already told about this work
         if (await tryWake(rt, db, full, REVIEW_NUDGE, "review-pending", at)) actions.push(`reviewer-woken:${r.id}`);
       }
     }
