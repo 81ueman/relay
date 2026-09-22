@@ -2,10 +2,9 @@ import { spawnSync } from "node:child_process";
 import type { Database } from "bun:sqlite";
 import { now } from "../db";
 import { unreadCounts } from "../messages";
-import { nextMailNudgeIn } from "../mail-policy";
 import { findRuntime, listRuntimes } from "../runtimes";
 import { getNotes, listTasks, taskCounts, unclaimableRunnableTasks } from "../tasks";
-import { toolWarnMs } from "../scheduler";
+import { toolMaxMs } from "../scheduler";
 import { listWorkers, quietActive, type WorkerRow } from "../workers";
 import type { Task, WorkerRuntime } from "../schema";
 import { readPanes, relayWorkspaces, type PaneTelemetry } from "./herdr";
@@ -219,7 +218,7 @@ export function buildDashboardView(db: Database, opts: BuildOptions): DashboardV
   for (const w of workers) w.affinity = affinity.byWorker.get(w.id) ?? NO_AFFINITY;
 
   // ---- attention (derived only; never written to the DB) --------------------
-  const attention = deriveAttention(db, workers, tasks, at);
+  const attention = deriveAttention(db, workers, tasks);
 
   const counts = taskCounts(db);
   const view: DashboardView = {
@@ -315,8 +314,7 @@ export function buildForest(tasks: Task[]): { forest: DashboardTaskNode[]; byId:
 function deriveAttention(
   db: Database,
   workers: DashboardWorker[],
-  tasks: Task[],
-  at: number
+  tasks: Task[]
 ): DashboardAttention[] {
   const out: DashboardAttention[] = [];
   for (const w of workers) {
@@ -327,23 +325,25 @@ function deriveAttention(
       out.push({ kind: "worker", id: w.id, ageMs: w.progressAgeMs,
                  text: `${w.taskId ?? "-"} working but runtime idle, no quiet lease` });
     }
-    // Early hang detection: a command that has been running past the warn
-    // threshold is surfaced WITH its text, before the stall clock can see it
-    // (Herdr reports `working` for the whole command, so the stall path is blind).
-    if (w.tool && w.tool.ageMs > toolWarnMs()) {
-      const budget = w.tool.timeoutMs != null ? `, timeout ${Math.round(w.tool.timeoutMs / 1000)}s` : "";
-      const cmd = w.tool.command ? `: ${w.tool.command}` : "";
-      out.push({ kind: "worker", id: w.id, ageMs: w.tool.ageMs,
-                 text: `tool ${w.tool.name} running${cmd}${budget}` });
+    // Tools are STATUS on the WORKERS row (`tool:<name> <age>`). They only rise
+    // to ATTENTION when they are ACTIONABLE: overdue (past their own timeout) or
+    // stale (no finish event was ever seen). A tool merely running past the
+    // surfacing threshold is not attention.
+    if (w.tool) {
+      const overdue = w.tool.timeoutMs != null && w.tool.ageMs > w.tool.timeoutMs;
+      const stale = w.tool.ageMs > toolMaxMs();
+      if (overdue || stale) {
+        const budget = w.tool.timeoutMs != null ? `, timeout ${Math.round(w.tool.timeoutMs / 1000)}s` : "";
+        const cmd = w.tool.command ? `: ${w.tool.command}` : "";
+        out.push({ kind: "worker", id: w.id, ageMs: w.tool.ageMs,
+                   text: `tool ${w.tool.name} ${stale ? "stale" : "overdue"}${cmd}${budget}` });
+      }
     }
     if (w.state === "starting" && (w.progressAgeMs ?? 0) > 120_000) {
       out.push({ kind: "worker", id: w.id, ageMs: null, text: `starting for a while (attach stuck?)` });
     }
-    if (w.unread) {
-      const next = nextMailNudgeIn(db, w.id, at);
-      const when = next == null ? "" : next <= 0 ? " (nudge now)" : ` (next nudge in ${Math.ceil(next / 1000)}s)`;
-      out.push({ kind: "worker", id: w.id, ageMs: null, text: `unread messages=${w.unread}${when}` });
-    }
+    // `unread messages` is STATUS, not attention: it lives on the WORKERS row
+    // (`mail:N`), so a worker with queued mail does not pad ATTENTION.
     if (!w.paneId) {
       out.push({ kind: "worker", id: w.id, ageMs: null, text: "supervised worker has no visible runtime pane" });
     }

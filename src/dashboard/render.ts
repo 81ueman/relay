@@ -106,6 +106,17 @@ export function renderDashboard(view: DashboardView, opts: RenderOptions = {}): 
   }
   lines.push(trim(parts.join("   "), width));
 
+  // ATTENTION is the "what needs me" section. It renders FIRST (before WORK):
+  // the pane-height clip (T326) can hide anything below a long WORK tree, and
+  // the operator was losing the actionable rows off the bottom of the pane.
+  lines.push("");
+  lines.push(c(view.attention.length ? `ATTENTION · ${view.attention.length}` : "ATTENTION", "bold"));
+  if (!view.attention.length) lines.push(c("  none", "gray"));
+  for (const a of view.attention) {
+    const age = a.ageMs != null ? `  ${fmtAge(a.ageMs)}` : "";
+    lines.push(c(trim(`  ! ${a.id.padEnd(16)} ${a.text}${age}`, width), "red"));
+  }
+
   lines.push("");
   lines.push(c("WORK", "bold"));
   renderWork(lines, view.taskForest, width, c);
@@ -115,14 +126,6 @@ export function renderDashboard(view: DashboardView, opts: RenderOptions = {}): 
   if (!view.workers.length) lines.push(c("  (none)", "gray"));
   else renderWorkers(lines, view, width, c, links);
   if (links && view.workers.length) lines.push(c("  Ctrl+click a pane id → focus that pane", "dim"));
-
-  lines.push("");
-  lines.push(c("ATTENTION", "bold"));
-  if (!view.attention.length) lines.push(c("  none", "gray"));
-  for (const a of view.attention) {
-    const age = a.ageMs != null ? `  ${fmtAge(a.ageMs)}` : "";
-    lines.push(c(trim(`  ! ${a.id.padEnd(16)} ${a.text}${age}`, width), "red"));
-  }
 
   if (opts.runtimeHistory) {
     lines.push("");
@@ -304,6 +307,12 @@ function renderWorker(
   // command text and the overdue flag stay in ATTENTION.
   if (w.tool) {
     const label = `  tool:${w.tool.name} ${fmtAge(w.tool.ageMs)}`;
+    push(label, dwidth(label));
+  }
+  // Queued mail is STATUS (not attention): show the count here, on the worker
+  // row, so an unread backlog is visible without padding ATTENTION.
+  if (w.unread > 0) {
+    const label = `  mail:${w.unread}`;
     push(label, dwidth(label));
   }
   // Optional affinity hint for an idle peer: which task pulled it into this

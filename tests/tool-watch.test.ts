@@ -126,22 +126,28 @@ describe("early surfacing", () => {
     expect(toolEvents("worker.tool_long")).toBe(1);
   });
 
-  test("dashboard ATTENTION shows the running command and its age", async () => {
+  test("dashboard: an OVERDUE tool is ATTENTION; a merely-running tool is WORKERS status", async () => {
     managed("w1");
     const started = now() - 5 * 60 * 1000;
-    setWorkerTool(db, "w1", { name: "shell", command: "bun test --watch", timeoutMs: null }, started);
+    // Running past the surfacing threshold but WITHIN its own budget: this is
+    // STATUS ("tool shell running"), so it lives on the WORKERS row, not ATTENTION.
+    setWorkerTool(db, "w1", { name: "shell", command: "bun test --watch", timeoutMs: 10 * 60 * 1000 }, started);
 
-    const view = buildDashboardView(db, { root: "/tmp", panes: new Map(), at: now() });
+    let view = buildDashboardView(db, { root: "/tmp", panes: new Map(), at: now() });
     const worker = view.workers.find((w) => w.id === "w1")!;
     expect(worker.tool?.name).toBe("shell");
     expect(worker.tool?.command).toBe("bun test --watch");
+    expect(view.attention.some((a) => a.id === "w1" && a.text.includes("tool shell"))).toBe(false);
+    let text = renderDashboard(view, { color: false, width: 160 });
+    expect(text).toContain("tool:shell"); // status stays visible on the WORKERS row
+
+    // Past its declared timeout: ACTIONABLE, so it rises to ATTENTION with the command.
+    setWorkerTool(db, "w1", { name: "shell", command: "bun test --watch", timeoutMs: 60 * 1000 }, started);
+    view = buildDashboardView(db, { root: "/tmp", panes: new Map(), at: now() });
     const att = view.attention.find((a) => a.id === "w1" && a.text.includes("tool shell"));
     expect(att).toBeDefined();
+    expect(att!.text).toContain("overdue");
     expect(att!.text).toContain("bun test --watch");
-
-    // The WORKERS row also carries the running tool + age (not only ATTENTION).
-    const text = renderDashboard(view, { color: false, width: 160 });
-    expect(text).toContain("tool:shell");
   });
 
   test("a lost finish event is cleared once the marker is stale", async () => {

@@ -444,7 +444,7 @@ describe("worker affinity (dashboard projection)", () => {
     // Six queued, but `seed` is ANCHORED on one of them, so five remain as queue.
     expect(c.claimableTaskIds.length).toBe(5);
     const text = renderDashboard(v, { width: 120 });
-    const workersSection = text.split("WORKERS")[1].split("ATTENTION")[0];
+    const workersSection = text.split("WORKERS")[1];
     const headerLine = workersSection.split("\n").find((l) => l.includes(cluster.id))!;
     expect(headerLine).toContain("next:");
     expect(headerLine).toContain("+1 more"); // cap 4, so 4 shown + 1 extra

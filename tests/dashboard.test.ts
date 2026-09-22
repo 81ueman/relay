@@ -118,7 +118,7 @@ describe("dashboard model", () => {
     expect(v.attention.some((a) => a.text.includes("no visible runtime pane"))).toBe(true);
   });
 
-  test("attention: unclaimable, blocked reason, unread messages", () => {
+  test("attention: unclaimable + blocked reason; unread is status (WORKERS, not ATTENTION)", () => {
     registerWorker(db, "w", { role: "worker" });
     addTask(db, { title: "x", role: "ghost-role" }); // queued, no worker has this role
     const b = addTask(db, { title: "b" });
@@ -128,7 +128,12 @@ describe("dashboard model", () => {
     const texts = view().attention.map((a) => a.text).join(" | ");
     expect(texts).toContain("unclaimable role=ghost-role");
     expect(texts).toContain("blocked_human: need API semantics");
-    expect(texts).toContain("unread messages=1");
+    // Unread is STATUS, not attention: it must not pad ATTENTION.
+    expect(texts).not.toContain("unread messages");
+    // ...it is shown on the WORKERS row instead.
+    const out = renderDashboard(view(), { color: false, width: 120 });
+    const workersSection = out.split("WORKERS")[1];
+    expect(workersSection).toContain("mail:1");
   });
 });
 
@@ -151,6 +156,20 @@ describe("dashboard renderer", () => {
     expect(out).toContain("dp-1");
     expect(out).toContain("g3");
     expect(out).toContain("w52:p8K");
+  });
+
+  test("ATTENTION renders FIRST, before WORK and WORKERS (T341)", () => {
+    const out = renderDashboard(sample(), { color: false, links: false, width: 100 });
+    const lines = out.split("\n");
+    const iAtt = lines.findIndex((l) => l === "ATTENTION" || l.startsWith("ATTENTION ·"));
+    const iWork = lines.findIndex((l) => l === "WORK");
+    const iWorkers = lines.findIndex((l) => l === "WORKERS");
+    expect(iAtt).toBeGreaterThan(-1);
+    expect(iWork).toBeGreaterThan(-1);
+    expect(iWorkers).toBeGreaterThan(-1);
+    // The actionable section is above the (potentially long, clipped) tree.
+    expect(iAtt).toBeLessThan(iWork);
+    expect(iWork).toBeLessThan(iWorkers);
   });
 
   test("OSC8 pane link when links are on", () => {
