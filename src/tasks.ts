@@ -19,7 +19,9 @@ export const STALE_LEASE = "STALE_LEASE";
 // Runnable gating (declared prerequisites + the reviewer gate)
 //
 // A `queued` task is only RUNNABLE when:
-//   1. every `task_deps` prerequisite is `done`; and
+//   1. every `task_deps` prerequisite is satisfied — `done`, or (for a REVIEWER
+//      gate only) still in `review`, so a gate can pick up its input the moment
+//      it is submitted (T295); and
 //   2. if it is a queued REVIEWER gate (role='reviewer' with NO declared
 //      prerequisite) something is actually in `review`.
 //
@@ -30,15 +32,27 @@ export const STALE_LEASE = "STALE_LEASE";
 // the CP-W3 gate T153). A reviewer's PRIMARY path — claiming a task already in
 // state='review' — is unaffected; this only gates the pre-created queued gate.
 // A gate that declares its inputs as dependencies becomes runnable as soon as
-// they are done, independent of the review queue.
+// they are submitted/done, independent of the review queue. (2) bars only the
+// AUTOMATIC paths (`relay next`, the scheduler): an explicit `relay claim
+// <gate-id>` deliberately opens the named gate (T295).
 //
 // `RUNNABLE_TASK_SQL` must stay in sync with `isRunnableNow`.
 // ---------------------------------------------------------------------------
 
+// A prerequisite counts as MET when it is `done`. For a REVIEWER gate it also
+// counts when the prerequisite is merely `review`: a review gate's input is
+// ready for review the moment it is submitted, so requiring the input to be
+// APPROVED first deadlocks the gate (the gate IS the approval). Reviewers are
+// the only role for which this applies, and it is what makes the documented
+// remedy — `relay task depend <gate> <inputs>` — actually work (T295).
+// `t.role = 'reviewer'` is NULL-safe via IFNULL: SQL three-valued logic would
+// otherwise make `NOT (NULL AND ...)` NULL and silently admit every gated task.
 const DEPS_DONE_SQL = `NOT EXISTS (
   SELECT 1 FROM task_deps dep
     LEFT JOIN tasks d ON d.id = dep.depends_on
-   WHERE dep.task_id = t.id AND (d.id IS NULL OR d.state != 'done')
+   WHERE dep.task_id = t.id
+     AND (d.id IS NULL
+          OR (d.state != 'done' AND NOT (IFNULL(t.role, '') = 'reviewer' AND d.state = 'review')))
 )`;
 const REVIEW_GATE_SQL =
   `(t.role IS NOT 'reviewer'
@@ -95,6 +109,14 @@ export interface ClaimOptions {
   role?: string;
   /** false = escape hatch (--any-role); defaults to `roleStrictDefault()`. */
   strictRole?: boolean;
+  /**
+   * Explicit named claim of a queued reviewer gate: the caller has deliberately
+   * named the gate, so the "a standing gate needs something in review" churn
+   * guard is bypassed (the guard exists to stop the AUTOMATIC `relay next` from
+   * grabbing a standing gate). Only `relay claim <id>` sets this; `relay next`
+   * and the scheduler never do. Declared *dependencies* still gate it.
+   */
+  allowReviewerGate?: boolean;
 }
 
 /** True when `matchRole` may claim a task tagged `taskRole` under the policy. */
@@ -241,15 +263,24 @@ export function taskDependencies(db: Database, taskId: string): string[] {
   ).map((r) => r.depends_on);
 }
 
-/** True when every declared prerequisite of `task` is `done` (unknown = unmet). */
+/**
+ * True when every declared prerequisite of `task` is satisfied. A prerequisite
+ * is satisfied when it is `done`; for a REVIEWER gate a prerequisite in `review`
+ * also counts (its input is ready to be reviewed — the gate is the approval).
+ * Unknown prerequisites are unmet. Mirrors DEPS_DONE_SQL.
+ */
 export function dependenciesMet(db: Database, task: Task): boolean {
+  // A reviewer gate additionally accepts a prerequisite still in `review`.
+  const relaxed = task.role === "reviewer";
   const unmet = db
     .query(
       `SELECT COUNT(*) AS n FROM task_deps dep
          LEFT JOIN tasks d ON d.id = dep.depends_on
-        WHERE dep.task_id = ? AND (d.id IS NULL OR d.state != 'done')`
+        WHERE dep.task_id = ?
+          AND (d.id IS NULL
+               OR (d.state != 'done' AND NOT (? AND d.state = 'review')))`
     )
-    .get(task.id) as { n: number };
+    .get(task.id, relaxed ? 1 : 0) as { n: number };
   return unmet.n === 0;
 }
 
@@ -409,12 +440,18 @@ export function claimNext(db: Database, workerId: string, opts: ClaimOptions = {
 export function claimTask(db: Database, taskId: string, workerId: string, opts: ClaimOptions = {}): Task {
   const worker = getWorker(db, workerId);
   if (!worker) throw new Error(`unknown worker: ${workerId}. Register first: relay worker register ${workerId}`);
-  if (worker.role === "reviewer") throw new Error(`reviewers take review tasks via \`relay next\`, not claim`);
   const t = now();
   db.run("BEGIN IMMEDIATE");
   try {
     const task = getTask(db, taskId);
     if (!task) throw new Error(`unknown task: ${taskId}`);
+    // Reviewers take review work via `relay next` — EXCEPT an explicitly named
+    // queued reviewer GATE. Naming the gate is the intended escape from the
+    // T295 unclaimable state (a standing gate with nothing in review is parked
+    // by design, so the owner needs one supported way to pick it up).
+    if (worker.role === "reviewer" && !(task.role === "reviewer" && task.state === "queued")) {
+      throw new Error(`reviewers take review tasks via \`relay next\`, not claim (name a queued reviewer gate to claim one explicitly)`);
+    }
     if (task.state !== "queued") throw new Error(`cannot claim task in state ${task.state}`);
     const { matchRole, strict } = claimPolicy(worker.role, opts);
     if (!roleMatches(task.role, matchRole, strict)) {
@@ -429,9 +466,10 @@ export function claimTask(db: Database, taskId: string, workerId: string, opts: 
         `cannot claim task ${taskId}: not yet runnable — prerequisite ${taskDependencies(db, taskId).join(", ")} is not done`
       );
     }
-    if (task.role === "reviewer" && taskDependencies(db, taskId).length === 0 && !reviewPending(db)) {
+    if (task.role === "reviewer" && taskDependencies(db, taskId).length === 0 && !reviewPending(db) && !opts.allowReviewerGate) {
       throw new Error(
-        `cannot claim task ${taskId}: not yet runnable — a reviewer gate needs something in review (or declared deps)`
+        `cannot claim task ${taskId}: not yet runnable — a reviewer gate needs something in review, or ` +
+        `declare its inputs with \`relay task depend ${taskId} <input,...>\``
       );
     }
     db.query(

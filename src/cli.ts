@@ -700,9 +700,16 @@ async function main(): Promise<void> {
         const id = argv[1];
         if (!id) throw new Error("usage: relay claim <task-id>");
         const workerId = resolveWorkerId(db, flag(argv, "--worker"));
+        // Naming a queued reviewer GATE is a deliberate act: it opens the gate's
+        // "something must be in review" churn guard (which exists to stop the
+        // AUTOMATIC `relay next`/scheduler from grabbing a standing gate). Any
+        // other reviewer claim is still refused inside claimTask.
+        const target = getTask(db, id);
+        const namedReviewerGate = !!target && target.role === "reviewer" && target.state === "queued";
         const claimed = claimTask(db, id, workerId, {
           role: flag(argv, "--role") ?? undefined,
           strictRole: hasFlag(argv, "--any-role") ? false : undefined,
+          allowReviewerGate: namedReviewerGate,
         });
         console.log(`${claimed.id} lease=${claimed.lease_token}`);
         printTaskContext(db, claimed.id);

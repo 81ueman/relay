@@ -151,11 +151,19 @@ relay task depend T153 --clear                                        # remove t
 - Run gating is orthogonal to `role` and is **not** bypassable with
   `--any-role`. An explicit `relay claim` of a gated task refuses with
   *not yet runnable*.
+- For a **`role=reviewer` gate** a prerequisite counts as satisfied when it is
+  `done` **or merely `review`**: the gate's input is ready to be reviewed the
+  moment it is submitted, so requiring it to be approved first would deadlock
+  the gate (the gate *is* the approval). Non-reviewer tasks still require `done`.
+  This is what makes the documented remedy actually work when the input is
+  submitted-but-not-yet-approved (T295).
 - A pre-created queued `role=reviewer` gate with **no** declared prerequisites
   is runnable only while something is in `review`; declare its inputs to make it
-  open independently. This stops the scheduler from waking an idle reviewer and
-  claiming the gate before its implementation sibling is submitted (the
-  claim/release churn seen live on the standing OSPF review gate).
+  open independently (see below). It can ALSO always be taken by **naming it**:
+  `relay claim <gate-id>` opens a named queued reviewer gate explicitly, because
+  the deliberate act of naming it is exactly what the rule protects against
+  (only `relay next`/the scheduler are barred from grabbing a *standing* gate,
+  never an explicit named claim) — T295.
 - `relay status` lists gated tasks under **Waiting (not yet runnable)** so they
   are visible instead of looking stranded or unclaimable.
 - Cycles and unknown prerequisites are refused at insert time.

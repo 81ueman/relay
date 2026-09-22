@@ -166,6 +166,61 @@ describe("reviewer gate: not runnable before its sibling is submitted (T225)", (
     expect(actions.some((a) => a.startsWith("reviewer-woken"))).toBe(true);
   });
 
+  test("a gate's prerequisite is satisfied while it is merely IN REVIEW (T295)", () => {
+    managed("reviewer", "reviewer");
+    managed("dev", "worker");
+    const input = addTask(db, { title: "input" });
+    const gate = addTask(db, { title: "gate", role: "reviewer", dependsOn: [input.id] });
+
+    expect(isRunnableNow(db, gate)).toBe(false);
+    claimNext(db, "dev"); // input
+    submitTask(db, input.id, "dev"); // input -> review (NOT yet done)
+
+    // The gate's input is ready to be reviewed: the gate is runnable now.
+    expect(reviewPending(db)).toBe(true);
+    expect(isRunnableNow(db, gate)).toBe(true);
+    expect(claimableRunnableTasks(db, "reviewer").map((t) => t.id)).toContain(gate.id);
+    expect(notYetRunnableTasks(db)).toHaveLength(0);
+  });
+
+  test("relaxed deps apply ONLY to reviewer gates: a worker task still needs DONE (T295)", () => {
+    managed("dev", "worker");
+    const input = addTask(db, { title: "input" });
+    const dependent = addTask(db, { title: "dependent", dependsOn: [input.id] });
+    claimNext(db, "dev"); // input
+    submitTask(db, input.id, "dev"); // -> review
+
+    expect(isRunnableNow(db, dependent)).toBe(false);
+    expect(runnableTasks(db)).toHaveLength(0);
+    expect(() => claimTask(db, dependent.id, "dev")).toThrow(/not yet runnable/);
+  });
+
+  test("an explicitly named queued reviewer gate is claimable; relay next stays parked (T295)", () => {
+    managed("reviewer", "reviewer");
+    const gate = addTask(db, { title: "standing gate", role: "reviewer", priority: 50 });
+
+    // Nothing in review, no deps: the AUTOMATIC path must not take it.
+    expect(reviewPending(db)).toBe(false);
+    expect(claimNext(db, "reviewer", { role: "reviewer" })).toBeNull();
+    expect(notYetRunnableTasks(db).map((t) => t.id)).toEqual([gate.id]);
+
+    // Naming the gate is the deliberate escape: claimable by id.
+    const claimed = claimTask(db, gate.id, "reviewer", { allowReviewerGate: true });
+    expect(claimed.state).toBe("running");
+    expect(claimed.assignee).toBe("reviewer");
+  });
+
+  test("the explicit-gate escape does not bypass declared deps (T295)", () => {
+    managed("reviewer", "reviewer");
+    const input = addTask(db, { title: "input" });
+    const gate = addTask(db, { title: "gate", role: "reviewer", dependsOn: [input.id] });
+
+    // Even with the escape flag, an UNSATISFIED declared dep still gates it.
+    expect(() =>
+      claimTask(db, gate.id, "reviewer", { allowReviewerGate: true })
+    ).toThrow(/not yet runnable/);
+  });
+
   test("a gate with declared deps runs when they are done, even with nothing in review", () => {
     managed("reviewer", "reviewer");
     managed("dev", "worker");
