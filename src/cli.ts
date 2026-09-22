@@ -23,6 +23,7 @@ import {
 } from "./workers";
 import { resolveWorkerIdentity } from "./identity";
 import { runDashboard } from "./dashboard/command";
+import { runGc } from "./gc";
 
 // A role is "known" if it matches a registered worker or a built-in special role.
 // Used for a non-fatal warning on `task add --role`, never a rejection.
@@ -76,6 +77,7 @@ Usage:
   relay status
   relay dashboard [--watch] [--show [--tab]] [--hide] [--doctor] [--json] [--runtime-history]
   relay events [--follow] [--limit N]
+  relay gc [--apply] [--with-history] [--older-than <30s|2m|1h>] [--json]
 
   # Debug entrypoint (the OpenCode plugin normally talks to the daemon socket)
   relay event record --type <t> [--session <sid>] [--worker <id>] [--task <tid>] [--payload <json>]
@@ -218,6 +220,16 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
     ],
   },
   events: { about: "Print recent events, or follow them (Ctrl-C to stop).", usage: ["relay events [--follow] [--limit N]"] },
+  gc: {
+    about:
+      "Purge historical rows: retired workers, terminal (done/failed) tasks, stale/dead/cleaned runtimes, and unmanaged/retired sessions. DRY-RUN by default; --apply deletes. Refuses to touch non-retired workers or non-terminal tasks, and a terminal task still required as a dependency or with a non-terminal child is skipped. events/messages/task_notes are NEVER removed unless --with-history.",
+    usage: [
+      "relay gc [--apply] [--with-history] [--older-than <30s|2m|1h>] [--json]",
+      "  --apply          actually delete (default: report only)",
+      "  --with-history   also delete events/messages/task_notes referencing purged rows",
+      "  --older-than <d> only purge rows older than this (grace window)",
+    ],
+  },
   event: {
     about: "Debug entrypoint: record an event. session.idle/error drive the same state machine as the daemon.",
     usage: ["relay event record --type <t> [--session <sid>] [--worker <id>] [--task <tid>] [--payload <json>]"],
@@ -363,7 +375,7 @@ const VALUE_FLAGS = new Set([
   "--role", "--state", "--limit", "--interval", "--session", "--runtime", "--cwd",
   "--command", "--title", "--acceptance", "--priority", "--parent", "--plan",
   "--dir", "--worktree", "--pane", "--tab", "--workspace", "--type", "--payload",
-  "--ack", "--depends-on",
+  "--ack", "--depends-on", "--older-than",
 ]);
 
 /** Positional args only, skipping flags and their (known) values, e.g. ["T12","reason"]. */
@@ -856,6 +868,36 @@ async function main(): Promise<void> {
             console.log(`#${m.id} to=${m.recipient} from=${m.sender} kind=${m.kind} task=${m.task_id ?? "-"}: ${m.payload}`);
           }
         }
+        break;
+      }
+
+      case "gc": {
+        // Explicit, safe purge of historical rows. Dry-run by default; only
+        // `--apply` deletes, and only retired workers / terminal tasks /
+        // terminal runtimes / unmanaged-or-retired sessions. History
+        // (events/messages/task_notes) is untouched unless --with-history.
+        const rest = argv.slice(1);
+        const apply = hasFlag(rest, "--apply");
+        const withHistory = hasFlag(rest, "--with-history");
+        const olderRaw = flag(rest, "--older-than");
+        const olderThanMs = olderRaw ? parseDuration(olderRaw) : 0;
+        const plan = runGc(db, { apply, withHistory, olderThanMs });
+        if (hasFlag(rest, "--json")) {
+          console.log(JSON.stringify(plan, null, 2));
+          break;
+        }
+        console.log(`relay gc — ${plan.applied ? "APPLIED" : "dry-run (pass --apply to delete)"}`);
+        const list = (ids: (string | number)[]) => (ids.length ? `  ${ids.join(",")}` : "");
+        console.log(`workers:   ${plan.workers.length}${list(plan.workers)}`);
+        console.log(`tasks:     ${plan.tasks.length}${list(plan.tasks)}`);
+        console.log(`sessions:  ${plan.sessions.length}${list(plan.sessions)}`);
+        console.log(`runtimes:  ${plan.runtimes.length}${list(plan.runtimes)}`);
+        if (withHistory) {
+          console.log(`history:   events=${plan.history.events} messages=${plan.history.messages} task_notes=${plan.history.task_notes}`);
+        }
+        console.log(`skipped:   ${plan.skipped.length}`);
+        for (const s of plan.skipped) console.log(`  ${s.kind} ${s.id}: ${s.reason}`);
+        if (!plan.applied) console.log("nothing was deleted (dry-run)");
         break;
       }
 

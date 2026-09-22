@@ -77,7 +77,10 @@ role = R (non-null)     -> claimable ONLY by a worker registered with role R
   role-tagged tasks.
 - Review tasks (`state=review`) are still claimable only by `role=reviewer`
   workers, and reviewers check the review queue before queued work. A reviewer
-  also claims queued `role=reviewer` tasks.
+  also claims queued `role=reviewer` tasks — but a **pre-created queued review
+  gate** is only *runnable* while something is in `review` (or its declared
+  prerequisites are done), so it cannot be claimed before its inputs exist (see
+  **Run gating** below).
 - `relay task add --role R` warns (stderr, non-fatal) when `R` matches no
   registered worker and is not a built-in special role
   (`worker`/`planner`/`reviewer`) — a typo cannot silently create an
@@ -127,6 +130,57 @@ tombstone instead and takes it out of every operational surface:
   first. `relay worker unretire <id>` reverses it, and re-registering the same id
   revives it automatically.
 - `worker.retired` / `worker.unretired` are recorded in the event log.
+- Attaching a live session to a retired id **revives** it (the same intent as
+  re-registering): `relay session attach` / the plugin's `session.attach` clears
+  the tombstone and logs `worker.unretired`. Only a *successful* attach revives;
+  a rejected one leaves the tombstone untouched.
+
+### Run gating: declared prerequisites (`relay task depend`)
+
+A queued task is **not runnable** — never offered by `relay next`, never
+claimable, never woken — until every prerequisite it declares is `done`:
+
+```bash
+relay task add "review gate" --role reviewer --depends-on T150,T151   # at creation
+relay task depend T153 T152 T154                                      # set/replace later
+relay task depend T153 --clear                                        # remove the gate
+```
+
+- Prerequisites are a join table, so a gate can wait on several sibling inputs
+  (the CP-W3 gate T153 waited on T150/T151/T152/T154).
+- Run gating is orthogonal to `role` and is **not** bypassable with
+  `--any-role`. An explicit `relay claim` of a gated task refuses with
+  *not yet runnable*.
+- A pre-created queued `role=reviewer` gate with **no** declared prerequisites
+  is runnable only while something is in `review`; declare its inputs to make it
+  open independently. This stops the scheduler from waking an idle reviewer and
+  claiming the gate before its implementation sibling is submitted (the
+  claim/release churn seen live on the standing OSPF review gate).
+- `relay status` lists gated tasks under **Waiting (not yet runnable)** so they
+  are visible instead of looking stranded or unclaimable.
+- Cycles and unknown prerequisites are refused at insert time.
+
+### Historical cleanup: `relay gc`
+
+There was no supported purge for old worker/runtime/session/task rows (fleet
+cleanup needed raw SQL). `relay gc` is **dry-run by default**:
+
+```bash
+relay gc                              # report only (deletes nothing)
+relay gc --apply                      # delete the reported rows
+relay gc --apply --older-than 1h      # only rows older than a grace window
+relay gc --apply --with-history       # also purge their events/messages/task_notes
+```
+
+- Only **retired** workers, **terminal** (`done`/`failed`) tasks,
+  `stale`/`dead`/`cleaned` runtimes, and unmanaged/retired sessions are
+  eligible. Live workers and non-terminal tasks are never selected, and every
+  `DELETE` re-asserts that predicate.
+- A terminal task still required as a dependency (or with a non-terminal child)
+  is **skipped**, not deleted.
+- `events`, `messages` and `task_notes` are **never** touched without
+  `--with-history`; with it, only rows referencing the purged workers/tasks go.
+- Every applied run logs `gc.applied`.
 
 ### Clean hand-back: `relay release`
 
