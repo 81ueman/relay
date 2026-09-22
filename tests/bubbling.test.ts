@@ -5,7 +5,7 @@ import { join } from "node:path";
 import type { Database } from "bun:sqlite";
 import { openDb } from "../src/db";
 import { inboxFor, sendMessage } from "../src/messages";
-import { addTask, approveTask, claimTask, getNotes, getTask, releaseTask, submitTask, blockTask } from "../src/tasks";
+import { addTask, approveTask, claimTask, getNotes, getTask, releaseTask, submitTask, blockTask, setTaskParent, taskChildren } from "../src/tasks";
 import { registerWorker } from "../src/workers";
 
 // One-hop completion bubbling: a done child tells its IMMEDIATE parent via a
@@ -216,5 +216,56 @@ describe("one-hop completion bubbling", () => {
     expect(getNotes(db, parent.id).some((n) => n.kind === "child_blocked")).toBe(true);
     const n = (db.query(`SELECT COUNT(*) AS n FROM messages`).get() as { n: number }).n;
     expect(n).toBe(0);
+  });
+});
+
+// T324: parent_task_id was creation-only, so a subtree created without --parent
+// was orphaned (no bubbling, wrong tree). `setTaskParent` is the supported fix.
+describe("task reparenting (T324)", () => {
+  test("reparenting restores one-hop bubbling to the new parent", () => {
+    const P = addTask(db, { title: "orphaned-subtree-root" });
+    const C = addTask(db, { title: "orphan child" }); // created with NO parent
+    expect(getTask(db, C.id)!.parent_task_id).toBeNull();
+    expect(bubblingNotes(P.id)).toEqual([]);
+
+    const updated = setTaskParent(db, C.id, P.id);
+    expect(updated.parent_task_id).toBe(P.id);
+    expect(taskChildren(db, P.id).map((t) => t.id)).toEqual([C.id]);
+
+    complete(C.id); // the child now bubbles to the new parent
+    expect(bubblingNotes(P.id)).toEqual(["child_done", "children_done"]);
+  });
+
+  test("reparenting a subtree root re-attaches the WHOLE subtree", () => {
+    const P = addTask(db, { title: "new root" });
+    const R = addTask(db, { title: "subtree root" }); // orphan
+    const G = addTask(db, { title: "grandchild", parentTaskId: R.id });
+    setTaskParent(db, R.id, P.id);
+    // The grandchild still points at R: one hop from P reaches R, then G.
+    expect(taskChildren(db, P.id).map((t) => t.id)).toEqual([R.id]);
+    expect(taskChildren(db, R.id).map((t) => t.id)).toEqual([G.id]);
+  });
+
+  test("reparent validates: unknown parent, self-parent and cycles are refused", () => {
+    const P = addTask(db, { title: "P" });
+    const C = addTask(db, { title: "C", parentTaskId: P.id });
+    const G = addTask(db, { title: "G", parentTaskId: C.id });
+
+    expect(() => setTaskParent(db, C.id, "T999")).toThrow(/unknown parent task/);
+    expect(() => setTaskParent(db, C.id, C.id)).toThrow(/own parent/);
+    // P is an ancestor of G: making P a child of G would close a cycle.
+    expect(() => setTaskParent(db, P.id, G.id)).toThrow(/parent cycle/);
+    // A refused reparent must not have mutated anything.
+    expect(getTask(db, P.id)!.parent_task_id).toBeNull();
+  });
+
+  test("reparent to null (clear) detaches, and is always allowed", () => {
+    const P = addTask(db, { title: "P" });
+    const C = addTask(db, { title: "C", parentTaskId: P.id });
+    expect(setTaskParent(db, C.id, null).parent_task_id).toBeNull();
+    expect(taskChildren(db, P.id)).toHaveLength(0);
+    // Detached, the child no longer bubbles.
+    complete(C.id);
+    expect(bubblingNotes(P.id)).toEqual([]);
   });
 });

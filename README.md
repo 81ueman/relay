@@ -847,7 +847,21 @@ recipient, no operator alias, and no role-based coordinator routing.
 **work decomposition**, not authority between workers: the same worker may own a
 parent and its child, and a parent's assignee may change at any time. Relay
 routes work-completion through **task ownership**, not through a hierarchy of
-agents.
+agents. `--parent` used to be creation-only, so a subtree created without it was
+orphaned (no bubbling, wrong tree); reparent it in place:
+
+```bash
+relay task reparent T312 T301        # re-attach an orphaned subtree
+relay task move T312 T301            # alias
+relay task reparent T312 --clear     # detach (always allowed)
+```
+
+The new parent must exist and must not be a descendant of the task — a
+reparent that would make the task its own ancestor is refused (`parent cycle`),
+as is `self` and an unknown parent. Reattaching a subtree root re-attaches the
+whole subtree (each node keeps its own `parent_task_id`). `task.reparented` /
+`task.unparented` are recorded in the event log, and `relay task list` shows each
+task's `parent=`.
 
 **Completion bubbling.** When a task reaches `done`, its IMMEDIATE parent gets a
 durable `child_done` task note (visible in `relay task show <parent> --json`),

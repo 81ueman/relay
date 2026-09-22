@@ -223,6 +223,51 @@ export function setTaskPlan(db: Database, taskId: string, planId: string | null)
 }
 
 // ---------------------------------------------------------------------------
+// Task tree: reparenting (T324)
+// ---------------------------------------------------------------------------
+
+/** Direct children of a task (the one-hop subtree `child_done` bubbles to). */
+export function taskChildren(db: Database, taskId: string): Task[] {
+  return db
+    .query(`SELECT * FROM tasks WHERE parent_task_id = ? ORDER BY created_at ASC`)
+    .all(taskId) as Task[];
+}
+
+/**
+ * Set (or clear, with null) a task's parent. `parent_task_id` was creation-only,
+ * so a subtree created without `--parent` was orphaned: no `child_done` bubbling
+ * and the wrong tree, fixable only by direct SQLite surgery on the live DB.
+ *
+ * Validates the new parent exists and rejects cycles (a task may not become its
+ * own ancestor), mirroring `assertDependencies`. Clearing is always allowed.
+ * Returns the updated task and the parent's direct children (for the caller).
+ */
+export function setTaskParent(db: Database, taskId: string, parentId: string | null): Task {
+  const task = getTask(db, taskId);
+  if (!task) throw new Error(`unknown task: ${taskId}`);
+  if (parentId !== null) {
+    if (parentId === taskId) throw new Error(`task ${taskId} cannot be its own parent`);
+    if (!getTask(db, parentId)) throw new Error(`unknown parent task: ${parentId}`);
+    // Walk UP from the proposed parent: reaching taskId would make taskId its own
+    // ancestor. `seen` guards against a pre-existing malformed cycle looping.
+    const seen = new Set<string>();
+    for (let cur: string | null = parentId; cur !== null; cur = getTask(db, cur)?.parent_task_id ?? null) {
+      if (cur === taskId) throw new Error(`parent cycle: ${taskId} is an ancestor of ${parentId}`);
+      if (seen.has(cur)) break; // already-malformed chain: stop, don't hang
+      seen.add(cur);
+    }
+  }
+  db.query(`UPDATE tasks SET parent_task_id = ?, updated_at = ? WHERE id = ?`).run(parentId, now(), taskId);
+  logEvent(db, {
+    source: "cli",
+    taskId,
+    type: parentId ? "task.reparented" : "task.unparented",
+    payload: { from: task.parent_task_id, to: parentId },
+  });
+  return getTask(db, taskId)!;
+}
+
+// ---------------------------------------------------------------------------
 // Declared prerequisites (task_deps): run gating for pre-created work
 // ---------------------------------------------------------------------------
 

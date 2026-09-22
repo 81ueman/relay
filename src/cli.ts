@@ -14,7 +14,7 @@ import type { Task } from "./schema";
 import {
   addTask, approveTask, blockTask, claimNext, claimTask, claimableRunnableTasks, getNotes, getTask,
   listTasks, notesClaimingApproval, notYetRunnableTasks, rejectTask, releaseTask, runnableTasks, setTaskDependencies,
-  submitTask, taskCounts, taskDependencies, unblockTask,
+  submitTask, taskCounts, taskDependencies, taskChildren, setTaskParent, unblockTask,
   unclaimableRunnableTasks, addNote, setTaskPlan, waitTask,
 } from "./tasks";
 import {
@@ -174,6 +174,14 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
     usage: [
       "relay task depend <task-id> <dep-id...>",
       "relay task depend <task-id> --clear",
+    ],
+  },
+  "task reparent": {
+    about: "Set (or clear, with --clear) a task's parent. `--parent` was creation-only, so a subtree created without it was orphaned: no child_done bubbling and the wrong tree, fixable only by raw SQLite surgery. The new parent must exist and must not be a descendant of the task (cycle refused).",
+    usage: [
+      "relay task reparent <task-id> <new-parent-id>",
+      "relay task reparent <task-id> --clear",
+      "relay task move <task-id> <new-parent-id>   # alias",
     ],
   },
   next: {
@@ -627,7 +635,7 @@ async function main(): Promise<void> {
           const state = flag(argv.slice(1), "--state");
           for (const t of listTasks(db, state)) {
             const deps = taskDependencies(db, t.id);
-            console.log(`${t.id}\t${t.state}\tprio=${t.priority}\trole=${t.role ?? "-"}\tassignee=${t.assignee ?? "-"}\tplan=${t.plan_id ?? "-"}\tdepends=${deps.length ? deps.join(",") : "-"}\t${t.title}`);
+            console.log(`${t.id}\t${t.state}\tprio=${t.priority}\trole=${t.role ?? "-"}\tassignee=${t.assignee ?? "-"}\tparent=${t.parent_task_id ?? "-"}\tplan=${t.plan_id ?? "-"}\tdepends=${deps.length ? deps.join(",") : "-"}\t${t.title}`);
           }
         } else if (sub === "link") {
           const [taskId, planId] = [argv[2], argv[3]];
@@ -652,6 +660,23 @@ async function main(): Promise<void> {
           console.log(`${t.id} depends_on=${got.length ? got.join(",") : "-"}`);
           if (!clear && got.length === 0) {
             console.error(`relay: warning: ${t.id} has no prerequisites; it is ungated (pass --clear to be explicit)`);
+          }
+        } else if (sub === "reparent" || sub === "move") {
+          const taskId = argv[2];
+          const parentId = argv[3];
+          if (!taskId) {
+            throw new Error(
+              `usage: relay task ${sub} <task-id> <new-parent-id> | --clear\n  ` +
+              `(parents were creation-only; this fixes an orphaned subtree so child_done bubbles)`
+            );
+          }
+          const clear = hasFlag(argv.slice(2), "--clear");
+          if (!clear && !parentId) throw new Error(`usage: relay task ${sub} <task-id> <new-parent-id> | --clear`);
+          const t = setTaskParent(db, taskId, clear ? null : parentId);
+          console.log(`${t.id} parent=${t.parent_task_id ?? "-"}${clear ? " (unparented)" : ""}`);
+          if (!clear) {
+            const kids = taskChildren(db, parentId).map((k) => k.id);
+            console.log(`  ${parentId} now has ${kids.length} direct child(ren): ${kids.join(",") || "-"}`);
           }
         } else if (sub === "show") {
           const id = argv[2];
