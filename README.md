@@ -28,6 +28,48 @@ Failure philosophy: `process alive ≠ progressing`, `session idle ≠ done`,
 `LLM says done ≠ done`, `wake delivered ≠ accepted`,
 `human blocker ≠ worker must stop`, `parent dead ≠ system stops`.
 
+## Quick start (5 minutes)
+
+**Prerequisites:** [Bun](https://bun.sh), [Herdr](https://github.com/81ueman/herdr),
+[OpenCode](https://opencode.ai). Relay only manages OpenCode sessions running
+inside a **Herdr pane** — that is the one hard requirement.
+
+```sh
+# 1) install the CLI (builds a standalone artifact) and link the OpenCode plugin
+git clone https://github.com/81ueman/relay && cd relay
+scripts/install.sh
+
+# 2) create the control plane (SQLite, WAL) in the project you want supervised
+cd /path/to/your/project
+relay init
+
+# 3) run the supervisor (one per project)
+relay daemon
+
+# 4) start an OpenCode agent in a Herdr pane, then attach it as a worker
+relay worker register my-worker --role worker --runtime <herdr-pane-id> --cwd "$PWD"
+#   ...then, inside that OpenCode session, call the `agent_attach` tool:
+#   worker_id="my-worker", pane_id="<herdr-pane-id>"
+```
+
+Then:
+
+```sh
+relay status                        # workers + counts
+relay dashboard --watch             # live tree (ATTENTION first)
+relay task add "do the thing" --role worker
+relay next --worker my-worker       # claim work
+```
+
+- **Task lifecycle:** `relay next` → `claim` → work → `relay note` →
+  `relay submit --evidence` → review → `done`. A worker saying "done" is *not*
+  completion; `submit` sends to review, approval makes it `done`.
+- **Agents get skills** via APM (optional but recommended):
+  `apm install -g --target agent-skills 81ueman/relay` installs `agent-worker`
+  (the relay protocol) and `parallel-worktrees` (recursive worktree lanes).
+- **Deeper reference:** the `Install` and `Setup` sections below, and
+  `formal/Relay.tla` for the normative wake/scheduling model.
+
 ## Core invariant
 
 ```text
