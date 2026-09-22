@@ -342,6 +342,37 @@ export function detachSession(db: Database, sessionId: string): Session | null {
 }
 
 /**
+ * A worker's stored binding can go stale across an OpenCode/Herdr restart: the
+ * session id recorded in the DB is no longer hosted by any live Herdr pane, so
+ * the worker stays unattached and no honest session can take it over — the
+ * attach guard would refuse with "already managed by <dead session>".
+ *
+ * The session id is the durable identity, but Herdr is the source of truth for
+ * whether that identity is LIVE. When the bound session is absent from the set
+ * Herdr authoritatively reports, the binding is corrected (managed -> standalone)
+ * so the live session can re-bind. A binding whose session IS still live is
+ * never touched: that is a genuine steal and attachSession keeps refusing it.
+ *
+ * Returns true when a stale binding was released. Throws if the worker still
+ * owns a task (detachSession's own guard), which must be resolved first.
+ */
+export function releaseUnhostedBinding(
+  db: Database,
+  workerId: string,
+  incomingSessionId: string,
+  liveSessions: Iterable<string>
+): boolean {
+  const w = getWorker(db, workerId);
+  const bound = w?.opencode_session_id;
+  if (!bound || bound === incomingSessionId) return false;
+  const boundSession = getSession(db, bound);
+  if (!boundSession || boundSession.managed !== 1) return false;
+  if (new Set(liveSessions).has(bound)) return false;
+  detachSession(db, bound);
+  return true;
+}
+
+/**
  * Gate an inbound session event. Returns the managed session, or null when the
  * event must be ignored. Managed events MUST carry a generation: a missing or
  * mismatched generation is ignored (zombie protection). Never writes.

@@ -13,7 +13,7 @@ import { runDaemon } from "./daemon";
 import { handleErrorSignal, handleIdleSignal, reconcile } from "./reconciler";
 import { buildRuntime, HerdrRuntime } from "./runtime/herdr";
 import { supervisorView, isOperationalWorker } from "./scheduler";
-import { attachSession, detachSession, getSession, listSessions } from "./sessions";
+import { attachSession, detachSession, getSession, listSessions, releaseUnhostedBinding } from "./sessions";
 import { listRuntimes, adoptRuntimeTarget } from "./runtimes";
 import type { Task } from "./schema";
 import {
@@ -719,19 +719,32 @@ async function main(): Promise<void> {
           // over the caller's $HERDR_* env, which leaks the CALLER's pane when
           // attaching a session in another pane/workspace.
           const dir = flag(rest, "--dir") ?? undefined;
+          // An explicit --pane likewise supersedes the caller's env: the pane's
+          // own live workspace/tab is authoritative, so a stale $HERDR_WORKSPACE_ID
+          // or $HERDR_TAB_ID from the caller must not veto the attach.
+          const explicitPane = flag(rest, "--pane");
+          const noEnv = !!dir || !!explicitPane;
           const rt = buildRuntime();
           const identity = await rt.resolveIdentity({
             sessionId,
             hint: {
-              paneId: flag(rest, "--pane") ?? (dir ? undefined : process.env.HERDR_PANE_ID),
-              tabId: flag(rest, "--tab") ?? (dir ? undefined : process.env.HERDR_TAB_ID),
-              workspaceId: flag(rest, "--workspace") ?? (dir ? undefined : process.env.HERDR_WORKSPACE_ID),
+              paneId: explicitPane ?? (dir ? undefined : process.env.HERDR_PANE_ID),
+              tabId: flag(rest, "--tab") ?? (noEnv ? undefined : process.env.HERDR_TAB_ID),
+              workspaceId: flag(rest, "--workspace") ?? (noEnv ? undefined : process.env.HERDR_WORKSPACE_ID),
               directory: dir,
               // A codex session has a UUID id (not `ses...`); declare its kind so
               // identity resolution accepts the codex agent.
               agentKind: flag(rest, "--kind") ?? (/^ses/.test(sessionId) ? "opencode" : "codex"),
             },
           });
+          // Correct a stale stored binding before attachSession's steal guard:
+          // if the worker's recorded session is no longer hosted by Herdr (e.g.
+          // after a restart), release it so this live session can take over.
+          const explicitWorker = flag(rest, "--worker") ?? process.env.RELAY_WORKER;
+          const targetWorker = explicitWorker ?? getSession(db, sessionId)?.worker_id;
+          if (targetWorker) {
+            releaseUnhostedBinding(db, targetWorker, sessionId, await rt.reportedSessions());
+          }
           const s = attachSession(db, sessionId, {
             role: flag(rest, "--role") ?? undefined,
             workerId: flag(rest, "--worker") ?? undefined,

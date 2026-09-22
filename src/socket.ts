@@ -4,7 +4,7 @@ import { defaultSockPath } from "./db";
 import { logEvent } from "./events";
 import { handleErrorSignal, handleIdleSignal, reconcile } from "./reconciler";
 import type { HerdrIdentity, Runtime } from "./runtime/runtime";
-import { attachSession, detachSession, gateEvent, managedWorkerForSession } from "./sessions";
+import { attachSession, detachSession, gateEvent, getSession, managedWorkerForSession, releaseUnhostedBinding } from "./sessions";
 import type { DaemonIdentity } from "./singleton";
 import { getWorker, setWorkerState, setWorkerTool, clearWorkerTool, touchSeen } from "./workers";
 
@@ -129,6 +129,21 @@ export async function handleSocketMessage(msg: SocketMessage, ctx: SocketContext
           payload: { sessionId: msg.session_id, stage: "identity", directory: msg.directory ?? null, reason },
         });
         return { ok: false, reason };
+      }
+
+      // The session id is the durable identity, but a worker's binding recorded
+      // before an OpenCode/Herdr restart can point at a session Herdr no longer
+      // hosts. Correct it (release the dead binding) so the live session can
+      // re-bind, instead of failing with "already managed by <dead session>".
+      // A binding whose session is still live is left untouched for
+      // attachSession's steal guard to reject.
+      const targetWorker = msg.worker_id ?? getSession(db, msg.session_id)?.worker_id;
+      if (targetWorker) {
+        try {
+          releaseUnhostedBinding(db, targetWorker, msg.session_id, await runtime.reportedSessions());
+        } catch (e) {
+          return { ok: false, reason: String(e).slice(0, 200) };
+        }
       }
     }
 

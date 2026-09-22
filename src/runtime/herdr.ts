@@ -451,6 +451,20 @@ export class HerdrRuntime implements Runtime {
   }
 
   /**
+   * Authoritative liveness set: the session ids Herdr itself maps to live panes.
+   * Used to correct a stored worker binding whose session vanished across a
+   * restart. Never consults a stored pane/workspace (those go stale).
+   */
+  async reportedSessions(): Promise<Set<string>> {
+    const ids = new Set<string>();
+    for (const a of listAgents()) {
+      const v = a?.agent_session?.value;
+      if (typeof v === "string" && v.length > 0) ids.add(v);
+    }
+    return ids;
+  }
+
+  /**
    * Spawn a brand-new generation in a fresh tab in the EXPLICIT relay
    * workspace. Returns Herdr metadata; the daemon records it as 'starting'
    * (relay_owned=true) and only promotes it to 'active' after managed attach.

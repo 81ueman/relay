@@ -123,6 +123,15 @@ export interface Runtime {
    * ambiguous mappings are rejected, never guessed.
    */
   resolveIdentity(input: { sessionId: string; hint?: HerdrIdentityHint }): Promise<HerdrIdentity>;
+  /**
+   * The set of OpenCode session ids Herdr AUTHORITATIVELY maps to a live pane
+   * (`agent_session`). This is the liveness oracle used to decide whether a
+   * stored worker binding is stale: a session id absent from this set is no
+   * longer hosted by Herdr and its binding may be corrected. It is deliberately
+   * narrower than resolveIdentity: it never consults a stale pane/workspace
+   * hint and never guesses.
+   */
+  reportedSessions(): Promise<Set<string>>;
 }
 
 export class MockRuntime implements Runtime {
@@ -145,6 +154,8 @@ export class MockRuntime implements Runtime {
   failCleanup = new Set<string>();
   /** sessionId -> resolved Herdr identity (manual attach). Missing => reject. */
   identities = new Map<string, HerdrIdentity>();
+  /** Extra session ids Herdr reports as live (reportedSessions), for stale-binding tests. */
+  reported = new Set<string>();
   /** Every resolveIdentity call (for hint/verification assertions). */
   resolves: { sessionId: string; hint?: HerdrIdentityHint }[] = [];
   /** workerId -> polled agent status (codex path). */
@@ -242,5 +253,9 @@ export class MockRuntime implements Runtime {
     const id = this.identities.get(input.sessionId);
     if (!id) throw new Error("session is not running inside Herdr (simulated)");
     return id;
+  }
+  async reportedSessions(): Promise<Set<string>> {
+    // Every identity the mock can resolve is, by definition, hosted live.
+    return new Set<string>([...this.identities.keys(), ...this.reported]);
   }
 }
