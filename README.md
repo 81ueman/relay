@@ -309,15 +309,21 @@ waiting for the next tick), so dragging the pane drops `progress -> generation
 two columns. Three things keep it readable:
 
 - **Clipped to the pane height.** A frame taller than the pane would scroll into
-  the scrollback, and `ESC[2J` clears only the *visible* screen — so every redraw
-  appended another stale copy. Each frame is now clipped to the pane height (a
-  `… N more line(s) hidden` marker replaces the last row), so it can never
-  overflow or accumulate.
+  the scrollback, and a full-screen erase clears only the *visible* screen — so
+  every redraw appended another stale copy. Each frame is clipped to the pane
+  height **minus one row** (a line that exactly fills the pane width sets the
+  terminal's wrap-pending flag, so the next line-feed would scroll) and written
+  with **no trailing newline**, so it can never overflow or accumulate.
 - **Alternate screen.** On a TTY the loop draws in the alternate screen buffer
   (`ESC[?1049h … ESC[?1049l`), so nothing enters your scrollback and quitting
-  restores the screen you had before. Use `--no-alt-screen` to draw inline.
-- **Pause (`space` or `p`).** The view freezes with a `PAUSED` banner, so a
-  frame is never wiped mid-read; any key resumes. `Ctrl-C`/`q` exits and restores
+  restores the screen you had before. `--no-alt-screen` draws inline; that keeps
+  the *visible* frame correct and singular, but past frames remain in your
+  scrollback (a full-screen redraw in a shared buffer always pushes rows), so the
+  alt-screen default is what you want for a fixed view.
+- **Pause and scroll (`space`/`p`, then `↑`/`↓`, `j`/`k`, PageUp/Down).** Pausing
+  freezes the view with a `PAUSED` banner showing the visible line range
+  (`lines 1-11/88`); the arrows/`j`/`k` scroll it so the clipped tail is
+  readable, and space resumes at the live top. `Ctrl-C`/`q` exits and restores
   the terminal (cursor, screen).
 
 Worker and Runtime stay distinct. A worker row is:
@@ -1078,11 +1084,12 @@ an active quiet lease renders `quiet` and suppresses it · retired workers are
 hidden · no runtime pane → `unavailable` + ATTENTION · unread ATTENTION carries
 the `relay wait`-policy next-nudge countdown · narrow widths never overflow (CJK
 counts 2) · `--json` preserves the worker/runtime split · `relay dashboard
---json` / `--doctor` run end to end · `--watch` re-reads the terminal width on
-resize instead of caching the startup value (columns drop, then come back) ·
-`--watch` re-reads the terminal height and CLIPS every frame to it (never
-overflows/accumulates) with a `… N more hidden` marker, and `--no-alt-screen`
-draws inline.
+--json` / `--doctor` run end to end · `--watch` re-reads the terminal width/height
+on resize instead of caching the startup value · `windowLines` windows a frame to
+the pane (never more rows than fit, top line kept, offset clamped), and the
+inline path emits no trailing newline (the off-by-one that scrolled the pane).
+The alt-screen + pause/scroll behaviour is verified in a real tmux emulator
+(history stays flat; the top line survives; paused scroll reads the clipped tail).
 
 ## Layout
 

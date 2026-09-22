@@ -63,20 +63,16 @@ export function terminalHeight(fallback = 40): number {
 }
 
 /**
- * Clip a rendered frame to `height` rows (ANSI-safe: the renderer emits one
- * logical line per `\n`, and SGR sequences never contain newlines). When it
- * clamps, the last visible row is replaced by a marker so the operator knows
- * content was cut rather than silently lost. Never returns more than `height`
- * lines, so a frame can never overflow the pane and scroll.
+ * Window a rendered frame for the pane: return the `rows` lines starting at
+ * `offset`, clamped so the window never runs past the end and never returns more
+ * than `rows` lines. The watch loop uses this both for the live top (`offset=0`)
+ * and for paused scrolling, so a frame can never overflow the pane.
  */
-export function clipToHeight(text: string, height: number): string {
-  const lines = text.split("\n");
-  if (height <= 0) return "";
-  if (lines.length <= height) return text;
-  const kept = lines.slice(0, height - 1);
-  const hidden = lines.length - kept.length;
-  kept.push(`\x1b[2m… ${hidden} more line(s) hidden (resize taller or press p to pause)\x1b[0m`);
-  return kept.join("\n");
+export function windowLines(lines: string[], offset: number, rows: number): string[] {
+  if (rows <= 0) return [];
+  const maxOffset = Math.max(0, lines.length - rows);
+  const start = Math.min(Math.max(0, offset), maxOffset);
+  return lines.slice(start, start + rows);
 }
 
 export async function runDashboard(args: string[]): Promise<number> {
@@ -169,20 +165,51 @@ export async function runDashboard(args: string[]): Promise<number> {
       const altScreen = interactive && !hasFlag(args, "--no-alt-screen");
       // Pause/resume: while paused the view is frozen and a PAUSED banner is
       // shown, so the operator can read the tree at leisure without it being
-      // wiped by the next tick. Space or `p` toggles.
+      // wiped by the next tick. Space or `p` toggles. While paused, ↑/↓ (k/j)
+      // SCROLL the view so the clipped tail is readable — the operator asked to
+      // read the whole tree without it being wiped.
       let paused = false;
+      let scroll = 0;
+      let lastFrame: string[] = [];
       const write = (s: string) => stdout.write(s);
+      if (interactive && !altScreen) {
+        // Be honest: inline mode shares the terminal's scrollback, and a
+        // full-screen redraw necessarily pushes rows there. The VISIBLE frame is
+        // correct and singular, but scrolling up will show past frames.
+        console.error("relay dashboard --watch: --no-alt-screen draws inline; past frames remain in your scrollback (use the default alt-screen for a fixed view).");
+      }
       const draw = () => {
         width = terminalWidth() ?? width;
         const height = terminalHeight();
         const frame = json
           ? renderDashboardJson(build())
           : renderDashboard(build(), { color, links: color, width, runtimeHistory: history });
-        // CLIP to the pane: an overflowing frame scrolls, and \x1b[2J cannot
-        // clear scrollback, so each redraw would append a stale copy.
-        write("\x1b[2J\x1b[H");
-        if (paused) write("\x1b[7m PAUSED \x1b[0m (space/p resume)\n");
-        write(clipToHeight(frame, Math.max(1, height - (paused ? 1 : 0))) + "\n");
+        lastFrame = frame.split("\n");
+        // A paused view is FROZEN: keep the frame we already hold so a tick
+        // cannot move it under the reader.
+        let lines = lastFrame;
+        // CLIP to the pane: an overflowing frame scrolls into the scrollback, and
+        // clearing the screen cannot clear scrollback, so each redraw would append
+        // a stale copy. alt-screen (default) removes scrollback entirely.
+        //
+        // HOME + ERASE-DOWN (`\x1b[H\x1b[0J`), NOT `\x1b[2J`: ED2 (full-screen
+        // erase) makes some emulators push the visible screen into scrollback.
+        write("\x1b[H\x1b[0J");
+        // Reserve the bottom row (a full-width line sets the wrap-pending flag,
+        // and the following LF scrolls one row — verified in a real tmux).
+        const usable = Math.max(1, height - 1);
+        const banner = paused
+          ? `\x1b[7m PAUSED \x1b[0m ${scroll > 0 ? `↑` : " "}${scroll + usable < lines.length ? `↓` : " "} ` +
+            `lines ${scroll + 1}-${Math.min(scroll + usable, lines.length)}/${lines.length}  ` +
+            `(space resume · ↑/↓ scroll)\n`
+          : "";
+        const bannerRows = paused ? 1 : 0;
+        if (banner) write(banner);
+        const rows = Math.max(1, usable - bannerRows);
+        const maxScroll = Math.max(0, lines.length - rows);
+        if (scroll > maxScroll) scroll = maxScroll;
+        const view = windowLines(lines, scroll, rows);
+        write(view.join("\n"));
       };
       const enterAlt = () => { if (altScreen) write("\x1b[?1049h"); };
       const leaveAlt = () => { if (altScreen) write("\x1b[?1049l"); };
@@ -201,7 +228,19 @@ export async function runDashboard(args: string[]): Promise<number> {
       const onKey = (chunk: Buffer) => {
         const s = chunk.toString("utf8");
         if (s === "\u0003" || s === "q") { cleanup(); process.exit(0); } // Ctrl-C / q
-        if (s === " " || s === "p") { paused = !paused; draw(); }
+        if (s === " " || s === "p") {
+          paused = !paused;
+          if (!paused) scroll = 0; // resuming returns to the live top
+          draw();
+          return;
+        }
+        if (!paused) return; // scrolling only makes sense in a frozen view
+        const usable = Math.max(1, terminalHeight() - 1 - 1);
+        const maxScroll = Math.max(0, lastFrame.length - usable);
+        if (s === "\u001b[A" || s === "k") { scroll = Math.max(0, scroll - 1); draw(); }
+        else if (s === "\u001b[B" || s === "j") { scroll = Math.min(maxScroll, scroll + 1); draw(); }
+        else if (s === "\u001b[5~") { scroll = Math.max(0, scroll - usable); draw(); }       // PageUp
+        else if (s === "\u001b[6~") { scroll = Math.min(maxScroll, scroll + usable); draw(); } // PageDown
       };
 
       if (interactive) {

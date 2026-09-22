@@ -242,8 +242,8 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
   dashboard: {
     about:
       "Read-only human dashboard: Relay task tree + workers (current runtime overlaid) + attention, with Herdr pane links. Never mutates state; --show/--hide manage only its own UI pane. " +
-      "--watch renders in the ALTERNATE screen (nothing enters your scrollback, and quitting restores the prior screen), CLIPS each frame to the pane height so it can never scroll/accumulate, and freezes on space/p (PAUSED). " +
-      "Use --no-alt-screen to draw inline instead (for piping/logging); running WITHOUT --watch is already a one-shot snapshot in normal scrollback.",
+      "--watch renders in the ALTERNATE screen (nothing enters your scrollback, and quitting restores the prior screen), clips each frame to the pane height (reserving the bottom row so it can never scroll/accumulate), and freezes on space/p (PAUSED) — while paused, ↑/↓ (j/k, PageUp/Down) scroll the view so the clipped tail is readable. " +
+      "--no-alt-screen draws inline instead (for piping/logging; visible frame is correct but past frames stay in scrollback); running WITHOUT --watch is a one-shot snapshot.",
     usage: [
       "relay dashboard",
       "relay dashboard --watch [--interval <ms>] [--no-alt-screen]",

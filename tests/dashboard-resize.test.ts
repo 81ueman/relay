@@ -7,7 +7,7 @@ import { openDb } from "../src/db";
 import { renderDashboard } from "../src/dashboard/render";
 import { buildDashboardView } from "../src/dashboard/model";
 import { dwidth } from "../src/dashboard/render";
-import { terminalWidth, terminalHeight, clipToHeight } from "../src/dashboard/command";
+import { terminalWidth, terminalHeight, windowLines } from "../src/dashboard/command";
 import type { PaneTelemetry } from "../src/dashboard/herdr";
 import { recordRuntime } from "../src/runtimes";
 import { addTask, claimTask } from "../src/tasks";
@@ -145,47 +145,38 @@ describe("dashboard watch readability (T326)", () => {
     }
   });
 
-  test("clipToHeight never returns more than `height` lines", () => {
-    const frame = Array.from({ length: 40 }, (_, i) => `line ${i}`).join("\n");
-    for (const h of [1, 5, 24, 40]) {
-      expect(clipToHeight(frame, h).split("\n").length).toBeLessThanOrEqual(h);
+  test("windowLines never returns more than `rows` lines and clamps the offset", () => {
+    const lines = Array.from({ length: 40 }, (_, i) => `line ${i}`);
+    for (const rows of [1, 5, 24, 40]) {
+      for (const off of [0, 10, 39, 1000]) {
+        expect(windowLines(lines, off, rows).length).toBeLessThanOrEqual(rows);
+      }
     }
-    // A frame that fits is returned UNCHANGED (no marker, no truncation).
-    expect(clipToHeight("a\nb\nc", 10)).toBe("a\nb\nc");
+    // The live view (offset 0) starts at the TOP — the line the off-by-one lost.
+    expect(windowLines(lines, 0, 10)[0]).toBe("line 0");
+    expect(windowLines(lines, 0, 10)).toHaveLength(10);
+    // Scrolling moves the window and stops at the end (no overrun, no padding).
+    expect(windowLines(lines, 5, 10)[0]).toBe("line 5");
+    expect(windowLines(lines, 1000, 10)[0]).toBe("line 30"); // maxOffset = 30
+    expect(windowLines(lines, 1000, 10)).toHaveLength(10);
+    // A frame that fits is returned whole; rows<=0 is empty.
+    expect(windowLines(["a", "b", "c"], 0, 10)).toEqual(["a", "b", "c"]);
+    expect(windowLines(lines, 0, 0)).toEqual([]);
   });
 
-  test("a clipped frame says how much was hidden instead of silently dropping it", () => {
-    const frame = Array.from({ length: 30 }, (_, i) => `line ${i}`).join("\n");
-    const clipped = clipToHeight(frame, 10);
-    const lines = clipped.split("\n");
-    expect(lines).toHaveLength(10);
-    expect(lines[0]).toBe("line 0");
-    expect(lines[8]).toBe("line 8");
-    expect(lines[9]).toMatch(/more line\(s\) hidden/);
-    // The marker reports the exact number of rows that did not fit.
-    expect(lines[9]).toContain("21 more"); // 30 - 9 kept = 21
-  });
-
-  test("clipping is ANSI-safe (SGR sequences have no newlines) and height<=0 yields empty", () => {
-    const colored = "\x1b[1mWORK\x1b[0m\n  task\n  worker\n\x1b[2m(tail)\x1b[0m";
-    const clipped = clipToHeight(colored, 3);
-    expect(clipped.split("\n")).toHaveLength(3);
-    expect(clipped).toContain("WORK");
-    expect(clipToHeight("anything", 0)).toBe("");
-    expect(clipToHeight("anything", -5)).toBe("");
-  });
-
-  test("a real dashboard view is clipped to a short pane (the accumulation repro)", () => {
-    const v = view();
-    const frame = renderDashboard(v, { color: false, width: 80 });
-    // The un-clipped view is taller than a short pane would allow.
-    const paneHeight = 8;
-    expect(frame.split("\n").length).toBeGreaterThan(paneHeight);
-    const clipped = clipToHeight(frame, paneHeight);
-    expect(clipped.split("\n").length).toBeLessThanOrEqual(paneHeight);
-    // Content is still readable: the header and the WORK tree survive.
-    expect(clipped).toContain("relay /");
-    expect(clipped).toContain("WORK");
+  test("the watch frame reserves the bottom row and emits NO trailing newline", () => {
+    // The off-by-one the reviewer found: N lines + a trailing LF is N line-feeds
+    // in an N-row pane, so the pane scrolls one row and loses the TOP line. The
+    // loop clips to `height - 1` and writes `view.join("\n")` (no trailing LF),
+    // which reuses the windowing helper the loop calls.
+    const height = 12;
+    const frame = Array.from({ length: 30 }, (_, i) => `line ${i}`);
+    const view = windowLines(frame, 0, Math.max(1, height - 1));
+    const written = view.join("\n");
+    expect(view).toHaveLength(height - 1);
+    expect(written.split("\n")).toHaveLength(height - 1);
+    expect(written.endsWith("\n")).toBe(false); // <-- the fix
+    expect(written.split("\n")[0]).toBe("line 0"); // top line survives
   });
 });
 
