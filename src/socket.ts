@@ -4,9 +4,9 @@ import { defaultSockPath } from "./db";
 import { logEvent } from "./events";
 import { handleErrorSignal, handleIdleSignal, reconcile } from "./reconciler";
 import type { HerdrIdentity, Runtime } from "./runtime/runtime";
-import { attachSession, detachSession, gateEvent, managedWorkerForSession } from "./sessions";
+import { attachSession, detachSession, gateEvent, getSession, managedWorkerForSession, releaseUnhostedBinding } from "./sessions";
 import type { DaemonIdentity } from "./singleton";
-import { getWorker, setWorkerState, setWorkerTool, clearWorkerTool, setWorkerContext, touchSeen } from "./workers";
+import { getWorker, setWorkerState, setWorkerTool, clearWorkerTool, setWorkerContext, touchSeen, reviveFailedWorkerIfAlive } from "./workers";
 
 // JSON Lines over a Unix domain socket. Small protocol:
 //   {"type":"session.idle","session_id":"ses_xxx","generation":2}
@@ -133,6 +133,21 @@ export async function handleSocketMessage(msg: SocketMessage, ctx: SocketContext
         });
         return { ok: false, reason };
       }
+
+      // The session id is the durable identity, but a worker's binding recorded
+      // before an OpenCode/Herdr restart can point at a session Herdr no longer
+      // hosts. Correct it (release the dead binding) so the live session can
+      // re-bind, instead of failing with "already managed by <dead session>".
+      // A binding whose session is still live is left untouched for
+      // attachSession's steal guard to reject.
+      const targetWorker = msg.worker_id ?? getSession(db, msg.session_id)?.worker_id;
+      if (targetWorker) {
+        try {
+          releaseUnhostedBinding(db, targetWorker, msg.session_id, await runtime.reportedSessions());
+        } catch (e) {
+          return { ok: false, reason: String(e).slice(0, 200) };
+        }
+      }
     }
 
     let s;
@@ -180,6 +195,12 @@ export async function handleSocketMessage(msg: SocketMessage, ctx: SocketContext
   // agree, or the event belongs to a superseded/foreign session.
   const workerId = managedWorkerForSession(db, session);
   if (!workerId) return { ok: true, ignored: "fenced-out" };
+
+  // T393: a managed event PROVES the session is live. If a failed liveness probe
+  // left this worker `dead`/`stalled`, revive it BEFORE handling the event: a
+  // dead-marked-but-live session would otherwise keep running unsupervised and
+  // the supervisor could spawn a duplicate generation for the same worker.
+  reviveFailedWorkerIfAlive(db, workerId);
 
   if (IDLE_TYPES.has(type)) {
     const outcome = await handleIdleSignal(db, runtime, workerId);

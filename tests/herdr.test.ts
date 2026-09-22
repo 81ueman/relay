@@ -100,6 +100,54 @@ describe("A. manual attach of an existing Herdr session", () => {
   });
 });
 
+describe("A2. stale binding rebind (session id is the durable identity)", () => {
+  test("a worker bound to a session Herdr no longer hosts is released and re-binds", async () => {
+    // g1: ses_dead attaches and becomes the worker's binding.
+    rt.setIdentity("ses_dead", IDENTITY);
+    const first = await handleSocketMessage(
+      { type: "session.attach", session_id: "ses_dead", role: "worker", worker_id: "w1", pane_id: IDENTITY.paneId },
+      ctx
+    );
+    expect(first.ok).toBe(true);
+    expect(getWorker(db, "w1")!.opencode_session_id).toBe("ses_dead");
+
+    // Restart: Herdr no longer reports ses_dead, but reports ses_live instead.
+    rt.identities.delete("ses_dead");
+    const live: HerdrIdentity = { ...IDENTITY, agent: "herdr-agent-2", paneId: "w9:p9" };
+    rt.setIdentity("ses_live", live);
+
+    const second = await handleSocketMessage(
+      { type: "session.attach", session_id: "ses_live", role: "worker", worker_id: "w1", pane_id: live.paneId },
+      ctx
+    );
+    expect(second.ok).toBe(true);
+    const w = getWorker(db, "w1")!;
+    expect(w.opencode_session_id).toBe("ses_live");
+    expect(getSession(db, "ses_dead")!.managed).toBe(0);
+    expect(getSession(db, "ses_live")!.managed).toBe(1);
+  });
+
+  test("a still-live binding is never stolen", async () => {
+    rt.setIdentity("ses_a", IDENTITY);
+    rt.setIdentity("ses_b", { ...IDENTITY, agent: "herdr-agent-b", paneId: "w9:pb" });
+    expect(
+      (await handleSocketMessage(
+        { type: "session.attach", session_id: "ses_a", role: "worker", worker_id: "w2", pane_id: IDENTITY.paneId },
+        ctx
+      )).ok
+    ).toBe(true);
+
+    const steal = await handleSocketMessage(
+      { type: "session.attach", session_id: "ses_b", role: "worker", worker_id: "w2", pane_id: "w9:pb" },
+      ctx
+    );
+    expect(steal.ok).toBe(false);
+    expect(String(steal.reason)).toMatch(/already managed by ses_a/);
+    expect(getWorker(db, "w2")!.opencode_session_id).toBe("ses_a");
+    expect(getSession(db, "ses_b")).toBeNull();
+  });
+});
+
 describe("B. non-Herdr attach is rejected", () => {
   test("an unverifiable identity creates no session, worker or runtime", async () => {
     const before = eventCount();
