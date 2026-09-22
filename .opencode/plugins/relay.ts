@@ -38,6 +38,7 @@
 //   ln -s "$(pwd)/.opencode/plugins/relay.ts" ~/.config/opencode/plugins/relay.ts
 
 import net from "node:net";
+import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import path from "node:path";
 
@@ -61,6 +62,8 @@ interface RelayPluginState {
   detachedCache: Set<string>;
   /** sessionID -> project directory (resolved once from the server, successes only). */
   directoryCache: Map<string, string | null>;
+  /** directory -> MAIN git worktree root (or null). Cached: never spawn git per event. */
+  repoRootCache: Map<string, string | null>;
   /** Sessions we already told the daemon to attach (marker or env). */
   autoAttached: Set<string>;
   /** sessionID -> last auto-attach attempt time (retry cooldown). */
@@ -77,6 +80,7 @@ const G: RelayPluginState = ((globalThis as any).__relayPlugin ??= {
   generationCache: new Map(),
   detachedCache: new Set(),
   directoryCache: new Map(),
+  repoRootCache: new Map(),
   autoAttached: new Set(),
   attachAttemptAt: new Map(),
   pendingAttach: new Map(),
@@ -88,6 +92,7 @@ G.toolLocations ??= new Set();
 G.generationCache ??= new Map();
 G.detachedCache ??= new Set();
 G.directoryCache ??= new Map();
+G.repoRootCache ??= new Map();
 G.autoAttached ??= new Set();
 G.attachAttemptAt ??= new Map();
 G.pendingAttach ??= new Map();
@@ -107,6 +112,33 @@ const ENV_GENERATION = (() => {
 const ATTACH_MARKER = /RELAY-ATTACH\s+worker=([A-Za-z0-9._-]+)\s+gen=(\d+)(?:\s+token=([A-Za-z0-9._-]+))?/;
 
 /**
+ * The MAIN worktree root of the git repo containing `directory`, or null.
+ *
+ * A linked worktree (`~/.herdr/worktrees/<repo>/<lane>`) has no ancestor
+ * `.relay`; the git COMMON dir points at the MAIN checkout's `.git`, whose
+ * parent is the main worktree root. Same repository, so resolving there can
+ * never cross-route to another project. Cached per directory: socketPathFor runs
+ * on every forwarded event and must not spawn git each time.
+ */
+export function gitRepoRoot(directory: string): string | null {
+  const key = path.resolve(directory);
+  const cached = G.repoRootCache.get(key);
+  if (cached !== undefined) return cached;
+  let root: string | null = null;
+  try {
+    const out = execFileSync("git", ["-C", key, "rev-parse", "--path-format=absolute", "--git-common-dir"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    if (out) root = path.dirname(out);
+  } catch {
+    root = null;
+  }
+  G.repoRootCache.set(key, root);
+  return root;
+}
+
+/**
  * Resolve the daemon socket for a session's project directory.
  *
  * INVARIANT (fail closed): when the session directory IS known we NEVER fall
@@ -116,7 +148,8 @@ const ATTACH_MARKER = /RELAY-ATTACH\s+worker=([A-Za-z0-9._-]+)\s+gen=(\d+)(?:\s+
  * plane. So, with a known directory:
  *   1. the nearest existing `<dir>/.relay/relay.sock` (walking up), else
  *   2. the nearest `<dir>/.relay/` (socket not created yet), else
- *   3. no socket at all (drop).
+ *   3. the MAIN checkout's `.relay` via the git common dir (git worktree), else
+ *   4. no socket at all (drop).
  * `RELAY_SOCK` is only consulted when the directory is unknown AND the
  * deployment explicitly opts into dedicated single-project mode
  * (`RELAY_DEDICATED=1`). Otherwise there is no session→project evidence, so
@@ -150,6 +183,14 @@ export function socketPathFor(directory?: string | null): string | null {
 
   const relayDir = walk((d) => (existsSync(path.join(d, ".relay")) ? d : null));
   if (relayDir) return path.join(relayDir, ".relay", "relay.sock");
+
+  // Git-worktree fallback (same repository => still fail closed across projects).
+  const root = gitRepoRoot(directory);
+  if (root) {
+    const rootSock = path.join(root, ".relay", "relay.sock");
+    if (existsSync(rootSock)) return rootSock;
+    if (existsSync(path.join(root, ".relay"))) return rootSock;
+  }
 
   // Known directory with no project control plane: NEVER another project's
   // RELAY_SOCK. Fail closed.

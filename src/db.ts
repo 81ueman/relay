@@ -1,9 +1,33 @@
 import { Database } from "bun:sqlite";
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { SCHEMA } from "./schema";
 
 export const STATE_DIR = ".relay";
+
+/**
+ * The MAIN worktree root of the git repository containing `dir`, or null when
+ * `dir` is not in a git repo (or git is unavailable).
+ *
+ * A linked git worktree (e.g. `~/.herdr/worktrees/<repo>/<lane>`) has no
+ * ancestor `.relay`, so the directory walk cannot find the control plane. The
+ * git COMMON dir always points at the MAIN checkout's `.git`, whose parent is
+ * the main worktree root — same repository, so this never cross-routes to
+ * another project's control plane.
+ */
+export function gitRepoRoot(dir: string): string | null {
+  try {
+    const out = execFileSync("git", ["-C", dir, "rev-parse", "--path-format=absolute", "--git-common-dir"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    if (!out) return null;
+    return dirname(out);
+  } catch {
+    return null;
+  }
+}
 
 export function defaultDbPath(cwd = process.cwd()): string {
   if (process.env.RELAY_DB) return resolve(process.env.RELAY_DB);
@@ -17,6 +41,14 @@ export function defaultDbPath(cwd = process.cwd()): string {
     const parent = dirname(cur);
     if (parent === cur) break;
     cur = parent;
+  }
+  // Worktree fallback: a linked worktree lives outside the main checkout, with
+  // no ancestor `.relay`. Resolve the MAIN repo through the git common dir and
+  // reuse ITS control plane, so a worktree session/CLI finds the daemon/socket
+  // automatically instead of creating a split ledger.
+  const root = gitRepoRoot(cwd);
+  if (root && existsSync(join(root, STATE_DIR))) {
+    return join(root, STATE_DIR, "state.db");
   }
   return join(cwd, STATE_DIR, "state.db");
 }

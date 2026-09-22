@@ -455,6 +455,25 @@ always called with `--workspace <ws>`; if no workspace is configured the spawn
 fails closed rather than silently using the currently focused workspace (which
 is how agents once landed in an unrelated workspace).
 
+### Git worktrees: one control plane per repository
+
+A linked git worktree (`~/.herdr/worktrees/<repo>/<lane>`) has no ancestor
+`.relay`, so it used to be unusable: the plugin resolved no socket (dropping
+every event) and the CLI could not find `state.db`. Both now resolve the **main
+checkout** through the git common dir, so a worktree session attaches to the
+main repo's daemon automatically — no manual `.relay` symlink:
+
+```text
+<worktree>/  --git rev-parse --git-common-dir-->  <main>/.git  -->  <main>/.relay
+```
+
+- Same repository ⇒ the resolution can never cross-route to another project's
+  control plane; per-directory routing stays fail-closed (a directory with no
+  repo/`.relay` still drops).
+- `relay session attach` records the worktree root in the session row
+  (`directory` / `worktree`); the control plane itself stays centralized in the
+  main checkout, so one ledger serves every lane.
+
 ## Managed sessions: plain `opencode` stays untouched
 
 Herdr-runtime is mandatory; Relay *management* is optional. Running OpenCode
