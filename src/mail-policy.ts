@@ -54,7 +54,7 @@ export function immediateKindSql(): string {
 export function nextMailNudgeIn(db: Database, recipient: string, at = now()): number | null {
   const q = db
     .query(
-      `SELECT MIN(created_at) AS oldest,
+      `SELECT MIN(CASE WHEN kind IN (${immediateKindSql()}) THEN created_at END) AS oldest,
               SUM(CASE WHEN kind IN (${immediateKindSql()}) THEN 1 ELSE 0 END) AS immediate
          FROM messages WHERE recipient = ? AND state = 'queued'`
     )

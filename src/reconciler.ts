@@ -585,12 +585,13 @@ async function nudgeUnreadMail(
   const cap = starvationCapMs();
   const rows = db
     .query(
-      `SELECT recipient, COUNT(*) AS n, MIN(created_at) AS oldest,
+      `SELECT recipient, COUNT(*) AS n,
+              MIN(CASE WHEN kind IN (${immediateKindSql()}) THEN created_at END) AS oldest,
               SUM(CASE WHEN kind IN (${immediateKindSql()}) THEN 1 ELSE 0 END) AS immediate
          FROM messages WHERE state = 'queued'
         GROUP BY recipient`
     )
-    .all() as { recipient: string; n: number; oldest: number; immediate: number }[];
+    .all() as { recipient: string; n: number; oldest: number | null; immediate: number }[];
   if (rows.length === 0) return;
   for (const { recipient, n, oldest, immediate } of rows) {
     // PULL-ONLY: ordinary mail never nudges. Only actionable (immediate) kinds
@@ -604,9 +605,13 @@ async function nudgeUnreadMail(
     // bounded quiet lease, which is exactly the "resume me for something useful"
     // signal (child_done must still wake a quiet parent). `state='working'` and a
     // live tool are the durable busy signals; `rt.isWorking` covers a busy
-    // transport whose worker row is not yet touched. A STALE turn (past the
-    // starvation cap) is nudged once anyway so durable mail is not starved.
-    const stale = at - oldest >= cap;
+    // transport whose worker row is not yet touched. A STALE turn is nudged once
+    // anyway so durable mail is not starved.
+    //
+    // `oldest` is the oldest IMMEDIATE message only: a stale PULL-ONLY message
+    // must never make `stale` permanently true and re-enable mid-turn interrupts
+    // (that was the bug where ordinary mail poisoned the starvation clock).
+    const stale = oldest !== null && at - oldest >= cap;
     const quiet = quietActive(w, at);
     const busy =
       !quiet &&
@@ -614,15 +619,27 @@ async function nudgeUnreadMail(
         w.tool_started_at !== null ||
         (typeof rt.isWorking === "function" && (await rt.isWorking(w).catch(() => false))));
     if (busy && !stale) {
-      logEvent(db, {
-        source: "supervisor", workerId: recipient, type: "worker.mail_nudge_deferred",
-        payload: { recipient, count: n, reason: w.state === "working" ? "working" : w.tool_started_at !== null ? "tool" : "busy" },
-      });
+      // Cooldown the DEFERRED log itself: otherwise a worker that stays busy
+      // logs one event per reconcile tick (log spam).
+      if (!recentlyEvent(db, recipient, "worker.mail_nudge_deferred", at, window)) {
+        logEvent(db, {
+          source: "supervisor", workerId: recipient, type: "worker.mail_nudge_deferred",
+          payload: { recipient, count: n, reason: w.state === "working" ? "working" : w.tool_started_at !== null ? "tool" : "busy" },
+        });
+      }
       continue;
     }
+    // The wake text must match the message: an urgent interrupt is not "not
+    // urgent — finish what you are doing".
+    const urgent = db
+      .query(`SELECT COUNT(*) AS n FROM messages WHERE recipient = ? AND state='queued' AND kind = 'urgent'`)
+      .get(recipient) as { n: number };
+    const body = urgent.n > 0
+      ? `${RELAY_TAG}URGENT: you have ${n} unread durable message(s) needing attention now — run \`relay inbox --claim\`.`
+      : `${RELAY_TAG}You have ${n} unread durable message(s). Not urgent — finish your current step, then run \`relay inbox --claim\` at a stopping point. Relay keeps reminding you until you read it.`;
     try {
-      await rt.wake(w, `${RELAY_TAG}You have ${n} unread durable message(s). Not urgent — finish your current step, then run \`relay inbox --claim\` at a stopping point. Relay keeps reminding you until you read it.`);
-      logEvent(db, { source: "supervisor", workerId: recipient, type: "worker.mail_nudged", payload: { recipient, count: n, starvation: busy && stale } });
+      await rt.wake(w, body);
+      logEvent(db, { source: "supervisor", workerId: recipient, type: "worker.mail_nudged", payload: { recipient, count: n, starvation: busy && stale, urgent: urgent.n > 0 } });
       actions.push(`mail-nudged:${recipient}`);
     } catch (e) {
       logEvent(db, { source: "supervisor", workerId: recipient, type: "worker.wake_failed", payload: { reason: "unread-mail", error: String(e).slice(0, 200) } });

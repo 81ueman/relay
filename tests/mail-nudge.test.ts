@@ -198,3 +198,67 @@ describe("mid-work deferral (T329)", () => {
     expect(actions).toContain("mail-nudged:worker-b");
   });
 });
+
+// T329 follow-up (reviewer-4): three defects in the first cut.
+describe("starvation clock, deferred-log cooldown, urgent text (T329 follow-up)", () => {
+  test("a stale PULL-ONLY message does NOT poison the starvation clock", async () => {
+    process.env.RELAY_MAIL_NUDGE_MS = "600000";
+    process.env.RELAY_MAIL_STARVATION_MS = "600000";
+    registerWorker(db, "worker-b", { role: "worker" });
+    db.query(`UPDATE workers SET state='working' WHERE id='worker-b'`).run();
+    // An OLD ordinary (pull-only) message: it must not make `stale` true.
+    const old = sendMessage(db, "worker-a", "worker-b", "ancient fyi", { kind: "note" });
+    db.query(`UPDATE messages SET created_at=? WHERE id=?`).run(Date.now() - 3_600_000, old);
+    staleMessage("worker-b", "interrupt!", "urgent");
+
+    const { actions } = await reconcile(db, rt);
+    expect(actions).not.toContain("mail-nudged:worker-b"); // stays deferred
+  });
+
+  test("a stale IMMEDIATE message past the cap DOES nudge (starvation still works)", async () => {
+    process.env.RELAY_MAIL_NUDGE_MS = "600000";
+    process.env.RELAY_MAIL_STARVATION_MS = "1000"; // short cap
+    registerWorker(db, "worker-b", { role: "worker" });
+    db.query(`UPDATE workers SET state='working' WHERE id='worker-b'`).run();
+    const id = sendMessage(db, "worker-a", "worker-b", "old urgent", { kind: "urgent" });
+    db.query(`UPDATE messages SET created_at=? WHERE id=?`).run(Date.now() - 5000, id);
+
+    const { actions } = await reconcile(db, rt);
+    expect(actions).toContain("mail-nudged:worker-b");
+    const nudged = listEvents(db, { limit: 50 }).find((e) => e.type === "worker.mail_nudged");
+    expect(JSON.parse(nudged!.payload_json).starvation).toBe(true);
+  });
+
+  test("worker.mail_nudge_deferred is cooldown-limited (no per-tick spam)", async () => {
+    process.env.RELAY_MAIL_NUDGE_MS = "600000";
+    process.env.RELAY_MAIL_STARVATION_MS = "600000";
+    registerWorker(db, "worker-b", { role: "worker" });
+    db.query(`UPDATE workers SET state='working' WHERE id='worker-b'`).run();
+    staleMessage("worker-b", "interrupt!", "urgent");
+    for (let i = 0; i < 20; i++) await reconcile(db, rt);
+    const deferred = listEvents(db, { limit: 500 }).filter((e) => e.type === "worker.mail_nudge_deferred");
+    expect(deferred.length).toBeLessThanOrEqual(1);
+  });
+
+  test("an URGENT nudge says URGENT, not 'not urgent'", async () => {
+    registerWorker(db, "worker-b", { role: "worker" }); // idle
+    staleMessage("worker-b", "interrupt!", "urgent");
+    await reconcile(db, rt);
+    expect(rt.wakes.find((w) => w.workerId === "worker-b")!.text).toContain("URGENT");
+  });
+
+  test("a completion notice keeps the 'not urgent' text", async () => {
+    registerWorker(db, "worker-b", { role: "worker" }); // idle parent owner
+    const parent = addTask(db, { title: "parent" });
+    registerWorker(db, "worker-c", { role: "worker" });
+    const child = addTask(db, { title: "child", parentTaskId: parent.id });
+    db.query(`UPDATE tasks SET assignee='worker-b' WHERE id=?`).run(parent.id);
+    claimTask(db, child.id, "worker-c");
+    submitTask(db, child.id, "worker-c", { evidence: "x" });
+    approveTask(db, child.id, "reviewer");
+    await reconcile(db, rt);
+    const text = rt.wakes.find((w) => w.workerId === "worker-b")!.text;
+    expect(text).toContain("Not urgent");
+    expect(text).not.toContain("URGENT:");
+  });
+});
