@@ -421,15 +421,16 @@ relay init           # creates .relay/state.db (WAL)
 relay daemon         # reconcile loop + Unix socket .relay/relay.sock
 ```
 
-The OpenCode plugin (`.opencode/plugins/relay.ts`) and Skill
-(`skills/agent-worker/SKILL.md`, symlinked from `.opencode/skills/agent-worker`)
-are auto-discovered under this repo:
+The OpenCode plugin (`.opencode/plugins/relay.ts`) and Skills
+(`skills/agent-worker/SKILL.md` and `skills/parallel-worktrees/SKILL.md`,
+symlinked from `.opencode/skills/`) are auto-discovered under this repo:
 
 ```bash
 opencode plugin list   # relay ... .opencode/plugins/relay.ts
 ```
 
-The `agent-worker` skill is also published through APM (Agent Package Manager):
+The `agent-worker` and `parallel-worktrees` skills are also published through APM
+(Agent Package Manager):
 
 ```bash
 apm install -g --target agent-skills 81ueman/relay
@@ -1025,6 +1026,6 @@ src/cli.ts  daemon.ts  db.ts  schema.ts  scheduler.ts  reconciler.ts
     runtimes.ts  mail-policy.ts  runtime/{runtime,herdr}.ts
     dashboard/{command,model,render,affinity,herdr,doctor}.ts
 .opencode/plugins/relay.ts  integrations/herdr/{herdr-plugin.toml,focus-pane.ts}
-skills/agent-worker/SKILL.md
+skills/agent-worker/SKILL.md  skills/parallel-worktrees/SKILL.md
 tests/{integration,contract,lifecycle,herdr,release,dashboard,dashboard-affinity}.test.ts
 ```
