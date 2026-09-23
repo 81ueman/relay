@@ -50,6 +50,7 @@ import {
   getNotes,
   getTask,
   hasClaimableReview,
+  resolveHumanInterface,
   reviewTasks,
   unclaimableRunnableTasks,
 } from "./tasks";
@@ -339,6 +340,81 @@ function releaseTaskOfDeadWorker(db: Database, workerId: string, taskId: string 
  * cross-process case.
  */
 const restartingWorkers = new Set<string>();
+
+/**
+ * T516: cadence for re-alerting an unattended UNCLAIMABLE runnable task. Long
+ * enough not to nag, short enough that work nobody can take is not forgotten.
+ */
+function unclaimableAlertMs(): number {
+  const v = Number(process.env.RELAY_UNCLAIMABLE_ALERT_MS ?? String(30 * 60_000));
+  return Number.isFinite(v) && v >= 0 ? v : 30 * 60_000;
+}
+
+/** Newest unclaimable-alert timestamp for a task (0 if never alerted). */
+function lastUnclaimableAlertAt(db: Database, taskId: string): number {
+  const r = db
+    .query(
+      `SELECT MAX(timestamp) AS t FROM events
+        WHERE task_id = ? AND type IN ('task.unclaimable_notified', 'task.unclaimable_unrouted')`
+    )
+    .get(taskId) as { t: number | null };
+  return r.t ?? 0;
+}
+
+/**
+ * T516: a RUNNABLE task whose role matches NO registered worker is offered to
+ * nobody. Relay already detects it (status Attention, supervisor.unclaimable_work),
+ * but that is PASSIVE: the responsible coordinator had to poll to notice (live:
+ * T499 role=sym-cond sat runnable+unclaimable). Push it instead — a durable
+ * message to the responsible owner (nearest assigned ancestor, or RELAY_HUMAN),
+ * so the owner is told rather than required to look.
+ *
+ * Evaluated INDEPENDENTLY of the wake loop above: an idle worker of a DIFFERENT
+ * role (or a successful wake for other work) must never mask it. Bounded by a
+ * cooldown so an unattended task re-alerts at a human cadence, not every tick.
+ */
+async function notifyUnclaimableRunnable(db: Database, actions: string[], at: number): Promise<void> {
+  const stranded = unclaimableRunnableTasks(db);
+  if (stranded.length === 0) return;
+  const window = unclaimableAlertMs();
+  let alerted = false;
+  for (const task of stranded) {
+    if (lastUnclaimableAlertAt(db, task.id) > at - window) continue;
+    alerted = true;
+    const recipient = resolveHumanInterface(db, task);
+    const body =
+      `${RELAY_TAG}${task.id} is RUNNABLE but UNCLAIMABLE — role '${task.role}' matches no registered worker, ` +
+      `so nobody can take it. Register or spawn a worker of that role (or change the task's role): ` +
+      `\`relay worker spawn <id> --role ${task.role}\`.`;
+    if (recipient) {
+      sendMessage(db, "relay", recipient, body, { kind: "unclaimable_role", taskId: task.id });
+      logEvent(db, {
+        source: "supervisor",
+        taskId: task.id,
+        type: "task.unclaimable_notified",
+        payload: { recipient, role: task.role },
+      });
+    } else {
+      // No assigned ancestor and no RELAY_HUMAN: make it LOUD, never silent.
+      logEvent(db, {
+        source: "supervisor",
+        taskId: task.id,
+        type: "task.unclaimable_unrouted",
+        payload: { role: task.role },
+      });
+    }
+    actions.push(`unclaimable:${task.id}`);
+  }
+  if (alerted) {
+    // Keep the historical signal (now bounded to the alert cadence rather than
+    // logged every tick) alongside the per-task notify events.
+    logEvent(db, {
+      source: "supervisor",
+      type: "supervisor.unclaimable_work",
+      payload: { tasks: stranded.map((t) => ({ id: t.id, role: t.role })) },
+    });
+  }
+}
 
 /**
  * Restart = CONTROL-PLANE policy, built from transport primitives:
@@ -1491,7 +1567,6 @@ export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<
         .filter((x) => x.state === "dead" || x.state === "stalled")
         .filter((x) => claimableRunnableTasks(db, x.id).length > 0)
         .sort((a, b) => a.id.localeCompare(b.id))[0];
-      const stranded = unclaimableRunnableTasks(db);
       if (fallen) {
         if (await restartWorker(db, rt, fallen, at)) actions.push(`restarted:${fallen.id}`);
         else actions.push(`restart-skipped:${fallen.id}`);
@@ -1499,21 +1574,18 @@ export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<
         actions.push("wake-suppressed");
       } else if (operationalWorkers(db).some((x) => x.state === "starting")) {
         actions.push("awaiting-start");
-      } else if (stranded.length > 0) {
-        // Runnable work exists but no registered worker role can claim it: make
-        // the stranded task visible instead of looping on a wake that cannot help.
-        logEvent(db, {
-          source: "supervisor",
-          type: "supervisor.unclaimable_work",
-          payload: { tasks: stranded.map((t) => ({ id: t.id, role: t.role })) },
-        });
-        actions.push(`unclaimable:${stranded.map((t) => t.id).join(",")}`);
       } else {
         logEvent(db, { source: "supervisor", type: "supervisor.no_idle_worker", payload: { view } });
         actions.push("no-idle-worker");
       }
     }
   }
+
+  // 4a. Runnable work whose role matches NO registered worker is offered to
+  //     nobody. Evaluate it OUTSIDE the wake branch above: an idle worker of a
+  //     DIFFERENT role (wake-suppressed) or a successful wake for other work
+  //     must never mask it. Notifies the responsible owner (T516).
+  await notifyUnclaimableRunnable(db, actions, at);
 
   // 4b. A RUNNING task whose assignee is IDLE and no longer holds it must still
   //     be driven to completion once its work is unblocked (T489).

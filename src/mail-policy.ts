@@ -14,6 +14,12 @@ export const IMMEDIATE_MAIL_KINDS = [
   "children_blocked",
   /** T337: a task entered blocked_human — surface it to the human interface. */
   "blocked_human",
+  /**
+   * T516: runnable work whose role matches NO registered worker is offered to
+   * nobody. Push it to the responsible owner promptly instead of waiting for a
+   * coordinator to poll `relay status` Attention.
+   */
+  "unclaimable_role",
   /** `relay send --urgent`: a genuine interrupt that MAY wake a busy worker. */
   "urgent",
 ] as const;
