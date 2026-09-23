@@ -51,7 +51,9 @@ import {
   getTask,
   hasClaimableReview,
   resolveHumanInterface,
+  restoreTasksOrphanedByDeadWorker,
   reviewTasks,
+  reviveWorkerRestoringTasks,
   unclaimableRunnableTasks,
 } from "./tasks";
 import {
@@ -64,7 +66,6 @@ import {
   clearQuiet,
   clearWorkerTool,
   quietActive,
-  reviveFailedWorkerIfAlive,
   type WorkerRow,
 } from "./workers";
 import { RELAY_TAG, sendMessage } from "./messages";
@@ -1386,7 +1387,7 @@ export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<
       // generation while the live session keeps running unsupervised.
       const evidence = sessionAliveEvidence(db, fresh, at);
       if (evidence) {
-        reviveFailedWorkerIfAlive(db, w.id, at);
+        reviveWorkerRestoringTasks(db, w.id, at);
         actions.push(`revived-by-event:${w.id}`);
         continue;
       }
@@ -1423,6 +1424,9 @@ export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<
         setWorkerState(db, w.id, "idle");
         logEvent(db, { source: "supervisor", workerId: w.id, type: "worker.revived", payload: { was: fresh.state } });
         actions.push(`revived:${w.id}`);
+        // T523: re-adopt the running tasks a transient dead window released.
+        const restored = restoreTasksOrphanedByDeadWorker(db, w.id, at);
+        if (restored.length > 0) actions.push(`restored:${restored.join(",")}`);
         if (claimableRunnableTasks(db, w.id).length > 0) {
           const full = getWorker(db, w.id)!;
           if (await tryWake(rt, db, full, NEXT_NUDGE, "revived", at)) actions.push(`woken:${w.id}`);

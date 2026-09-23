@@ -6,7 +6,8 @@ import { handleErrorSignal, handleIdleSignal, reconcile } from "./reconciler";
 import type { HerdrIdentity, Runtime } from "./runtime/runtime";
 import { attachSession, detachSession, gateEvent, getSession, managedWorkerForSession, releaseUnhostedBinding } from "./sessions";
 import type { DaemonIdentity } from "./singleton";
-import { getWorker, setWorkerState, setWorkerTool, clearWorkerTool, setWorkerContext, touchSeen, reviveFailedWorkerIfAlive } from "./workers";
+import { reviveWorkerRestoringTasks } from "./tasks";
+import { getWorker, setWorkerState, setWorkerTool, clearWorkerTool, setWorkerContext, touchSeen } from "./workers";
 
 // JSON Lines over a Unix domain socket. Small protocol:
 //   {"type":"session.idle","session_id":"ses_xxx","generation":2}
@@ -200,7 +201,8 @@ export async function handleSocketMessage(msg: SocketMessage, ctx: SocketContext
   // left this worker `dead`/`stalled`, revive it BEFORE handling the event: a
   // dead-marked-but-live session would otherwise keep running unsupervised and
   // the supervisor could spawn a duplicate generation for the same worker.
-  reviveFailedWorkerIfAlive(db, workerId);
+  // T523: also re-adopt the running tasks a transient dead window released.
+  reviveWorkerRestoringTasks(db, workerId);
 
   if (IDLE_TYPES.has(type)) {
     const outcome = await handleIdleSignal(db, runtime, workerId);

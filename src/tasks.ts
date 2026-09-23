@@ -7,10 +7,11 @@ import {
   getWorker,
   listWorkers,
   normalizeWorkerAfterTaskRelease,
+  reviveFailedWorkerIfAlive,
   setQuiet,
   touchProgress,
 } from "./workers";
-import type { Task, TaskState } from "./schema";
+import type { Task, TaskState, WorkerState } from "./schema";
 import { RELAY_TAG, sendMessage } from "./messages";
 
 export const STALE_LEASE = "STALE_LEASE";
@@ -615,6 +616,95 @@ function clearCurrentTaskOrRestoreParent(
   } else {
     clearCurrentTask(db, workerId);
   }
+}
+
+/**
+ * T523: how long after a dead-worker release a revive may still re-adopt the
+ * lost tasks. Long enough to cover a transient dead window, short enough that a
+ * genuinely-dead worker's abandoned work is not silently taken back later.
+ */
+function deadRestoreMs(): number {
+  const v = Number(process.env.RELAY_DEAD_RESTORE_MS ?? String(10 * 60_000));
+  return Number.isFinite(v) && v >= 0 ? v : 10 * 60_000;
+}
+
+/**
+ * T523: a TRANSIENT dead verdict must not orphan a worker's running program.
+ *
+ * A worker that is mid-turn (the plugin forwards no events while the model
+ * processes a long prompt) can be marked dead; its RUNNING assigned tasks are
+ * then released to queued/unassigned (directly by the dead path and, for the
+ * non-current ones, by lease expiry). A second later the session emits an event
+ * and is revived — into an empty program (live: program-coord-2 lost roots
+ * T199/T496/T503 this way).
+ *
+ * On revive, re-adopt the tasks this worker lost to that dead window: tasks
+ * whose most recent release was a dead-worker requeue / lease expiry attributable
+ * to this worker, within a bounded grace, and which are STILL queued and
+ * unassigned. A task another worker already picked up, or one deliberately
+ * released/blocked since, is left untouched.
+ */
+export function restoreTasksOrphanedByDeadWorker(
+  db: Database,
+  workerId: string,
+  at = now(),
+  graceMs = deadRestoreMs()
+): string[] {
+  const lost = db
+    .query(
+      `SELECT DISTINCT task_id FROM events
+        WHERE worker_id = ? AND task_id IS NOT NULL
+          AND type IN ('task.requeued_dead_worker', 'task.lease_expired')
+          AND timestamp > ?
+        ORDER BY task_id`
+    )
+    .all(workerId, at - graceMs) as { task_id: string }[];
+  if (lost.length === 0) return [];
+  const restored: string[] = [];
+  const until = at + leaseMs();
+  for (const { task_id } of lost) {
+    const task = getTask(db, task_id);
+    if (!task || task.state !== "queued" || task.assignee !== null) continue; // taken/released since
+    db.query(
+      `UPDATE tasks SET state = 'running', assignee = ?, lease_token = lease_token + 1,
+         lease_until = ?, updated_at = ? WHERE id = ? AND state = 'queued' AND assignee IS NULL`
+    ).run(workerId, until, at, task_id);
+    const changed = (db.query(`SELECT changes() AS n`).get() as { n: number }).n;
+    if (changed === 0) continue; // lost the race to another claim
+    logEvent(db, { source: "supervisor", workerId, taskId: task_id, type: "task.reassigned_on_revive" });
+    restored.push(task_id);
+  }
+  if (restored.length > 0) {
+    // Point the worker at its best restored task so the pointer is consistent
+    // with the ownership it just regained (T495).
+    const best = db
+      .query(`SELECT id FROM tasks WHERE state = 'running' AND assignee = ? ORDER BY priority DESC, created_at ASC LIMIT 1`)
+      .get(workerId) as { id: string } | null;
+    if (best) {
+      db.query(`UPDATE workers SET current_task_id = ?, state = 'working', updated_at = ? WHERE id = ?`).run(best.id, at, workerId);
+    }
+  }
+  return restored;
+}
+
+/**
+ * T523: revive a failed-state worker AND re-adopt the running tasks a transient
+ * dead window released. Every revive path (socket event, reconciler) goes
+ * through here so a revived program comes back whole, not empty.
+ */
+export function reviveWorkerRestoringTasks(db: Database, workerId: string, at = now()): WorkerState | null {
+  const was = reviveFailedWorkerIfAlive(db, workerId, at);
+  if (was === null) return null;
+  const restored = restoreTasksOrphanedByDeadWorker(db, workerId, at);
+  if (restored.length > 0) {
+    logEvent(db, {
+      source: "supervisor",
+      workerId,
+      type: "worker.revived_restored_tasks",
+      payload: { was, tasks: restored },
+    });
+  }
+  return was;
 }
 
 /**
