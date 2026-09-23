@@ -287,6 +287,42 @@ function sessionAliveEvidence(db: Database, w: WorkerRow, at: number): string | 
   return null;
 }
 
+/**
+ * T532: is the worker's PANE actively working right now?
+ *
+ * A long model turn forwards NO plugin events, so event-only liveness expires
+ * and a live, mid-turn session gets declared dead (its program released). Herdr
+ * knows better: the pane's `agent_status` is `working`. Probe the RECORDED pane
+ * id first — a stale/renamed agent target can fail `agent get <name>` while the
+ * pane itself is plainly alive and working.
+ */
+async function paneWorking(db: Database, rt: Runtime, w: WorkerRow): Promise<boolean> {
+  const cur = findRuntime(db, w.id, w.generation) ?? getActiveRuntime(db, w.id);
+  const probe = cur?.pane_id ? { ...w, runtime_id: cur.pane_id } : w;
+  return rt.isWorking(probe).catch(() => false);
+}
+
+/**
+ * T532: has a restart already been REFUSED for this exact generation? A refusal
+ * (adopted generation relay cannot retire) is definitive — retrying it every
+ * cooldown just floods worker.restart_refused. Latch it until the generation
+ * changes.
+ */
+function restartRefusedForGeneration(db: Database, workerId: string, generation: number): boolean {
+  const r = db
+    .query(
+      `SELECT payload_json AS p FROM events
+        WHERE worker_id = ? AND type = 'worker.restart_refused' ORDER BY id DESC LIMIT 1`
+    )
+    .get(workerId) as { p: string } | null;
+  if (!r) return false;
+  try {
+    return (JSON.parse(r.p) as { generation?: number }).generation === generation;
+  } catch {
+    return false;
+  }
+}
+
 function recentlyWoken(db: Database, workerId: string, at: number): boolean {
   return recentlyEvent(db, workerId, "worker.woken", at, wakeCooldownMs());
 }
@@ -443,6 +479,9 @@ async function restartWorker(
   opts: { handoff?: string } = {}
 ): Promise<boolean> {
   if (restartingWorkers.has(w.id)) return false;
+  // T532: a definitive refusal for this generation is not retried (silently) —
+  // only a generation change re-opens it, so the refusal log does not loop.
+  if (restartRefusedForGeneration(db, w.id, w.generation)) return false;
   const cooldown = restartCooldownMs();
   // Back off both after a successful spawn and after a failure: otherwise a
   // failing spawn (e.g. a stale leftover agent name) retries every tick and
@@ -1391,6 +1430,22 @@ export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<
         actions.push(`revived-by-event:${w.id}`);
         continue;
       }
+      // T532: a pane Herdr reports as WORKING is alive even with no plugin
+      // events (a long model turn forwards none). Never release its program or
+      // restart it — revive in place.
+      if (await paneWorking(db, rt, fresh)) {
+        reviveWorkerRestoringTasks(db, w.id, at);
+        if (!recentlyEvent(db, w.id, "worker.alive_by_pane", at, sessionLivenessMs())) {
+          logEvent(db, {
+            source: "supervisor",
+            workerId: w.id,
+            type: "worker.alive_by_pane",
+            payload: { probe: "pane.working", taskId: fresh.current_task_id },
+          });
+        }
+        actions.push(`revived-by-pane:${w.id}`);
+        continue;
+      }
       const requeued = releaseTaskOfDeadWorker(db, w.id, fresh.current_task_id, at);
       if (requeued) actions.push(`requeued:${requeued}`);
       // A failed generation cannot be executing anything: drop the tool marker.
@@ -1459,6 +1514,21 @@ export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<
         actions.push(`alive-by-event:${w.id}`);
         continue;
       }
+      // T532: a pane Herdr reports as WORKING is ALIVE. The isAlive probe can
+      // fail on a stale/renamed target while the pane is mid-turn; declaring it
+      // dead released its program and looped restart_refused (live: program-coord-2).
+      if (await paneWorking(db, rt, fresh)) {
+        if (!recentlyEvent(db, w.id, "worker.alive_by_pane", at, sessionLivenessMs())) {
+          logEvent(db, {
+            source: "supervisor",
+            workerId: w.id,
+            type: "worker.alive_by_pane",
+            payload: { probe: "isAlive=false", taskId: fresh.current_task_id },
+          });
+        }
+        actions.push(`alive-by-pane:${w.id}`);
+        continue;
+      }
       setWorkerState(db, w.id, "dead");
       logEvent(db, { source: "supervisor", workerId: w.id, type: "worker.dead" });
       actions.push(`dead:${w.id}`);
@@ -1501,7 +1571,7 @@ export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<
       // An agent Herdr reports as "working" is executing right now (e.g. a long
       // benchmark inside one tool call): that is PROGRESS for the stall clock, so
       // neither nudge nor release it — no relay command is expected mid-command.
-      const agentBusy = await rt.isWorking(fresh).catch(() => false);
+      const agentBusy = await paneWorking(db, rt, fresh);
       const quiet = quietActive(fresh, at);
       if (task.state === "running" && !agentBusy && !quiet && at - fresh.last_progress_at > stallTimeout) {
         if (!fresh.nudged_at) {
