@@ -9,6 +9,7 @@ import { MockRuntime, type HerdrIdentity } from "../src/runtime/runtime";
 import { attachSession } from "../src/sessions";
 import { addTask, claimNext, submitTask } from "../src/tasks";
 import { registerWorker, getWorker } from "../src/workers";
+import { sendMessage } from "../src/messages";
 import { needsWorkerWakeup } from "../src/scheduler";
 
 // Regression: "a queued role-gated task with a matching idle (not retired, no
@@ -189,6 +190,73 @@ describe("wake: queued role-gated task + matching idle worker", () => {
     await reconcile(db, rt);
 
     expect(wokenIds()).not.toContain("control-go");
+  });
+});
+
+// T489: a RUNNING task whose assignee is idle and no longer holds it had NO wake
+// path. The pointer is overwritten by `claimNext` when the worker claims a
+// different task (e.g. one of its own children) and cleared when that task is
+// submitted; stall-nudge keys on current_task_id, the idle wake keys on queued
+// work, and the mail wake keys on unread mail — so the lane stalled at submit.
+
+function lostPointerScenario(): { parentId: string } {
+  managedWorker("lane", "lane");
+  const parent = addTask(db, { title: "inspect", role: "lane" });
+  claimNext(db, "lane"); // lane holds the running parent...
+  addTask(db, { title: "c1", parentTaskId: parent.id, role: "lane-helper" });
+  addTask(db, { title: "c2", parentTaskId: parent.id, role: "lane-helper" });
+  // ...but claims a child, and submitting it clears current_task_id. The worker
+  // is left idle with the running parent still assigned to it.
+  db.query(`UPDATE workers SET current_task_id = NULL, state='idle' WHERE id='lane'`).run();
+  db.query(`UPDATE messages SET state='acked' WHERE recipient='lane'`).run();
+  return { parentId: parent.id };
+}
+
+describe("T489: idle assignee of a running task is re-nudged", () => {
+  test("all children done + idle assignee not holding the parent => nudge", async () => {
+    const { parentId } = lostPointerScenario();
+    db.query(`UPDATE tasks SET state='done', assignee=NULL WHERE parent_task_id = ?`).run(parentId);
+
+    const r = await reconcile(db, rt);
+
+    expect(wokenIds()).toContain("lane");
+    expect(r.actions.some((a) => a.startsWith(`idle-assignee-nudged:lane:${parentId}`))).toBe(true);
+    expect(rt.wakes.find((w) => w.workerId === "lane")!.text).toContain(
+      `relay: Your task ${parentId} is still running`
+    );
+  });
+
+  test("no nudge while a direct child is still unfinished", async () => {
+    const { parentId } = lostPointerScenario();
+    db.query(`UPDATE tasks SET state='done', assignee=NULL WHERE parent_task_id = ? AND title='c1'`).run(parentId);
+
+    const r = await reconcile(db, rt);
+    expect(r.actions.some((a) => a.startsWith("idle-assignee-nudged:"))).toBe(false);
+  });
+
+  test("no nudge while the assignee has unread mail (the mail wake owns it)", async () => {
+    const { parentId } = lostPointerScenario();
+    db.query(`UPDATE tasks SET state='done', assignee=NULL WHERE parent_task_id = ?`).run(parentId);
+    sendMessage(db, "relay", "lane", "children done", { kind: "children_done", taskId: parentId });
+
+    const r = await reconcile(db, rt);
+    expect(r.actions.some((a) => a.startsWith("idle-assignee-nudged:"))).toBe(false);
+  });
+
+  test("re-nudge is bounded by the stall window, not every tick", async () => {
+    const { parentId } = lostPointerScenario();
+    db.query(`UPDATE tasks SET state='done', assignee=NULL WHERE parent_task_id = ?`).run(parentId);
+
+    const t0 = Date.now();
+    await reconcile(db, rt, t0);
+    expect(wokenIds()).toContain("lane");
+
+    rt.wakes.length = 0;
+    await reconcile(db, rt, t0 + 30000); // inside the 60s stall window
+    expect(wokenIds()).not.toContain("lane");
+
+    await reconcile(db, rt, t0 + 62000); // past it
+    expect(wokenIds()).toContain("lane");
   });
 });
 

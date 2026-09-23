@@ -1200,6 +1200,63 @@ async function processInFlightTools(db: Database, rt: Runtime, actions: string[]
   }
 }
 
+/**
+ * T489: a RUNNING task can outlive its assignee's pointer to it. The pointer is
+ * overwritten when the worker claims a DIFFERENT task (e.g. one of its own
+ * children): `claimNext` moves `workers.current_task_id`, and submitting that
+ * other task clears it — leaving the running parent assigned to a worker that no
+ * longer holds it. No wake path then matches: stall-nudge keys on
+ * `current_task_id`, the idle wake keys on QUEUED work the worker can claim, and
+ * the mail wake keys on unread mail. The lane stalls silently at the submit
+ * step (live: T478 -> sbv2, 2026-09-23).
+ *
+ * Invariant: `tasks.state='running'` with an assignee IS live work. When the
+ * assignee is idle, supervised, no longer holds the task, has no unread mail,
+ * and the task is UNBLOCKED (no children, or every direct child done — the
+ * `children_done` signal), the supervisor MUST re-nudge it to continue/submit.
+ * Re-nudging is bounded by the stall window, so an ignored nudge repeats at a
+ * human cadence rather than every tick.
+ */
+async function renudgeIdleAssigneesOfRunningTasks(
+  db: Database, rt: Runtime, actions: string[], at: number
+): Promise<void> {
+  const stallTimeout = stallMs();
+  const running = db
+    .query(`SELECT id, assignee FROM tasks WHERE state = 'running' AND assignee IS NOT NULL`)
+    .all() as { id: string; assignee: string }[];
+  for (const task of running) {
+    const w = getWorker(db, task.assignee);
+    if (!w || !isOperationalWorker(db, w)) continue;
+    if (w.state !== "idle") continue;            // mid-turn / waiting: its own paths apply
+    if (w.current_task_id === task.id) continue; // still holds it: stall/idle paths cover it
+    // Unblocked: no children yet, or every direct child is DONE (matches children_done).
+    const kids = db
+      .query(
+        `SELECT COUNT(*) AS total, SUM(CASE WHEN state = 'done' THEN 1 ELSE 0 END) AS done
+           FROM tasks WHERE parent_task_id = ?`
+      )
+      .get(task.id) as { total: number; done: number };
+    if (kids.total > 0 && kids.done !== kids.total) continue;
+    // Unread mail is the mail wake's job (and the primary notification).
+    const unread = db
+      .query(`SELECT COUNT(*) AS n FROM messages WHERE recipient = ? AND state IN ('queued','delivered')`)
+      .get(w.id) as { n: number };
+    if (unread.n > 0) continue;
+    if (w.nudged_at !== null && at - w.nudged_at <= stallTimeout) continue; // bounded cadence
+    if (await tryWake(rt, db, w, CONTINUE_NUDGE(task.id), "idle-assignee-running-task", at)) {
+      db.query(`UPDATE workers SET nudged_at = ?, updated_at = ? WHERE id = ?`).run(at, at, w.id);
+      logEvent(db, {
+        source: "supervisor",
+        workerId: w.id,
+        taskId: task.id,
+        type: "task.idle_assignee_nudged",
+        payload: { children: kids.total, done: kids.done },
+      });
+      actions.push(`idle-assignee-nudged:${w.id}:${task.id}`);
+    }
+  }
+}
+
 /** One deterministic reconcile pass. Safe to run every 1-2s. */
 export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<ReconcileResult> {
   const actions: string[] = [];
@@ -1457,6 +1514,10 @@ export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<
       }
     }
   }
+
+  // 4b. A RUNNING task whose assignee is IDLE and no longer holds it must still
+  //     be driven to completion once its work is unblocked (T489).
+  await renudgeIdleAssigneesOfRunningTasks(db, rt, actions, at);
 
   if (needsReviewer(view)) {
     if (autoApproveEnabled()) {
