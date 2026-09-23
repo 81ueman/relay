@@ -19,6 +19,7 @@ import {
 } from "./runtimes";
 import {
   contextPercent,
+  contextRotateAdopted,
   contextRotateGraceMs,
   contextWedgeTokens,
   idleWorkers,
@@ -132,6 +133,18 @@ export const CONTEXT_ROTATE_NUDGE = (percent: number) =>
   `CONTEXT HIGH (${Math.round(percent)}%): checkpoint now. ` +
   `Write \`relay note <task> "HANDOFF: <state, files, next steps, blockers>"\`, then END YOUR TURN. ` +
   `relay will rotate you to a fresh session and pass the handoff to your successor.`;
+
+/**
+ * T551 #3: the SESSION-PER-TASK variant for an ADOPTED lane relay cannot retire.
+ * The worker must do the rotation itself: finish/checkpoint the current task,
+ * then start a fresh session and re-attach (agent_attach). Relay detects the
+ * re-attach as a new generation and clears the pending request.
+ */
+export const CONTEXT_SELF_ROTATE_NUDGE = (percent: number) =>
+  `CONTEXT HIGH (${Math.round(percent)}%): checkpoint now. ` +
+  `Write \`relay note <task> "HANDOFF: <state, files, next steps, blockers>"\`, then END YOUR TURN. ` +
+  `This lane is adopted, so relay cannot rotate it: at the next TASK BOUNDARY start a FRESH ` +
+  `session (session-per-task) and re-attach it, then \`relay next\`. Your successor re-claims the task.`;
 
 function wakeCooldownMs(): number {
   const v = Number(process.env.RELAY_WAKE_COOLDOWN_MS ?? "30000");
@@ -534,12 +547,14 @@ async function restartWorker(
   rt: Runtime,
   w: WorkerRow,
   at: number,
-  opts: { handoff?: string } = {}
+  opts: { handoff?: string; allowAdoptedReplace?: boolean } = {}
 ): Promise<boolean> {
   if (restartingWorkers.has(w.id)) return false;
   // T532: a definitive refusal for this generation is not retried (silently) —
   // only a generation change re-opens it, so the refusal log does not loop.
-  if (restartRefusedForGeneration(db, w.id, w.generation)) return false;
+  // T551 #2: a deliberate retire-and-replace of an adopted lane IS the
+  // generation change, so it bypasses a prior refusal for that generation.
+  if (!opts.allowAdoptedReplace && restartRefusedForGeneration(db, w.id, w.generation)) return false;
   const cooldown = restartCooldownMs();
   // Back off both after a successful spawn and after a failure: otherwise a
   // failing spawn (e.g. a stale leftover agent name) retries every tick and
@@ -581,15 +596,21 @@ async function spawnFreshGeneration(
   rt: Runtime,
   w: WorkerRow,
   at: number,
-  opts: { handoff?: string } = {}
+  opts: { handoff?: string; allowAdoptedReplace?: boolean } = {}
 ): Promise<boolean> {
-  // 0. Only a relay-OWNED current generation may be replaced. An adopted
-  //    (manual, relay_owned=0) runtime can never be closed by relay, so spawning
-  //    a replacement would leave TWO live agents on the same task — the old one
-  //    still editing the same files. Refuse and surface it instead of silently
-  //    creating a competing agent.
+  // 0. Only a relay-OWNED current generation may be replaced by default. An
+  //    adopted (manual, relay_owned=0) runtime can never be CLOSED by relay, so
+  //    spawning a replacement would leave TWO live agents on the same task — the
+  //    old one still editing the same files. Refuse and surface it instead of
+  //    silently creating a competing agent.
+  //
+  //    EXCEPTION (T551 #2, opt-in via RELAY_ROTATE_ADOPTED): the context-rotation
+  //    path may RETIRE-AND-REPLACE an adopted lane. It only does so at a turn
+  //    boundary (idle) after best-effort interrupting the old agent and
+  //    superseding its session, so the old tab is inert; it is never closed.
   const currentRuntime = findRuntime(db, w.id, w.generation) ?? getActiveRuntime(db, w.id);
-  if (!currentRuntime || currentRuntime.relay_owned !== 1) {
+  const adoptedReplace = currentRuntime?.relay_owned !== 1 && opts.allowAdoptedReplace === true;
+  if (!currentRuntime || (currentRuntime.relay_owned !== 1 && !adoptedReplace)) {
     logEvent(db, {
       source: "supervisor",
       workerId: w.id,
@@ -601,6 +622,14 @@ async function spawnFreshGeneration(
       },
     });
     return false;
+  }
+  if (adoptedReplace) {
+    logEvent(db, {
+      source: "supervisor",
+      workerId: w.id,
+      type: "worker.adopted_replaced",
+      payload: { generation: w.generation, runtimeId: currentRuntime.runtime_id, reason: "context rotation" },
+    });
   }
 
   // 1. Old generation -> stale. The tab is never closed in the restart path.
@@ -939,10 +968,16 @@ async function rotateWorker(
 ): Promise<boolean> {
   if (restartingWorkers.has(w.id)) return false;
 
-  // An adopted (manual, relay_owned=0) runtime can never be closed by relay;
-  // spawning a replacement would leave TWO live agents on the same files.
+  // An adopted (manual, relay_owned=0) runtime can never be CLOSED by relay;
+  // spawning a replacement would leave TWO live agents on the same files. With
+  // RELAY_ROTATE_ADOPTED (T551 #2) we RETIRE-AND-REPLACE it instead: the caller
+  // has already required a turn boundary (idle), and spawnFreshGeneration
+  // interrupts the old agent and supersedes its session, so the old tab is
+  // inert. The tab itself is never closed.
   const current = findRuntime(db, w.id, w.generation) ?? getActiveRuntime(db, w.id);
-  if (!current || current.relay_owned !== 1) {
+  const adopted = !current || current.relay_owned !== 1;
+  const replaceAdopted = adopted && !!current && contextRotateAdopted();
+  if (adopted && !replaceAdopted) {
     if (!recentlyEvent(db, w.id, "worker.context_rotate_refused", at, restartCooldownMs())) {
       logEvent(db, {
         source: "supervisor",
@@ -971,7 +1006,7 @@ async function rotateWorker(
 
   const full = getWorker(db, w.id)!;
   const before = full.generation;
-  const ok = await restartWorker(db, rt, full, at, { handoff });
+  const ok = await restartWorker(db, rt, full, at, { handoff, allowAdoptedReplace: replaceAdopted });
   if (!ok) {
     // The managed-generation path refused (re-entrancy / cap / backoff / spawn
     // failure). Keep the pending request so a later pass retries after backoff.
@@ -989,6 +1024,7 @@ async function rotateWorker(
       percent: Math.round(contextPercent(w)),
       usedTokens: w.context_used_tokens,
       requeuedTask: requeued,
+      replacedAdopted: replaceAdopted,
     },
   });
   return true;
@@ -1007,7 +1043,12 @@ async function rotateWorker(
  * running task may never report `idle` (the supervisor keeps it `working`), so
  * without it a high-context worker could loop forever past the threshold.
  *
- * An adopted (relay_owned=0) lane is REFUSED, never spawned (see rotateWorker).
+ * An adopted (relay_owned=0) lane is handled in one of two ways (T551 #2/#3):
+ *   - RELAY_ROTATE_ADOPTED=1: RETIRE-AND-REPLACE at a turn boundary (idle only,
+ *     never the grace fallback) — see rotateWorker;
+ *   - otherwise: the worker SELF-rotates (session-per-task) at a task boundary.
+ *     Relay asks once and never loops; a fresh session attach clears the request
+ *     (sessions.attachSession). This replaces the old refusal loop.
  */
 async function processContextRotation(db: Database, rt: Runtime, actions: string[], at: number): Promise<void> {
   const grace = contextRotateGraceMs();
@@ -1020,28 +1061,14 @@ async function processContextRotation(db: Database, rt: Runtime, actions: string
     if (!needsContextRotation(w, at)) continue;
 
     const active = findRuntime(db, w.id, w.generation) ?? getActiveRuntime(db, w.id);
-    if (!active || active.relay_owned !== 1) {
-      // We cannot rotate an adopted lane. Do not send a directive we cannot
-      // honour; surface the condition at most once per backoff window.
-      if (!recentlyEvent(db, w.id, "worker.context_rotate_refused", at, restartCooldownMs())) {
-        logEvent(db, {
-          source: "supervisor",
-          workerId: w.id,
-          type: "worker.context_rotate_refused",
-          payload: {
-            generation: w.generation,
-            relayOwned: active?.relay_owned ?? null,
-            reason: "current generation is not relay-owned (adopted); relay cannot retire it",
-          },
-        });
-      }
-      actions.push(`context-refused:${w.id}`);
-      continue;
-    }
+    const adopted = !active || active.relay_owned !== 1;
+    const replaceAdopted = adopted && !!active && contextRotateAdopted();
 
-    // Phase 1: request.
+    // Phase 1: request. An adopted lane relay will NOT replace gets the
+    // session-per-task wording (it must rotate itself).
     if (w.context_rotate_requested_at === null) {
-      const text = CONTEXT_ROTATE_NUDGE(contextPercent(w));
+      const selfRotate = adopted && !replaceAdopted;
+      const text = selfRotate ? CONTEXT_SELF_ROTATE_NUDGE(contextPercent(w)) : CONTEXT_ROTATE_NUDGE(contextPercent(w));
       sendMessage(db, "relay", w.id, `${RELAY_TAG}${text}`, {
         kind: "handoff",
         taskId: w.current_task_id ?? undefined,
@@ -1052,7 +1079,12 @@ async function processContextRotation(db: Database, rt: Runtime, actions: string
         workerId: w.id,
         taskId: w.current_task_id,
         type: "worker.context_rotate_requested",
-        payload: { percent: Math.round(contextPercent(w)), usedTokens: w.context_used_tokens },
+        payload: {
+          percent: Math.round(contextPercent(w)),
+          usedTokens: w.context_used_tokens,
+          adopted,
+          selfRotate,
+        },
       });
       actions.push(`context-requested:${w.id}`);
       // Push it now; nudgeUnreadMail is the durable safety net if this wake is
@@ -1061,8 +1093,18 @@ async function processContextRotation(db: Database, rt: Runtime, actions: string
       continue;
     }
 
-    // Phase 2: rotate at a turn boundary, or once the grace has elapsed.
+    // Phase 2: rotate at a turn boundary.
     const requestedAt = w.context_rotate_requested_at;
+    if (adopted && !replaceAdopted) {
+      // Relay cannot replace an adopted lane: the worker self-rotates at a task
+      // boundary. Never re-nudge, never log per pass — a fresh session attach
+      // clears the pending request (sessions.attachSession). Staying silent here
+      // is deliberate: this pass runs every tick.
+      continue;
+    }
+    // An adopted replacement must be at a turn boundary: never the grace
+    // fallback (the old agent must not be mid-edit when we replace it).
+    if (replaceAdopted && w.state !== "idle") continue;
     if (w.state !== "idle" && at - requestedAt < grace) continue;
 
     const handoff = gatherHandoff(db, w);

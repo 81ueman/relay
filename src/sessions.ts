@@ -11,7 +11,7 @@ import {
   nextGeneration,
   recordRuntime,
 } from "./runtimes";
-import { getWorker, isRetired, registerWorker, unretireWorker } from "./workers";
+import { getWorker, isRetired, registerWorker, setWorkerContextRotated, unretireWorker } from "./workers";
 import { getTask } from "./tasks";
 import type { Worker } from "./schema";
 
@@ -214,10 +214,14 @@ export function attachSession(db: Database, sessionId: string, opts: AttachOptio
     ) {
       throw new Error(`attach rejected: worker ${workerId} is busy with task ${worker0.current_task_id}`);
     }
-    // Do not steal another managed worker binding without an explicit detach.
+    // Do not steal another managed worker binding without an explicit detach —
+    // EXCEPT when a context rotation is pending (T551 #3): the worker is
+    // deliberately moving to a fresh session, so the new session supersedes the
+    // old binding. (A worker that still OWNS a task is refused above, so nothing
+    // is stranded.)
     if (worker0 && worker0.opencode_session_id && worker0.opencode_session_id !== sessionId) {
       const bound = getSession(db, worker0.opencode_session_id);
-      if (bound && bound.managed === 1) {
+      if (bound && bound.managed === 1 && worker0.context_rotate_requested_at == null) {
         throw new Error(
           `attach rejected: worker ${workerId} is already managed by ${worker0.opencode_session_id}; detach it first`
         );
@@ -308,6 +312,27 @@ export function attachSession(db: Database, sessionId: string, opts: AttachOptio
        generation = excluded.generation, directory = excluded.directory, worktree = excluded.worktree,
        attached_at = excluded.attached_at, detached_at = NULL, updated_at = excluded.updated_at`
   ).run(sessionId, worker.id, role, generation, opts.directory ?? null, opts.worktree ?? null, t, t);
+
+  // T551 #3: a worker that binds a NEW session while a context rotation was
+  // pending has SELF-rotated (session-per-task). Treat the new session as the
+  // rotation: clear the pending request and fence the old metric, so the
+  // rotation policy starts fresh instead of waiting forever for a replacement
+  // relay cannot perform on an adopted lane.
+  if (worker0?.context_rotate_requested_at != null && generation > (worker0.generation ?? 0)) {
+    setWorkerContextRotated(db, worker.id, t);
+    logEvent(db, {
+      source: "supervisor",
+      workerId: worker.id,
+      type: "worker.context_rotate",
+      payload: {
+        reason: "session-per-task",
+        fromGeneration: worker0.generation,
+        toGeneration: generation,
+        sessionId,
+      },
+    });
+  }
+
   logEvent(db, {
     source: "supervisor",
     workerId: worker.id,

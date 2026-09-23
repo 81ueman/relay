@@ -37,7 +37,7 @@ const KEYS = [
   "RELAY_DB", "RELAY_STALL_MS", "RELAY_LEASE_MS", "RELAY_LEASE_LIVENESS_GRACE_MS",
   "RELAY_WAKE_COOLDOWN_MS", "RELAY_RESTART_COOLDOWN_MS", "RELAY_RESTART_CAP",
   "RELAY_CONTEXT_ROTATE_PCT", "RELAY_CONTEXT_ROTATE_COOLDOWN_MS",
-  "RELAY_CONTEXT_ROTATE_GRACE_MS", "RELAY_RUNTIME_CLEANUP_GRACE_MS",
+  "RELAY_CONTEXT_ROTATE_GRACE_MS", "RELAY_RUNTIME_CLEANUP_GRACE_MS", "RELAY_ROTATE_ADOPTED",
 ];
 
 let dir = "";
@@ -269,7 +269,8 @@ describe("cooperative rotation policy", () => {
 });
 
 describe("safety fences", () => {
-  test("an adopted (relay_owned=0) worker is refused, never spawned", async () => {
+  test("an adopted (relay_owned=0) worker is never spawned; it is asked to self-rotate", async () => {
+    delete process.env.RELAY_ROTATE_ADOPTED;
     managed("w1");
     await sendContext("w1", 900000);
 
@@ -278,8 +279,11 @@ describe("safety fences", () => {
     const w = getWorker(db, "w1")!;
     expect(rt.starts).toHaveLength(0);
     expect(w.generation).toBe(1);
-    expect(w.context_rotate_requested_at).toBeNull();
-    expect(eventTypes()).toContain("worker.context_rotate_refused");
+    // Relay cannot retire the adopted tab, so it asks the worker to self-rotate
+    // (session-per-task) instead of refusing in a 30s loop (T551 #2/#3).
+    expect(w.context_rotate_requested_at).not.toBeNull();
+    expect(eventTypes()).toContain("worker.context_rotate_requested");
+    expect(eventTypes()).not.toContain("worker.context_rotate_refused");
   });
 
   test("a stale-generation context event is ignored (fenced)", async () => {
@@ -374,5 +378,103 @@ describe("plugin context extraction", () => {
       },
     };
     expect(contextUsedTokens(message)).toEqual({ used: 359_000, model: "deepseek-v4.1-flash" });
+  });
+});
+
+// T551 #2/#3: rotation must be REACHABLE for an adopted (relay_owned=0) lane,
+// which is the fleet's normal state. Two mechanisms, neither of which loops:
+//   - RELAY_ROTATE_ADOPTED=1 -> retire-and-replace at an IDLE boundary;
+//   - default -> ask the worker to self-rotate (session-per-task); a fresh
+//     session attach clears the pending request.
+describe("adopted-lane rotation (T551 #2/#3)", () => {
+  test("without RELAY_ROTATE_ADOPTED: asks the worker to self-rotate, never a refusal loop", async () => {
+    delete process.env.RELAY_ROTATE_ADOPTED;
+    managed("w1");
+    await sendContext("w1", 900000);
+
+    const first = await reconcile(db, rt);
+    expect(first.actions.join(",")).toContain("context-requested:w1");
+    const w = getWorker(db, "w1")!;
+    expect(w.context_rotate_requested_at).not.toBeNull();
+    expect(eventTypes()).toContain("worker.context_rotate_requested");
+    expect(eventTypes()).not.toContain("worker.context_rotate_refused");
+    expect(rt.starts).toHaveLength(0);
+
+    // A later pass is a quiet no-op (pending): no refusal, no re-request, no
+    // spawn, and nothing appended to the reconcile action log.
+    const second = await reconcile(db, rt);
+    expect(second.actions.filter((a) => a.startsWith("context")).join(",")).toBe("");
+    expect(rt.starts).toHaveLength(0);
+    expect(eventTypes().filter((t) => t === "worker.context_rotate_requested")).toHaveLength(1);
+  });
+
+  test("with RELAY_ROTATE_ADOPTED: retire-and-replace at an idle boundary; the old tab is never cleaned", async () => {
+    process.env.RELAY_ROTATE_ADOPTED = "1";
+    managed("w1");
+    await sendContext("w1", 900000);
+
+    await reconcile(db, rt); // phase 1: request
+    expect(rt.starts).toHaveLength(0);
+
+    setWorkerState(db, "w1", "idle");
+    await reconcile(db, rt); // phase 2: replace
+
+    const w = getWorker(db, "w1")!;
+    expect(w.generation).toBe(2);
+    expect(rt.starts).toHaveLength(1);
+    // The old adopted runtime is stale but NEVER closed.
+    const old = findRuntime(db, "w1", 1)!;
+    expect(old.state).toBe("stale");
+    expect(old.relay_owned).toBe(0);
+    expect(rt.cleanups).not.toContain(old.runtime_id);
+    // The old session can no longer drive the worker.
+    expect(getSession(db, "ses_w1")!.managed).toBe(0);
+    expect(eventTypes()).toContain("worker.adopted_replaced");
+    const rotate = listEvents(db, { limit: 200 }).find((e) => e.type === "worker.context_rotate")!;
+    expect(rotate.payload_json).toContain('"replacedAdopted":true');
+  });
+
+  test("with RELAY_ROTATE_ADOPTED: never replaces mid-turn (no grace fallback)", async () => {
+    process.env.RELAY_ROTATE_ADOPTED = "1";
+    managed("w1");
+    addTask(db, { title: "long context work" });
+    claimNext(db, "w1"); // state stays 'working'
+    await sendContext("w1", 900000);
+
+    const t0 = 1_000_000;
+    await reconcile(db, rt, t0); // request
+    await reconcile(db, rt, t0 + 180_001); // past the grace, still working
+    expect(rt.starts).toHaveLength(0);
+    expect(getWorker(db, "w1")!.generation).toBe(1);
+  });
+
+  test("a new session attach clears a pending rotation (session-per-task)", async () => {
+    delete process.env.RELAY_ROTATE_ADOPTED;
+    managed("w1");
+    await sendContext("w1", 900000);
+    await reconcile(db, rt); // request pending
+    expect(getWorker(db, "w1")!.context_rotate_requested_at).not.toBeNull();
+
+    // The worker starts a FRESH session and attaches it. A pending rotation
+    // authorises superseding the old binding (no explicit detach needed).
+    attachSession(db, "ses_w1b", {
+      role: "worker",
+      workerId: "w1",
+      identity: {
+        agent: "w1-agent",
+        tabId: "tab-w1",
+        paneId: "pane-w1",
+        workspaceId: "w-ext",
+        agentKind: "opencode",
+      },
+    });
+
+    const w = getWorker(db, "w1")!;
+    expect(w.opencode_session_id).toBe("ses_w1b");
+    expect(w.context_rotate_requested_at).toBeNull();
+    expect(w.generation).toBeGreaterThan(1);
+    expect(getSession(db, "ses_w1")!.managed).toBe(0);
+    const rotate = listEvents(db, { limit: 200 }).find((e) => e.type === "worker.context_rotate")!;
+    expect(rotate.payload_json).toContain("session-per-task");
   });
 });

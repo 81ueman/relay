@@ -60,6 +60,35 @@ before taking the next task, so nothing is missed even if a wake was deferred.
   reminding you (and the message is stored), so nothing is lost by finishing first.
 - Terminal/pane idle is NOT task done. Task DB is the source of truth.
 
+## Context rotation (session-per-task)
+
+Long-lived sessions are the dominant token cost: every turn re-reads the whole
+history as cached context. Relay watches your context occupancy and, past the
+threshold, sends a **`CONTEXT HIGH`** directive. When you get one:
+
+1. **Checkpoint immediately**:
+   `relay note <task> "HANDOFF: <state, files, next steps, blockers>"`.
+2. **End your turn** so the rotation can happen.
+
+Then it depends on the lane:
+
+- **Relay-owned lane** — relay replaces your session automatically and passes the
+  handoff to your successor. Just checkpoint and end the turn.
+- **Adopted lane (manual attach — the common case)** — relay cannot close or
+  replace your tab. Rotate **yourself at the next task boundary**:
+  1. Finish cleanly first: `relay submit <task> --evidence "..."` (or
+     `relay block` / `relay release`). Never leave a task half-owned.
+  2. Start a **fresh session** in your pane (the TUI's new-session action) and
+     re-attach it (`agent_attach`). Relay sees the new session as a new
+     generation and treats it as the rotation — the pending request clears
+     automatically. (If `RELAY_ROTATE_ADOPTED=1`, relay instead replaces your
+     lane for you at your next idle boundary.)
+
+**Session-per-task discipline** (the cheapest habit): prefer a fresh session per
+task (or per few tasks) over carrying one session across many. After a
+`submit`/`block`, if your context is high, start fresh before `relay next` — do
+not carry a huge transcript into the next task.
+
 ## Task hierarchy (optional — work decomposition, not authority)
 
 A task may have a parent: `relay task add "..." --parent T12`. This expresses

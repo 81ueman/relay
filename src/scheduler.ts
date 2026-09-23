@@ -118,6 +118,21 @@ export function contextRotateGraceMs(): number {
   return Number.isFinite(v) && v >= 0 ? v : 180000;
 }
 
+/**
+ * T551 #2: whether an ADOPTED (relay_owned=0) lane may be retired-and-replaced
+ * by a fresh relay-owned generation when its context is high.
+ *
+ * Default OFF. An adopted lane's Herdr tab is never closed by relay, so a
+ * replacement can briefly coexist with the old agent. That is safe only when
+ * the old agent is at a turn boundary (idle): the rotation path therefore
+ * requires idle for an adopted lane and never applies the grace fallback. When
+ * OFF, relay instead asks the worker to self-rotate (session-per-task, #3).
+ */
+export function contextRotateAdopted(): boolean {
+  const v = process.env.RELAY_ROTATE_ADOPTED;
+  return v === "1" || v === "true";
+}
+
 /** Context occupancy of a worker as a percentage of the model limit (0 when unknown). */
 export function contextPercent(w: WorkerRow): number {
   const used = w.context_used_tokens;
