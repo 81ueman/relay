@@ -55,15 +55,29 @@ export function herdrTarget(w: Pick<Worker, "id" | "runtime_id">): string {
  * running under the sanitized name (`u2-corpus` -> `u2_corpus`). Addressing it
  * by the bare worker id then fails with agent_not_found and the wake is lost.
  *
- * Preference order: the recorded runtime, the worker id, then the sanitized id;
- * each is accepted as a live agent name, or resolved to its pane. Falls back to
- * the recorded/id target so the caller still gets an honest error when nothing
+ * Preference order: the pane hosting the worker's BOUND session (T542), then the
+ * recorded runtime, the worker id, then the sanitized id; each name-or-id is
+ * accepted as a live agent, or resolved to its pane. Falls back to the
+ * recorded/id target so the caller still gets an honest error when nothing
  * matches.
  */
 export function resolveHerdrTarget(
-  w: Pick<Worker, "id" | "runtime_id">,
+  w: Pick<Worker, "id" | "runtime_id"> & { opencode_session_id?: string | null },
   agents: HerdrAgentEntry[]
 ): string {
+  // T542: the MOST authoritative target is the live agent HOSTING this worker's
+  // bound session. A `relay session attach --pane <P>` worker (or a manually
+  // registered peer) can carry a LOGICAL runtime_id ("program-coord-2") while
+  // its agent actually runs on a pane ("w6D:pR"): addressing by the logical name
+  // fails with agent_not_found and every wake is lost. The session mapping does
+  // not lie — if the session is hosted at a pane, wake that pane.
+  const session = w.opencode_session_id ?? "";
+  if (session) {
+    const host = agents.find(
+      (a) => a?.agent_session?.value === session && typeof a?.pane_id === "string" && a.pane_id
+    );
+    if (host?.pane_id) return host.pane_id;
+  }
   const candidates: string[] = [];
   if (w.runtime_id) candidates.push(w.runtime_id);
   candidates.push(w.id);

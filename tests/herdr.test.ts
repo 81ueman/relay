@@ -448,6 +448,44 @@ describe("L. wake target resolution", () => {
     expect(resolveHerdrTarget({ id: "ghost", runtime_id: null }, [])).toBe("ghost");
     expect(resolveHerdrTarget({ id: "ghost", runtime_id: "stale-runtime" }, [])).toBe("stale-runtime");
   });
+
+  // T542: a `relay session attach --pane <P>` worker can carry a LOGICAL
+  // runtime_id while its agent runs on a pane; the bound session is the
+  // authoritative mapping, so wake must target that pane.
+  const liveSession = (pane_id: string, session: string, name: string | null = null): HerdrAgentEntry => ({
+    pane_id,
+    name,
+    tab_id: "w1:t1",
+    agent: "opencode",
+    agent_session: { value: session },
+  });
+
+  test("the pane hosting the bound session wins over a logical runtime_id", () => {
+    expect(
+      resolveHerdrTarget(
+        { id: "program-coord-2", runtime_id: "program-coord-2", opencode_session_id: "ses_live" },
+        [liveSession("w6D:pR", "ses_live")]
+      )
+    ).toBe("w6D:pR");
+  });
+
+  test("the session mapping beats a same-named agent on a different pane", () => {
+    expect(
+      resolveHerdrTarget(
+        { id: "program-coord-2", runtime_id: "program-coord-2", opencode_session_id: "ses_live" },
+        [liveSession("wXX:p1", "ses_other", "program-coord-2"), liveSession("w6D:pR", "ses_live")]
+      )
+    ).toBe("w6D:pR");
+  });
+
+  test("no session mapping keeps the old resolution (honest error, unchanged)", () => {
+    expect(
+      resolveHerdrTarget(
+        { id: "program-coord-2", runtime_id: "program-coord-2", opencode_session_id: "ses_gone" },
+        [liveSession("w6D:pR", "ses_other")]
+      )
+    ).toBe("program-coord-2");
+  });
 });
 
 describe("N. restart cap", () => {

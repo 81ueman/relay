@@ -348,7 +348,19 @@ async function tryWake(
     logEvent(db, { source: "supervisor", workerId: w.id, type: "worker.woken", payload: { reason } });
     return true;
   } catch (e) {
-    logEvent(db, { source: "supervisor", workerId: w.id, type: "worker.wake_failed", payload: { reason, error: String(e).slice(0, 200) } });
+    // T542: an UNROUTABLE target (logical runtime_id with no live agent) must
+    // not spin the event log every attempt. Log the failure once per wake
+    // cooldown and mark the channel unroutable; the wake is still retried after
+    // the cooldown so a recovered target heals on its own.
+    if (!recentlyEvent(db, w.id, "worker.wake_failed", at, wakeCooldownMs())) {
+      logEvent(db, { source: "supervisor", workerId: w.id, type: "worker.wake_failed", payload: { reason, error: String(e).slice(0, 200) } });
+      logEvent(db, {
+        source: "supervisor",
+        workerId: w.id,
+        type: "worker.wake_unroutable",
+        payload: { reason, target: w.runtime_id ?? w.id },
+      });
+    }
     return false;
   }
 }
@@ -1095,6 +1107,9 @@ async function nudgeUnreadMail(
     const w = getWorker(db, recipient);
     if (!w || w.retired_at !== null) continue;
     if (recentlyEvent(db, recipient, "worker.mail_nudged", at, window)) continue;
+    // T542: an unroutable wake channel must back off like a delivered nudge —
+    // otherwise the mail wake retries (and logs wake_failed) every tick.
+    if (recentlyEvent(db, recipient, "worker.wake_failed", at, window)) continue;
 
     // Per-class starvation: the older of the two classes decides `stale`, each
     // against its own cap. (An idle worker nudges regardless of `stale`.)
@@ -1132,7 +1147,14 @@ async function nudgeUnreadMail(
       logEvent(db, { source: "supervisor", workerId: recipient, type: "worker.mail_nudged", payload: { recipient, count: n, starvation: busy && stale, urgent: urgent.n > 0 } });
       actions.push(`mail-nudged:${recipient}`);
     } catch (e) {
+      // Bounded (see the skip above): one failure per mail-nudge window.
       logEvent(db, { source: "supervisor", workerId: recipient, type: "worker.wake_failed", payload: { reason: "unread-mail", error: String(e).slice(0, 200) } });
+      logEvent(db, {
+        source: "supervisor",
+        workerId: recipient,
+        type: "worker.wake_unroutable",
+        payload: { reason: "unread-mail", target: w.runtime_id ?? w.id },
+      });
     }
   }
 }
