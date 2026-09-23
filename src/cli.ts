@@ -1,14 +1,15 @@
 #!/usr/bin/env bun
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { defaultDbPath, initControlPlane, now, openDb, outsideRepoDefault, STATE_DIR } from "./db";
+import { defaultDbPath, defaultSockPath, initControlPlane, now, openDb, outsideRepoDefault, STATE_DIR } from "./db";
 import {
   applyDbMove, configPath, describeDb, findLegacyDb, planDbMove, readConfig, resolveDb,
 } from "./db-location";
 import { formatEvent, listEvents, logEvent } from "./events";
 import { ackMessage, claimInbox, deliverMessage, getMessage, inboxFor, RELAY_TAG, sendMessage, unreadCounts } from "./messages";
 import { isImmediateKind } from "./mail-policy";
-import { staleBuildWarning, versionLine } from "./version";
+import { daemonBuildWarning, staleBuildWarning, versionLine } from "./version";
+import { probeSocket } from "./singleton";
 import { runDaemon } from "./daemon";
 import { handleErrorSignal, handleIdleSignal, reconcile } from "./reconciler";
 import { buildRuntime, HerdrRuntime } from "./runtime/herdr";
@@ -1257,6 +1258,18 @@ async function main(): Promise<void> {
         console.log("System");
         console.log("------");
         console.log(view.status);
+        // The daemon is a long-lived process: a rebuilt/reinstalled CLI does not
+        // change it. Report the RUNNING daemon's build so a stale supervisor is
+        // visible instead of silently serving old code.
+        const probe = await probeSocket(defaultSockPath());
+        if (probe.status === "live") {
+          const build = probe.identity?.build ?? null;
+          console.log(`daemon ${probe.identity?.pid ?? "?"} build ${build ?? "unknown"}`);
+          const drift = daemonBuildWarning(build);
+          if (drift) console.log(drift);
+        } else {
+          console.log(`daemon ${probe.status}`);
+        }
         break;
       }
 

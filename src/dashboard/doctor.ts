@@ -1,8 +1,9 @@
-import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { Database } from "bun:sqlite";
 import { listRuntimes } from "../runtimes";
+import { probeSocket } from "../singleton";
 import { listTasks } from "../tasks";
+import { daemonBuildWarning } from "../version";
 import { listWorkers } from "../workers";
 import { readPanes } from "./herdr";
 
@@ -10,12 +11,22 @@ import { readPanes } from "./herdr";
  * `relay dashboard --doctor`: a Relay-centric source check. Unlike the normal
  * dashboard this is diagnostic, so it may report runtime counts directly.
  */
-export function dashboardDoctor(db: Database, dbPath: string, root: string): string {
+export async function dashboardDoctor(db: Database, dbPath: string, root: string): Promise<string> {
   const lines: string[] = [];
   lines.push(`repo             ${root}`);
   lines.push(`relay db         OK ${dbPath}`);
   const sock = join(dirname(dbPath), "relay.sock");
-  lines.push(`daemon/socket    ${existsSync(sock) ? `OK ${sock}` : "(no socket)"}`);
+  // Probe (don't just stat) the socket: the RUNNING daemon's build is the only
+  // evidence of whether a landed fix is actually being served.
+  const probe = await probeSocket(sock);
+  if (probe.status === "live") {
+    const build = probe.identity?.build ?? null;
+    lines.push(`daemon/socket    OK ${sock} (pid ${probe.identity?.pid ?? "?"}, build ${build ?? "unknown"})`);
+    const drift = daemonBuildWarning(build);
+    if (drift) lines.push(`daemon build     WARN ${drift}`);
+  } else {
+    lines.push(`daemon/socket    ${probe.status === "absent" ? "(no socket)" : probe.status}`);
+  }
 
   const workers = listWorkers(db);
   const tasks = listTasks(db);

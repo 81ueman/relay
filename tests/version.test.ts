@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildCommit, relayVersion, repoHead, staleBuildWarning, versionLine } from "../src/version";
+import { buildCommit, daemonBuildWarning, relayVersion, repoHead, staleBuildWarning, versionLine } from "../src/version";
 
 // T338: the installed CLI is a BUILD artifact, so it must be able to report
 // which revision it is and warn when it is behind repo HEAD. These tests run
@@ -53,5 +53,32 @@ describe("version/build identity (T338)", () => {
 
   test("a versionLine with an explicit version renders it", () => {
     expect(versionLine("9.9.9")).toStartWith("relay 9.9.9");
+  });
+});
+
+// T493: the daemon is a long-lived process. Rebuilding + reinstalling the CLI
+// does not change it, so "the fix landed" can be false even though every file
+// on disk is current. Compare the daemon's reported build against the CLI's.
+describe("running-daemon build drift (T493)", () => {
+  test("no warning when the daemon built from the same revision as the CLI", () => {
+    expect(daemonBuildWarning("f6db9af", "f6db9af")).toBeNull();
+  });
+
+  test("warns, naming both revisions, when the daemon serves a stale build", () => {
+    const warn = daemonBuildWarning("76e0e20", "f6db9af");
+    expect(warn).not.toBeNull();
+    expect(warn).toContain("76e0e20");
+    expect(warn).toContain("f6db9af");
+    expect(warn).toMatch(/STALE|stale/);
+  });
+
+  test("an unknown daemon build (older daemon, no field) never warns", () => {
+    expect(daemonBuildWarning(null, "f6db9af")).toBeNull();
+    expect(daemonBuildWarning(undefined, "f6db9af")).toBeNull();
+  });
+
+  test("a source-run CLI ('dev') or a 'dev' daemon never warns", () => {
+    expect(daemonBuildWarning("76e0e20", "dev")).toBeNull();
+    expect(daemonBuildWarning("dev", "f6db9af")).toBeNull();
   });
 });

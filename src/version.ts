@@ -91,3 +91,24 @@ export function staleBuildWarning(version = relayVersion()): string | null {
   if (!built || !head || built === "dev" || built === head) return null;
   return `relay: warning: installed build ${built} is behind repo HEAD ${head} — rebuild+reinstall: bun run build && cp dist/cli.js ~/.local/share/relay/cli.js`;
 }
+
+/**
+ * Warn when the RUNNING daemon was built from a different revision than this
+ * CLI. Rebuilding + reinstalling the CLI does not touch the long-lived daemon
+ * process, so a landed fix can stay inactive until the daemon is restarted.
+ * Without this comparison the mismatch is silent: everything looks deployed.
+ *
+ * Only meaningful when both builds are known (an older daemon reports no build,
+ * and a source-run CLI reports "dev").
+ */
+export function daemonBuildWarning(
+  daemonBuild: string | null | undefined,
+  cliBuild = buildCommit()
+): string | null {
+  if (!cliBuild || cliBuild === "dev" || !daemonBuild || daemonBuild === "dev") return null;
+  if (cliBuild === daemonBuild) return null;
+  return (
+    `relay: warning: running daemon was built from ${daemonBuild}, but this CLI is ${cliBuild} — ` +
+    `the daemon is serving a STALE build; restart it to activate the installed CLI`
+  );
+}

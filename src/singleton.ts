@@ -42,10 +42,24 @@ export interface DaemonIdentity {
   db_path: string;
   runtime: string;
   sock_path: string;
+  /**
+   * The source commit the RUNNING daemon was built from, or null.
+   *
+   * A daemon is a long-lived in-memory process: rebuilding + reinstalling the
+   * CLI does NOT change it. Echoing the build lets a client detect that the
+   * live supervisor is serving a stale revision (code landed, daemon not
+   * restarted) instead of silently assuming the new build is active.
+   */
+  build: string | null;
 }
 
-export function daemonIdentity(dbPath: string, sockPath: string, runtime: string): DaemonIdentity {
-  return { pid: process.pid, db_path: dbPath, runtime, sock_path: sockPath };
+export function daemonIdentity(
+  dbPath: string,
+  sockPath: string,
+  runtime: string,
+  build: string | null = null
+): DaemonIdentity {
+  return { pid: process.pid, db_path: dbPath, runtime, sock_path: sockPath, build };
 }
 
 /**
@@ -173,6 +187,9 @@ function parseIdentity(buf: string): DaemonIdentity | null {
         db_path: id.db_path,
         runtime: String(id.runtime ?? ""),
         sock_path: String(id.sock_path ?? ""),
+        // Older daemons predate the field: an absent build is unknown, not
+        // implicitly equal to the client's.
+        build: typeof id.build === "string" && id.build ? id.build : null,
       };
     }
   } catch {

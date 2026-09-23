@@ -125,7 +125,7 @@ export async function runDashboard(args: string[]): Promise<number> {
   if (hasFlag(args, "--doctor")) {
     const db = openDb(dbPath);
     try {
-      console.log(dashboardDoctor(db, dbPath, root));
+      console.log(await dashboardDoctor(db, dbPath, root));
     } finally {
       db.close();
     }

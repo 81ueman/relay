@@ -13,6 +13,7 @@ import {
   daemonIdentity,
   type SupervisorLock,
 } from "./singleton";
+import { buildCommit } from "./version";
 
 export interface DaemonOptions {
   dbPath?: string;
@@ -79,7 +80,7 @@ export async function runDaemon(opts: DaemonOptions = {}): Promise<void> {
       db,
       runtime: rt,
       wakeReconcile: { value: true },
-      identity: daemonIdentity(dbPath, sockPath, rt.name),
+      identity: daemonIdentity(dbPath, sockPath, rt.name, buildCommit()),
     };
     console.error(`[relay] daemon starting db=${dbPath} interval=${intervalMs}ms runtime=${rt.name}`);
 

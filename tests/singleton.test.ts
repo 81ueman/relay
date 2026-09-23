@@ -97,6 +97,44 @@ describe("socket ownership probe", () => {
     expect(existsSync(sockPath)).toBe(false);
   });
 
+  test("the ping identity echoes the daemon's build commit (T493)", async () => {
+    const dir = tempDir();
+    const dbPath = join(dir, "state.db");
+    const sockPath = join(dir, "relay.sock");
+    const ctx = ctxFor(dbPath, sockPath);
+    ctx.identity = daemonIdentity(dbPath, sockPath, "mock", "deadbee");
+    const handle = startSocketServer(ctx, sockPath);
+    try {
+      const probe = await probeSocket(sockPath);
+      expect(probe.status).toBe("live");
+      if (probe.status === "live") expect(probe.identity?.build).toBe("deadbee");
+    } finally {
+      handle.stop();
+      ctx.db.close();
+    }
+  });
+
+  test("a daemon that predates the build field reports an UNKNOWN build, not a match (T493)", async () => {
+    const dir = tempDir();
+    const sockPath = join(dir, "relay.sock");
+    // A raw responder with the old identity shape: pid + db_path, no build.
+    const server = createServer((socket) => {
+      socket.on("data", () => {
+        socket.write(
+          JSON.stringify({ ok: true, pong: true, identity: { pid: 123, db_path: join(dir, "x.db"), runtime: "old", sock_path: sockPath } }) + "\n"
+        );
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(sockPath, resolve));
+    try {
+      const probe = await probeSocket(sockPath);
+      expect(probe.status).toBe("live");
+      if (probe.status === "live") expect(probe.identity?.build).toBeNull();
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
   test("a live daemon for a different DB on the same socket is a config error", async () => {
     const dir = tempDir();
     const sockPath = join(dir, "relay.sock");

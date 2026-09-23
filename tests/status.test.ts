@@ -4,6 +4,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Database } from "bun:sqlite";
 import { openDb } from "../src/db";
+import { MockRuntime } from "../src/runtime/runtime";
+import { daemonIdentity } from "../src/singleton";
+import { startSocketServer, type SocketContext } from "../src/socket";
 import { addTask, claimNext, submitTask } from "../src/tasks";
 import { registerWorker } from "../src/workers";
 
@@ -132,5 +135,38 @@ describe("relay status: what each worker picks up next", () => {
     expect(workerLine(out, "w")).toContain("next: (none)");
     expect(out).toContain("Unclaimable");
     expect(out).toContain("role=dataplane-rust");
+  });
+});
+
+// T493: the RUNNING daemon is a long-lived process, so a rebuilt+reinstalled
+// CLI does not change what it serves. `relay status` must make a stale daemon
+// build visible instead of implying the landed code is live.
+describe("relay status: running-daemon build drift (T493)", () => {
+  test("a daemon built from a different revision is reported with a restart hint", async () => {
+    const dbPath = join(dir, ".relay", "state.db");
+    const sockPath = join(dir, ".relay", "relay.sock");
+    const ctx: SocketContext = {
+      db,
+      runtime: new MockRuntime(),
+      wakeReconcile: { value: false },
+      identity: daemonIdentity(dbPath, sockPath, "mock", "deadbee"),
+    };
+    const handle = startSocketServer(ctx, sockPath);
+    try {
+      // ASYNC spawn: the ping server lives in THIS process, and a synchronous
+      // spawn would block the event loop so it could never accept the probe.
+      const proc = Bun.spawn(["bun", cli, "status"], {
+        cwd: dir,
+        env: { ...process.env, FORCE_COLOR: "0", RELAY_DB: dbPath },
+        stdout: "pipe",
+      });
+      const out = await new Response(proc.stdout).text();
+      expect(await proc.exited).toBe(0);
+      expect(out).toContain("daemon");
+      expect(out).toContain("build deadbee");
+      expect(out).toMatch(/STALE|stale/);
+    } finally {
+      handle.stop();
+    }
   });
 });
