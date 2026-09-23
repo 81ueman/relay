@@ -576,6 +576,48 @@ export function unblockTask(db: Database, taskId: string, workerId: string): Tas
 }
 
 /**
+ * Clear the worker's current-task pointer after it releases `releasedId`.
+ *
+ * A worker may own a RUNNING parent (e.g. a persistent integration task) while
+ * it works one of that parent's children: claiming the child OVERWRITES
+ * `workers.current_task_id`. Releasing the child used to leave the pointer NULL
+ * even though the parent was still running and assigned to the worker — so the
+ * parent became unholdable. `relay wait <parent>` refused ("does not hold it"),
+ * the idle wake keys on QUEUED work the worker can claim, and `relay next` never
+ * re-offers a running task; only the T489 re-nudge carried it.
+ *
+ * `current_task_id` must mean "the running task this worker owns and should act
+ * on next", so restore the remaining running task it is assigned (highest
+ * priority). Only when it owns no other running task is the pointer cleared,
+ * which preserves the ordinary submit -> idle path.
+ *
+ * No-op unless the pointer currently IS `releasedId`: a pointer to some other
+ * task is not ours to clobber (e.g. a reviewer approving a child after the
+ * submitter already moved on).
+ */
+function clearCurrentTaskOrRestoreParent(
+  db: Database,
+  workerId: string,
+  releasedId: string,
+  at = now()
+): void {
+  const w = getWorker(db, workerId);
+  if (!w || w.current_task_id !== releasedId) return;
+  const next = db
+    .query(
+      `SELECT id FROM tasks
+        WHERE state = 'running' AND assignee = ? AND id != ?
+        ORDER BY priority DESC, created_at ASC LIMIT 1`
+    )
+    .get(workerId, releasedId) as { id: string } | null;
+  if (next) {
+    db.query(`UPDATE workers SET current_task_id = ?, updated_at = ? WHERE id = ?`).run(next.id, at, workerId);
+  } else {
+    clearCurrentTask(db, workerId);
+  }
+}
+
+/**
  * Clean hand-back of a RUNNING task (mis-claimed ownership) without fabricating
  * a block/reject note. The task returns to `queued` with a bumped fencing token
  * and no assignee/lease; the previous owner's `current_task_id` is cleared.
@@ -603,12 +645,12 @@ export function releaseTask(db: Database, taskId: string, workerId: string, reas
        lease_token = lease_token + 1, updated_at = ? WHERE id = ?`
   ).run(t, taskId);
   if (task.assignee) {
-    clearCurrentTask(db, task.assignee);
+    clearCurrentTaskOrRestoreParent(db, task.assignee, taskId, t);
     normalizeWorkerAfterTaskRelease(db, task.assignee, t);
   }
   // A releasing non-owner (human/recovery) must not keep a stale pointer either.
   if (workerId !== task.assignee) {
-    db.query(`UPDATE workers SET current_task_id = NULL WHERE id = ? AND current_task_id = ?`).run(workerId, taskId);
+    clearCurrentTaskOrRestoreParent(db, workerId, taskId, t);
     normalizeWorkerAfterTaskRelease(db, workerId, t);
   }
   touchProgress(db, workerId, t);
@@ -728,7 +770,7 @@ export function submitTask(
     db.query(`INSERT INTO task_notes (task_id, worker_id, kind, body, created_at) VALUES (?, ?, 'evidence', ?, ?)`).run(taskId, workerId, opts.evidence, t);
   }
   db.query(`UPDATE tasks SET state = 'review', updated_at = ? WHERE id = ?`).run(t, taskId);
-  clearCurrentTask(db, workerId);
+  clearCurrentTaskOrRestoreParent(db, workerId, taskId, t);
   touchProgress(db, workerId, t);
   normalizeWorkerAfterTaskRelease(db, workerId, t);
   clearQuietLogged(db, workerId, taskId);
@@ -746,8 +788,8 @@ export function approveTask(db: Database, taskId: string, workerId: string): Tas
   // crash can never leave "child done but parent never told".
   db.transaction(() => {
     db.query(`UPDATE tasks SET state = 'done', updated_at = ? WHERE id = ?`).run(t, taskId);
-    if (task.assignee === workerId) clearCurrentTask(db, workerId);
-    else if (task.assignee) clearCurrentTask(db, task.assignee);
+    if (task.assignee === workerId) clearCurrentTaskOrRestoreParent(db, workerId, task.id, t);
+    else if (task.assignee) clearCurrentTaskOrRestoreParent(db, task.assignee, task.id, t);
     normalizeWorkerAfterTaskRelease(db, workerId, t);
     if (task.assignee && task.assignee !== workerId) normalizeWorkerAfterTaskRelease(db, task.assignee, t);
     touchProgress(db, workerId, t);
@@ -962,7 +1004,7 @@ export function rejectTask(db: Database, taskId: string, workerId: string, reaso
     `UPDATE tasks SET state = 'queued', assignee = NULL, lease_token = lease_token + 1, lease_until = NULL, updated_at = ? WHERE id = ?`
   ).run(t, taskId);
   if (task.assignee) {
-    clearCurrentTask(db, task.assignee);
+    clearCurrentTaskOrRestoreParent(db, task.assignee, taskId, t);
     normalizeWorkerAfterTaskRelease(db, task.assignee, t);
   }
   normalizeWorkerAfterTaskRelease(db, workerId, t);
@@ -992,12 +1034,13 @@ export function blockTask(db: Database, taskId: string, workerId: string, reason
     db.query(
       `UPDATE tasks SET state = ?, assignee = NULL, lease_until = NULL, lease_token = lease_token + 1, updated_at = ? WHERE id = ?`
     ).run(state, t, taskId);
-    // A blocked task never parks the worker: it must immediately take the next runnable task.
+    // A blocked task never parks the worker: it must immediately take the next runnable task
+    // (or resume the running parent it still owns — see clearCurrentTaskOrRestoreParent).
     if (task.assignee) {
-      clearCurrentTask(db, task.assignee);
+      clearCurrentTaskOrRestoreParent(db, task.assignee, taskId, t);
       normalizeWorkerAfterTaskRelease(db, task.assignee, t);
     }
-    db.query(`UPDATE workers SET current_task_id = NULL WHERE id = ? AND current_task_id = ?`).run(workerId, taskId);
+    clearCurrentTaskOrRestoreParent(db, workerId, taskId, t);
     normalizeWorkerAfterTaskRelease(db, workerId, t);
     touchProgress(db, workerId, t);
     if (task.assignee) clearQuietLogged(db, task.assignee, taskId);
