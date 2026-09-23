@@ -313,6 +313,37 @@ export function needsWorkerWakeup(v: SupervisorView): boolean {
   return v.runnable > 0;
 }
 
+/**
+ * T549: how many consecutive wake-without-claim cycles make an idle worker
+ * UNRESPONSIVE. A worker that is woken for claimable work, reports idle, and
+ * claims nothing is either slow to start or wedged. One or two cycles is normal
+ * latency; past this we stop treating it as a transient and surface it.
+ */
+export function unresponsiveWakeCount(): number {
+  const v = Number(process.env.RELAY_UNRESPONSIVE_WAKES ?? "3");
+  return Number.isFinite(v) && v >= 1 ? v : 3;
+}
+
+/**
+ * T549: the window over which consecutive failed wake cycles accumulate, and the
+ * cooldown on the surfaced `worker.wake_unresponsive` event (one per window).
+ */
+export function unresponsiveWindowMs(): number {
+  const v = Number(process.env.RELAY_UNRESPONSIVE_WINDOW_MS ?? "300000");
+  return Number.isFinite(v) && v >= 0 ? v : 300000;
+}
+
+/**
+ * T549: a worker sitting at very high context is the canonical wedge — live,
+ * reports idle, but the model no longer acts on a delivered wake. Measured live
+ * at ~311K-314K tokens. Used only to make the surfaced message specific; the
+ * unresponsive detector itself is context-agnostic.
+ */
+export function contextWedgeTokens(): number {
+  const v = Number(process.env.RELAY_CONTEXT_WEDGE_TOKENS ?? "250000");
+  return Number.isFinite(v) && v > 0 ? v : 250000;
+}
+
 export function needsPlanner(v: SupervisorView, plannerCount = 1): boolean {
   if (plannerCount === 0) return false;
   // A planner must not invent work out of thin air. Only top up the queue while

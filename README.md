@@ -1127,6 +1127,22 @@ worker, and borrowing a file default that lives in another live pane is
   Spawning a second agent on the same task is what produced duplicate, competing
   agents editing the same files. A live-but-stalled worker is released to `idle`
   (`worker.stall_released`) so the task can be re-claimed.
+- **High-context wedged session (T549)**: some sessions stop acting on a
+  delivered wake before the context-rotation threshold is reached (measured live
+  at ~311K–314K tokens). The supervisor still sends `worker.woken`, receives
+  `session.idle`, and — because the agent is **alive** — takes the
+  stall-release branch, so the worker can silently loop idle forever while
+  role-matched work sits queued. Relay now counts the consecutive wake-without-
+  claim cycles inside `RELAY_UNRESPONSIVE_WINDOW_MS` (default 5 min); after
+  `RELAY_UNRESPONSIVE_WAKES` (default 3) it logs **`worker.wake_unresponsive`**
+  (once per window) and surfaces the worker in `relay status` / dashboard
+  **ATTENTION** with its token figure — never a silent idle. **Operator
+  recovery** (the case that worked live): `relay session detach --session
+  <ses_…>`, close/retire the stuck pane, then spawn a fresh worker into the same
+  worktree — the new session starts near-empty (~20K) and claims immediately.
+  Prefer this when the worker's runtime is **adopted** (`relay_owned=0`, e.g. a
+  manually attached lane): automatic context rotation is refused for adopted
+  lanes, so relay cannot retire the wedged generation itself.
 - **Only relay-owned generations are replaceable**: a worker whose CURRENT
   runtime is adopted (`relay_owned=0`) is never auto-replaced, because relay
   cannot close that tab — replacing it would leave the old agent running

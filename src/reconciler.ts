@@ -20,6 +20,7 @@ import {
 import {
   contextPercent,
   contextRotateGraceMs,
+  contextWedgeTokens,
   idleWorkers,
   isOperationalWorker,
   isSupervisedWorker,
@@ -38,6 +39,8 @@ import {
   toolNoOutputMs,
   toolStaleGraceMs,
   toolWarnMs,
+  unresponsiveWakeCount,
+  unresponsiveWindowMs,
 } from "./scheduler";
 import { BOOTSTRAP_PROMPT } from "./runtime/herdr";
 import type { Session } from "./sessions";
@@ -325,6 +328,49 @@ function restartRefusedForGeneration(db: Database, workerId: string, generation:
 
 function recentlyWoken(db: Database, workerId: string, at: number): boolean {
   return recentlyEvent(db, workerId, "worker.woken", at, wakeCooldownMs());
+}
+
+/**
+ * T549: how many times has this worker been woken for runnable work within the
+ * unresponsive window? A worker that is woken, returns to idle, is woken again,
+ * and NEVER claims is wedged — the live high-context case saw `worker.woken`
+ * fire every few seconds while the session sat idle at 314K tokens.
+ */
+function recentWakeCount(db: Database, workerId: string, at: number): number {
+  const r = db
+    .query(
+      `SELECT COUNT(*) AS n FROM events
+        WHERE worker_id = ? AND type = 'worker.woken'
+          AND timestamp > ?`
+    )
+    .get(workerId, at - unresponsiveWindowMs()) as { n: number };
+  return r.n;
+}
+
+/**
+ * T549: an idle worker that has been woken repeatedly for claimable work but
+ * never claimed is UNRESPONSIVE, not merely starting up. Surface it (Attention,
+ * once per window) instead of silently re-waking forever. The event is the
+ * explicit signal the AC requires; the caller decides whether to act.
+ */
+function detectUnresponsiveIdle(db: Database, w: WorkerRow, at: number): boolean {
+  if (w.state !== "idle" || w.current_task_id !== null) return false;
+  if (!w.opencode_session_id) return false;
+  if (recentWakeCount(db, w.id, at) < unresponsiveWakeCount()) return false;
+  if (recentlyEvent(db, w.id, "worker.wake_unresponsive", at, unresponsiveWindowMs())) return false;
+  logEvent(db, {
+    source: "supervisor",
+    workerId: w.id,
+    type: "worker.wake_unresponsive",
+    payload: {
+      wakes: recentWakeCount(db, w.id, at),
+      generation: w.generation,
+      usedTokens: w.context_used_tokens,
+      highContext: (w.context_used_tokens ?? 0) >= contextWedgeTokens(),
+      role: w.role,
+    },
+  });
+  return true;
 }
 
 /**
@@ -1654,6 +1700,10 @@ export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<
           actions.push(`woken:${c.id}`);
           woken = true;
         }
+        // T549: an idle worker that keeps absorbing wakes without ever claiming
+        // is WEDGED (live: a ~314K-context session that ignored every prompt).
+        // Surface it once per window — a silent idle is the defect.
+        if (detectUnresponsiveIdle(db, full, at)) actions.push(`unresponsive:${c.id}`);
       })
     );
     if (!woken) {

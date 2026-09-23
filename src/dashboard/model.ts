@@ -4,7 +4,7 @@ import { now } from "../db";
 import { unreadCounts } from "../messages";
 import { findRuntime, listRuntimes } from "../runtimes";
 import { getNotes, listTasks, taskCounts, unclaimableRunnableTasks } from "../tasks";
-import { toolHardCapMs, toolMaxMs, toolNoOutputMs, toolWarnMs } from "../scheduler";
+import { toolHardCapMs, toolMaxMs, toolNoOutputMs, toolWarnMs, unresponsiveWindowMs } from "../scheduler";
 import { listWorkers, quietActive, type WorkerRow } from "../workers";
 import type { Task, WorkerRuntime } from "../schema";
 import { readPanes, relayWorkspaces, type PaneTelemetry } from "./herdr";
@@ -218,7 +218,7 @@ export function buildDashboardView(db: Database, opts: BuildOptions): DashboardV
   for (const w of workers) w.affinity = affinity.byWorker.get(w.id) ?? NO_AFFINITY;
 
   // ---- attention (derived only; never written to the DB) --------------------
-  const attention = deriveAttention(db, workers, tasks);
+  const attention = deriveAttention(db, workers, tasks, at);
 
   const counts = taskCounts(db);
   const view: DashboardView = {
@@ -314,7 +314,8 @@ export function buildForest(tasks: Task[]): { forest: DashboardTaskNode[]; byId:
 function deriveAttention(
   db: Database,
   workers: DashboardWorker[],
-  tasks: Task[]
+  tasks: Task[],
+  at: number
 ): DashboardAttention[] {
   const out: DashboardAttention[] = [];
   for (const w of workers) {
@@ -370,6 +371,35 @@ function deriveAttention(
     } else if (t.state === "failed") {
       out.push({ kind: "task", id: t.id, ageMs: null, text: "failed" });
     }
+  }
+  // T549: a worker woken repeatedly for claimable work that never claims is
+  // WEDGED, not idle. Surface it (once per window the supervisor logs it) so a
+  // high-context unresponsive session is never a silent idle. Bounded to the
+  // window so a recovered worker does not show a stale row forever.
+  const unresponsive = db
+    .query(
+      `SELECT worker_id AS id, MAX(timestamp) AS at, MAX(payload_json) AS p
+         FROM events WHERE type = 'worker.wake_unresponsive'
+        GROUP BY worker_id`
+    )
+    .all() as { id: string; at: number; p: string }[];
+  const window = unresponsiveWindowMs();
+  const seenWorkers = new Set(workers.map((w) => w.id));
+  for (const u of unresponsive) {
+    if (!seenWorkers.has(u.id)) continue;
+    if (workers.some((w) => w.id === u.id && w.state === "dead")) continue;
+    if (window > 0 && at - u.at > window) continue;
+    let usedTokens: number | null = null;
+    try {
+      usedTokens = (JSON.parse(u.p) as { usedTokens?: number | null }).usedTokens ?? null;
+    } catch { /* ignore malformed */ }
+    const ctx = usedTokens ? ` at ${Math.round(usedTokens / 1000)}K tokens` : "";
+    out.push({
+      kind: "worker",
+      id: u.id,
+      ageMs: u.at ? at - u.at : null,
+      text: `idle, woken repeatedly for runnable work but not claiming${ctx} — session may be wedged (detach + respawn)`,
+    });
   }
   return out;
 }
