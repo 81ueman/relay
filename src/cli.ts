@@ -28,6 +28,7 @@ import {
   quietActive, registerWorker, retireWorker, setWorkerState, touchSeen, unretireWorker,
 } from "./workers";
 import { resolveWorkerIdentity } from "./identity";
+import { usageReport, usageTotals, type UsageGroup, type UsageRow } from "./usage";
 import { attachPrompt, createLane, realHerdrRunner, reapLane } from "./spawn";
 import { runDashboard } from "./dashboard/command";
 import { runGc } from "./gc";
@@ -82,6 +83,7 @@ Usage:
   relay inbox [--worker <id>] [--claim] [--ack <msg-id>]
 
   relay status
+  relay cost [--by worker|task|session] [--since 24h] [--json]
   relay dashboard [--watch] [--show [--tab]] [--hide] [--doctor] [--json] [--runtime-history]
   relay events [--follow] [--limit N]
   relay gc [--apply] [--with-history] [--older-than <30s|2m|1h>] [--json]
@@ -277,6 +279,11 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
       "relay dashboard --json [--runtime-history]",
     ],
   },
+  cost: {
+    about:
+      "Attributed token/cost usage (from the plugin's session.usage telemetry). Groups by worker (default), task or session; deltas are attributed to the task the worker held when they were reported. --since accepts 30s/2m/1h/24h.",
+    usage: ["relay cost [--by worker|task|session] [--since 24h] [--json]"],
+  },
   events: { about: "Print recent events, or follow them (Ctrl-C to stop).", usage: ["relay events [--follow] [--limit N]"] },
   gc: {
     about:
@@ -371,6 +378,14 @@ function fmtAge(ms: number): string {
   return `${Math.floor(m / 60)}h`;
 }
 
+function fmtInt(n: number): string {
+  return Math.round(n).toLocaleString("en-US");
+}
+
+function fmtCost(n: number): string {
+  return `$${n.toFixed(4)}`;
+}
+
 /** Collapse whitespace and cap a command string for a one-line status row. */
 function truncText(s: string, max = 48): string {
   const one = s.replace(/\s+/g, " ").trim();
@@ -433,7 +448,7 @@ const VALUE_FLAGS = new Set([
   "--role", "--state", "--limit", "--interval", "--session", "--runtime", "--cwd",
   "--command", "--title", "--kind", "--acceptance", "--priority", "--parent", "--plan",
   "--dir", "--worktree", "--pane", "--tab", "--workspace", "--type", "--payload",
-  "--ack", "--depends-on", "--older-than", "--base", "--label",
+  "--ack", "--depends-on", "--older-than", "--base", "--label", "--since", "--by",
 ]);
 
 /** Positional args only, skipping flags and their (known) values, e.g. ["T12","reason"]. */
@@ -1270,6 +1285,45 @@ async function main(): Promise<void> {
         } else {
           console.log(`daemon ${probe.status}`);
         }
+        break;
+      }
+
+      case "cost": {
+        const by = (flag(argv, "--by") ?? "worker") as UsageGroup;
+        if (by !== "worker" && by !== "task" && by !== "session") {
+          throw new Error(`invalid --by '${by}' (use worker, task or session)`);
+        }
+        const sinceRaw = flag(argv, "--since");
+        const since = sinceRaw ? now() - parseDuration(sinceRaw) : undefined;
+        const rows = usageReport(db, by, since);
+        const totals = usageTotals(db, since);
+        if (hasFlag(argv, "--json")) {
+          console.log(JSON.stringify({ by, since: since ?? null, rows, totals }, null, 2));
+          break;
+        }
+        const window = sinceRaw ? `last ${sinceRaw}` : "all time";
+        console.log(`Usage by ${by} (${window})`);
+        console.log("");
+        if (rows.length === 0) {
+          console.log("(no usage recorded yet — the plugin reports session.usage on each turn)");
+          break;
+        }
+        const header =
+          `${"KEY".padEnd(22)} ${"COST".padStart(10)} ${"INPUT".padStart(12)} ` +
+          `${"OUTPUT".padStart(10)} ${"CACHE-READ".padStart(13)} ${"COMPACT".padStart(7)}`;
+        console.log(header);
+        console.log("-".repeat(header.length));
+        for (const r of rows) {
+          console.log(
+            `${r.key.padEnd(22).slice(0, 22)} ${fmtCost(r.cost).padStart(10)} ${fmtInt(r.input).padStart(12)} ` +
+              `${fmtInt(r.output).padStart(10)} ${fmtInt(r.cache_read).padStart(13)} ${String(r.compactions).padStart(7)}`
+          );
+        }
+        console.log("-".repeat(header.length));
+        console.log(
+          `${"TOTAL".padEnd(22)} ${fmtCost(totals.cost).padStart(10)} ${fmtInt(totals.input).padStart(12)} ` +
+            `${fmtInt(totals.output).padStart(10)} ${fmtInt(totals.cache_read).padStart(13)}`
+        );
         break;
       }
 

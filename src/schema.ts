@@ -190,6 +190,29 @@ export interface DbEvent {
   payload_json: string;
 }
 
+/**
+ * [ext] One attributed token/cost DELTA. The plugin forwards a session's
+ * session-lifetime CUMULATIVE usage (`session.usage`); the daemon turns each
+ * new reading into the difference from the previous one and records it here,
+ * tagged with the worker and the task that worker held at that moment. This is
+ * what makes "how much did THIS task cost?" answerable — the raw cumulative
+ * alone cannot be attributed across a long-lived session.
+ */
+export interface UsageSample {
+  id: number;
+  at: number;
+  session_id: string;
+  worker_id: string | null;
+  task_id: string | null;
+  generation: number;
+  cost: number;
+  tokens_input: number;
+  tokens_output: number;
+  tokens_reasoning: number;
+  tokens_cache_read: number;
+  tokens_cache_write: number;
+}
+
 export const SCHEMA = `
 PRAGMA journal_mode = WAL;
 
@@ -256,9 +279,46 @@ CREATE TABLE IF NOT EXISTS sessions (
   worktree TEXT,
   attached_at INTEGER,
   detached_at INTEGER,
-  updated_at INTEGER NOT NULL
+  updated_at INTEGER NOT NULL,
+  -- [ext] Cost/token observability (T551 #8). These hold the last CUMULATIVE
+  -- usage the plugin reported for this session; the daemon diffs each new
+  -- reading against them and records the delta in usage_samples. They are a
+  -- cursor, not a total — do not sum them across sessions.
+  usage_cost REAL NOT NULL DEFAULT 0,
+  usage_input INTEGER NOT NULL DEFAULT 0,
+  usage_output INTEGER NOT NULL DEFAULT 0,
+  usage_reasoning INTEGER NOT NULL DEFAULT 0,
+  usage_cache_read INTEGER NOT NULL DEFAULT 0,
+  usage_cache_write INTEGER NOT NULL DEFAULT 0,
+  usage_updated_at INTEGER,
+  -- [ext] Compaction observability: session_v2.time_compacting is always NULL,
+  -- so the count is reconstructed from plugin compaction events. compaction_open
+  -- tracks an in-flight compaction so a started+ended pair counts exactly once.
+  compactions INTEGER NOT NULL DEFAULT 0,
+  compaction_open INTEGER NOT NULL DEFAULT 0,
+  last_compacted_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_worker ON sessions(worker_id);
+
+-- [ext] Attributed token/cost deltas (see UsageSample). Append-only: the
+-- per-worker/per-task/per-session views are all GROUP BY queries over this.
+CREATE TABLE IF NOT EXISTS usage_samples (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  at INTEGER NOT NULL,
+  session_id TEXT NOT NULL,
+  worker_id TEXT,
+  task_id TEXT,
+  generation INTEGER NOT NULL DEFAULT 0,
+  cost REAL NOT NULL DEFAULT 0,
+  tokens_input INTEGER NOT NULL DEFAULT 0,
+  tokens_output INTEGER NOT NULL DEFAULT 0,
+  tokens_reasoning INTEGER NOT NULL DEFAULT 0,
+  tokens_cache_read INTEGER NOT NULL DEFAULT 0,
+  tokens_cache_write INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_usage_samples_task ON usage_samples(task_id);
+CREATE INDEX IF NOT EXISTS idx_usage_samples_worker ON usage_samples(worker_id, at);
+CREATE INDEX IF NOT EXISTS idx_usage_samples_session ON usage_samples(session_id, at);
 
 CREATE TABLE IF NOT EXISTS messages (
   id INTEGER PRIMARY KEY AUTOINCREMENT,

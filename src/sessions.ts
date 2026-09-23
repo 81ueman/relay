@@ -26,6 +26,18 @@ export interface Session {
   attached_at: number | null;
   detached_at: number | null;
   updated_at: number;
+  /** [ext] Last CUMULATIVE usage reported by the plugin (a cursor, not a total). */
+  usage_cost: number;
+  usage_input: number;
+  usage_output: number;
+  usage_reasoning: number;
+  usage_cache_read: number;
+  usage_cache_write: number;
+  usage_updated_at: number | null;
+  /** [ext] Compaction observability (see schema.ts sessions DDL). */
+  compactions: number;
+  compaction_open: number;
+  last_compacted_at: number | null;
 }
 
 export interface AttachOptions {

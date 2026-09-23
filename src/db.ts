@@ -236,6 +236,41 @@ function migrate(db: Database): void {
   if (columnExists(db, "worker_runtimes", "id") && !columnExists(db, "worker_runtimes", "bootstrap_sent_at")) {
     db.exec("ALTER TABLE worker_runtimes ADD COLUMN bootstrap_sent_at INTEGER;");
   }
+  // Cost/token + compaction observability on sessions (T551 #8). The cursor
+  // columns default to 0/NULL, so an existing session simply baselines on its
+  // first `session.usage` reading.
+  if (columnExists(db, "sessions", "session_id")) {
+    if (!columnExists(db, "sessions", "usage_cost")) {
+      db.exec("ALTER TABLE sessions ADD COLUMN usage_cost REAL NOT NULL DEFAULT 0;");
+    }
+    if (!columnExists(db, "sessions", "usage_input")) {
+      db.exec("ALTER TABLE sessions ADD COLUMN usage_input INTEGER NOT NULL DEFAULT 0;");
+    }
+    if (!columnExists(db, "sessions", "usage_output")) {
+      db.exec("ALTER TABLE sessions ADD COLUMN usage_output INTEGER NOT NULL DEFAULT 0;");
+    }
+    if (!columnExists(db, "sessions", "usage_reasoning")) {
+      db.exec("ALTER TABLE sessions ADD COLUMN usage_reasoning INTEGER NOT NULL DEFAULT 0;");
+    }
+    if (!columnExists(db, "sessions", "usage_cache_read")) {
+      db.exec("ALTER TABLE sessions ADD COLUMN usage_cache_read INTEGER NOT NULL DEFAULT 0;");
+    }
+    if (!columnExists(db, "sessions", "usage_cache_write")) {
+      db.exec("ALTER TABLE sessions ADD COLUMN usage_cache_write INTEGER NOT NULL DEFAULT 0;");
+    }
+    if (!columnExists(db, "sessions", "usage_updated_at")) {
+      db.exec("ALTER TABLE sessions ADD COLUMN usage_updated_at INTEGER;");
+    }
+    if (!columnExists(db, "sessions", "compactions")) {
+      db.exec("ALTER TABLE sessions ADD COLUMN compactions INTEGER NOT NULL DEFAULT 0;");
+    }
+    if (!columnExists(db, "sessions", "compaction_open")) {
+      db.exec("ALTER TABLE sessions ADD COLUMN compaction_open INTEGER NOT NULL DEFAULT 0;");
+    }
+    if (!columnExists(db, "sessions", "last_compacted_at")) {
+      db.exec("ALTER TABLE sessions ADD COLUMN last_compacted_at INTEGER;");
+    }
+  }
   // NOTE: (worker_id, generation) is kept unique by application logic (the
   // monotonic `nextGeneration` helper), not by a DB constraint. Legacy rows may
   // legitimately share a generation (e.g. an active row plus a protected stale

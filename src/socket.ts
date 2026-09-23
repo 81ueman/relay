@@ -8,6 +8,7 @@ import { contextLimitTokens } from "./scheduler";
 import { attachSession, detachSession, gateEvent, getSession, managedWorkerForSession, releaseUnhostedBinding } from "./sessions";
 import type { DaemonIdentity } from "./singleton";
 import { reviveWorkerRestoringTasks } from "./tasks";
+import { recordSessionCompaction, recordSessionUsage, type CompactionStatus, type UsageReading } from "./usage";
 import { getWorker, setWorkerState, setWorkerTool, clearWorkerTool, setWorkerContext, touchSeen } from "./workers";
 
 // JSON Lines over a Unix domain socket. Small protocol:
@@ -18,6 +19,12 @@ import { getWorker, setWorkerState, setWorkerTool, clearWorkerTool, setWorkerCon
 //   {"type":"session.context","session_id":...,"payload":{"used_tokens":N,"model":"..."}}
 //     (context-window telemetry: `input + cache.read` of the latest assistant
 //      message; drives the cooperative-handoff rotation policy)
+//   {"type":"session.usage","session_id":...,"payload":{"cost":N,"input":N,"output":N,
+//     "reasoning":N,"cache_read":N,"cache_write":N}}
+//     (CUMULATIVE session cost/tokens; the daemon diffs it against the session
+//      cursor and records the delta attributed to the worker's current task)
+//   {"type":"session.compaction","session_id":...,"payload":{"status":"started|ended|failed|completed","reason":"..."}}
+//     (compaction observability; session_v2.time_compacting is always NULL)
 //   {"type":"session.attach","session_id":...,"role":...,"worker_id":...,"generation":N,...}
 //     (generation present = relay-spawned session; absent = manual attach, then
 //      the daemon resolves the Herdr identity from the session `directory`
@@ -85,6 +92,39 @@ const PERMISSION_REPLIED = new Set(["permission.replied", "form.replied", "form.
 // best-effort and the reconciler also sweeps stale markers.
 const TOOL_STARTED = "tool.started";
 const TOOL_AFTER = "tool.execute.after";
+
+function numOrZero(v: unknown): number {
+  return typeof v === "number" && Number.isFinite(v) ? v : 0;
+}
+
+/**
+ * Parse a cumulative `session.usage` payload. Returns null when nothing
+ * measurable arrived (a defensive parse of host data — never a crash).
+ */
+function usageReadingFromPayload(payload: unknown): UsageReading | null {
+  if (!payload || typeof payload !== "object") return null;
+  const p = payload as Record<string, unknown>;
+  const reading: UsageReading = {
+    cost: numOrZero(p.cost),
+    input: numOrZero(p.input),
+    output: numOrZero(p.output),
+    reasoning: numOrZero(p.reasoning),
+    cacheRead: numOrZero(p.cache_read),
+    cacheWrite: numOrZero(p.cache_write),
+  };
+  const any =
+    reading.cost > 0 ||
+    reading.input > 0 ||
+    reading.output > 0 ||
+    reading.reasoning > 0 ||
+    reading.cacheRead > 0 ||
+    reading.cacheWrite > 0;
+  return any ? reading : null;
+}
+
+function compactionStatusOf(v: unknown): CompactionStatus | null {
+  return v === "started" || v === "ended" || v === "failed" || v === "completed" ? v : null;
+}
 
 export async function handleSocketMessage(msg: SocketMessage, ctx: SocketContext): Promise<Record<string, unknown>> {
   const { db, runtime } = ctx;
@@ -322,6 +362,36 @@ export async function handleSocketMessage(msg: SocketMessage, ctx: SocketContext
     });
     setWorkerContext(db, workerId, used);
     return { ok: true };
+  }
+
+  // Cost/token observability (T551 #8). The plugin forwards a session's
+  // session-lifetime CUMULATIVE cost/tokens (`session.usage`); the daemon diffs
+  // it against the per-session cursor and records the delta attributed to the
+  // worker's CURRENT task. TELEMETRY: no state change, no `touchSeen`.
+  if (type === "session.usage") {
+    const reading = usageReadingFromPayload(msg.payload);
+    if (!reading) return { ok: true, ignored: "bad-usage" };
+    const w = getWorker(db, workerId);
+    const sample = recordSessionUsage(db, {
+      sessionId: session.session_id,
+      workerId,
+      taskId: w?.current_task_id ?? null,
+      generation: session.generation,
+      reading,
+    });
+    return { ok: true, ...(sample ? { recorded: true } : { ignored: "baseline-or-empty" }) };
+  }
+
+  // Compaction observability: `session_v2.time_compacting` is always NULL, so
+  // the count is reconstructed from these events (see usage.ts). Every status
+  // is logged; the counter increments exactly once per compaction.
+  if (type === "session.compaction") {
+    const p = (msg.payload ?? {}) as { status?: unknown; reason?: unknown };
+    const status = compactionStatusOf(p.status);
+    if (!status) return { ok: true, ignored: "bad-compaction" };
+    const reason = typeof p.reason === "string" ? p.reason : null;
+    const { counted } = recordSessionCompaction(db, { sessionId: session.session_id, status, reason });
+    return { ok: true, counted };
   }
 
   // Liveness only. Explicit `relay note` remains the strongest progress signal.

@@ -74,6 +74,10 @@ interface RelayPluginState {
   contextLast: Map<string, number>;
   /** sessionID -> time the last context reading was forwarded (per-session throttle). */
   contextSentAt: Map<string, number>;
+  /** sessionID -> last cumulative usage forwarded (dedupe unchanged readings). */
+  usageLast: Map<string, string>;
+  /** sessionID -> time the last usage reading was forwarded (per-session throttle). */
+  usageSentAt: Map<string, number>;
   /** The live forwarder's controller (aborted when a reload takes over). */
   controller?: AbortController;
 }
@@ -90,6 +94,8 @@ const G: RelayPluginState = ((globalThis as any).__relayPlugin ??= {
   pendingAttach: new Map(),
   contextLast: new Map(),
   contextSentAt: new Map(),
+  usageLast: new Map(),
+  usageSentAt: new Map(),
 }) as RelayPluginState;
 
 // A hot reload can adopt a globalThis state object created by an older load that
@@ -104,6 +110,8 @@ G.attachAttemptAt ??= new Map();
 G.pendingAttach ??= new Map();
 G.contextLast ??= new Map();
 G.contextSentAt ??= new Map();
+G.usageLast ??= new Map();
+G.usageSentAt ??= new Map();
 
 // Env-only auto attach is OFF by default: a shared server's process env names
 // at most one worker, so it cannot identify a session. Opt in only for
@@ -446,7 +454,16 @@ async function maybeAttachFromEnv(sessionID: string | undefined, directory?: str
 
 function sessionIDOf(data: any): string | undefined {
   if (!data || typeof data !== "object") return undefined;
-  const candidates = [data.sessionID, data.session?.id, data.info?.id, data.form?.sessionID];
+  const candidates = [
+    data.sessionID,
+    data.session?.id,
+    data.info?.id,
+    data.form?.sessionID,
+    // Some V2 events (e.g. session.next.compaction.*) nest their payload under
+    // `data`; accept that shape too so the event is never dropped for want of a
+    // session id.
+    data.data?.sessionID,
+  ];
   for (const c of candidates) {
     if (typeof c === "string" && c) return c;
   }
@@ -487,19 +504,31 @@ const TOOL_AFTER = "tool.execute.after";
 // Herdr reports `working` the whole time).
 const TOOL_STARTED = "tool.started";
 
-// Context-window telemetry. The V2 SDK confirms two token-bearing events:
-// `EventMessageUpdated` (properties.info is an AssistantMessage whose `tokens`
-// is `{input, output, reasoning, cache:{read,write}}` — PER TURN, i.e. the
-// current context occupancy) and `EventSessionUpdated` (properties.info is a
-// Session with the same `tokens` shape, plus `model` — SESSION-LIFETIME
-// CUMULATIVE, NOT occupancy). The two must never be conflated: reading the
-// cumulative as occupancy is what latched the reconciler's rotation guard.
+// Token-bearing events. Two KINDS of token usage arrive, and they must never be
+// conflated — reading a cumulative total as occupancy is what latched the
+// reconciler's rotation guard (T551):
 //
-// We deliberately do NOT gate detection on these names: `maybeForwardContext`
-// scans ANY event for token usage, so a host event-name change or a new
-// token-bearing event cannot silently disable context detection. The set
-// below only documents the confirmed host names.
-export const CONTEXT_USAGE_TYPES = new Set(["message.updated", "session.updated"]);
+//   OCCUPANCY (per message / per step): `message.updated`
+//     (properties.info is an AssistantMessage whose `tokens` is
+//     `{input, output, reasoning, cache:{read,write}}`) and `session.step.ended`
+//     (`data = {sessionID, assistantMessageID, cost, tokens, ...}`).
+//   CUMULATIVE (session lifetime): `session.usage.updated`
+//     (`data = {sessionID, cost, tokens}`) and a full Session object.
+//
+// The names actually emitted by OpenCode 2.0.4 are the `session.*` forms above
+// (NOT the SDK's `session.updated`), which is why classification keys off the
+// SHAPE (role / assistantMessageID / sessionID+cost+tokens), not the name.
+//
+// We deliberately do NOT gate detection on event names: `maybeForwardContext`
+// and `maybeForwardUsage` scan EVERY event, so a host rename or a new
+// token-bearing event cannot silently disable detection. The set below only
+// documents the confirmed host names.
+export const CONTEXT_USAGE_TYPES = new Set([
+  "message.updated",
+  "session.step.ended",
+  "session.usage.updated",
+  "session.updated",
+]);
 // At most one `session.context` per session per window: the stream is
 // high-frequency and the metric barely moves within a few seconds.
 const CONTEXT_THROTTLE_MS = 5000;
@@ -560,9 +589,34 @@ function isTokenUsageObject(value: unknown): value is { input: number; cache: { 
  * carries project/directory/slug identity and no role. This distinction is the
  * whole point of the metric split: only a message's tokens are occupancy.
  */
+function isObject(v: unknown): v is Record<string, unknown> {
+  return !!v && typeof v === "object";
+}
+
+/**
+ * Classify the object that HOLDS a `tokens` object (its parent, not the tokens
+ * object itself). Observed host shapes (OpenCode 2.0.4):
+ *
+ *   message.updated      properties.info = AssistantMessage {role:"assistant", tokens}
+ *   session.step.ended   data = {sessionID, assistantMessageID, cost, tokens, ...}
+ *   session.usage.updated data = {sessionID, cost, tokens}   <- SESSION CUMULATIVE
+ *   session (full)       info = Session {id:"ses_...", projectID, cost, tokens}
+ *
+ * Only an assistant message / a per-step usage is occupancy; the session-level
+ * usage event and a full Session are cumulative.
+ */
 function classifyTokenContainer(container: Record<string, unknown> | undefined): TokenUsageSource {
   if (!container) return "unknown";
+  // Per-message / per-step usage (occupancy): role or an assistant message id.
   if (container.role === "assistant") return "message";
+  if (typeof container.assistantMessageID === "string") return "message";
+  // Session-level usage event: {sessionID, cost, tokens} with no message id.
+  if (typeof container.sessionID === "string" && "cost" in container && isObject(container.tokens)) {
+    return "session";
+  }
+  // A full Session object. Its own id is `ses_...`; projectID/directory/title are
+  // present on the API shape but not guaranteed on a streamed one.
+  if (typeof container.id === "string" && container.id.startsWith("ses")) return "session";
   if (
     typeof container.projectID === "string" ||
     typeof container.directory === "string" ||
@@ -709,6 +763,119 @@ function maybeForwardContext(sessionID: string | undefined, data: unknown, direc
   }
 }
 
+/**
+ * A session's session-lifetime CUMULATIVE cost and token counts, read from a
+ * Session object (`session.updated`). Unlike `contextUsedTokens` this is NOT
+ * occupancy — it is the running total the daemon diffs to attribute cost to a
+ * task. Returns undefined when no Session carrying tokens is present.
+ */
+export interface SessionUsage {
+  cost: number;
+  input: number;
+  output: number;
+  reasoning: number;
+  cacheRead: number;
+  cacheWrite: number;
+}
+
+function isSessionContainer(obj: Record<string, unknown>): boolean {
+  if (obj.role === "assistant") return false;
+  if (typeof obj.assistantMessageID === "string") return false;
+  // session.usage.updated: {sessionID, cost, tokens}
+  if (typeof obj.sessionID === "string" && "cost" in obj && isObject(obj.tokens)) return true;
+  if (typeof obj.id === "string" && obj.id.startsWith("ses")) return true;
+  return (
+    typeof obj.projectID === "string" ||
+    typeof obj.directory === "string" ||
+    (typeof obj.slug === "string" && typeof obj.title === "string")
+  );
+}
+
+export function sessionUsageOf(data: unknown, depth = 0): SessionUsage | undefined {
+  if (depth > 6 || !data || typeof data !== "object") return undefined;
+  try {
+    const obj = data as Record<string, unknown>;
+    if (isSessionContainer(obj)) {
+      const tokens = obj.tokens as Record<string, unknown> | undefined;
+      if (tokens && typeof tokens === "object") {
+        const cache = tokens.cache as Record<string, unknown> | undefined;
+        const num = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : 0);
+        return {
+          cost: num(obj.cost),
+          input: num(tokens.input),
+          output: num(tokens.output),
+          reasoning: num(tokens.reasoning),
+          cacheRead: cache ? num(cache.read) : 0,
+          cacheWrite: cache ? num(cache.write) : 0,
+        };
+      }
+    }
+    for (const value of Object.values(obj)) {
+      const found = sessionUsageOf(value, depth + 1);
+      if (found) return found;
+    }
+  } catch {
+    // Never throw out of a best-effort telemetry scan.
+  }
+  return undefined;
+}
+
+/**
+ * Forward a session's cumulative usage (`session.usage`) when a Session event
+ * carries it. Throttled per session and deduped on the whole reading, like
+ * `session.context`. The daemon turns it into an attributed delta.
+ */
+function maybeForwardUsage(sessionID: string | undefined, data: unknown, directory?: string): void {
+  try {
+    if (!sessionID) return;
+    const reading = sessionUsageOf(data);
+    if (!reading) return;
+    // Dedupe on the whole reading, not just cost: a free/zero-cost model still
+    // moves tokens, and the daemon needs those deltas.
+    const marker = `${reading.cost}:${reading.input}:${reading.output}:${reading.reasoning}:${reading.cacheRead}:${reading.cacheWrite}`;
+    const last = G.usageLast.get(sessionID);
+    if (last !== undefined && last === marker) return; // nothing new
+    const at = Date.now();
+    const sentAt = G.usageSentAt.get(sessionID) ?? 0;
+    if (at - sentAt < CONTEXT_THROTTLE_MS) return; // rate limit
+    G.usageLast.set(sessionID, marker);
+    G.usageSentAt.set(sessionID, at);
+    sendEvent(
+      {
+        type: "session.usage",
+        ...withGeneration(sessionID, {
+          payload: {
+            cost: reading.cost,
+            input: reading.input,
+            output: reading.output,
+            reasoning: reading.reasoning,
+            cache_read: reading.cacheRead,
+            cache_write: reading.cacheWrite,
+          },
+        }),
+      },
+      directory
+    );
+  } catch {
+    // Telemetry must never break a session.
+  }
+}
+
+/**
+ * Normalize a compaction event type onto a single status. The host emits
+ * `session.next.compaction.started/ended` (SDK) and `session.compaction.*`
+ * (observed in the binary) plus the durable `session.compacted`; match
+ * defensively by substring so a rename cannot silently drop the signal.
+ * `compaction.delta` is deliberately ignored (it fires many times per run).
+ */
+export function compactionStatusOf(type: string): "started" | "ended" | "failed" | "completed" | undefined {
+  if (type === "session.compacted") return "completed";
+  if (/compaction\.started/.test(type)) return "started";
+  if (/compaction\.ended/.test(type)) return "ended";
+  if (/compaction\.failed/.test(type)) return "failed";
+  return undefined;
+}
+
 async function forwardEvent(
   ctx: any,
   type: string,
@@ -727,6 +894,27 @@ async function forwardEvent(
   // hard-coded name (see CONTEXT_USAGE_TYPES): any event carrying assistant
   // token usage must be able to trigger `session.context`.
   maybeForwardContext(sessionID, data, directory);
+  // Cumulative cost/token telemetry (`session.usage`), also scanned from every
+  // event so a Session-bearing event cannot silently stop reporting usage.
+  maybeForwardUsage(sessionID, data, directory);
+
+  // Compaction observability: normalize the several host event names onto one
+  // status. `session_v2.time_compacting` is always NULL, so this is the only
+  // reliable signal that a compaction happened.
+  const compaction = compactionStatusOf(type);
+  if (compaction) {
+    const d = data as { reason?: unknown; data?: { reason?: unknown } } | undefined;
+    const reason =
+      typeof d?.reason === "string" ? d.reason : typeof d?.data?.reason === "string" ? d.data.reason : undefined;
+    sendEvent(
+      {
+        type: "session.compaction",
+        ...withGeneration(sessionID, { payload: { status: compaction, ...(reason ? { reason } : {}) } }),
+      },
+      directory
+    );
+    return;
+  }
 
   if (IDLE_TYPES.has(type)) {
     // Always forwarded; the daemon gates on managed + generation. Normalized to
