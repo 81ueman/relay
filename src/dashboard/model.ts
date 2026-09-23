@@ -390,15 +390,23 @@ function deriveAttention(
     if (workers.some((w) => w.id === u.id && w.state === "dead")) continue;
     if (window > 0 && at - u.at > window) continue;
     let usedTokens: number | null = null;
+    let highContext = false;
     try {
-      usedTokens = (JSON.parse(u.p) as { usedTokens?: number | null }).usedTokens ?? null;
+      const p = JSON.parse(u.p) as { usedTokens?: number | null; highContext?: boolean };
+      usedTokens = p.usedTokens ?? null;
+      highContext = p.highContext === true;
     } catch { /* ignore malformed */ }
     const ctx = usedTokens ? ` at ${Math.round(usedTokens / 1000)}K tokens` : "";
+    // Only a HIGH-context session is the known wedge. A low-context worker that
+    // was merely slow to start gets a softer, non-alarming row (live: rust-http
+    // flagged at 121K and claimed ~20s later).
     out.push({
       kind: "worker",
       id: u.id,
       ageMs: u.at ? at - u.at : null,
-      text: `idle, woken repeatedly for runnable work but not claiming${ctx} — session may be wedged (detach + respawn)`,
+      text: highContext
+        ? `idle, woken repeatedly for runnable work but not claiming${ctx} — session may be wedged (detach + respawn)`
+        : `idle, woken repeatedly for runnable work but not claiming${ctx} — slow to start?`,
     });
   }
   return out;

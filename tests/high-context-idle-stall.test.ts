@@ -146,8 +146,9 @@ describe("T549: a woken-but-never-claiming idle worker is surfaced, never silent
     expect(p.usedTokens).toBe(314000);
   });
 
-  test("dashboard ATTENTION surfaces the wedged worker", async () => {
+  test("dashboard ATTENTION surfaces the wedged worker (high context)", async () => {
     managedWorker("rust-http", "rust-http");
+    setWorkerContext(db, "rust-http", 314000);
     addTask(db, { title: "T543 work", role: "rust-http" });
 
     const t0 = Date.now();
@@ -157,6 +158,22 @@ describe("T549: a woken-but-never-claiming idle worker is surfaced, never silent
     const row = view.attention.find((a) => a.id === "rust-http" && a.kind === "worker");
     expect(row?.text ?? "").toContain("woken repeatedly");
     expect(row?.text ?? "").toContain("wedged");
+    expect(row?.text ?? "").toContain("314K tokens");
+  });
+
+  test("dashboard ATTENTION is softer for a low-context slow starter (not called wedged)", async () => {
+    managedWorker("rust-http", "rust-http");
+    setWorkerContext(db, "rust-http", 121000);
+    addTask(db, { title: "T543 work", role: "rust-http" });
+
+    const t0 = Date.now();
+    for (let i = 1; i <= 3; i++) await reconcile(db, rt, t0 + i * 1_000);
+
+    const view = buildDashboardView(db, { root: dir, panes: null, at: t0 + 3_000 });
+    const row = view.attention.find((a) => a.id === "rust-http" && a.kind === "worker");
+    expect(row?.text ?? "").toContain("woken repeatedly");
+    expect(row?.text ?? "").toContain("slow to start");
+    expect(row?.text ?? "").not.toContain("wedged");
   });
 
   test("dashboard ATTENTION drops the row once the window has passed (recovered worker)", async () => {
