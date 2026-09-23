@@ -143,6 +143,34 @@ describe("session.context is telemetry", () => {
     expect(res).toMatchObject({ ok: true, ignored: "bad-context" });
     expect(getWorker(db, "w1")!.context_used_tokens).toBeNull();
   });
+
+  test("an implausible occupancy (a legacy cumulative) never latches the guard", async () => {
+    seedSpawned("w1", 1);
+    // An OLD plugin forwards the session cumulative as `used_tokens`; it exceeds
+    // the 1M model limit and must be rejected, not stored.
+    const res = await sendContext("w1", 49_880_961);
+    expect(res).toMatchObject({ ok: true, ignored: "context-over-limit" });
+    expect(getWorker(db, "w1")!.context_used_tokens).toBeNull();
+  });
+
+  test("a cumulative-only reading is telemetry, never occupancy (T551)", async () => {
+    seedSpawned("w1", 1);
+    const res = await handleSocketMessage(
+      {
+        type: "session.context",
+        session_id: "ses_w1",
+        payload: { cumulative_tokens: 49_880_961, model: "deepseek-v4.1-flash" },
+      },
+      ctx
+    );
+    expect(res).toMatchObject({ ok: true, ignored: "cumulative-only" });
+    // The session-lifetime total must NEVER be read as occupancy.
+    expect(getWorker(db, "w1")!.context_used_tokens).toBeNull();
+    // ...but it is still observable in the event log.
+    const ev = listEvents(db, { limit: 100 }).find((e) => e.type === "session.context");
+    expect(ev).toBeDefined();
+    expect(ev!.payload_json).toContain("cumulative_tokens");
+  });
 });
 
 describe("cooperative rotation policy", () => {
@@ -316,5 +344,35 @@ describe("plugin context extraction", () => {
     expect(tokenUsageOf("nope")).toBeNull();
     expect(tokenUsageOf({ input: "x", cache: { read: 2 } })).toBeNull();
     expect(contextUsedTokens({ input: 0, cache: { read: 0 } })).toBeUndefined();
+  });
+
+  test("a Session's cumulative tokens are NOT occupancy (T551)", () => {
+    // Shape of `session.updated`: properties.info is a Session whose `tokens`
+    // are session-LIFETIME totals (the real dp-alg reading that latched).
+    const session = {
+      sessionID: "ses_x",
+      info: {
+        id: "ses_x",
+        slug: "quiet-river",
+        projectID: "prj_1",
+        directory: "/proj/x",
+        title: "long-lived",
+        tokens: { input: 198_913, output: 100, reasoning: 0, cache: { read: 49_682_048, write: 0 } },
+      },
+    };
+    const reading = contextUsedTokens(session)!;
+    expect(reading.used).toBeUndefined();
+    expect(reading.cumulative).toBe(49_880_961);
+
+    // The same shape on an assistant message (message.updated) IS occupancy.
+    const message = {
+      sessionID: "ses_x",
+      info: {
+        role: "assistant",
+        modelID: "deepseek-v4.1-flash",
+        tokens: { input: 359_000, output: 100, reasoning: 0, cache: { read: 0, write: 0 } },
+      },
+    };
+    expect(contextUsedTokens(message)).toEqual({ used: 359_000, model: "deepseek-v4.1-flash" });
   });
 });

@@ -489,12 +489,15 @@ const TOOL_STARTED = "tool.started";
 
 // Context-window telemetry. The V2 SDK confirms two token-bearing events:
 // `EventMessageUpdated` (properties.info is an AssistantMessage whose `tokens`
-// is `{input, output, reasoning, cache:{read,write}}`) and `EventSessionUpdated`
-// (properties.info is a Session with the same `tokens` shape, plus `model`).
+// is `{input, output, reasoning, cache:{read,write}}` — PER TURN, i.e. the
+// current context occupancy) and `EventSessionUpdated` (properties.info is a
+// Session with the same `tokens` shape, plus `model` — SESSION-LIFETIME
+// CUMULATIVE, NOT occupancy). The two must never be conflated: reading the
+// cumulative as occupancy is what latched the reconciler's rotation guard.
 //
 // We deliberately do NOT gate detection on these names: `maybeForwardContext`
-// scans ANY event for assistant token usage, so a host event-name change or a
-// new token-bearing event cannot silently disable context detection. The set
+// scans ANY event for token usage, so a host event-name change or a new
+// token-bearing event cannot silently disable context detection. The set
 // below only documents the confirmed host names.
 export const CONTEXT_USAGE_TYPES = new Set(["message.updated", "session.updated"]);
 // At most one `session.context` per session per window: the stream is
@@ -521,35 +524,95 @@ export function toolTelemetry(event: any): Record<string, unknown> {
 }
 
 /**
- * Defensive recursive finder for an assistant token-usage object: a nested
- * object with a numeric `input` and a numeric `cache.read` (schema
- * `TokenUsage.Info` / `AssistantMessage.tokens`). Bounded depth, never throws —
- * the event payload is host data and may be any shape, including a future one.
+ * Where a token-usage object was found. `message` is an AssistantMessage's
+ * per-turn `tokens` (current context OCCUPANCY). `session` is a Session's
+ * session-lifetime `tokens` (CUMULATIVE — must never be read as occupancy).
+ * `unknown` keeps the historical best-effort behaviour when the host wraps the
+ * usage in a shape we do not recognise, so a host rename cannot silently
+ * disable context detection.
  */
-export function tokenUsageOf(data: unknown, depth = 0): { input: number; cacheRead: number } | null {
-  if (depth > 6 || !data || typeof data !== "object") return null;
+export type TokenUsageSource = "message" | "session" | "unknown";
+
+export interface TokenUsage {
+  input: number;
+  cacheRead: number;
+  source: TokenUsageSource;
+}
+
+/** A `TokenUsage.Info` / `tokens` object: numeric `input` and `cache.read`. */
+function isTokenUsageObject(value: unknown): value is { input: number; cache: { read: number } } {
+  if (!value || typeof value !== "object") return false;
+  const obj = value as Record<string, unknown>;
+  const cache = obj.cache;
+  return (
+    typeof obj.input === "number" &&
+    Number.isFinite(obj.input) &&
+    !!cache &&
+    typeof cache === "object" &&
+    typeof (cache as Record<string, unknown>).read === "number" &&
+    Number.isFinite((cache as Record<string, unknown>).read)
+  );
+}
+
+/**
+ * Classify the object that HOLDS a `tokens` object (its parent, not the tokens
+ * object itself). An AssistantMessage carries `role: "assistant"`; a Session
+ * carries project/directory/slug identity and no role. This distinction is the
+ * whole point of the metric split: only a message's tokens are occupancy.
+ */
+function classifyTokenContainer(container: Record<string, unknown> | undefined): TokenUsageSource {
+  if (!container) return "unknown";
+  if (container.role === "assistant") return "message";
+  if (
+    typeof container.projectID === "string" ||
+    typeof container.directory === "string" ||
+    (typeof container.slug === "string" && typeof container.title === "string")
+  ) {
+    return "session";
+  }
+  return "unknown";
+}
+
+/**
+ * Defensive recursive collector for token-usage objects. Bounded depth, never
+ * throws — the event payload is host data and may be any shape, including a
+ * future one. Each match records the SOURCE of its parent container so the
+ * caller can tell occupancy (assistant message) from cumulative (session).
+ */
+export function collectTokenUsage(
+  data: unknown,
+  depth = 0,
+  out: TokenUsage[] = [],
+  container?: Record<string, unknown>
+): TokenUsage[] {
+  if (depth > 6 || !data || typeof data !== "object") return out;
   try {
     const obj = data as Record<string, unknown>;
-    const input = obj.input;
-    const cache = obj.cache as Record<string, unknown> | undefined;
-    const cacheRead =
-      cache && typeof cache === "object" ? (cache as Record<string, unknown>).read : undefined;
-    if (
-      typeof input === "number" &&
-      Number.isFinite(input) &&
-      typeof cacheRead === "number" &&
-      Number.isFinite(cacheRead)
-    ) {
-      return { input, cacheRead };
+    if (isTokenUsageObject(obj)) {
+      out.push({
+        input: obj.input,
+        cacheRead: (obj.cache as { read: number }).read,
+        source: classifyTokenContainer(container),
+      });
+      return out;
     }
     for (const value of Object.values(obj)) {
-      const found = tokenUsageOf(value, depth + 1);
-      if (found) return found;
+      collectTokenUsage(value, depth + 1, out, obj);
     }
   } catch {
     // Never throw out of a best-effort telemetry scan.
   }
-  return null;
+  return out;
+}
+
+/**
+ * First token-usage object found anywhere in `data`, or null. Historical API
+ * kept for callers that only need the raw numbers; `contextUsedTokens` is the
+ * one that separates occupancy from cumulative.
+ */
+export function tokenUsageOf(data: unknown): { input: number; cacheRead: number } | null {
+  const first = collectTokenUsage(data)[0];
+  return first ? { input: first.input, cacheRead: first.cacheRead } : null;
 }
 
 /** Bounded recursive search for a model id anywhere nearby (`modelID`, `model.id`). */
@@ -575,16 +638,37 @@ function findModelID(value: unknown, depth = 0): string | undefined {
 }
 
 /**
- * Current context occupancy of the latest assistant message: `input +
- * cache.read` (the prompt/context tokens in play), or undefined when no token
- * usage is present in the event.
+ * Token reading for a host event, split by MEANING:
+ *   - `used`       current context OCCUPANCY (an assistant message's
+ *                  `input + cache.read`). Only this may drive rotation.
+ *   - `cumulative` session-lifetime prompt tokens (a Session's `tokens`).
+ *                  Telemetry only — never occupancy.
+ *
+ * A message reading wins over a session reading. When the only match is a
+ * Session, `used` is deliberately left undefined so the reconciler's
+ * high-context guard cannot latch on a cumulative total (the T551 bug: a
+ * session's 49,880,961 cumulative was read as 359K of occupancy). An
+ * unrecognised wrapper still falls back to `used` so a host rename cannot
+ * silently disable detection.
  */
-export function contextUsedTokens(data: unknown): { used: number; model?: string } | undefined {
-  const usage = tokenUsageOf(data);
-  if (!usage) return undefined;
-  const used = usage.input + usage.cacheRead;
-  if (!Number.isFinite(used) || used <= 0) return undefined;
-  return { used, model: findModelID(data) };
+export function contextUsedTokens(
+  data: unknown
+): { used?: number; cumulative?: number; model?: string } | undefined {
+  const usages = collectTokenUsage(data);
+  if (usages.length === 0) return undefined;
+  const model = findModelID(data);
+  const size = (u: TokenUsage | undefined): number | undefined => {
+    if (!u) return undefined;
+    const n = u.input + u.cacheRead;
+    return Number.isFinite(n) && n > 0 ? n : undefined;
+  };
+  const used =
+    size(usages.find((u) => u.source === "message")) ??
+    size(usages.find((u) => u.source === "unknown"));
+  if (used !== undefined) return { used, ...(model ? { model } : {}) };
+  const cumulative = size(usages.find((u) => u.source === "session"));
+  if (cumulative !== undefined) return { cumulative, ...(model ? { model } : {}) };
+  return undefined;
 }
 
 /**
@@ -598,19 +682,25 @@ function maybeForwardContext(sessionID: string | undefined, data: unknown, direc
     if (!sessionID) return;
     const reading = contextUsedTokens(data);
     if (!reading) return;
+    // Dedupe on whichever value moved. A cumulative-only reading (session.updated)
+    // carries no occupancy and is forwarded as telemetry WITHOUT `used_tokens`,
+    // so the daemon can log it but never applies it to the rotation guard.
+    const marker = reading.used ?? reading.cumulative ?? 0;
     const at = Date.now();
     const last = G.contextLast.get(sessionID);
-    if (last !== undefined && last === reading.used) return; // nothing new
+    if (last !== undefined && last === marker) return; // nothing new
     const sentAt = G.contextSentAt.get(sessionID) ?? 0;
     if (at - sentAt < CONTEXT_THROTTLE_MS) return; // rate limit
-    G.contextLast.set(sessionID, reading.used);
+    G.contextLast.set(sessionID, marker);
     G.contextSentAt.set(sessionID, at);
+    const payload: Record<string, unknown> = {};
+    if (reading.used !== undefined) payload.used_tokens = reading.used;
+    if (reading.cumulative !== undefined) payload.cumulative_tokens = reading.cumulative;
+    if (reading.model) payload.model = reading.model;
     sendEvent(
       {
         type: "session.context",
-        ...withGeneration(sessionID, {
-          payload: { used_tokens: reading.used, ...(reading.model ? { model: reading.model } : {}) },
-        }),
+        ...withGeneration(sessionID, { payload }),
       },
       directory
     );

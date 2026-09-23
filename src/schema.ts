@@ -106,8 +106,11 @@ export interface Worker {
   /**
    * [ext] Context-window telemetry. The OpenCode plugin forwards
    * `session.context` carrying the latest assistant message's
-   * `input + cache.read` (the current prompt/context occupancy). The daemon
-   * stores it and the reconciler applies a COOPERATIVE HANDOFF policy at
+   * `input + cache.read` (the current prompt/context OCCUPANCY). A Session's
+   * session-lifetime `tokens` are forwarded separately as `cumulative_tokens`
+   * and are NEVER stored here: conflating the cumulative with occupancy latched
+   * this metric on a single reading (T551). The daemon stores the occupancy and
+   * the reconciler applies a COOPERATIVE HANDOFF policy at
    * `RELAY_CONTEXT_ROTATE_PCT` of the model limit: ask the worker to checkpoint,
    * then rotate it to a fresh generation. Like the tool marker this is telemetry
    * — it never changes the worker's state, task ownership or lease.

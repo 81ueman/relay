@@ -4,6 +4,7 @@ import { defaultSockPath } from "./db";
 import { logEvent } from "./events";
 import { handleErrorSignal, handleIdleSignal, reconcile } from "./reconciler";
 import type { HerdrIdentity, Runtime } from "./runtime/runtime";
+import { contextLimitTokens } from "./scheduler";
 import { attachSession, detachSession, gateEvent, getSession, managedWorkerForSession, releaseUnhostedBinding } from "./sessions";
 import type { DaemonIdentity } from "./singleton";
 import { reviveWorkerRestoringTasks } from "./tasks";
@@ -265,20 +266,60 @@ export async function handleSocketMessage(msg: SocketMessage, ctx: SocketContext
     return { ok: true };
   }
 
-  // Context-window telemetry from the plugin (a nested object in the host's
-  // assistant-message `tokens`). Like the tool marker it is TELEMETRY: no state
-  // change, no `touchSeen`. The reconciler's cooperative-handoff policy reads
-  // the persisted metric on a later pass. A non-positive/non-finite value is
-  // ignored (a defensive parse of host data, never a crash).
+  // Context-window telemetry from the plugin. Like the tool marker it is
+  // TELEMETRY: no state change, no `touchSeen`. The reconciler's
+  // cooperative-handoff policy reads the persisted metric on a later pass. A
+  // non-positive/non-finite value is ignored (a defensive parse of host data,
+  // never a crash).
+  //
+  // `used_tokens` is current context OCCUPANCY (an assistant message's
+  // `input + cache.read`) and is the ONLY value allowed to drive rotation.
+  // `cumulative_tokens` is session-lifetime telemetry from `session.updated`:
+  // it is logged but NEVER written to `context_used_tokens` — reading a
+  // cumulative total as occupancy is what latched the high-context guard on a
+  // single reading (T551). A payload carrying only the cumulative is accepted
+  // and recorded as telemetry, not rejected.
   if (type === "session.context") {
-    const p = (msg.payload ?? {}) as { used_tokens?: unknown; model?: unknown };
+    const p = (msg.payload ?? {}) as {
+      used_tokens?: unknown;
+      cumulative_tokens?: unknown;
+      model?: unknown;
+    };
+    const model = typeof p.model === "string" && p.model ? p.model : undefined;
+    const cumulative =
+      typeof p.cumulative_tokens === "number" &&
+      Number.isFinite(p.cumulative_tokens) &&
+      p.cumulative_tokens > 0
+        ? p.cumulative_tokens
+        : null;
     const used =
       typeof p.used_tokens === "number" && Number.isFinite(p.used_tokens) && p.used_tokens > 0
         ? p.used_tokens
         : null;
-    if (used === null) return { ok: true, ignored: "bad-context" };
-    const model = typeof p.model === "string" && p.model ? p.model : undefined;
-    logEvent(db, { source: "opencode", workerId, type, payload: { used_tokens: used, model: model ?? null } });
+    // Defence in depth for sessions still running an OLD plugin that forwards a
+    // Session's cumulative as `used_tokens`: an occupancy above the model limit
+    // is impossible, so it must never reach the rotation guard.
+    if (used !== null && used > contextLimitTokens()) {
+      return { ok: true, ignored: "context-over-limit" };
+    }
+    if (used === null) {
+      if (cumulative !== null) {
+        logEvent(db, {
+          source: "opencode",
+          workerId,
+          type,
+          payload: { cumulative_tokens: cumulative, model: model ?? null },
+        });
+        return { ok: true, ignored: "cumulative-only" };
+      }
+      return { ok: true, ignored: "bad-context" };
+    }
+    logEvent(db, {
+      source: "opencode",
+      workerId,
+      type,
+      payload: { used_tokens: used, cumulative_tokens: cumulative, model: model ?? null },
+    });
     setWorkerContext(db, workerId, used);
     return { ok: true };
   }
