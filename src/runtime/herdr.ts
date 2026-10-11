@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { resolve as resolvePath } from "node:path";
 import type { Worker } from "../schema";
+import { harness, inferKind } from "../harness";
 import {
   MockRuntime,
   type AgentStatus,
@@ -225,11 +226,11 @@ function tabExists(tabId: string): boolean {
 }
 
 /** Retry `agent start` a few times: a freshly created tab's shell may not be ready yet. */
-async function startAgentWithRetry(name: string, paneId: string): Promise<void> {
+async function startAgentWithRetry(name: string, paneId: string, kind: string): Promise<void> {
   let lastErr = "";
   for (let attempt = 0; attempt < 3; attempt++) {
     if (attempt > 0) await Bun.sleep(1500);
-    const r = runHerdr(["agent", "start", name, "--kind", "opencode", "--pane", paneId, "--timeout", "60000"], 75000);
+    const r = runHerdr(["agent", "start", name, "--kind", kind, "--pane", paneId, "--timeout", "60000"], 75000);
     if (r.ok || runHerdr(["agent", "get", name], 5000).ok) return;
     lastErr = (r.stderr || r.stdout).trim().slice(0, 200);
   }
@@ -428,10 +429,11 @@ export class HerdrRuntime implements Runtime {
   async resolveIdentity(input: { sessionId: string; hint?: HerdrIdentityHint }): Promise<HerdrIdentity> {
     const { sessionId, hint } = input;
     const agents = listAgents();
-    // A codex session carries a UUID id (never `ses...`): infer the expected
-    // agent kind so a codex pane is accepted instead of failing the opencode
-    // checks. An explicit hint wins.
-    const wantKind = hint?.agentKind ?? (/^ses/.test(sessionId) ? "opencode" : "codex");
+    // Infer the expected agent kind from the session id (see src/harness.ts): a
+    // bare UUID is the historical non-`ses` codex default, `session-<uuid>` is
+    // dsh. An explicit hint always wins, so a claude UUID is resolved by
+    // declaring `--kind claude`.
+    const wantKind = hint?.agentKind ?? inferKind(sessionId);
 
     // 1. Authoritative: Herdr itself maps the session to a pane.
     const reported = agents.filter((a) => a?.agent_session && a.agent_session.value === sessionId);
@@ -502,6 +504,16 @@ export class HerdrRuntime implements Runtime {
         "no Herdr workspace configured: set RELAY_HERDR_WORKSPACE (or HERDR_WORKSPACE_ID); refusing to spawn into the focused workspace"
       );
     }
+    // Herdr can only start harnesses that register a real `--kind`. dsh is not
+    // one: it is started by hand and its relay plugin self-reports the pane, so
+    // an autonomous (re)spawn is refused with a clear message instead of a
+    // confusing `agent start` failure.
+    const startKind = harness(w.agent_kind)?.herdrStartKind ?? null;
+    if (!startKind) {
+      throw new Error(
+        `cannot spawn ${w.agent_kind} worker ${w.id}: Herdr has no '${w.agent_kind}' agent kind; start it by hand (dsh --profile web) and attach with relay session attach --kind ${w.agent_kind}`
+      );
+    }
     const cwd = w.cwd ?? process.cwd();
     const name = agentNameFor(w.id, generation);
     const attachToken = randomUUID();
@@ -546,7 +558,7 @@ export class HerdrRuntime implements Runtime {
     }
 
     try {
-      await startAgentWithRetry(name, paneId);
+      await startAgentWithRetry(name, paneId, startKind);
       // NOTE: `start` is a transport primitive ONLY. It does NOT send the
       // bootstrap prompt and does NOT touch the DB: the supervisor must first
       // durably record this generation (relay_owned, attach_token) and only then

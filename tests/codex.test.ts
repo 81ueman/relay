@@ -5,7 +5,7 @@ import { join } from "node:path";
 import type { Database } from "bun:sqlite";
 import { openDb } from "../src/db";
 import { listEvents } from "../src/events";
-import { pollCodexWorker, reconcile } from "../src/reconciler";
+import { pollWorker, reconcile } from "../src/reconciler";
 import { MockRuntime, type HerdrIdentity } from "../src/runtime/runtime";
 import { handleSocketMessage, type SocketContext } from "../src/socket";
 import { attachSession, getSession } from "../src/sessions";
@@ -104,7 +104,7 @@ describe("codex liveness/idle is POLLED from Herdr status", () => {
     const before = getWorker(db, "codex-v4-example")!.last_seen_at;
     rt.setAgentStatus("codex-v4-example", "working");
     await Bun.sleep(5);
-    const outcome = await pollCodexWorker(db, rt, "codex-v4-example");
+    const outcome = await pollWorker(db, rt, "codex-v4-example");
     expect(outcome).toBe("working");
     expect(getWorker(db, "codex-v4-example")!.last_seen_at).toBeGreaterThanOrEqual(before);
     expect(listEvents(db, { limit: 20 }).some((e) => e.type === "worker.status_polled")).toBe(true);
@@ -113,14 +113,14 @@ describe("codex liveness/idle is POLLED from Herdr status", () => {
   test("blocked status maps to waiting_input (never offered new work)", async () => {
     attachedCodex("codex-v4-example");
     rt.setAgentStatus("codex-v4-example", "blocked");
-    expect(await pollCodexWorker(db, rt, "codex-v4-example")).toBe("blocked");
+    expect(await pollWorker(db, rt, "codex-v4-example")).toBe("blocked");
     expect(getWorker(db, "codex-v4-example")!.state).toBe("waiting_input");
   });
 
   test("dead status (unreachable agent) marks the worker dead", async () => {
     attachedCodex("codex-v4-example");
     rt.setAgentStatus("codex-v4-example", "dead");
-    expect(await pollCodexWorker(db, rt, "codex-v4-example")).toBe("dead");
+    expect(await pollWorker(db, rt, "codex-v4-example")).toBe("dead");
     expect(getWorker(db, "codex-v4-example")!.state).toBe("dead");
   });
 
@@ -128,14 +128,14 @@ describe("codex liveness/idle is POLLED from Herdr status", () => {
     attachedCodex("codex-v4-example");
     addTask(db, { title: "queued for codex", role: "design-v4" });
     rt.setAgentStatus("codex-v4-example", "idle");
-    const outcome = await pollCodexWorker(db, rt, "codex-v4-example");
+    const outcome = await pollWorker(db, rt, "codex-v4-example");
     expect(outcome).toBe("woke-next");
     expect(rt.wakes.map((w) => w.workerId)).toContain("codex-v4-example");
   });
 
-  test("an opencode worker is never polled (not-codex)", async () => {
+  test("an event-driven worker (opencode) is never polled", async () => {
     registerWorker(db, "oc-1", { role: "worker" });
-    expect(await pollCodexWorker(db, rt, "oc-1")).toBe("not-codex");
+    expect(await pollWorker(db, rt, "oc-1")).toBe("not-polled");
   });
 
   test("reconcile polls codex workers without disturbing opencode", async () => {

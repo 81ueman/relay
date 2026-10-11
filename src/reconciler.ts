@@ -1,6 +1,7 @@
 import type { Database } from "bun:sqlite";
 import { now } from "./db";
 import { countIdleSinceProgress, logEvent } from "./events";
+import { idlesViaPoll } from "./harness";
 import type { AgentStatus, Runtime, StartedRuntime } from "./runtime/runtime";
 import {
   cleanupCandidates,
@@ -259,13 +260,13 @@ function sessionEventFresh(db: Database, workerId: string, at: number): boolean 
 }
 
 /**
- * The single most recent codex agent poll for this worker: its timestamp and
- * status (0/"" when none). Codex has no plugin event stream, so its liveness
- * comes from `pollCodexWorker`. CRITICAL: this is the LATEST poll of ANY status
- * — a newer `dead`/`unknown` verdict must never be overridden by an older
- * successful one.
+ * The single most recent POLLED agent status for this worker: its timestamp and
+ * status (0/"" when none). A polled harness (codex, claude) has no plugin event
+ * stream, so its liveness comes from `pollWorker`. CRITICAL: this is the LATEST
+ * poll of ANY status — a newer `dead`/`unknown` verdict must never be overridden
+ * by an older successful one.
  */
-function lastCodexPoll(db: Database, workerId: string): { at: number; status: string } {
+function lastStatusPoll(db: Database, workerId: string): { at: number; status: string } {
   const r = db
     .query(
       `SELECT timestamp AS t, payload_json AS p FROM events
@@ -288,15 +289,15 @@ function lastCodexPoll(db: Database, workerId: string): { at: number; status: st
  *   - a live in-flight tool marker (a long benchmark emits `tool.started` and
  *     nothing until it returns; `processInFlightTools` has already reaped markers
  *     past their budget, so a surviving marker is a running tool);
- *   - a recent codex agent poll WHOSE LATEST STATUS is reachable (working/idle/
- *     blocked) — codex has no event stream; a latest `dead`/`unknown` poll is
- *     authoritative and yields nothing.
+ *   - a recent POLLED agent status WHOSE LATEST STATUS is reachable (working/
+ *     idle/blocked) — a polled harness has no event stream; a latest
+ *     `dead`/`unknown` poll is authoritative and yields nothing.
  */
 function sessionAliveEvidence(db: Database, w: WorkerRow, at: number): string | null {
   if (sessionEventFresh(db, w.id, at)) return "event";
   if (w.tool_started_at !== null && at - w.tool_started_at <= toolHardCapMs()) return "tool";
-  if (w.agent_kind === "codex") {
-    const poll = lastCodexPoll(db, w.id);
+  if (idlesViaPoll(w.agent_kind)) {
+    const poll = lastStatusPoll(db, w.id);
     const reachable = poll.status === "working" || poll.status === "idle" || poll.status === "blocked";
     if (reachable && poll.at > 0 && at - poll.at <= sessionLivenessMs()) return "codex-poll";
   }
@@ -1496,9 +1497,9 @@ export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<
   //     blocking tool so the session can continue.
   await processInFlightTools(db, rt, actions, at);
 
-  // 0b. Codex workers have no plugin event stream: poll Herdr agent status for
-  //     liveness/idle/blocked before the transport-dead walk below.
-  await pollCodexWorkers(db, rt, at);
+  // 0b. Polled workers (codex, claude) have no plugin event stream: poll Herdr
+  //     agent status for liveness/idle/blocked before the transport-dead walk.
+  await pollPolledWorkers(db, rt, at);
 
   // 1. Expire lapsed leases first (worker crash recovery). Only a missing or
   //    not-alive assignee is requeued; a live-but-slow worker keeps its lease.
@@ -1908,10 +1909,10 @@ export async function handleIdleSignal(db: Database, rt: Runtime, workerId: stri
   return "noop";
 }
 
-export async function pollCodexWorker(db: Database, rt: Runtime, workerId: string, at = now()): Promise<string> {
+export async function pollWorker(db: Database, rt: Runtime, workerId: string, at = now()): Promise<string> {
   const w = getWorker(db, workerId);
   if (!w) return "unknown-worker";
-  if (w.agent_kind !== "codex") return "not-codex";
+  if (!idlesViaPoll(w.agent_kind)) return "not-polled";
   if (typeof rt.agentStatus !== "function") return "unsupported";
   const status = await rt.agentStatus(w).catch(() => "unknown" as AgentStatus);
   logEvent(db, { source: "opencode", workerId, type: "worker.status_polled", payload: { status } });
@@ -1941,14 +1942,15 @@ export async function pollCodexWorker(db: Database, rt: Runtime, workerId: strin
 }
 
 /**
- * Poll every managed codex worker. Codex has no plugin event stream, so this is
- * its liveness/idle source; opencode workers are untouched.
+ * Poll every managed POLLED worker (codex, claude). A polled harness has no
+ * plugin event stream, so this is its liveness/idle source; event-driven workers
+ * (opencode, dsh) are untouched.
  */
-async function pollCodexWorkers(db: Database, rt: Runtime, at: number): Promise<void> {
+async function pollPolledWorkers(db: Database, rt: Runtime, at: number): Promise<void> {
   for (const w of listWorkers(db)) {
-    if (w.agent_kind !== "codex") continue;
+    if (!idlesViaPoll(w.agent_kind)) continue;
     if (!isSupervisedWorker(db, w)) continue;
-    await pollCodexWorker(db, rt, w.id, at).catch(() => "poll-error");
+    await pollWorker(db, rt, w.id, at).catch(() => "poll-error");
   }
 }
 

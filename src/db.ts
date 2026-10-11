@@ -152,9 +152,9 @@ function migrate(db: Database): void {
     if (!columnExists(db, "workers", "command")) {
       db.exec("ALTER TABLE workers ADD COLUMN command TEXT;");
     }
-    // Which agent runtime the worker is (opencode vs codex): codex has no plugin
-    // event stream, so liveness is polled from Herdr agent status. Existing rows
-    // are opencode.
+    // Which agent harness the worker is (see src/harness.ts): polled harnesses
+    // (codex, claude) have no plugin event stream, so liveness is polled from
+    // Herdr agent status. Existing rows are opencode.
     if (!columnExists(db, "workers", "agent_kind")) {
       db.exec("ALTER TABLE workers ADD COLUMN agent_kind TEXT NOT NULL DEFAULT 'opencode';");
     }

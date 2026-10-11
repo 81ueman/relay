@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { harness } from "./harness";
 
 /**
  * `relay worker spawn` / `relay worker reap` — one-command lane setup/teardown.
@@ -94,6 +95,12 @@ export interface SpawnResult {
 export function createLane(opts: SpawnOptions): { worktreePath: string; workspaceId: string | null; paneId: string | null; agentName: string; createdWorktree: boolean; steps: string[] } {
   const run = opts.run ?? realHerdrRunner();
   const kind = opts.kind ?? "opencode";
+  const startKind = harness(kind)?.herdrStartKind ?? null;
+  if (!startKind) {
+    throw new Error(
+      `cannot spawn a '${kind}' lane: Herdr has no '${kind}' agent kind; start it by hand and attach instead`
+    );
+  }
   const steps: string[] = [];
   let worktreePath = opts.cwd ?? "";
   let workspaceId: string | null = null;
@@ -125,7 +132,7 @@ export function createLane(opts: SpawnOptions): { worktreePath: string; workspac
   }
 
   const agentName = opts.id;
-  const startArgs = ["agent", "start", agentName, "--kind", kind];
+  const startArgs = ["agent", "start", agentName, "--kind", startKind];
   if (paneId) startArgs.push("--pane", paneId);
   startArgs.push("--timeout", String(opts.timeoutMs ?? 90000));
   const started = run(startArgs, (opts.timeoutMs ?? 90000) + 15000);

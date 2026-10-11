@@ -2,6 +2,7 @@ import type { Database } from "bun:sqlite";
 import { existsSync, statSync, unlinkSync } from "node:fs";
 import { defaultSockPath } from "./db";
 import { logEvent } from "./events";
+import { resolveKind } from "./harness";
 import { handleErrorSignal, handleIdleSignal, reconcile } from "./reconciler";
 import type { HerdrIdentity, Runtime } from "./runtime/runtime";
 import { contextLimitTokens } from "./scheduler";
@@ -47,9 +48,10 @@ export interface SocketMessage {
   /** Per-spawn attach secret (relay-spawned generations only). */
   token?: string;
   /**
-   * Agent runtime kind. OpenCode sessions are attached with a `ses...` id and
-   * need no declaration; a codex session has a UUID id and MUST pass
-   * `kind:"codex"` so the `ses...` guard is not weakened.
+   * Agent harness kind (`opencode|codex|claude|dsh`). OpenCode (`ses...`) and
+   * dsh (`session-<uuid>`) sessions are recognized by shape and need no
+   * declaration; a bare UUID is ambiguous (codex vs claude) and MUST pass
+   * `kind` so the `ses...` guard is not weakened.
    */
   kind?: string;
   /** Herdr identity hints (manual attach): directory is authoritative when no pane is given. */
@@ -136,15 +138,13 @@ export async function handleSocketMessage(msg: SocketMessage, ctx: SocketContext
 
   if (type === "session.attach") {
     if (!msg.session_id) return { ok: false, reason: "no-session" };
-    // Defense in depth: an OpenCode session id must look like `ses...`; shell
-    // ids (`sh_...`) must never become managed sessions. A CODEX session has a
-    // UUID id and is accepted ONLY when the client declares kind:"codex" — the
-    // opencode guard is not weakened (an undeclared non-`ses` id is refused).
-    const isOpencode = /^ses/.test(msg.session_id);
-    const isCodex =
-      msg.kind === "codex" &&
-      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(msg.session_id);
-    if (!isOpencode && !isCodex) return { ok: false, reason: "not-a-session-id" };
+    // Defense in depth: only a session id its harness could have minted is
+    // accepted. OpenCode (`ses...`) and dsh (`session-<uuid>`) are recognized by
+    // shape; a bare UUID is ambiguous (codex vs claude) and is accepted ONLY
+    // when the client declares `kind` — the opencode guard is never weakened (an
+    // undeclared non-`ses` id is refused). See `src/harness.ts`.
+    const kind = resolveKind(msg.session_id, msg.kind);
+    if (!kind) return { ok: false, reason: "not-a-session-id" };
 
     // Manual attach (no generation): the session must PROVABLY be running inside
     // a Herdr agent. Resolve + verify BEFORE any DB write so a rejected attach
@@ -159,7 +159,7 @@ export async function handleSocketMessage(msg: SocketMessage, ctx: SocketContext
             tabId: msg.tab_id,
             workspaceId: msg.workspace_id,
             directory: msg.directory,
-            agentKind: isCodex ? "codex" : undefined,
+            agentKind: kind,
           },
         });
       } catch (e) {
@@ -203,6 +203,7 @@ export async function handleSocketMessage(msg: SocketMessage, ctx: SocketContext
         // attaches omit it and get a bumped one plus the resolved identity.
         generation: typeof msg.generation === "number" ? msg.generation : undefined,
         attachToken: msg.token,
+        agentKind: kind,
         identity,
       });
     } catch (e) {

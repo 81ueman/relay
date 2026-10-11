@@ -6,6 +6,7 @@ import {
   applyDbMove, configPath, describeDb, findLegacyDb, planDbMove, readConfig, resolveDb,
 } from "./db-location";
 import { formatEvent, listEvents, logEvent } from "./events";
+import { AGENT_KINDS_HELP, inferKind, isKnownKind } from "./harness";
 import { ackMessage, claimInbox, deliverMessage, getMessage, inboxFor, RELAY_TAG, sendMessage, unreadCounts } from "./messages";
 import { isImmediateKind } from "./mail-policy";
 import { daemonBuildWarning, staleBuildWarning, versionLine } from "./version";
@@ -623,13 +624,14 @@ async function main(): Promise<void> {
           const id = argv[2];
           if (!id) {
             throw new Error(
-              "usage: relay worker spawn <id> --role <R> [--kind opencode|codex] [--base <ref>] [--label <L>] " +
+              `usage: relay worker spawn <id> --role <R> [--kind ${AGENT_KINDS_HELP}] [--base <ref>] [--label <L>] ` +
               "[--cwd <existing-dir>] [--pane <pane>] [--no-attach]"
             );
           }
           const rest = argv.slice(2);
           const role = flag(rest, "--role") ?? "worker";
           const kind = flag(rest, "--kind") ?? "opencode";
+          if (!isKnownKind(kind)) throw new Error(`unknown --kind '${kind}' (expected ${AGENT_KINDS_HELP})`);
           const wantAttach = !hasFlag(rest, "--no-attach");
           if (!knownRole(db, role)) {
             console.error(
@@ -657,7 +659,7 @@ async function main(): Promise<void> {
           // worker is an ADOPTED (relay_owned=0) worker, not a managed generation.
           const w = registerWorker(db, id, {
             role,
-            agentKind: kind === "codex" ? "codex" : "opencode",
+            agentKind: kind,
             runtimeId: created.paneId ?? undefined,
             cwd: created.worktreePath,
           });
@@ -727,7 +729,7 @@ async function main(): Promise<void> {
         const rest = argv.slice(2);
         if (sub === "attach") {
           const sessionId = flag(rest, "--session");
-          if (!sessionId) throw new Error("usage: relay session attach --session <sid> [--role R] [--worker W] [--dir D] [--pane P] [--tab T]");
+          if (!sessionId) throw new Error(`usage: relay session attach --session <sid> [--role R] [--worker W] [--kind ${AGENT_KINDS_HELP}] [--dir D] [--pane P] [--tab T]`);
           // Manual attach: the session must provably live inside a Herdr agent.
           // Resolve + verify BEFORE touching the DB; unverifiable => fail closed.
           // `--dir <project>` identifies the pane from the session's working
@@ -735,6 +737,10 @@ async function main(): Promise<void> {
           // over the caller's $HERDR_* env, which leaks the CALLER's pane when
           // attaching a session in another pane/workspace.
           const dir = flag(rest, "--dir") ?? undefined;
+          const declaredKind = flag(rest, "--kind") ?? undefined;
+          if (declaredKind && !isKnownKind(declaredKind)) {
+            throw new Error(`unknown --kind '${declaredKind}' (expected ${AGENT_KINDS_HELP})`);
+          }
           // An explicit --pane likewise supersedes the caller's env: the pane's
           // own live workspace/tab is authoritative, so a stale $HERDR_WORKSPACE_ID
           // or $HERDR_TAB_ID from the caller must not veto the attach.
@@ -748,9 +754,10 @@ async function main(): Promise<void> {
               tabId: flag(rest, "--tab") ?? (noEnv ? undefined : process.env.HERDR_TAB_ID),
               workspaceId: flag(rest, "--workspace") ?? (noEnv ? undefined : process.env.HERDR_WORKSPACE_ID),
               directory: dir,
-              // A codex session has a UUID id (not `ses...`); declare its kind so
-              // identity resolution accepts the codex agent.
-              agentKind: flag(rest, "--kind") ?? (/^ses/.test(sessionId) ? "opencode" : "codex"),
+              // A bare-UUID session (codex/claude) is declared with `--kind`;
+              // `ses...` (opencode) and `session-<uuid>` (dsh) are inferred. See
+              // src/harness.ts.
+              agentKind: declaredKind ?? inferKind(sessionId),
             },
           });
           // Correct a stale stored binding before attachSession's steal guard:
@@ -764,7 +771,7 @@ async function main(): Promise<void> {
           const s = attachSession(db, sessionId, {
             role: flag(rest, "--role") ?? undefined,
             workerId: flag(rest, "--worker") ?? undefined,
-            agentKind: flag(rest, "--kind") ?? undefined,
+            agentKind: declaredKind,
             directory: dir,
             worktree: flag(rest, "--worktree") ?? undefined,
             identity,

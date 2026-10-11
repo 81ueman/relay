@@ -61,9 +61,11 @@ export interface Worker {
   id: string;
   role: string;
   /**
-   * Which agent runtime this worker is: "opencode" (plugin event stream) or
-   * "codex" (no plugin; liveness/idle/blocked are POLLED from Herdr agent
-   * status). Set at attach time from the resolved Herdr agent kind; defaults to
+   * Which agent harness this worker is, from the registry in `src/harness.ts`
+   * ("opencode" | "codex" | "claude" | "dsh"). Event-driven harnesses stream
+   * session.idle/tool/permission; polled harnesses (codex, claude) have no event
+   * stream and their liveness/idle/blocked are POLLED from Herdr agent status.
+   * Set at attach time from the resolved Herdr agent kind; defaults to
    * "opencode" so every pre-existing worker row is unchanged.
    */
   agent_kind: string;
