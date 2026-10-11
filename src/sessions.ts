@@ -1,6 +1,7 @@
 import type { Database } from "bun:sqlite";
 import { now } from "./db";
 import { logEvent } from "./events";
+import { clearWake } from "./wake-outbox";
 import type { HerdrIdentity } from "./runtime/runtime";
 import {
   findRuntime,
@@ -366,6 +367,9 @@ export function detachSession(db: Database, sessionId: string): Session | null {
 
   db.query(`UPDATE sessions SET managed = 0, detached_at = ?, updated_at = ? WHERE session_id = ?`).run(t, t, sessionId);
   if (s.worker_id) {
+    // A detached worker is no longer operational: drop any queued plugin nudge
+    // so a later re-attach never picks up a stale instruction.
+    clearWake(db, s.worker_id);
     const w = getWorker(db, s.worker_id);
     if (w && w.opencode_session_id === sessionId) {
       // No managed session => not operational: no wake, no poll, no restart.

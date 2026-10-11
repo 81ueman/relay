@@ -33,6 +33,7 @@ import { usageReport, usageTotals, type UsageGroup, type UsageRow } from "./usag
 import { attachPrompt, createLane, realHerdrRunner, reapLane } from "./spawn";
 import { runDashboard } from "./dashboard/command";
 import { runGc } from "./gc";
+import { wakeWorker } from "./wake-outbox";
 
 // A role is "known" if it matches a registered worker or a built-in special role.
 // Used for a non-fatal warning on `task add --role`, never a rejection.
@@ -1103,7 +1104,7 @@ async function main(): Promise<void> {
         }
         try {
           const rt = new HerdrRuntime();
-          await rt.wake(targetRow, `${RELAY_TAG}A durable message arrived (id ${id}). Not urgent — finish what you are doing, then run \`relay inbox --claim\` when you reach a stopping point. It is stored and will not be lost.`);
+          await wakeWorker(rt, db, targetRow, `${RELAY_TAG}A durable message arrived (id ${id}). Not urgent — finish what you are doing, then run \`relay inbox --claim\` when you reach a stopping point. It is stored and will not be lost.`, "mail");
           console.log(`sent msg=${id} (wake delivered)`);
         } catch (e) {
           console.log(`sent msg=${id} (wake failed, message remains queued: ${String(e).slice(0, 120)})`);

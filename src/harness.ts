@@ -22,11 +22,20 @@
 // session-id validation; the poll path and spawn path read this table too.
 
 export type IdlesVia = "events" | "poll";
+/** How relay delivers a nudge to the harness. */
+export type WakeVia = "herdr" | "plugin";
 
 export interface Harness {
   /** Value stored in `workers.agent_kind` (and sent as `kind` on attach). */
   readonly id: string;
   readonly idlesVia: IdlesVia;
+  /**
+   * How a nudge reaches the harness:
+   *   "herdr"  — typed into its Herdr pane (`herdr agent prompt`).
+   *   "plugin" — written to the durable wake outbox and pulled by the harness's
+   *              relay plugin (a server harness like dsh has no input pane).
+   */
+  readonly wakeVia: WakeVia;
   /** Herdr agent kind / report label used by identity resolution. */
   readonly herdrKind: string;
   /** Does `sessionId` look like an id this harness could have minted? */
@@ -50,6 +59,7 @@ export const HARNESSES: readonly Harness[] = [
   {
     id: "opencode",
     idlesVia: "events",
+    wakeVia: "herdr",
     herdrKind: "opencode",
     matchesSessionId: (s) => OPENCODE_RE.test(s),
     herdrStartKind: "opencode",
@@ -58,6 +68,7 @@ export const HARNESSES: readonly Harness[] = [
   {
     id: "codex",
     idlesVia: "poll",
+    wakeVia: "herdr",
     herdrKind: "codex",
     matchesSessionId: (s) => UUID_RE.test(s),
     herdrStartKind: "codex",
@@ -66,6 +77,7 @@ export const HARNESSES: readonly Harness[] = [
   {
     id: "claude",
     idlesVia: "poll",
+    wakeVia: "herdr",
     herdrKind: "claude",
     matchesSessionId: (s) => UUID_RE.test(s),
     herdrStartKind: "claude",
@@ -74,6 +86,7 @@ export const HARNESSES: readonly Harness[] = [
   {
     id: "dsh",
     idlesVia: "events",
+    wakeVia: "plugin",
     herdrKind: "dsh",
     matchesSessionId: (s) => DSH_RE.test(s),
     // Herdr has no `dsh` agent kind: a dsh worker is started by hand and its
@@ -117,6 +130,15 @@ export function idlesViaPoll(kind: string | null | undefined): boolean {
 /** The Herdr agent kind for a harness id, or null when unknown. */
 export function herdrKindOf(kind: string | null | undefined): string | null {
   return harness(kind)?.herdrKind ?? null;
+}
+
+/**
+ * True when a nudge must be queued in the durable wake outbox for the harness's
+ * relay plugin to pull, rather than typed into a Herdr pane (a server harness
+ * like dsh has no input pane). Unknown kinds default to the Herdr path.
+ */
+export function wakeViaPlugin(kind: string | null | undefined): boolean {
+  return harness(kind)?.wakeVia === "plugin";
 }
 
 /**

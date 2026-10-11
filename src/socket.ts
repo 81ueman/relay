@@ -10,6 +10,7 @@ import { attachSession, detachSession, gateEvent, getSession, managedWorkerForSe
 import type { DaemonIdentity } from "./singleton";
 import { reviveWorkerRestoringTasks } from "./tasks";
 import { recordSessionCompaction, recordSessionUsage, type CompactionStatus, type UsageReading } from "./usage";
+import { awaitWake } from "./wake-outbox";
 import { getWorker, setWorkerState, setWorkerTool, clearWorkerTool, setWorkerContext, touchSeen } from "./workers";
 
 // JSON Lines over a Unix domain socket. Small protocol:
@@ -58,6 +59,11 @@ export interface SocketMessage {
   pane_id?: string;
   tab_id?: string;
   workspace_id?: string;
+  /**
+   * `worker.wake.await` long-poll window in ms (clamped to 30s). A plugin-woken
+   * harness with no session/worker binding yet gets `{ok:true,wake:null}`.
+   */
+  wait_ms?: number;
 }
 
 export interface SocketContext {
@@ -134,6 +140,20 @@ export async function handleSocketMessage(msg: SocketMessage, ctx: SocketContext
 
   if (type === "ping") {
     return { ok: true, pong: true, ...(ctx.identity ? { identity: ctx.identity } : {}) };
+  }
+
+  // Plugin-woken harnesses (dsh) PULL their next nudge here instead of receiving
+  // a keystroke in a Herdr pane. Resolve the worker from `worker_id`, else from a
+  // managed `session_id`; an unknown/unattached target is not an error — the
+  // caller simply keeps polling. `takeWake` clears the row, so a nudge is
+  // delivered exactly once.
+  if (type === "worker.wake.await") {
+    const workerId = msg.worker_id ?? (msg.session_id ? getSession(db, msg.session_id)?.worker_id : null) ?? null;
+    if (!workerId) return { ok: true, wake: null };
+    if (!getWorker(db, workerId)) return { ok: true, wake: null };
+    const waitMs = Math.max(0, Math.min(Number(msg.wait_ms ?? 25000) || 0, 30000));
+    const wake = await awaitWake(db, workerId, waitMs);
+    return { ok: true, wake };
   }
 
   if (type === "session.attach") {
