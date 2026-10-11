@@ -1,0 +1,20 @@
+# relay-bridge — DeepSeek Harness (dsh) <-> relay
+#
+# One insert over the profile root. The plugin (lib/index.js) makes a dsh
+# session a first-class relay worker with no Herdr input pane: it self-reports
+# the pane to Herdr (identity/status), forwards session + in-flight tool events
+# to the relay daemon, and long-polls the durable wake outbox, delivering each
+# nudge via agent.followup().
+#
+# Install into a profile (from the relay checkout):
+#   dsh plugin --profile web add /path/to/relay/integrations/dsh-relay
+#
+# Config (all optional):
+#   report: true        # self-report identity/status to Herdr
+#   wake:   true        # pull and deliver wake nudges
+#   agentLabel: dsh     # Herdr agent label used for identity resolution
+#   paneIdEnv: HERDR_PANE_ID
+
+- insert:
+    - id: relay-bridge
+      name: '@relay/dsh-relay'
