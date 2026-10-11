@@ -7,14 +7,23 @@ description: Durable-task worker for the relay supervisor. Start with `relay nex
 
 You are a worker under the `relay` supervisor. SQLite is the source of truth — not your pane state, not Herdr idle, not your own claim of "done".
 
-If this session is not yet managed, run the `agent_attach` tool first (or ask for
-`relay session attach --session <id>`). In a shared checkout, where several agents
-run in the same directory, the daemon cannot tell which pane is yours unless you
-say so — pass your Herdr pane: `agent_attach(pane_id="$HERDR_PANE_ID")`, or from
-your own shell run `relay session attach --session <id>` with no `--dir` (it uses
-`$HERDR_PANE_ID`). Never claim work before a successful attach: relay cannot wake
-a worker with no managed session, and its runtime/generation stay unrecorded.
-Detaching (`agent_detach`) returns you to a normal standalone session.
+If this session is not yet managed, attach it first. relay treats every harness
+alike; only the attach call differs (declare it with `--kind`):
+
+- **OpenCode** — call the `agent_attach` tool (it fills in session/dir/worktree
+  from context), or `relay session attach --session ses_...`.
+- **Claude Code / Codex** — `relay session attach --session <uuid> --kind claude`
+  (or `--kind codex`). A bare UUID is ambiguous, so `--kind` is required.
+- **dsh (DeepSeek Harness)** — its relay plugin self-reports the pane to Herdr;
+  attach with `relay session attach --session session-<uuid> --kind dsh --worker <w>`.
+
+In a shared checkout, where several agents run in the same directory, the daemon
+cannot tell which pane is yours unless you say so — name your Herdr pane:
+`agent_attach(pane_id="$HERDR_PANE_ID")` (OpenCode), or from your own shell run
+`relay session attach --session <id>` with no `--dir` (it uses `$HERDR_PANE_ID`).
+Never claim work before a successful attach: relay cannot wake a worker with no
+managed session, and its runtime/generation stay unrecorded. An OpenCode session
+detaches with `agent_detach`; other harnesses use `relay session detach`.
 
 ## The loop (no waiting)
 
@@ -79,7 +88,7 @@ Then it depends on the lane:
   1. Finish cleanly first: `relay submit <task> --evidence "..."` (or
      `relay block` / `relay release`). Never leave a task half-owned.
   2. Start a **fresh session** in your pane (the TUI's new-session action) and
-     re-attach it (`agent_attach`). Relay sees the new session as a new
+     re-attach it (`agent_attach`, or `relay session attach`). Relay sees the new session as a new
      generation and treats it as the rotation — the pending request clears
      automatically. (If `RELAY_ROTATE_ADOPTED=1`, relay instead replaces your
      lane for you at your next idle boundary.)
