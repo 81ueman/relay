@@ -86,8 +86,34 @@ session is managed and it will only nudge through the outbox.
 - the wake loop measured ~1 poll/s under an instant-reply server (the pre-fix
   build sent 4M requests and never exited).
 
+### Real-relay end-to-end (dsh 0.1.5-rc.1, Herdr 0.9.1)
+
+Driven against a real `relay` daemon (source build), a live long-lived dsh agent
+(SDK profile, `session/prompt`), pane `agent=dsh`:
+
+- `relay session attach --kind dsh` binds the worker (`runtime_id=<pane>`);
+- a row in relay's wake outbox is pulled by the plugin's `worker.wake.await` and
+  delivered via `followup()` — the agent runs a **second turn** with no typing,
+  and `relay events` shows `session.status working` -> `session.idle`;
+- the wake loop is paced (~1 poll/s) and never hot-loops.
+
 ## Notes / limits
 
+- **Use a long-lived profile.** `--profile web` (recommended) or an
+  sdk/acp server keep the agent alive across turns, which is what makes
+  `followup()` wakes work. `--profile headless` is a **one-shot**: it disposes
+  its agent after the first task, so a wake delivered afterwards has no live
+  agent (`followup` would target a disposed agent). Do not run headless as a
+  supervised worker.
+- **stdout may be a protocol channel.** Profiles `sdk` and `acp` reserve stdout
+  for JSON-RPC frames, so the plugin logs to **stderr** only. Keep any added
+  logging on stderr too.
+- **The `agents` service is captured at `apply` time.** Cordis resolves a
+  service through the context getter; reading `ctx.agents` from the long-lived
+  wake loop throws `cannot get required service "agents" in inactive context`
+  once this plugin's fiber is no longer the active provider — and an unhandled
+  rejection is fatal to dsh. `deliver()` therefore uses the captured service
+  (falling back to the last-seen agent handle) and is fully guarded.
 - One `dsh --profile web` server per Herdr pane maps that pane to one relay
   worker; run one server per worker (its own tab), as relay spawns agent tabs
   one-per-worker.

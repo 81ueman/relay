@@ -16,8 +16,11 @@
 // Everything is best-effort and never throws into dsh: a missing Herdr or relay
 // socket must not break the agent. Errors are logged once per session.
 //
-// NOTE: untested against a live dsh here (no dsh in CI). Verify the smoke path
-// in README.md before relying on it.
+// NOTE: there is no dsh in CI. This is live-verified against dsh 0.1.5-rc.1
+// (see README.md "Verified"); re-run the smoke path before relying on a new
+// dsh version or profile. Use a LONG-LIVED profile (`web`, or an sdk/acp server):
+// `--profile headless` is a one-shot that disposes its agent after the first
+// task, so a wake delivered later has no live agent to `followup()`.
 
 import { spawnSync } from "node:child_process";
 import {
@@ -38,11 +41,13 @@ const WAKE_POLL_MS = 20000;
 // instantly; without this the loop spins.
 const WAKE_MIN_GAP_MS = 1000;
 
+// Log to STDERR: some profiles (sdk/acp) reserve stdout for protocol frames, so
+// writing status there would corrupt the transport. Stderr is safe everywhere.
 function log(msg) {
   try {
-    console.log(`[relay-bridge] ${msg}`);
+    process.stderr.write(`[relay-bridge] ${msg}\n`);
   } catch {
-    /* stdout closed */
+    /* stderr closed */
   }
 }
 
@@ -108,6 +113,18 @@ export function apply(ctx, config = {}) {
     log(`no ${cfg.paneIdEnv}; Herdr reporting disabled (relay cannot resolve the pane)`);
   }
 
+  // Capture the `agents` service NOW, while this plugin's context is active.
+  // Resolving it later via `ctx.agents` (a property access) throws
+  // `cannot get required service "agents" in inactive context` once this fiber
+  // is no longer the active provider, and an unhandled rejection is FATAL to
+  // dsh. The service object itself is stable and its `.get(id)` needs no ctx.
+  let agentsSvc = null;
+  try {
+    agentsSvc = ctx.agents;
+  } catch {
+    agentsSvc = null;
+  }
+
   /** sessionId -> bridge state */
   const states = new Map();
 
@@ -123,17 +140,23 @@ export function apply(ctx, config = {}) {
     const sessionId = String((agent && agent.session && agent.session.id) || (agent && agent.id) || "");
     if (!isDshSessionId(sessionId)) return null;
     let st = states.get(sessionId);
-    if (st) return st;
+    if (st) {
+      // Keep the freshest agent handle: it is the LIVE object we wake through.
+      st.agent = agent;
+      return st;
+    }
     const cwd = sessionCwd(agent);
-    st = { sessionId, cwd, client: new RelayClient(resolveRelaySocket(cwd)), stopped: false };
+    st = { sessionId, cwd, agent, client: new RelayClient(resolveRelaySocket(cwd)), stopped: false };
     states.set(sessionId, st);
     if (cfg.report) reportHerdr(paneId, cfg.agentLabel, sessionId, cwd, null);
     log(`session ${sessionId} -> relay ${st.client.sockPath}`);
-    if (cfg.wake) void wakeLoop(ctx, st);
+    if (cfg.wake) {
+      void wakeLoop(st).catch((e) => log(`wake loop ended for ${sessionId}: ${String(e).slice(0, 160)}`));
+    }
     return st;
   }
 
-  async function wakeLoop(agentCtx, st) {
+  async function wakeLoop(st) {
     while (!st.stopped) {
       const started = Date.now();
       let wake = null;
@@ -143,16 +166,28 @@ export function apply(ctx, config = {}) {
         wake = null;
       }
       if (st.stopped) break;
-      if (wake && wake.text) deliver(agentCtx, st, wake);
+      if (wake && wake.text) deliver(st, wake);
       const gap = wakeBackoff(Date.now() - started, WAKE_MIN_GAP_MS);
       if (gap > 0 && !st.stopped) await sleep(gap);
     }
   }
 
-  function deliver(agentCtx, st, wake) {
-    const agent = agentCtx.agents.get(st.sessionId);
-    if (!agent) return;
+  /**
+   * Wake the agent via the `agents` service captured at apply time, falling back
+   * to the live agent handle seen in events. We do NOT read `ctx.agents` here:
+   * cordis resolves a service through the context getter, and a long-lived async
+   * loop can run when this plugin's context is no longer the active provider —
+   * that throws `cannot get required service "agents" in inactive context`,
+   * which as an unhandled rejection is FATAL to dsh. Everything is guarded so
+   * delivery can never take the agent down.
+   */
+  function deliver(st, wake) {
     try {
+      const agent = (agentsSvc && agentsSvc.get(st.sessionId)) || st.agent;
+      if (!agent || typeof agent.followup !== "function") {
+        log(`no agent handle for ${st.sessionId}; wake dropped`);
+        return;
+      }
       agent.followup({ content: [{ type: "text", text: String(wake.text) }], source: { kind: "plugin", plugin: "relay" } });
       log(`delivered wake to ${st.sessionId} (${wake.reason || "wake"})`);
     } catch (e) {
