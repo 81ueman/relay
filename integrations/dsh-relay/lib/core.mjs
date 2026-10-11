@@ -80,6 +80,18 @@ export function relayEventForAgentStatus(status) {
 }
 
 /**
+ * Milliseconds to sleep before the next `worker.wake.await` poll so the loop can
+ * never spin. relay long-polls (blocking up to `wait_ms`), but a poll can still
+ * return fast: a null wake for a session relay has not attached yet, or a
+ * connection error while the daemon is down. Without a floor the loop would
+ * hammer the socket (observed: 4M requests/s against a fast server).
+ */
+export function wakeBackoff(waitedMs, minGapMs = 1000) {
+  const waited = Number.isFinite(waitedMs) ? waitedMs : 0;
+  return waited >= minGapMs ? 0 : minGapMs - waited;
+}
+
+/**
  * A JSON-Lines request/response client for one relay socket. A fresh connection
  * per request keeps it stateless and matches relay's one-response-per-line
  * server. Resolves null (never throws) on timeout/transport error.

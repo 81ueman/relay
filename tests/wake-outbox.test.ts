@@ -112,4 +112,14 @@ describe("socket worker.wake.await", () => {
     const res = await handleSocketMessage({ type: "worker.wake.await", worker_id: "ghost", wait_ms: 0 }, ctx);
     expect(res).toMatchObject({ ok: true, wake: null });
   });
+
+  test("an unattached session still HOLDS the poll window (never hot-loops the client)", async () => {
+    const started = Date.now();
+    const res = await handleSocketMessage(
+      { type: "worker.wake.await", session_id: DSH_SESSION, wait_ms: 150 },
+      ctx
+    );
+    expect(res).toMatchObject({ ok: true, wake: null });
+    expect(Date.now() - started).toBeGreaterThanOrEqual(120);
+  });
 });

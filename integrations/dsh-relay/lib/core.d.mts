@@ -7,6 +7,7 @@ export function relayEventForSessionEvent(
   event: { type?: string; name?: string; callId?: string; message?: { id?: string }; error?: unknown }
 ): { type: string; payload?: Record<string, unknown> } | null;
 export function relayEventForAgentStatus(status: string): { type: string; payload?: Record<string, unknown> } | null;
+export function wakeBackoff(waitedMs: number, minGapMs?: number): number;
 export function relayRequest(sockPath: string, msg: unknown, timeoutMs?: number): Promise<Record<string, unknown> | null>;
 export class RelayClient {
   constructor(sockPath: string, opts?: { timeoutMs?: number });

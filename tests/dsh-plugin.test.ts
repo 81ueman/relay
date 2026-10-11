@@ -9,6 +9,7 @@ import {
   relayEventForSessionEvent,
   relayRequest,
   resolveRelaySocket,
+  wakeBackoff,
 } from "../integrations/dsh-relay/lib/core.mjs";
 
 // T-DSH-PLUGIN: the pure core of the dsh <-> relay bridge. The cordis glue
@@ -133,5 +134,18 @@ describe("JSON-Lines transport against a live relay-style socket", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("wakeBackoff", () => {
+  test("a fast reply (or a connection error) cannot spin the wake loop", () => {
+    // A poll that returned instantly still sleeps the floor before re-polling.
+    expect(wakeBackoff(0, 1000)).toBe(1000);
+    expect(wakeBackoff(50, 1000)).toBe(950);
+  });
+
+  test("a poll that already blocked for the floor is not padded", () => {
+    expect(wakeBackoff(1000, 1000)).toBe(0);
+    expect(wakeBackoff(20000, 1000)).toBe(0);
   });
 });

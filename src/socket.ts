@@ -148,11 +148,18 @@ export async function handleSocketMessage(msg: SocketMessage, ctx: SocketContext
   // caller simply keeps polling. `takeWake` clears the row, so a nudge is
   // delivered exactly once.
   if (type === "worker.wake.await") {
-    const workerId = msg.worker_id ?? (msg.session_id ? getSession(db, msg.session_id)?.worker_id : null) ?? null;
-    if (!workerId) return { ok: true, wake: null };
-    if (!getWorker(db, workerId)) return { ok: true, wake: null };
     const waitMs = Math.max(0, Math.min(Number(msg.wait_ms ?? 25000) || 0, 30000));
-    const wake = await awaitWake(db, workerId, waitMs);
+    const workerId = msg.worker_id ?? (msg.session_id ? getSession(db, msg.session_id)?.worker_id : null) ?? null;
+    const worker = workerId ? getWorker(db, workerId) : undefined;
+    if (!worker) {
+      // Nothing can be delivered for a session relay has not attached (yet).
+      // Still hold the poll window: this IS a long-poll, and returning instantly
+      // would let a client that re-polls in a loop spin at full speed (the dsh
+      // plugin does exactly this, including while the daemon is down).
+      if (waitMs > 0) await Bun.sleep(waitMs);
+      return { ok: true, wake: null };
+    }
+    const wake = await awaitWake(db, workerId!, waitMs);
     return { ok: true, wake };
   }
 

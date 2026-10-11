@@ -26,12 +26,17 @@ import {
   relayEventForAgentStatus,
   relayEventForSessionEvent,
   resolveRelaySocket,
+  wakeBackoff,
 } from "./core.mjs";
 
 export const name = "relay-bridge";
 export const inject = ["agents"];
 
 const WAKE_POLL_MS = 20000;
+// Floor between wake polls. relay long-polls, but a null reply for an
+// unattached session (or a connection error while the daemon is down) returns
+// instantly; without this the loop spins.
+const WAKE_MIN_GAP_MS = 1000;
 
 function log(msg) {
   try {
@@ -39,6 +44,14 @@ function log(msg) {
   } catch {
     /* stdout closed */
   }
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function herdrBin() {
+  return process.env.HERDR_BIN_PATH || "herdr";
 }
 
 function run(bin, args, timeout = 6000) {
@@ -50,22 +63,32 @@ function run(bin, args, timeout = 6000) {
   }
 }
 
-/** Report the session's presence + a status transition to Herdr. */
-function reportHerdr(paneId, sessionId, cwd, state) {
+/**
+ * Report the session's presence + status to Herdr.
+ *
+ * The `report-agent` call is what LABELS the pane `agent=dsh`; relay's identity
+ * resolution matches on that label (Herdr 0.9.x does not record a resume
+ * command / `agent_session` mapping for an agent it does not ship, so the label
+ * — not the session mapping — is the load-bearing part). We therefore always
+ * report a state, defaulting to `unknown` at session start.
+ *
+ * `report-agent-session` is sent on the start report for forward compatibility:
+ * Herdr >= 0.10 records the resume command from it, 0.9.x ignores it.
+ */
+function reportHerdr(paneId, label, sessionId, cwd, state) {
   if (!paneId) return;
-  if (state) {
-    run("herdr", [
-      "pane", "report-agent", paneId,
-      "--source", "dsh-relay",
-      "--agent", "dsh",
-      "--state", state,
-      "--agent-session-id", sessionId,
-    ]);
-  } else {
-    run("herdr", [
+  run(herdrBin(), [
+    "pane", "report-agent", paneId,
+    "--source", "dsh-relay",
+    "--agent", label,
+    "--state", state || "unknown",
+    "--agent-session-id", sessionId,
+  ]);
+  if (!state) {
+    run(herdrBin(), [
       "pane", "report-agent-session", paneId,
       "--source", "dsh-relay",
-      "--agent", "dsh",
+      "--agent", label,
       "--agent-session-id", sessionId,
       "--agent-session-path", cwd,
     ]);
@@ -104,7 +127,7 @@ export function apply(ctx, config = {}) {
     const cwd = sessionCwd(agent);
     st = { sessionId, cwd, client: new RelayClient(resolveRelaySocket(cwd)), stopped: false };
     states.set(sessionId, st);
-    if (cfg.report) reportHerdr(paneId, sessionId, cwd, null);
+    if (cfg.report) reportHerdr(paneId, cfg.agentLabel, sessionId, cwd, null);
     log(`session ${sessionId} -> relay ${st.client.sockPath}`);
     if (cfg.wake) void wakeLoop(ctx, st);
     return st;
@@ -112,6 +135,7 @@ export function apply(ctx, config = {}) {
 
   async function wakeLoop(agentCtx, st) {
     while (!st.stopped) {
+      const started = Date.now();
       let wake = null;
       try {
         wake = await st.client.awaitWake(st.sessionId, { waitMs: WAKE_POLL_MS });
@@ -120,6 +144,8 @@ export function apply(ctx, config = {}) {
       }
       if (st.stopped) break;
       if (wake && wake.text) deliver(agentCtx, st, wake);
+      const gap = wakeBackoff(Date.now() - started, WAKE_MIN_GAP_MS);
+      if (gap > 0 && !st.stopped) await sleep(gap);
     }
   }
 
@@ -150,7 +176,7 @@ export function apply(ctx, config = {}) {
       if (!agent) return;
       const st = ensure(agent);
       if (!st) return;
-      if (cfg.report) reportHerdr(paneId, st.sessionId, st.cwd, payload.status === "running" ? "working" : "idle");
+      if (cfg.report) reportHerdr(paneId, cfg.agentLabel, st.sessionId, st.cwd, payload.status === "running" ? "working" : "idle");
       const msg = relayEventForAgentStatus(payload.status);
       if (msg) void st.client.notify({ ...msg, session_id: st.sessionId });
     } catch {
@@ -176,7 +202,7 @@ export function apply(ctx, config = {}) {
       const st = states.get(sessionId);
       if (st) {
         st.stopped = true;
-        if (cfg.report) reportHerdr(paneId, sessionId, st.cwd, "unknown");
+        if (cfg.report) reportHerdr(paneId, cfg.agentLabel, sessionId, st.cwd, "unknown");
         states.delete(sessionId);
       }
     } catch {
