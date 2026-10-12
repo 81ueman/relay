@@ -45,6 +45,7 @@ import {
   unresponsiveWindowMs,
 } from "./scheduler";
 import { BOOTSTRAP_PROMPT } from "./runtime/herdr";
+import { processReminders } from "./reminders";
 import type { Session } from "./sessions";
 import type { WorkerRuntime } from "./schema";
 import {
@@ -1814,6 +1815,10 @@ export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<
 
   // 5. Nudge recipients with undelivered mail (a durable safety net for a missed
   //    send-time wake; peer messages and completion notices alike).
+  //    Standing reminders enqueue FIRST, so the durable nudge below delivers a
+  //    reminder queued this very pass at the same idle boundary (a reminder never
+  //    stacks behind unread mail — see src/reminders.ts).
+  processReminders(db, actions, at);
   await nudgeUnreadMail(db, rt, actions, at);
 
   // 5b. Cooperative context rotation: a managed worker whose context window

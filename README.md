@@ -1037,6 +1037,23 @@ Cooldown: at most one nudge per `RELAY_MAIL_NUDGE_MS` (default 3 min) per
 recipient, and reading the inbox marks messages delivered, stopping the nudge.
 `relay status` shows `(nudge now)` when an actionable message is ready to fire.
 
+**Standing reminders (the daemon owns the schedule).** Because the relay daemon
+already runs continuously, it — not `launchd`/`cron` — owns recurring sends.
+Register a reminder once and the daemon enqueues the durable message on its
+reconcile cadence:
+
+```bash
+relay remind add needsfix-coord --every 30m "定期nudge: check Linear for runnable tasks"
+relay remind list            # add --json for machine-readable, --all to include disabled
+relay remind rm 3            # DISABLES (keeps the row as history)
+```
+
+A reminder fires when `--every` (`30s` / `30m` / `1h`) has elapsed since its last
+send **and** the recipient has no unread (queued or delivered, i.e. un-acked)
+mail. The anti-spam guard skips — and does not advance the reminder rather than
+stacking behind — unread mail, so a nudge can never pile up behind one the worker
+has not read. The first send lands one full interval after `add`.
+
 **Task hierarchy (optional).** A task may have `parent_task_id`. This expresses
 **work decomposition**, not authority between workers: the same worker may own a
 parent and its child, and a parent's assignee may change at any time. Relay

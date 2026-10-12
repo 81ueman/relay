@@ -34,6 +34,7 @@ import { attachPrompt, createLane, realHerdrRunner, reapLane } from "./spawn";
 import { runDashboard } from "./dashboard/command";
 import { runGc } from "./gc";
 import { wakeWorker } from "./wake-outbox";
+import { addReminder, disableReminder, listReminders } from "./reminders";
 
 // A role is "known" if it matches a registered worker or a built-in special role.
 // Used for a non-fatal warning on `task add --role`, never a rejection.
@@ -83,6 +84,10 @@ Usage:
 
   relay send <worker-id> "message" [--task <tid>] [--kind <k>]
   relay inbox [--worker <id>] [--claim] [--ack <msg-id>]
+
+  relay remind add <worker-id> --every <30s|30m|1h> "message" [--kind note]
+  relay remind list [--json] [--all]
+  relay remind rm <id>
 
   relay status
   relay cost [--by worker|task|session] [--since 24h] [--json]
@@ -265,6 +270,15 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
     ],
   },
   inbox: { about: "Read (and optionally claim/ack) the worker's own inbox.", usage: ["relay inbox [--worker <id>] [--claim] [--ack <msg-id>]"] },
+  remind: {
+    about:
+      "Standing reminders: the always-on daemon enqueues a recurring durable message to a worker — the daemon owns the schedule (no launchd/cron). A reminder fires when --every has elapsed since its last send AND the recipient has no unread mail, so reminders never stack behind an unread one. rm DISABLES (enabled=0) rather than deleting, keeping the row as history.",
+    usage: [
+      'relay remind add <worker-id> --every <30s|30m|1h> "message" [--kind note]',
+      "relay remind list [--json] [--all]",
+      "relay remind rm <id>",
+    ],
+  },
   status: { about: "Print workers, task counts, and the supervisor view (lightweight inspection).", usage: ["relay status"] },
   dashboard: {
     about:
@@ -303,7 +317,7 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
   },
 };
 
-const GROUP_COMMANDS = new Set(["worker", "session", "task", "event"]);
+const GROUP_COMMANDS = new Set(["worker", "session", "task", "event", "remind"]);
 
 function commandUsage(path: string[]): string {
   for (let n = path.length; n >= 1; n--) {
@@ -440,6 +454,14 @@ function printTaskContext(db: ReturnType<typeof openDb>, taskId: string): void {
   return ms;
 }
 
+/** Render an interval ms back to its compact `30s` / `30m` / `1h` form. */
+function fmtEvery(ms: number): string {
+  if (ms % 3_600_000 === 0) return `${ms / 3_600_000}h`;
+  if (ms % 60_000 === 0) return `${ms / 60_000}m`;
+  if (ms % 1_000 === 0) return `${ms / 1_000}s`;
+  return `${ms}ms`;
+}
+
 /**
  * Flags that CONSUME the following token as their value. Boolean flags
  * (`--human`, `--any-role`, `--json`, ...) are deliberately absent, so a
@@ -451,6 +473,7 @@ const VALUE_FLAGS = new Set([
   "--command", "--title", "--kind", "--acceptance", "--priority", "--parent", "--plan",
   "--dir", "--worktree", "--pane", "--tab", "--workspace", "--type", "--payload",
   "--ack", "--depends-on", "--older-than", "--base", "--label", "--since", "--by",
+  "--every",
 ]);
 
 /** Positional args only, skipping flags and their (known) values, e.g. ["T12","reason"]. */
@@ -1131,6 +1154,53 @@ async function main(): Promise<void> {
           for (const m of items) {
             console.log(`#${m.id} to=${m.recipient} from=${m.sender} kind=${m.kind} task=${m.task_id ?? "-"}: ${m.payload}`);
           }
+        }
+        break;
+      }
+
+      case "remind": {
+        const sub = argv[1];
+        if (sub === "add") {
+          const rest = argv.slice(2);
+          const usageLine = 'usage: relay remind add <worker-id> --every <30s|30m|1h> "message" [--kind note]';
+          const workerId = positionals(rest)[0];
+          if (!workerId) throw new Error(usageLine);
+          const everyRaw = flag(rest, "--every");
+          if (!everyRaw) throw new Error(`${usageLine}\n  --every is required (e.g. --every 30m)`);
+          const everyMs = parseDuration(everyRaw);
+          const message = resolveText(rest, usageLine);
+          const kind = flag(rest, "--kind") ?? "note";
+          const w = getWorker(db, workerId);
+          if (!w) throw new Error(`${usageLine}\n  unknown worker: ${workerId} (register it first)`);
+          if (w.retired_at !== null) throw new Error(`${usageLine}\n  worker ${workerId} is retired`);
+          const r = addReminder(db, workerId, message, everyMs, kind);
+          console.log(`reminder #${r.id} -> ${r.worker_id} every=${fmtEvery(r.every_ms)} kind=${r.kind}: ${r.message}`);
+        } else if (sub === "list") {
+          const rest = argv.slice(2);
+          const rows = listReminders(db, { includeDisabled: hasFlag(rest, "--all") });
+          if (hasFlag(rest, "--json")) {
+            console.log(JSON.stringify(rows, null, 2));
+          } else if (rows.length === 0) {
+            console.log("no reminders");
+          } else {
+            for (const r of rows) {
+              const last = r.last_sent_at ? `${fmtAge(now() - r.last_sent_at)} ago` : "never";
+              console.log(
+                `#${r.id}\t${r.worker_id}\tevery=${fmtEvery(r.every_ms)}\tkind=${r.kind}\tlast=${last}${r.enabled ? "" : "\tDISABLED"}: ${r.message}`
+              );
+            }
+          }
+        } else if (sub === "rm" || sub === "remove") {
+          const idRaw = argv[2];
+          if (!idRaw || !/^\d+$/.test(idRaw)) throw new Error("usage: relay remind rm <id>");
+          const r = disableReminder(db, Number(idRaw));
+          console.log(`disabled reminder #${r.id} (${r.worker_id}); it will not fire again`);
+        } else {
+          throw new Error(
+            'usage: relay remind add <worker-id> --every <30s|30m|1h> "message" [--kind note]\n' +
+              "       relay remind list [--json] [--all]\n" +
+              "       relay remind rm <id>"
+          );
         }
         break;
       }
