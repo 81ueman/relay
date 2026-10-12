@@ -21,6 +21,10 @@ const TASK_COLOR: Record<string, keyof typeof A> = {
 const WORKER_COLOR: Record<string, keyof typeof A> = {
   working: "green", idle: "gray", waiting_input: "yellow", stalled: "red", dead: "red", starting: "cyan",
 };
+// A worker's ROLE separates the two classes the lane model depends on: the
+// implementation WORKERS (per-lane `fix-*` roles) and the REVIEWER(s) that only
+// ever claim a task in `review`. Display/colour only — never state.
+const REVIEWER_ROLE = /^(reviewer|planner)$/i;
 
 export const PANE_LINK_BASE = "https://relay.local/pane/";
 
@@ -101,6 +105,7 @@ export function renderDashboard(view: DashboardView, opts: RenderOptions = {}): 
 
   const s = view.summary;
   const parts = [`${s.total} tasks`, `${s.done} done`];
+  if (s.groups) parts.push(`${s.groups} groups`);
   for (const st of ["running", "queued", "review", "blocked_human", "blocked_internal", "failed"]) {
     if (s.counts[st]) parts.push(`${s.counts[st]} ${st}`);
   }
@@ -152,15 +157,21 @@ function renderWork(lines: string[], forest: DashboardTaskNode[], width: number,
   const cols = 8 + 1 + stW + 1;
 
   const emitNode = (n: DashboardTaskNode, prefix: string, branch: string, childPrefix: string): void => {
-    const tag = c(trim(n.state, stW).padEnd(stW), TASK_COLOR[n.state]);
     const tree = prefix + branch;
     const avail = width - cols - dwidth(tree);
-    if (n.children.length && n.allDone) {
-      const suffix = `  (${n.subtreeSize}/${n.subtreeSize} done)`;
-      const title = "✓ " + trim(n.title, Math.max(1, avail - dwidth(suffix) - 2));
-      lines.push(c(`${n.id.padEnd(8)} ${tag} ${tree}${title}${suffix}`, "gray"));
+    if (n.children.length) {
+      // Container / roll-up: a group header, never a work unit. Progress is over
+      // its descendant LEAVES, so a partly-done program reads `(3/8 done)`.
+      const { done, total } = leafStats(n);
+      const suffix = `  (${done}/${total} done)`;
+      const tag = c("group".padEnd(stW), "blue");
+      const title = trim(n.title, Math.max(1, avail - dwidth(suffix) - 2));
+      const all = total > 0 && done === total;
+      lines.push(c(`${n.id.padEnd(8)} ${tag} ${tree}${all ? "✓ " : ""}${title}${suffix}`, all ? "gray" : "bold"));
+      emitGroup(n.children, childPrefix, false);
       return;
     }
+    const tag = c(trim(n.state, stW).padEnd(stW), TASK_COLOR[n.state]);
     const owner = n.assignee ?? n.role ?? "-";
     let role = n.role && n.assignee ? `  role=${n.role}` : "";
     if (avail - 8 < dwidth(role)) role = "";
@@ -196,6 +207,19 @@ function renderWork(lines: string[], forest: DashboardTaskNode[], width: number,
   };
 
   emitGroup(forest, "", true);
+}
+
+/** Descendant-LEAF progress for a container: done leaves / total leaves. */
+function leafStats(n: DashboardTaskNode): { done: number; total: number } {
+  if (!n.children.length) return { done: n.state === "done" ? 1 : 0, total: 1 };
+  let done = 0;
+  let total = 0;
+  for (const k of n.children) {
+    const r = leafStats(k);
+    done += r.done;
+    total += r.total;
+  }
+  return { done, total };
 }
 
 /**
@@ -269,10 +293,12 @@ function truncIds(ids: string[], cap = 4): string {
  * Column layout for a worker row. Shared by `renderWorker` and the WORKERS
  * column header so the two cannot drift apart.
  */
-function workerLayout(width: number): { idW: number; stW: number; exW: number } {
+function workerLayout(width: number): { idW: number; roleW: number; stW: number; exW: number } {
   const wide = width >= 56;
   return {
     idW: wide ? 16 : Math.max(8, Math.min(16, width - 27)),
+    // ROLE separates worker vs reviewer at a glance; only at comfortable width.
+    roleW: width >= 86 ? 12 : 0,
     stW: wide ? 13 : 8,
     exW: wide ? 12 : 8,
   };
@@ -286,11 +312,17 @@ function workerLayout(width: number): { idW: number; stW: number; exW: number } 
  * tail columns only appear at the widths the rows themselves show them.
  */
 function workerHeader(width: number): string {
-  const { idW, stW, exW } = workerLayout(width);
+  const { idW, roleW, stW, exW } = workerLayout(width);
   const state = stW >= 12 ? "STATE(relay)" : "STATE";
   const exec = exW >= 11 ? "EXEC(herdr)" : "EXEC";
-  let s = `  ${"ID".padEnd(idW)} ${state.padEnd(stW)} ${exec.padEnd(exW)} ${"TASK".padEnd(5)}`;
-  let used = 2 + idW + 1 + stW + 1 + exW + 1 + 5;
+  let s = `  ${"ID".padEnd(idW)}`;
+  let used = 2 + idW;
+  if (roleW > 0) {
+    s += ` ${"ROLE".padEnd(roleW)}`;
+    used += 1 + roleW;
+  }
+  s += ` ${state.padEnd(stW)} ${exec.padEnd(exW)} ${"TASK".padEnd(5)}`;
+  used += 1 + stW + 1 + exW + 1 + 5;
   const add = (label: string, w: number): void => {
     if (used + w <= width) {
       s += label.padEnd(w);
@@ -311,14 +343,17 @@ function renderWorker(
   links: boolean,
   indented = true
 ): void {
-  const { idW, stW, exW } = workerLayout(width);
+  const { idW, roleW, stW, exW } = workerLayout(width);
   const tag = c(trim(w.state, stW).padEnd(stW), WORKER_COLOR[w.state]);
   const execColor: keyof typeof A = w.exec === "busy" ? "green"
     : w.exec === "!idle" ? "red" : w.exec === "quiet" ? "cyan" : "gray";
   const exec = c(trim(w.exec, exW).padEnd(exW), execColor);
   const task = trim(w.taskId ?? "-", 5).padEnd(5);
-  const lead = `  ${trim(w.id, idW).padEnd(idW)} ${tag} ${exec} ${task}`;
-  let used = 2 + idW + 1 + stW + 1 + exW + 1 + 5;
+  const roleCell = roleW > 0
+    ? ` ${c(trim(w.role ?? "-", roleW).padEnd(roleW), REVIEWER_ROLE.test(w.role) ? "magenta" : "gray")}`
+    : "";
+  const lead = `  ${trim(w.id, idW).padEnd(idW)}${roleCell} ${tag} ${exec} ${task}`;
+  let used = 2 + idW + (roleW > 0 ? 1 + roleW : 0) + 1 + stW + 1 + exW + 1 + 5;
   let tail = "";
   const push = (text: string, w_: number): void => {
     if (used + w_ <= width) {

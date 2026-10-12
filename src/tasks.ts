@@ -59,7 +59,11 @@ const REVIEW_GATE_SQL =
   `(t.role IS NOT 'reviewer'
     OR EXISTS (SELECT 1 FROM task_deps dep WHERE dep.task_id = t.id)
     OR EXISTS (SELECT 1 FROM tasks r WHERE r.state = 'review'))`;
-const RUNNABLE_TASK_SQL = `t.state = 'queued' AND ${DEPS_DONE_SQL} AND ${REVIEW_GATE_SQL}`;
+// A CONTAINER task has children (a roll-up / hierarchy node). It is not a unit
+// of work, so it is never offered, claimable, or counted as runnable. Derived
+// from `parent_task_id` alone — no stored flag, no extra task state.
+const CONTAINER_TASK_SQL = `NOT EXISTS (SELECT 1 FROM tasks c WHERE c.parent_task_id = t.id)`;
+const RUNNABLE_TASK_SQL = `t.state = 'queued' AND ${DEPS_DONE_SQL} AND ${REVIEW_GATE_SQL} AND ${CONTAINER_TASK_SQL}`;
 
 /**
  * Clear a worker's quiet lease after an explicit relay action (note/submit/block/
@@ -335,12 +339,18 @@ export function reviewPending(db: Database): boolean {
   return reviewTasks(db).length > 0;
 }
 
+/** True when `taskId` has at least one child (a hierarchy / roll-up node). */
+export function hasChildren(db: Database, taskId: string): boolean {
+  return !!db.query(`SELECT 1 AS x FROM tasks WHERE parent_task_id = ? LIMIT 1`).get(taskId);
+}
+
 /**
  * Single-task runnable check, mirroring RUNNABLE_TASK_SQL. `reviewExists` lets a
  * caller scanning many tasks avoid a review-queue query per task.
  */
 export function isRunnableNow(db: Database, task: Task, reviewExists?: boolean): boolean {
   if (task.state !== "queued") return false;
+  if (hasChildren(db, task.id)) return false; // a container is a roll-up, not work
   if (!dependenciesMet(db, task)) return false;
   if (task.role === "reviewer" && taskDependencies(db, task.id).length === 0) {
     return reviewExists ?? reviewPending(db);
@@ -356,7 +366,7 @@ export function isRunnableNow(db: Database, task: Task, reviewExists?: boolean):
 export function notYetRunnableTasks(db: Database): Task[] {
   const reviewExists = reviewPending(db);
   return (db.query(`SELECT * FROM tasks WHERE state = 'queued' ORDER BY priority DESC, created_at ASC`).all() as Task[])
-    .filter((t) => !isRunnableNow(db, t, reviewExists));
+    .filter((t) => !hasChildren(db, t.id) && !isRunnableNow(db, t, reviewExists));
 }
 
 /**

@@ -30,6 +30,8 @@ export interface DashboardTaskNode {
   depth: number;
   children: DashboardTaskNode[];
   allDone: boolean;
+  /** True when this node has children (a roll-up / group node, never a work unit). */
+  isContainer: boolean;
   subtreeSize: number;
 }
 
@@ -92,6 +94,8 @@ export interface DashboardView {
   summary: {
     total: number;
     done: number;
+    /** Container / roll-up nodes (excluded from `total` and `counts`). */
+    groups: number;
     counts: Record<string, number>;
     workers: number;
     working: number;
@@ -221,11 +225,16 @@ export function buildDashboardView(db: Database, opts: BuildOptions): DashboardV
   const attention = deriveAttention(db, workers, tasks, at);
 
   const counts = taskCounts(db);
+  const containers = tasks.filter((t) => byId[t.id].isContainer);
+  // Containers are structure, not work: keep them out of the work counts so the
+  // summary reads the same whether or not a roll-up was introduced.
+  for (const t of containers) counts[t.state] = Math.max(0, (counts[t.state] ?? 0) - 1);
   const view: DashboardView = {
     root,
     summary: {
-      total: tasks.length,
+      total: tasks.length - containers.length,
       done: counts["done"] ?? 0,
+      groups: containers.length,
       counts,
       workers: workers.length,
       working: workers.filter((w) => w.state === "working").length,
@@ -262,7 +271,7 @@ export function buildForest(tasks: Task[]): { forest: DashboardTaskNode[]; byId:
     byId[t.id] = {
       id: t.id, title: t.title, state: t.state, role: t.role, assignee: t.assignee,
       parent: t.parent_task_id, priority: t.priority, updatedAt: t.updated_at,
-      depth: 0, children: [], allDone: false, subtreeSize: 1,
+      depth: 0, children: [], allDone: false, isContainer: false, subtreeSize: 1,
     };
   }
   const order: Record<string, number> = {};
@@ -294,6 +303,7 @@ export function buildForest(tasks: Task[]): { forest: DashboardTaskNode[]; byId:
     const kids = (childrenOf.get(n.id) ?? []).filter((k) => !seen.has(k.id));
     kids.sort(cmp);
     n.children = kids;
+    n.isContainer = kids.length > 0;
     let size = 1;
     let allDone = n.state === "done";
     for (const k of kids) {
