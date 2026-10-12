@@ -182,6 +182,25 @@ export interface Message {
   acked_at: number | null;
 }
 
+/**
+ * A standing reminder: a recurring relay-generated durable message to one
+ * worker, owned by the always-on daemon (not launchd/cron). On each reconcile
+ * the daemon enqueues `message` to `worker_id` when `every_ms` has elapsed since
+ * `last_sent_at` AND the recipient has no unread mail — so reminders never
+ * stack. `relay remind rm` DISABLES (enabled=0) instead of deleting, keeping the
+ * row as history.
+ */
+export interface Reminder {
+  id: number;
+  worker_id: string;
+  message: string;
+  kind: string;
+  every_ms: number;
+  last_sent_at: number | null;
+  created_at: number;
+  enabled: number;
+}
+
 export interface DbEvent {
   id: number;
   timestamp: number;
@@ -408,4 +427,20 @@ CREATE TABLE IF NOT EXISTS worker_wakes (
   text TEXT NOT NULL,
   created_at INTEGER NOT NULL
 );
+
+-- Standing reminders: the daemon-owned recurring nudge (see Reminder). The
+-- daemon enqueues the reminder message to its worker when every_ms has elapsed
+-- since last_sent_at and the recipient has no unread mail. enabled=0 is the
+-- tombstone the relay remind rm command writes (disable, never delete).
+CREATE TABLE IF NOT EXISTS reminders (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  worker_id TEXT NOT NULL,
+  message TEXT NOT NULL DEFAULT '',
+  kind TEXT NOT NULL DEFAULT 'note',
+  every_ms INTEGER NOT NULL,
+  last_sent_at INTEGER,
+  created_at INTEGER NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_reminders_due ON reminders(enabled, last_sent_at);
 `;
