@@ -32,6 +32,7 @@ import { resolveWorkerIdentity } from "./identity";
 import { usageReport, usageTotals, type UsageGroup, type UsageRow } from "./usage";
 import { attachPrompt, createLane, realHerdrRunner, reapLane } from "./spawn";
 import { runDashboard } from "./dashboard/command";
+import { runWeb } from "./web";
 import { runGc } from "./gc";
 import { wakeWorker } from "./wake-outbox";
 import { addReminder, disableReminder, listReminders } from "./reminders";
@@ -92,6 +93,7 @@ Usage:
   relay status
   relay cost [--by worker|task|session] [--since 24h] [--json]
   relay dashboard [--watch] [--show [--tab]] [--hide] [--doctor] [--json] [--runtime-history]
+  relay web [--host <h>] [--port <n>] [--token <t>]
   relay events [--follow] [--limit N]
   relay gc [--apply] [--with-history] [--older-than <30s|2m|1h>] [--json]
   relay db path | sources | move <path> [--apply]
@@ -280,6 +282,16 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
     ],
   },
   status: { about: "Print workers, task counts, and the supervisor view (lightweight inspection).", usage: ["relay status"] },
+  web: {
+    about:
+      "Small read/write web view of the control plane (Bun.serve, one self-contained page, no new dependencies). Binds 127.0.0.1 by default; --host 0.0.0.0 opts into a non-loopback bind (e.g. Tailscale), and a token (--token or RELAY_WEB_TOKEN) is then required on every request (Authorization: Bearer <t> or ?token=<t>) because the tailnet can reach it. GETs read the shared SQLite WAL read-only; the page's send form POSTs through the same durable `relay send` enqueue path.",
+    usage: [
+      "relay web [--host <h>] [--port <n>] [--token <t>]",
+      "  --host <h>   bind address (default 127.0.0.1; use 0.0.0.0 for a tailnet)",
+      "  --port <n>   listen port (default 8787)",
+      "  --token <t>  shared secret required on every request (env: RELAY_WEB_TOKEN)",
+    ],
+  },
   dashboard: {
     about:
       "Read-only human dashboard: Relay task tree + workers (current runtime overlaid) + attention, with Herdr pane links. Never mutates state; --show/--hide manage only its own UI pane. " +
@@ -596,6 +608,13 @@ async function main(): Promise<void> {
 
   if (cmd === "dashboard") {
     process.exitCode = await runDashboard(argv.slice(1));
+    return;
+  }
+
+  if (cmd === "web") {
+    // Long-running server: handled before the command DB is opened (like
+    // dashboard) so the CLI's single handle is never held open afterward.
+    await runWeb(argv.slice(1));
     return;
   }
 

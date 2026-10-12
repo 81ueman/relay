@@ -57,6 +57,7 @@ Then:
 ```sh
 relay status                        # workers + counts
 relay dashboard --watch             # live tree (ATTENTION first)
+relay web                           # browser view + send form (127.0.0.1:8787)
 relay task add "do the thing" --role worker
 relay next --worker my-worker       # claim work
 ```
@@ -475,6 +476,42 @@ herdr plugin link "$(pwd)/integrations/herdr"   # relay.pane-links
 See `integrations/herdr/README.md`. The handler is `relay dashboard --focus`
 (thin shim, no Python).
 
+## `relay web` (browser view + send)
+
+`relay dashboard` is the terminal view. `relay web` serves the same durable
+state (workers, tasks grouped by state, per-mailbox unread counts, and a
+selected worker's inbox) as a single self-contained HTML page, plus a small
+JSON API:
+
+```bash
+relay web                              # http://127.0.0.1:8787
+relay web --port 9000
+relay web --host 0.0.0.0 --token "$(openssl rand -hex 16)"   # reachable from the tailnet
+#   open  http://<tailscale-host>:8787/?token=<t>
+```
+
+- **Loopback by default.** It binds `127.0.0.1:8787` unless you opt in with
+  `--host`. `--host 0.0.0.0` (or a tailnet address) makes it reachable from
+  another machine — e.g. over Tailscale — which is why the host/port are
+  explicit rather than assumed.
+- **Token.** `--token <t>` (or `RELAY_WEB_TOKEN`) is required on **every**
+  request once set: `Authorization: Bearer <t>` or `?token=<t>`. With a
+  non-loopback bind and no token it prints a prominent warning and still starts
+  (the simple path the user asked for) — anyone who can reach the port can then
+  read state and send messages, so set a token on a tailnet.
+- **Read-only GETs.** `GET /api/status` and `GET /api/inbox?worker=<id>` open
+  the shared SQLite WAL **read-only**, so the view can never mutate state or
+  race the daemon. Viewing an inbox does **not** mark mail delivered (the
+  worker's own `relay inbox` is still what consumes it).
+- **One writer.** `POST /api/send` `{worker, message, kind?}` enqueues through
+  the **same** durable `sendMessage` path `relay send` uses — there is no second
+  delivery mechanism. `kind` is `note` (default) or `urgent`; the daemon's mail
+  policy delivers/wakes the recipient at the turn boundary. The page polls
+  `/api/status` every ~3s.
+- **No new dependencies and no external assets**: `Bun.serve` plus the repo's
+  existing DB helpers, and the page's CSS/JS are inline (a tailnet may have no
+  internet). It is an ops view — no accounts, no websockets.
+
 ## Install
 
 ```bash
@@ -606,6 +643,7 @@ RELAY_TOOL_WARN_MS=60000 RELAY_TOOL_BACKGROUND_MS=180000
 RELAY_TOOL_MAX_MS=3600000 RELAY_TOOL_STALE_GRACE_MS=60000
 RELAY_TOOL_HARD_CAP_MS=900000 RELAY_TOOL_NO_OUTPUT_MS=600000
 RELAY_BACKGROUND_KEY=ctrl+b
+RELAY_WEB_TOKEN=<t>          # token required by `relay web` (unless --token is given)
 RELAY_DEDICATED=1            # opt-in: allow $RELAY_SOCK when no session dir is known
 ```
 
