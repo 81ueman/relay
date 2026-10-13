@@ -13,6 +13,8 @@ import {
 } from "./workers";
 import type { Task, TaskState, WorkerState } from "./schema";
 import { RELAY_TAG, sendMessage } from "./messages";
+import { requestReconcile } from "./control";
+import { findTaskResult, insertTaskResult, notifyGatewayTo } from "./results";
 
 export const STALE_LEASE = "STALE_LEASE";
 
@@ -1083,8 +1085,19 @@ function notifyHumanBlocked(db: Database, task: Task, actor: string, reason: str
  * Blocked-child roll-up (one hop only): the immediate parent gets a durable
  * `child_blocked` note (+ `children_blocked` when ALL direct children are
  * blocked) and, when it has an assignee, an immediate message to that worker.
+ *
+ * `skipMessageTo` suppresses the assignee message when that recipient is ALSO the
+ * structured Gateway (a code-change child), so one block never notifies the
+ * Gateway twice.
  */
-function bubbleChildBlocked(db: Database, child: Task, actor: string, reason: string, at: number): void {
+function bubbleChildBlocked(
+  db: Database,
+  child: Task,
+  actor: string,
+  reason: string,
+  at: number,
+  opts: { skipMessageTo?: string | null } = {}
+): void {
   const parentId = child.parent_task_id;
   if (!parentId) return;
   const parent = getTask(db, parentId);
@@ -1108,7 +1121,7 @@ function bubbleChildBlocked(db: Database, child: Task, actor: string, reason: st
     ).run(parentId, actor, `${RELAY_TAG}All direct children of ${parentId} are blocked (${counts.blocked}/${counts.total}).`, at);
   }
 
-  if (parent.assignee) {
+  if (parent.assignee && parent.assignee !== opts.skipMessageTo) {
     sendMessage(db, "relay", parent.assignee, body, { kind: "child_blocked", taskId: parentId });
     if (allBlocked) {
       sendMessage(db, "relay", parent.assignee, `${RELAY_TAG}All direct children of ${parentId} are blocked (${counts.blocked}/${counts.total}).`, {
@@ -1124,6 +1137,35 @@ function bubbleChildBlocked(db: Database, child: Task, actor: string, reason: st
     payload: { child: child.id, state: child.state, allBlocked, assignee: parent.assignee ?? null },
   });
 }
+
+/**
+ * ISH-758: record a blocked child as a STRUCTURED ChildBlocked result and reach
+ * the Gateway exactly once. Called from `blockTask` for code-change tasks inside
+ * the block's own transaction; the legacy prose paths are skipped for those so
+ * the Gateway is never notified twice for one block.
+ *
+ * Returns true when this call produced the notification (false when a prior one
+ * already exists for this task/phase/attempt).
+ */
+export function recordChildBlocked(db: Database, childId: string, actor: string, reason: string): boolean {
+  const child = getTask(db, childId);
+  if (!child) throw new Error(`unknown task: ${childId}`);
+  const phase = child.phase ?? "";
+  if (findTaskResult(db, childId, phase, child.attempt, "ChildBlocked")) return false;
+  insertTaskResult(db, {
+    taskId: childId,
+    phase,
+    attempt: child.attempt,
+    kind: "ChildBlocked",
+    workerId: actor,
+    reason,
+  });
+  const parentId = child.parent_task_id;
+  const target = parentId ? getTask(db, parentId) ?? child : child;
+  const recipient = resolveHumanInterface(db, target);
+  return notifyGatewayTo(db, recipient, target, `${childId} is blocked${reason ? `: ${reason}` : ""}.`, "child_blocked");
+}
+
 
 export function rejectTask(db: Database, taskId: string, workerId: string, reason: string): Task {
   const task = getTask(db, taskId);
@@ -1178,11 +1220,23 @@ export function blockTask(db: Database, taskId: string, workerId: string, reason
     clearQuietLogged(db, workerId, taskId);
     logEvent(db, { source: "worker", workerId, taskId, type: human ? "task.blocked_human" : "task.blocked_internal", payload: { reason } });
     // One-hop roll-up: the immediate parent assignee must learn a child is stuck.
-    bubbleChildBlocked(db, getTask(db, taskId)!, workerId, reason, t);
-    // T337: a HUMAN block also reaches the human interface (or shouts if none
-    // resolves). blocked_internal never pings the human.
-    if (human) notifyHumanBlocked(db, getTask(db, taskId)!, workerId, reason, t);
+    const child = getTask(db, taskId)!;
+    const codeChild = child.code_change === 1;
+    const gateway = resolveHumanInterface(db, child);
+    // For a code-change child the structured ChildBlocked result is the Gateway
+    // notification (exactly once); the legacy prose paths are skipped so the
+    // Gateway is never told twice. The parent-assignee peer roll-up is kept, but
+    // its message is suppressed when it would target the same Gateway.
+    bubbleChildBlocked(db, child, workerId, reason, t, { skipMessageTo: codeChild ? gateway : null });
+    if (codeChild) {
+      recordChildBlocked(db, taskId, workerId, reason);
+    } else if (human) {
+      // T337: a HUMAN block also reaches the human interface (or shouts if none
+      // resolves). blocked_internal never pings the human.
+      notifyHumanBlocked(db, child, workerId, reason, t);
+    }
   })();
+  requestReconcile(db, `block:${taskId}`);
   return getTask(db, taskId)!;
 }
 

@@ -6,12 +6,14 @@ import type { Database } from "bun:sqlite";
 import { openDb } from "../src/db";
 import { MockRuntime } from "../src/runtime/runtime";
 import { reconcile } from "../src/reconciler";
-import { approveTask, claimNext, claimTask, getTask, runnableTasks, submitTask } from "../src/tasks";
+import { addTask, approveTask, blockTask, claimNext, claimTask, getTask, runnableTasks, submitTask } from "../src/tasks";
 import { registerWorker } from "../src/workers";
 import {
   acceptTask,
   canStartPhase,
   derivePhase,
+  findPassingReview,
+  findTaskResult,
   intakeTask,
   isCodeTask,
   linkTask,
@@ -150,7 +152,7 @@ describe("mandatory code-change gate", () => {
     expect(runnableTasks(db).some((x) => x.id === t.id)).toBe(false);
     expect(claimNext(db, "integ")).toBeNull();
     // Accepting before merge_ready is refused; at merge_ready it completes.
-    const done = acceptTask(db, t.id, "coordinator");
+    const done = acceptTask(db, t.id, "integ"); // integrator authority
     expect(done.state).toBe("done");
     expect(done.accepted_at).not.toBeNull();
   });
@@ -260,6 +262,126 @@ describe("phase skipping and stale/duplicate results are refused", () => {
   });
 });
 
+describe("HEAD change invalidates a review PASS (finding 1)", () => {
+  test("an integration submit naming a different HEAD sends the task back to review", () => {
+    const t = intakeTask(db, { provider: "linear", issueId: "ISH-30", codeChange: true, headSha: "aaa" });
+    claimTask(db, t.id, "impl");
+    submitPhase(db, t.id, "impl", { headSha: "aaa" });
+    claimTask(db, t.id, "ver");
+    recordVerification(db, t.id, "ver", { passed: true });
+    claimNext(db, "rev");
+    recordReview(db, t.id, "rev", { verdict: "pass", headSha: "aaa" }); // -> integration
+    expect(getTask(db, t.id)!.phase).toBe("integration");
+
+    claimTask(db, t.id, "integ");
+    const after = submitPhase(db, t.id, "integ", { headSha: "bbb" });
+    expect(after.phase).toBe("review");
+    expect(after.state).toBe("review");
+    expect(after.head_sha).toBe("bbb");
+    expect(after.attempt).toBe(1);
+    // No passing review for the new attempt/head -> accept is refused.
+    expect(() => acceptTask(db, t.id, "integ")).toThrow(/merge_ready|passing review/i);
+  });
+
+  test("an intake replay / linkTask HEAD change at merge_ready sends it back to review", () => {
+    const t = intakeTask(db, { provider: "linear", issueId: "ISH-31", codeChange: true, headSha: "ccc" });
+    toMergeReady(t.id);
+    expect(getTask(db, t.id)!.phase).toBe("merge_ready");
+    const replayed = intakeTask(db, { provider: "linear", issueId: "ISH-31", codeChange: true, headSha: "ddd" });
+    expect(replayed.id).toBe(t.id);
+    expect(replayed.phase).toBe("review");
+    expect(replayed.head_sha).toBe("ddd");
+  });
+
+  test("acceptTask refuses when the current HEAD is not the passing review's HEAD", () => {
+    const t = intakeTask(db, { provider: "linear", issueId: "ISH-32", codeChange: true, headSha: "aaa" });
+    toMergeReady(t.id);
+    // A raw head move (bypassing linkTask) must not slip past the accept gate.
+    db.query(`UPDATE tasks SET head_sha = 'bbb' WHERE id = ?`).run(t.id);
+    expect(findPassingReview(db, t.id, getTask(db, t.id)!.attempt)!.head_sha).toBe("aaa");
+    expect(() => acceptTask(db, t.id, "integ")).toThrow(/HEAD changed since the passing review/i);
+  });
+});
+
+describe("authority is enforced (finding 2)", () => {
+  test("a non-reviewer cannot record a review", () => {
+    const t = intakeTask(db, { provider: "linear", issueId: "ISH-33", codeChange: true });
+    claimTask(db, t.id, "impl");
+    submitPhase(db, t.id, "impl");
+    claimTask(db, t.id, "ver");
+    recordVerification(db, t.id, "ver", { passed: true });
+    expect(() => recordReview(db, t.id, "impl", { verdict: "pass" })).toThrow(/AUTHORITY/);
+  });
+
+  test("a reviewer who recorded the TaskSubmitted may not review its own work", () => {
+    const t = intakeTask(db, { provider: "linear", issueId: "ISH-34", codeChange: true });
+    // A reviewer's `relay next` falls through to the role-less queued implement task.
+    expect(claimNext(db, "rev")?.id).toBe(t.id);
+    submitPhase(db, t.id, "rev"); // rev recorded the TaskSubmitted for this attempt
+    claimTask(db, t.id, "ver");
+    recordVerification(db, t.id, "ver", { passed: true });
+    expect(claimNext(db, "rev")?.id).toBe(t.id); // holds the review claim
+    expect(() => recordReview(db, t.id, "rev", { verdict: "pass" })).toThrow(/own work|AUTHORITY/);
+  });
+
+  test("accept requires Gateway/human or integrator authority", () => {
+    const t = intakeTask(db, { provider: "linear", issueId: "ISH-35", codeChange: true });
+    toMergeReady(t.id);
+    expect(() => acceptTask(db, t.id, "impl")).toThrow(/AUTHORITY/);
+    expect(acceptTask(db, t.id, "integ").state).toBe("done");
+  });
+});
+
+describe("transitions are atomic (finding 3)", () => {
+  test("a failure after the result insert rolls back the result row", () => {
+    const t = intakeTask(db, { provider: "linear", issueId: "ISH-36", codeChange: true });
+    claimTask(db, t.id, "impl");
+    // Force the phase UPDATE to fail AFTER the TaskSubmitted row is inserted.
+    db.exec(
+      `CREATE TRIGGER fail_verify BEFORE UPDATE ON tasks
+         WHEN NEW.id = '${t.id}' AND NEW.phase = 'verify'
+         BEGIN SELECT RAISE(ABORT, 'boom'); END;`
+    );
+    expect(() => submitPhase(db, t.id, "impl")).toThrow(/boom/);
+    expect(findTaskResult(db, t.id, "implement", 0, "TaskSubmitted")).toBeNull();
+    const after = getTask(db, t.id)!;
+    expect(after.state).toBe("running");
+    expect(after.phase).toBe("implement");
+  });
+});
+
+describe("ChildBlocked is produced by the block path (finding 4)", () => {
+  test("blocking a code-change child records ChildBlocked and notifies the Gateway once", () => {
+    process.env.RELAY_HUMAN = "gateway";
+    const t = intakeTask(db, { provider: "linear", issueId: "ISH-37", codeChange: true });
+    claimTask(db, t.id, "impl");
+    blockTask(db, t.id, "impl", "no credentials", true);
+    expect(getTask(db, t.id)!.state).toBe("blocked_human");
+    expect(findTaskResult(db, t.id, "implement", 0, "ChildBlocked")).not.toBeNull();
+    const blocked = db
+      .query(`SELECT COUNT(*) AS n FROM messages WHERE recipient = 'gateway' AND kind = 'child_blocked'`)
+      .get() as { n: number };
+    const human = db
+      .query(`SELECT COUNT(*) AS n FROM messages WHERE recipient = 'gateway' AND kind = 'blocked_human'`)
+      .get() as { n: number };
+    expect(blocked.n).toBe(1);
+    expect(human.n).toBe(0); // legacy human prose path skipped for a code child
+  });
+
+  test("a parent assignee that is also the Gateway is not double-notified", () => {
+    process.env.RELAY_HUMAN = "gateway";
+    const parent = addTask(db, { title: "parent" });
+    db.query(`UPDATE tasks SET assignee = 'gateway' WHERE id = ?`).run(parent.id);
+    const child = intakeTask(db, { provider: "linear", issueId: "ISH-38", codeChange: true, parentTaskId: parent.id });
+    claimTask(db, child.id, "impl");
+    blockTask(db, child.id, "impl", "stuck", false);
+    const blocked = db
+      .query(`SELECT COUNT(*) AS n FROM messages WHERE recipient = 'gateway' AND kind = 'child_blocked'`)
+      .get() as { n: number };
+    expect(blocked.n).toBe(1); // structured path only; peer roll-up suppressed
+  });
+});
+
 describe("child accepted/blocked notifies the Gateway only when needed", () => {
   test("children_ready is sent once, only after ALL children are accepted", () => {
     process.env.RELAY_HUMAN = "gateway";
@@ -269,13 +391,13 @@ describe("child accepted/blocked notifies the Gateway only when needed", () => {
     toMergeReady(c1.id);
     toMergeReady(c2.id);
 
-    acceptTask(db, c1.id, "coordinator");
+    acceptTask(db, c1.id, "gateway"); // Gateway authority (RELAY_HUMAN)
     const afterFirst = db
       .query(`SELECT COUNT(*) AS n FROM messages WHERE recipient = 'gateway' AND kind = 'children_ready'`)
       .get() as { n: number };
     expect(afterFirst.n).toBe(0); // not all children done yet -> not needed
 
-    acceptTask(db, c2.id, "coordinator");
+    acceptTask(db, c2.id, "gateway");
     const afterSecond = db
       .query(`SELECT COUNT(*) AS n FROM messages WHERE recipient = 'gateway' AND kind = 'children_ready'`)
       .get() as { n: number };

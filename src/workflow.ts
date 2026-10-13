@@ -1,23 +1,19 @@
 import type { Database } from "bun:sqlite";
 import { now } from "./db";
 import { logEvent } from "./events";
-import { RELAY_TAG, sendMessage } from "./messages";
-import type { CodePhase, ResultKind, Task, TaskResult, TaskState } from "./schema";
+import { requestReconcile } from "./control";
+import {
+  findReviewForHead,
+  findPassingReview,
+  findSubmissionForAttempt,
+  findTaskResult,
+  insertTaskResult,
+  notifyGatewayTo,
+} from "./results";
+import type { CodePhase, ResultKind, Task, TaskState } from "./schema";
 import { INTEGRATOR_ROLE, REVIEWER_ROLE } from "./schema";
-import {
-  effectiveTaskRole,
-  getTask,
-  nextTaskId,
-  resolveHumanInterface,
-  taskChildren,
-  taskDependencies,
-} from "./tasks";
-import {
-  clearCurrentTask,
-  getWorker,
-  normalizeWorkerAfterTaskRelease,
-  touchProgress,
-} from "./workers";
+import { getTask, nextTaskId, resolveHumanInterface, taskChildren } from "./tasks";
+import { clearCurrentTask, getWorker, normalizeWorkerAfterTaskRelease, touchProgress } from "./workers";
 
 /**
  * ISH-758 minimal event-driven workflow core.
@@ -28,20 +24,25 @@ import {
  * done/failed). A STRUCTURED RESULT (src/schema.ts RESULT_KINDS) is the only
  * thing that advances a phase — `relay send` prose is never parsed for it.
  *
- * Every transition (a) records the structured result durably, (b) updates the
- * Task, and (c) bumps the reconcile-request token so the daemon wakes
- * IMMEDIATELY rather than waiting for its periodic tick. There is no separate
- * queue/outbox/engine: one SQLite DB, one control row.
+ * Every transition (a) records the structured result, (b) updates the Task and
+ * (c) releases the worker in ONE db.transaction, then bumps the reconcile token
+ * so the daemon wakes IMMEDIATELY. There is no separate queue/outbox/engine.
  */
 
 export const WORKFLOW_ERROR = "WORKFLOW";
 export const GATE_ERROR = "CODE_CHANGE_GATE";
+export const AUTHORITY_ERROR = "AUTHORITY";
 export const STALE_ATTEMPT = "STALE_ATTEMPT";
 export const DUPLICATE_DISPATCH = "DUPLICATE_DISPATCH";
 export const HEAD_MISMATCH = "HEAD_MISMATCH";
 
 /** The default review profile; a second profile is a genuinely different review. */
 export const DEFAULT_REVIEW_PROFILE = "default";
+
+// Re-exported so callers (daemon/tests) have one workflow entrypoint.
+export { requestReconcile, reconcileRequestToken } from "./control";
+export { recordChildBlocked } from "./tasks";
+export { findTaskResult, findReviewForHead, findPassingReview } from "./results";
 
 // ---------------------------------------------------------------------------
 // Phase graph + authority
@@ -69,7 +70,8 @@ export function nextPhase(phase: CodePhase): CodePhase | null {
  * task-type + authority (implement/verify/review/integrate/accept) rather than a
  * role per lane. Implement and verify share the task's declared role (an
  * independent verifier is a policy refinement, not a minimal-core requirement);
- * review and integration demand the dedicated reviewer/integrator authority.
+ * review demands the reviewer authority and integration/accept the integrator or
+ * Gateway authority.
  */
 export type Authority = "implement" | "verify" | "review" | "integrate" | "accept";
 
@@ -114,110 +116,6 @@ export function derivePhase(task: Task): CodePhase | null {
     default:
       return "implement";
   }
-}
-
-// ---------------------------------------------------------------------------
-// Structured results (durable, append-only)
-// ---------------------------------------------------------------------------
-
-export interface ResultInput {
-  taskId: string;
-  phase: string;
-  attempt: number;
-  kind: ResultKind;
-  workerId?: string | null;
-  passed?: boolean | null;
-  headSha?: string | null;
-  profile?: string | null;
-  evidenceRef?: string | null;
-  reason?: string | null;
-  payload?: unknown;
-}
-
-export function getResult(db: Database, id: number): TaskResult | null {
-  return (db.query(`SELECT * FROM task_results WHERE id = ?`).get(id) as TaskResult | null) ?? null;
-}
-
-export function findResult(
-  db: Database,
-  taskId: string,
-  phase: string,
-  attempt: number,
-  kind: ResultKind
-): TaskResult | null {
-  return (
-    (db
-      .query(
-        `SELECT * FROM task_results WHERE task_id = ? AND phase = ? AND attempt = ? AND kind = ?`
-      )
-      .get(taskId, phase, attempt, kind) as TaskResult | null) ?? null
-  );
-}
-
-/** Any ReviewResult already recorded for this exact PR head + review profile. */
-export function findReviewForHead(
-  db: Database,
-  taskId: string,
-  headSha: string | null,
-  profile: string
-): TaskResult | null {
-  if (!headSha) return null;
-  return (
-    (db
-      .query(
-        `SELECT * FROM task_results
-          WHERE task_id = ? AND kind = 'ReviewResult' AND head_sha = ? AND profile = ?
-          ORDER BY id ASC LIMIT 1`
-      )
-      .get(taskId, headSha, profile) as TaskResult | null) ?? null
-  );
-}
-
-function assertNoResult(
-  db: Database,
-  taskId: string,
-  phase: string,
-  attempt: number,
-  kind: ResultKind
-): void {
-  if (findResult(db, taskId, phase, attempt, kind)) {
-    throw new Error(
-      `${DUPLICATE_DISPATCH}: ${kind} already recorded for ${taskId} phase '${phase}' attempt ${attempt}`
-    );
-  }
-}
-
-function insertResult(db: Database, r: ResultInput): TaskResult {
-  const t = now();
-  const row = db
-    .query(
-      `INSERT INTO task_results
-         (task_id, phase, attempt, kind, worker_id, passed, head_sha, profile, evidence_ref, reason, payload_json, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    )
-    .run(
-      r.taskId,
-      r.phase,
-      r.attempt,
-      r.kind,
-      r.workerId ?? null,
-      r.passed === undefined || r.passed === null ? null : r.passed ? 1 : 0,
-      r.headSha ?? null,
-      r.profile ?? null,
-      r.evidenceRef ?? null,
-      r.reason ?? null,
-      JSON.stringify(r.payload ?? {}),
-      t
-    );
-  const id = Number(row.lastInsertRowid);
-  logEvent(db, {
-    source: "workflow",
-    workerId: r.workerId ?? null,
-    taskId: r.taskId,
-    type: `workflow.result.${r.kind}`,
-    payload: { id, phase: r.phase, attempt: r.attempt, passed: r.passed ?? null, head: r.headSha ?? null, reason: r.reason ?? null },
-  });
-  return getResult(db, id)!;
 }
 
 // ---------------------------------------------------------------------------
@@ -270,6 +168,30 @@ function applyPhase(db: Database, task: Task, phase: CodePhase, u: PhaseUpdate):
   return getTask(db, task.id)!;
 }
 
+/**
+ * A HEAD change after the review phase invalidates the pending/prior review:
+ * send the task BACK to review at a new attempt, so a PASS can never survive a
+ * moved HEAD. Must be called inside a transaction.
+ */
+function invalidateReview(db: Database, task: Task, newHead: string | null, reason: string, workerId?: string): Task {
+  const t = now();
+  db.query(
+    `UPDATE tasks
+        SET phase = 'review', state = 'review', claim_role = ?, assignee = NULL,
+            attempt = attempt + 1, head_sha = ?,
+            lease_token = lease_token + 1, lease_until = NULL, updated_at = ?
+      WHERE id = ?`
+  ).run(REVIEWER_ROLE, newHead, t, task.id);
+  logEvent(db, {
+    source: "workflow",
+    taskId: task.id,
+    type: "workflow.review_invalidated",
+    payload: { reason, fromHead: task.head_sha, toHead: newHead, fromPhase: task.phase, attempt: task.attempt + 1 },
+  });
+  if (workerId) releaseWorker(db, workerId, task.id);
+  return getTask(db, task.id)!;
+}
+
 function releaseWorker(db: Database, workerId: string, taskId: string, at = now()): void {
   const w = getWorker(db, workerId);
   if (w && w.current_task_id === taskId) clearCurrentTask(db, workerId);
@@ -297,6 +219,20 @@ function phaseOf(task: Task): CodePhase {
   const p = derivePhase(task);
   if (!p) throw new Error(`${WORKFLOW_ERROR}: task ${task.id} is not a code-change task`);
   return p;
+}
+
+function assertNoResult(
+  db: Database,
+  taskId: string,
+  phase: string,
+  attempt: number,
+  kind: ResultKind
+): void {
+  if (findTaskResult(db, taskId, phase, attempt, kind)) {
+    throw new Error(
+      `${DUPLICATE_DISPATCH}: ${kind} already recorded for ${taskId} phase '${phase}' attempt ${attempt}`
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -344,7 +280,8 @@ export function findTaskByWorkIdentity(
  * DIFFERENT Task. The unique index is the backstop for a concurrent insert.
  *
  * A replayed intake fills in any link (PR/branch/HEAD) it was previously missing
- * rather than creating a second row.
+ * rather than creating a second row — and, per the HEAD invariant, a HEAD change
+ * on a task already past review sends it back to review (see `linkTask`).
  */
 export function intakeTask(db: Database, input: IntakeInput): Task {
   const provider = input.provider.trim();
@@ -417,7 +354,16 @@ export function intakeTask(db: Database, input: IntakeInput): Task {
   return getTask(db, id)!;
 }
 
-/** Fill in / update the PR link on a task without clobbering existing values. */
+/** Phases in which a HEAD change must send the task back to review. */
+const REVIEW_PINNED_PHASES: CodePhase[] = ["review", "integration", "merge_ready"];
+
+/**
+ * Fill in / update the PR link on a task without clobbering existing values.
+ *
+ * HEAD is the review's identity: if the task is already at/past review and the
+ * HEAD changes, the prior review no longer applies — the task is sent back to
+ * review at a new attempt (a PASS can never survive a moved HEAD).
+ */
 export function linkTask(
   db: Database,
   taskId: string,
@@ -428,15 +374,25 @@ export function linkTask(
   const prUrl = link.prUrl ?? task.pr_url;
   const branch = link.branch ?? task.branch;
   const headSha = link.headSha ?? task.head_sha;
-  if (prUrl === task.pr_url && branch === task.branch && headSha === task.head_sha) return task;
-  db.query(`UPDATE tasks SET pr_url = ?, branch = ?, head_sha = ?, updated_at = ? WHERE id = ?`).run(
-    prUrl,
-    branch,
-    headSha,
-    now(),
-    taskId
-  );
-  return getTask(db, taskId)!;
+  const headChanged = headSha !== task.head_sha;
+  if (!headChanged && prUrl === task.pr_url && branch === task.branch) return task;
+  const updated = db.transaction(() => {
+    db.query(`UPDATE tasks SET pr_url = ?, branch = ?, head_sha = ?, updated_at = ? WHERE id = ?`).run(
+      prUrl,
+      branch,
+      headSha,
+      now(),
+      taskId
+    );
+    let next = getTask(db, taskId)!;
+    const phase = derivePhase(task);
+    if (headChanged && isCodeTask(task) && phase && REVIEW_PINNED_PHASES.includes(phase)) {
+      next = invalidateReview(db, next, headSha, "head-changed");
+    }
+    return next;
+  })();
+  if (headChanged) requestReconcile(db, `link-head:${taskId}`);
+  return updated;
 }
 
 // ---------------------------------------------------------------------------
@@ -452,7 +408,10 @@ export interface SubmitOptions {
 /**
  * Record a TaskSubmitted for the current implement/integration phase and advance
  * to the next phase. A code task NEVER becomes `done` here — an implement submit
- * moves to `verify` (or `review`), never to terminal.
+ * moves to `verify`, never to terminal.
+ *
+ * An integration submit that names a DIFFERENT HEAD invalidates the review PASS
+ * (the task goes back to review) rather than advancing to merge_ready.
  */
 export function submitPhase(db: Database, taskId: string, workerId: string, opts: SubmitOptions = {}): Task {
   const task = getTask(db, taskId);
@@ -467,27 +426,38 @@ export function submitPhase(db: Database, taskId: string, workerId: string, opts
     );
   }
   assertOwned(task, workerId, opts.leaseToken);
+
+  // Integration names a moved HEAD: the reviewed head no longer applies.
+  if (phase === "integration" && opts.headSha !== undefined && opts.headSha !== task.head_sha) {
+    const invalidated = db.transaction(() =>
+      invalidateReview(db, task, opts.headSha!, "integration-head-changed", workerId)
+    )();
+    requestReconcile(db, `head-changed:${taskId}`);
+    return invalidated;
+  }
+
   assertNoResult(db, taskId, phase, task.attempt, "TaskSubmitted");
-
-  const result = insertResult(db, {
-    taskId,
-    phase,
-    attempt: task.attempt,
-    kind: "TaskSubmitted",
-    workerId,
-    headSha: opts.headSha ?? task.head_sha,
-    evidenceRef: opts.evidence ?? null,
-  });
-
   const next = nextPhase(phase)!;
-  const updated = applyPhase(db, task, next, {
-    state: next === "review" ? "review" : "queued",
-    attempt: task.attempt,
-    claimRole: claimRoleForPhase(next, task.role),
-    headSha: opts.headSha !== undefined ? opts.headSha : undefined,
-    resultRef: `result:${result.id}`,
-  });
-  releaseWorker(db, workerId, taskId);
+  const updated = db.transaction(() => {
+    const result = insertTaskResult(db, {
+      taskId,
+      phase,
+      attempt: task.attempt,
+      kind: "TaskSubmitted",
+      workerId,
+      headSha: opts.headSha ?? task.head_sha,
+      evidenceRef: opts.evidence ?? null,
+    });
+    const u = applyPhase(db, task, next, {
+      state: next === "review" ? "review" : "queued",
+      attempt: task.attempt,
+      claimRole: claimRoleForPhase(next, task.role),
+      headSha: opts.headSha !== undefined ? opts.headSha : undefined,
+      resultRef: `result:${result.id}`,
+    });
+    releaseWorker(db, workerId, taskId);
+    return u;
+  })();
   requestReconcile(db, `submit:${taskId}:${next}`);
   return updated;
 }
@@ -519,39 +489,55 @@ export function recordVerification(
   assertOwned(task, workerId, opts.leaseToken);
   assertNoResult(db, taskId, phase, task.attempt, "VerificationResult");
 
-  const result = insertResult(db, {
-    taskId,
-    phase,
-    attempt: task.attempt,
-    kind: "VerificationResult",
-    workerId,
-    passed: opts.passed,
-    headSha: opts.headSha ?? task.head_sha,
-    evidenceRef: opts.evidence ?? null,
-  });
-
   if (opts.passed) {
-    const updated = applyPhase(db, task, "review", {
-      state: "review",
-      attempt: task.attempt,
-      claimRole: REVIEWER_ROLE,
-      headSha: opts.headSha !== undefined ? opts.headSha : undefined,
-      resultRef: `result:${result.id}`,
-    });
-    releaseWorker(db, workerId, taskId);
+    const updated = db.transaction(() => {
+      const result = insertTaskResult(db, {
+        taskId,
+        phase,
+        attempt: task.attempt,
+        kind: "VerificationResult",
+        workerId,
+        passed: true,
+        headSha: opts.headSha ?? task.head_sha,
+        evidenceRef: opts.evidence ?? null,
+      });
+      const u = applyPhase(db, task, "review", {
+        state: "review",
+        attempt: task.attempt,
+        claimRole: REVIEWER_ROLE,
+        headSha: opts.headSha !== undefined ? opts.headSha : undefined,
+        resultRef: `result:${result.id}`,
+      });
+      releaseWorker(db, workerId, taskId);
+      return u;
+    })();
     requestReconcile(db, `verified:${taskId}`);
     return updated;
   }
+
   // Failed verification: rework. A new attempt, head cleared (the old head's
   // verification no longer applies).
-  const updated = applyPhase(db, task, "implement", {
-    state: "queued",
-    attempt: task.attempt + 1,
-    claimRole: claimRoleForPhase("implement", task.role),
-    clearHead: true,
-    resultRef: `result:${result.id}`,
-  });
-  releaseWorker(db, workerId, taskId);
+  const updated = db.transaction(() => {
+    const result = insertTaskResult(db, {
+      taskId,
+      phase,
+      attempt: task.attempt,
+      kind: "VerificationResult",
+      workerId,
+      passed: false,
+      headSha: opts.headSha ?? task.head_sha,
+      evidenceRef: opts.evidence ?? null,
+    });
+    const u = applyPhase(db, task, "implement", {
+      state: "queued",
+      attempt: task.attempt + 1,
+      claimRole: claimRoleForPhase("implement", task.role),
+      clearHead: true,
+      resultRef: `result:${result.id}`,
+    });
+    releaseWorker(db, workerId, taskId);
+    return u;
+  })();
   requestReconcile(db, `verify-failed:${taskId}`);
   return updated;
 }
@@ -568,6 +554,10 @@ export interface ReviewOptions {
  * Record a structured ReviewResult. A PASS is invalid once the HEAD moves: the
  * reviewed head must match the task's current head, and a ReviewResult for the
  * same (task, head, profile) is refused as a duplicate dispatch.
+ *
+ * Authority: the reviewer must hold the REVIEWER_ROLE (or the review claim taken
+ * via `relay next`), and may not be the worker that recorded the TaskSubmitted
+ * for this attempt.
  */
 export function recordReview(db: Database, taskId: string, reviewerId: string, opts: ReviewOptions): Task {
   const task = getTask(db, taskId);
@@ -579,6 +569,19 @@ export function recordReview(db: Database, taskId: string, reviewerId: string, o
   }
   const reviewer = getWorker(db, reviewerId);
   if (!reviewer) throw new Error(`unknown worker: ${reviewerId}`);
+  const holdsClaim = task.assignee === reviewerId;
+  if (reviewer.role !== REVIEWER_ROLE && !holdsClaim) {
+    throw new Error(
+      `${AUTHORITY_ERROR}: ${reviewerId} (role '${reviewer.role}') may not review ${taskId}; ` +
+      `need role '${REVIEWER_ROLE}' or the review claim taken via \`relay next\``
+    );
+  }
+  const submission = findSubmissionForAttempt(db, taskId, task.attempt);
+  if (submission && submission.worker_id === reviewerId) {
+    throw new Error(
+      `${AUTHORITY_ERROR}: ${reviewerId} recorded the TaskSubmitted for ${taskId} attempt ${task.attempt} and may not review its own work`
+    );
+  }
   if (task.assignee && task.assignee !== reviewerId) {
     throw new Error(`${WORKFLOW_ERROR}: review of ${taskId} is held by ${task.assignee}, not ${reviewerId}`);
   }
@@ -588,9 +591,7 @@ export function recordReview(db: Database, taskId: string, reviewerId: string, o
   // cannot invalidate it; a mismatched one is a stale review of a moved head.
   const head = opts.headSha ?? task.head_sha;
   if (task.head_sha && opts.headSha && opts.headSha !== task.head_sha) {
-    throw new Error(
-      `${HEAD_MISMATCH}: review head ${opts.headSha} != task head ${task.head_sha} for ${taskId}`
-    );
+    throw new Error(`${HEAD_MISMATCH}: review head ${opts.headSha} != task head ${task.head_sha} for ${taskId}`);
   }
   if (opts.verdict === "pass" && task.head_sha && !opts.headSha) {
     throw new Error(`${HEAD_MISMATCH}: a PASS must name the reviewed HEAD (task ${taskId} is at ${task.head_sha})`);
@@ -601,45 +602,67 @@ export function recordReview(db: Database, taskId: string, reviewerId: string, o
   }
   assertNoResult(db, taskId, phase, task.attempt, "ReviewResult");
 
-  const result = insertResult(db, {
-    taskId,
-    phase,
-    attempt: task.attempt,
-    kind: "ReviewResult",
-    workerId: reviewerId,
-    passed: opts.verdict === "pass",
-    headSha: head,
-    profile,
-    reason: opts.reason ?? null,
-    evidenceRef: opts.evidence ?? null,
-  });
-
   if (opts.verdict === "pass") {
-    const updated = applyPhase(db, task, "integration", {
-      state: "queued",
-      attempt: task.attempt,
-      claimRole: INTEGRATOR_ROLE,
-      resultRef: `result:${result.id}`,
-    });
-    releaseWorker(db, reviewerId, taskId);
+    const updated = db.transaction(() => {
+      const result = insertTaskResult(db, {
+        taskId,
+        phase,
+        attempt: task.attempt,
+        kind: "ReviewResult",
+        workerId: reviewerId,
+        passed: true,
+        headSha: head,
+        profile,
+        reason: opts.reason ?? null,
+        evidenceRef: opts.evidence ?? null,
+      });
+      const u = applyPhase(db, task, "integration", {
+        state: "queued",
+        attempt: task.attempt,
+        claimRole: INTEGRATOR_ROLE,
+        resultRef: `result:${result.id}`,
+      });
+      releaseWorker(db, reviewerId, taskId);
+      return u;
+    })();
     requestReconcile(db, `review-pass:${taskId}`);
     return updated;
   }
-  const updated = applyPhase(db, task, "implement", {
-    state: "queued",
-    attempt: task.attempt + 1,
-    claimRole: claimRoleForPhase("implement", task.role),
-    clearHead: true,
-    resultRef: `result:${result.id}`,
-  });
-  releaseWorker(db, reviewerId, taskId);
+
+  const updated = db.transaction(() => {
+    const result = insertTaskResult(db, {
+      taskId,
+      phase,
+      attempt: task.attempt,
+      kind: "ReviewResult",
+      workerId: reviewerId,
+      passed: false,
+      headSha: head,
+      profile,
+      reason: opts.reason ?? null,
+      evidenceRef: opts.evidence ?? null,
+    });
+    const u = applyPhase(db, task, "implement", {
+      state: "queued",
+      attempt: task.attempt + 1,
+      claimRole: claimRoleForPhase("implement", task.role),
+      clearHead: true,
+      resultRef: `result:${result.id}`,
+    });
+    releaseWorker(db, reviewerId, taskId);
+    return u;
+  })();
   requestReconcile(db, `review-fail:${taskId}`);
   return updated;
 }
 
 /**
- * TaskAccepted — the ONLY way a code-change task becomes terminal. Requires the
- * task to be at `merge_ready`; a bare approve/auto-approve can never get here.
+ * TaskAccepted — the ONLY way a code-change task becomes terminal. Requires:
+ *   - the task at `merge_ready`;
+ *   - a passing ReviewResult for the CURRENT attempt whose head equals the
+ *     task's current head (a PASS cannot survive a moved HEAD);
+ *   - Gateway/human or integrator authority.
+ * A bare approve/auto-approve can never satisfy any of these.
  */
 export function acceptTask(db: Database, taskId: string, actor: string): Task {
   const task = getTask(db, taskId);
@@ -651,24 +674,51 @@ export function acceptTask(db: Database, taskId: string, actor: string): Task {
       `${GATE_ERROR}: cannot accept ${taskId} at phase '${phase}'; the code-change gate is satisfied only at merge_ready`
     );
   }
+
+  // Authority: the Gateway/human for the task, or an integrator.
+  const actorW = getWorker(db, actor);
+  const isIntegrator = actorW?.role === INTEGRATOR_ROLE;
+  const gateway = resolveHumanInterface(db, task);
+  const isGateway = gateway !== null && gateway === actor;
+  if (!isIntegrator && !isGateway) {
+    throw new Error(
+      `${AUTHORITY_ERROR}: ${actor} may not accept ${taskId}; need the Gateway/human (${gateway ?? "unresolved"}) or role '${INTEGRATOR_ROLE}'`
+    );
+  }
+
+  // The gate's evidence: a passing review of the CURRENT head + attempt.
+  const pass = findPassingReview(db, taskId, task.attempt);
+  if (!pass) {
+    throw new Error(`${GATE_ERROR}: ${taskId} has no passing review for attempt ${task.attempt}`);
+  }
+  if ((pass.head_sha ?? null) !== (task.head_sha ?? null)) {
+    throw new Error(
+      `${GATE_ERROR}: ${taskId} HEAD changed since the passing review ` +
+      `(reviewed ${pass.head_sha ?? "none"}, now ${task.head_sha ?? "none"}); re-review required`
+    );
+  }
+
   assertNoResult(db, taskId, phase, task.attempt, "TaskAccepted");
   const t = now();
-  const result = insertResult(db, {
-    taskId,
-    phase,
-    attempt: task.attempt,
-    kind: "TaskAccepted",
-    workerId: actor,
-  });
-  const updated = applyPhase(db, task, phase, {
-    state: "done",
-    attempt: task.attempt,
-    claimRole: null,
-    acceptedAt: t,
-    resultRef: `result:${result.id}`,
-  });
-  releaseWorker(db, actor, taskId, t);
-  notifyParentAccepted(db, updated);
+  const updated = db.transaction(() => {
+    const result = insertTaskResult(db, {
+      taskId,
+      phase,
+      attempt: task.attempt,
+      kind: "TaskAccepted",
+      workerId: actor,
+    });
+    const u = applyPhase(db, task, phase, {
+      state: "done",
+      attempt: task.attempt,
+      claimRole: null,
+      acceptedAt: t,
+      resultRef: `result:${result.id}`,
+    });
+    releaseWorker(db, actor, taskId, t);
+    notifyParentAccepted(db, u);
+    return u;
+  })();
   requestReconcile(db, `accept:${taskId}`);
   return updated;
 }
@@ -683,21 +733,10 @@ export function codeChangeGateSatisfied(task: Task): boolean {
   return derivePhase(task) === "merge_ready" && task.state === "done";
 }
 
-function notifyGateway(db: Database, task: Task, body: string, kind: string): boolean {
-  const recipient = resolveHumanInterface(db, task);
-  if (!recipient) {
-    logEvent(db, { source: "workflow", taskId: task.id, type: "workflow.gateway_unrouted", payload: { kind } });
-    return false;
-  }
-  sendMessage(db, "relay", recipient, `${RELAY_TAG}${body}`, { kind, taskId: task.id });
-  logEvent(db, { source: "workflow", workerId: recipient, taskId: task.id, type: "workflow.gateway_notified", payload: { kind } });
-  return true;
-}
-
 /**
  * On acceptance, tell the parent's Gateway ONLY when ALL direct children are
  * accepted (children-ready aggregation). Recorded as a durable ChildrenReady
- * result so it fires exactly once.
+ * result so it fires exactly once. Runs inside the caller's transaction.
  */
 function notifyParentAccepted(db: Database, child: Task): void {
   const parentId = child.parent_task_id;
@@ -707,38 +746,15 @@ function notifyParentAccepted(db: Database, child: Task): void {
   const kids = taskChildren(db, parentId);
   if (kids.length === 0) return;
   if (!kids.every((k) => k.state === "done")) return; // not ready yet
-  if (findResult(db, parentId, "", 0, "ChildrenReady")) return; // already told
-  insertResult(db, {
+  if (findTaskResult(db, parentId, "", 0, "ChildrenReady")) return; // already told
+  insertTaskResult(db, {
     taskId: parentId,
     phase: "",
     attempt: 0,
     kind: "ChildrenReady",
     payload: { children: kids.map((k) => k.id) },
   });
-  notifyGateway(db, parent, `${parentId}: all ${kids.length} child task(s) are ready.`, "children_ready");
-}
-
-/**
- * Record a ChildBlocked notification for a blocked child and reach the Gateway
- * exactly once. Used by the code-change block path; the legacy parent-assignee
- * bubbling is untouched.
- */
-export function recordChildBlocked(db: Database, childId: string, actor: string, reason: string): boolean {
-  const child = getTask(db, childId);
-  if (!child) throw new Error(`unknown task: ${childId}`);
-  const phase = derivePhase(child) ?? "";
-  if (findResult(db, childId, phase, child.attempt, "ChildBlocked")) return false;
-  insertResult(db, {
-    taskId: childId,
-    phase,
-    attempt: child.attempt,
-    kind: "ChildBlocked",
-    workerId: actor,
-    reason,
-  });
-  const parentId = child.parent_task_id;
-  const target = parentId ? getTask(db, parentId) ?? child : child;
-  return notifyGateway(db, target, `${childId} is blocked${reason ? `: ${reason}` : ""}.`, "child_blocked");
+  notifyGatewayTo(db, resolveHumanInterface(db, parent), parent, `${parentId}: all ${kids.length} child task(s) are ready.`, "children_ready");
 }
 
 // ---------------------------------------------------------------------------
@@ -755,7 +771,7 @@ export function canStartPhase(db: Database, taskId: string, phase: CodePhase, at
   if ((task.phase ?? derivePhase(task)) !== phase) return false;
   if (task.attempt !== attempt) return false;
   if (phase === "review") return !findReviewForHead(db, taskId, task.head_sha, task.review_profile ?? DEFAULT_REVIEW_PROFILE);
-  return !findResult(db, taskId, phase, attempt, "TaskSubmitted");
+  return !findTaskResult(db, taskId, phase, attempt, "TaskSubmitted");
 }
 
 /** Refuse a second start for the same Task/phase/attempt. */
@@ -765,32 +781,4 @@ export function assertStartable(db: Database, taskId: string, phase: CodePhase, 
       `${DUPLICATE_DISPATCH}: ${taskId} phase '${phase}' attempt ${attempt} is already started or no longer current`
     );
   }
-}
-
-// ---------------------------------------------------------------------------
-// Immediate daemon reconcile
-// ---------------------------------------------------------------------------
-
-export const RECONCILE_KEY = "reconcile_request";
-
-/**
- * Bump the durable reconcile-request token. The daemon polls this one row on its
- * 250ms tick (not the 1500ms reconcile interval) and reconciles IMMEDIATELY on a
- * change — a task-state update never waits for a periodic pass.
- */
-export function requestReconcile(db: Database, reason = ""): number {
-  const t = now();
-  db.query(
-    `INSERT INTO control (key, value, updated_at) VALUES (?, '1', ?)
-     ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT), updated_at = excluded.updated_at`
-  ).run(RECONCILE_KEY, t);
-  const row = db.query(`SELECT value FROM control WHERE key = ?`).get(RECONCILE_KEY) as { value: string };
-  logEvent(db, { source: "workflow", type: "workflow.reconcile_requested", payload: { reason, token: row.value } });
-  return Number(row.value);
-}
-
-/** The current reconcile-request token ("" when never requested). */
-export function reconcileRequestToken(db: Database): string {
-  const row = db.query(`SELECT value FROM control WHERE key = ?`).get(RECONCILE_KEY) as { value: string } | null;
-  return row?.value ?? "";
 }
