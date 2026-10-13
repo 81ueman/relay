@@ -24,6 +24,7 @@ import {
   submitTask, taskCounts, taskDependencies, taskChildren, setTaskParent, unblockTask,
   unclaimableRunnableTasks, addNote, setTaskPlan, waitTask,
 } from "./tasks";
+import { acceptTask, intakeTask, recordReview, recordVerification, submitPhase } from "./workflow";
 import {
   bindSession, findWorkerBySession, getWorker, listWorkers,
   quietActive, registerWorker, retireWorker, setWorkerState, touchSeen, unretireWorker,
@@ -40,7 +41,7 @@ import { addReminder, disableReminder, listReminders } from "./reminders";
 // A role is "known" if it matches a registered worker or a built-in special role.
 // Used for a non-fatal warning on `task add --role`, never a rejection.
 function knownRole(db: ReturnType<typeof openDb>, role: string): boolean {
-  if (role === "worker" || role === "planner" || role === "reviewer") return true;
+  if (role === "worker" || role === "planner" || role === "reviewer" || role === "integrator") return true;
   return listWorkers(db).some((w) => w.role === role);
 }
 
@@ -66,11 +67,17 @@ Usage:
   relay runtime list [--worker <id>] [--state <state>]
 
   relay task add "description" [--title T] [--acceptance A] [--priority N] [--role R] [--parent T1] [--plan <plan-id>] [--depends-on T1,T2]
+  relay task intake --provider P --issue ID [--slice S] [--title T] [--code-change] [--pr URL] [--branch B] [--head SHA]
   relay task link <task-id> <plan-id>
   relay task unlink <task-id>
   relay task depend <task-id> <dep-id...> | --clear
   relay task list [--state <state>]
   relay task show <id> [--json]
+
+  relay result submit <task-id> [--evidence E] [--head SHA] [--lease N] [--worker <id>]
+  relay result verify <task-id> --pass|--fail [--evidence E] [--head SHA] [--worker <id>]
+  relay result review <task-id> --pass|--fail [--head SHA] [--profile P] [--reason R] [--worker <id>]
+  relay result accept <task-id> [--worker <id>]
 
   relay next [--worker <id>] [--role <r>] [--any-role]
   relay claim <task-id> [--worker <id>] [--role <r>] [--any-role]
@@ -214,6 +221,23 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
   "task add": {
     about: "Queue a new task. --parent nests it under T1; approving a child then tells the immediate parent (one-hop completion bubbling: a child_done note on the parent, children_done when all direct children are done, and a durable message to the parent's current assignee). A --role makes the task claimable only by a worker of that role by default; an unknown role warns (non-fatal), and a role no registered worker has is surfaced as Unclaimable in `relay status`. --plan <plan-id> records which agent-status plan.json item this task belongs to. --depends-on T1,T2 declares prerequisites: the task is NOT runnable (never offered by `relay next`, never claimable, never woken) until every one is done.",
     usage: ['relay task add "description" [--title T] [--acceptance A] [--priority N] [--role R] [--parent T1] [--plan <plan-id>] [--depends-on T1,T2]'],
+  },
+  "task intake": {
+    about:
+      "Idempotent code-change intake, keyed by (provider, issue ID, slice). Replaying the same intake returns the SAME task; a different --slice of the same issue is a DIFFERENT task. --code-change marks it as a code-change task, which enforces the mandatory phase gate (implement -> verify -> review -> integration -> merge_ready -> accepted); `relay approve`/RELAY_AUTO_APPROVE can never complete it. --pr/--branch/--head link the PR; a review PASS is invalid once the head moves.",
+    usage: [
+      "relay task intake --provider P --issue ID [--slice S] [--title T] [--role R] [--priority N] [--parent T1] [--code-change] [--pr URL] [--branch B] [--head SHA]",
+    ],
+  },
+  result: {
+    about:
+      "Record a STRUCTURED workflow result and advance the task's phase (the source of truth — `relay send` prose is never parsed for a verdict). submit advances implement/integration; verify and review record a pass/fail; accept is the only way a code-change task becomes done (it must be at merge_ready). Duplicate/stale results are refused.",
+    usage: [
+      "relay result submit <task-id> [--evidence E] [--head SHA] [--lease N] [--worker <id>]",
+      "relay result verify <task-id> --pass|--fail [--evidence E] [--head SHA] [--worker <id>]",
+      "relay result review <task-id> --pass|--fail [--head SHA] [--profile P] [--reason R] [--worker <id>]",
+      "relay result accept <task-id> [--worker <id>]",
+    ],
   },
   "task list": { about: "List tasks (id, state, priority, role, assignee, plan, depends, title).", usage: ["relay task list [--state <state>]"] },
   "task show": { about: "Print one task as JSON (includes depends_on). Notes go to stderr so stdout stays parseable; --json emits ONE document with the task, its dependencies and its notes.", usage: ["relay task show <id> [--json]"] },
@@ -891,6 +915,31 @@ async function main(): Promise<void> {
           });
           const deps = taskDependencies(db, t.id);
           console.log(`${t.id} queued priority=${t.priority}${t.plan_id ? ` plan=${t.plan_id}` : ""}${deps.length ? ` depends_on=${deps.join(",")}` : ""}`);
+        } else if (sub === "intake") {
+          const rest = argv.slice(2);
+          const provider = flag(rest, "--provider");
+          const issueId = flag(rest, "--issue");
+          if (!provider || !issueId) {
+            throw new Error("usage: relay task intake --provider P --issue ID [--slice S] [--title T] [--code-change] [--pr URL] [--branch B] [--head SHA]");
+          }
+          const t = intakeTask(db, {
+            provider,
+            issueId,
+            slice: flag(rest, "--slice") ?? "",
+            title: flag(rest, "--title") ?? undefined,
+            description: flag(rest, "--description") ?? undefined,
+            acceptance: flag(rest, "--acceptance") ?? undefined,
+            priority: flag(rest, "--priority") ? Number(flag(rest, "--priority")) : 0,
+            role: flag(rest, "--role") ?? undefined,
+            codeChange: hasFlag(rest, "--code-change"),
+            parentTaskId: flag(rest, "--parent") ?? undefined,
+            prUrl: flag(rest, "--pr") ?? undefined,
+            branch: flag(rest, "--branch") ?? undefined,
+            headSha: flag(rest, "--head") ?? undefined,
+          });
+          console.log(
+            `${t.id} ${t.code_change === 1 ? `code-change phase=${t.phase}` : "task"} provider=${t.provider} issue=${t.issue_id} slice=${t.slice === "" ? "-" : t.slice} state=${t.state}`
+          );
         } else if (sub === "list") {
           const state = flag(argv.slice(1), "--state");
           for (const t of listTasks(db, state)) {
@@ -1019,11 +1068,21 @@ async function main(): Promise<void> {
         const workerId = resolveWorkerId(db, flag(argv, "--worker"));
         const evidence = flag(argv, "--evidence") ?? "";
         const leaseRaw = flag(argv, "--lease");
-        const t = submitTask(db, id, workerId, {
-          evidence,
-          leaseToken: leaseRaw !== undefined ? Number(leaseRaw) : undefined,
-        });
-        console.log(`${t.id} -> review`);
+        const leaseToken = leaseRaw !== undefined ? Number(leaseRaw) : undefined;
+        // A code-change task advances by STRUCTURED phase results; route it to
+        // the workflow so `relay submit` cannot skip verify/integration.
+        const target = getTask(db, id);
+        if (target?.code_change === 1) {
+          const t = submitPhase(db, id, workerId, {
+            evidence,
+            headSha: flag(argv, "--head") ?? undefined,
+            leaseToken,
+          });
+          console.log(`${t.id} -> phase=${t.phase} state=${t.state}`);
+        } else {
+          const t = submitTask(db, id, workerId, { evidence, leaseToken });
+          console.log(`${t.id} -> review`);
+        }
         break;
       }
 
@@ -1033,6 +1092,53 @@ async function main(): Promise<void> {
         const workerId = resolveWorkerId(db, flag(argv, "--worker"));
         const t = approveTask(db, id, workerId);
         console.log(`${t.id} -> done`);
+        break;
+      }
+
+      case "result": {
+        const sub = argv[1];
+        const id = argv[2];
+        const rest = argv.slice(2);
+        const usage =
+          "usage: relay result submit|verify|review|accept <task-id> [--pass|--fail] [--head SHA] [--worker <id>] ...";
+        if (!sub || !id) throw new Error(usage);
+        const workerId = resolveWorkerId(db, flag(argv, "--worker"));
+        if (sub === "submit") {
+          const t = submitPhase(db, id, workerId, {
+            evidence: flag(rest, "--evidence") ?? undefined,
+            headSha: flag(rest, "--head") ?? undefined,
+            leaseToken: flag(rest, "--lease") !== undefined ? Number(flag(rest, "--lease")) : undefined,
+          });
+          console.log(`${t.id} -> phase=${t.phase} state=${t.state}`);
+        } else if (sub === "verify") {
+          const passed = hasFlag(rest, "--pass");
+          const failed = hasFlag(rest, "--fail");
+          if (passed === failed) throw new Error("relay result verify requires exactly one of --pass / --fail");
+          const t = recordVerification(db, id, workerId, {
+            passed,
+            evidence: flag(rest, "--evidence") ?? undefined,
+            headSha: flag(rest, "--head") ?? undefined,
+            leaseToken: flag(rest, "--lease") !== undefined ? Number(flag(rest, "--lease")) : undefined,
+          });
+          console.log(`${t.id} -> phase=${t.phase} state=${t.state}`);
+        } else if (sub === "review") {
+          const passed = hasFlag(rest, "--pass");
+          const failed = hasFlag(rest, "--fail");
+          if (passed === failed) throw new Error("relay result review requires exactly one of --pass / --fail");
+          const t = recordReview(db, id, workerId, {
+            verdict: passed ? "pass" : "fail",
+            headSha: flag(rest, "--head") ?? undefined,
+            profile: flag(rest, "--profile") ?? undefined,
+            reason: flag(rest, "--reason") ?? undefined,
+            evidence: flag(rest, "--evidence") ?? undefined,
+          });
+          console.log(`${t.id} -> phase=${t.phase} state=${t.state}`);
+        } else if (sub === "accept") {
+          const t = acceptTask(db, id, workerId);
+          console.log(`${t.id} -> done (accepted)`);
+        } else {
+          throw new Error(`unknown result subcommand: ${sub}`);
+        }
         break;
       }
 
@@ -1246,7 +1352,7 @@ async function main(): Promise<void> {
         console.log(`sessions:  ${plan.sessions.length}${list(plan.sessions)}`);
         console.log(`runtimes:  ${plan.runtimes.length}${list(plan.runtimes)}`);
         if (withHistory) {
-          console.log(`history:   events=${plan.history.events} messages=${plan.history.messages} task_notes=${plan.history.task_notes}`);
+          console.log(`history:   events=${plan.history.events} messages=${plan.history.messages} task_notes=${plan.history.task_notes} task_results=${plan.history.task_results}`);
         }
         console.log(`skipped:   ${plan.skipped.length}`);
         for (const s of plan.skipped) console.log(`  ${s.kind} ${s.id}: ${s.reason}`);
@@ -1333,7 +1439,12 @@ async function main(): Promise<void> {
         if (gated.length === 0) console.log("(none)");
         for (const t of gated) {
           const deps = taskDependencies(db, t.id);
-          const why = deps.length ? `depends_on=${deps.join(",")}` : "reviewer gate (nothing in review)";
+          const why =
+            t.code_change === 1 && t.phase === "merge_ready"
+              ? "merge_ready (awaiting TaskAccepted)"
+              : deps.length
+                ? `depends_on=${deps.join(",")}`
+                : "reviewer gate (nothing in review)";
           console.log(`${t.id}  role=${t.role ?? "-"}  ${why}  ${t.title}`);
         }
         // A note can claim APPROVE without a transition (T151): the task then

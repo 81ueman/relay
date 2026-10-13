@@ -34,7 +34,7 @@ export interface GcPlan {
   /** worker_runtimes.id */
   runtimes: number[];
   /** Counts of history rows that WOULD be removed (only computed with --with-history). */
-  history: { events: number; messages: number; task_notes: number };
+  history: { events: number; messages: number; task_notes: number; task_results: number };
   skipped: GcSkip[];
   /** Dry-run: nothing has been deleted. */
   applied: boolean;
@@ -133,11 +133,12 @@ export function planGc(db: Database, opts: GcOptions = {}): GcPlan {
   }
 
   // 5. History counts (targeted: only rows referencing the purged workers/tasks).
-  const history = { events: 0, messages: 0, task_notes: 0 };
+  const history = { events: 0, messages: 0, task_notes: 0, task_results: 0 };
   if (withHistory) {
     history.events = countWhere(db, "events", workerTaskPredicate(workers, tasks));
     history.messages = countWhere(db, "messages", messagePredicate(workers, tasks));
     history.task_notes = countWhere(db, "task_notes", workerTaskPredicate(workers, tasks));
+    history.task_results = countWhere(db, "task_results", workerTaskPredicate([], tasks));
   }
 
   return { withHistory, olderThanMs, workers, tasks, sessions, runtimes, history, skipped, applied: false };
@@ -225,6 +226,11 @@ export function applyGc(db: Database, plan: GcPlan): GcPlan {
         db.query(`DELETE FROM events WHERE ${wt.sql}`).run(...(wt.params as never[]));
         const msg = messagePredicate(plan.workers, plan.tasks);
         db.query(`DELETE FROM messages WHERE ${msg.sql}`).run(...(msg.params as never[]));
+        // Structured workflow results reference a task only (no worker column).
+        if (plan.tasks.length > 0) {
+          const tr = workerTaskPredicate([], plan.tasks);
+          db.query(`DELETE FROM task_results WHERE ${tr.sql}`).run(...(tr.params as never[]));
+        }
       }
     }
   })();

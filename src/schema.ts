@@ -30,6 +30,26 @@ export type MessageState = (typeof MESSAGE_STATES)[number];
 export const RUNTIME_STATES = ["starting", "active", "stale", "dead", "cleaned"] as const;
 export type RuntimeState = (typeof RUNTIME_STATES)[number];
 
+/**
+ * Code-change workflow phases (ISH-758). `phase` is the STAGE of a code-change
+ * task; the existing `state` column stays the single lifecycle source of truth
+ * (queued/running/review/done/blocked/failed). There is deliberately no second
+ * "workflow state": blocked and terminal live in `state`, so the two concepts do
+ * not duplicate each other.
+ *
+ *   implement -> verify -> review -> integration -> merge_ready -> (accepted)
+ *
+ * A task with `code_change = 0` has `phase = NULL` and behaves exactly like the
+ * legacy task machine (submit -> review -> approve). The phase graph only
+ * applies to code-change tasks.
+ */
+export const CODE_PHASES = ["implement", "verify", "review", "integration", "merge_ready"] as const;
+export type CodePhase = (typeof CODE_PHASES)[number];
+
+/** The functional authority a phase requires (see `src/workflow.ts`). */
+export const INTEGRATOR_ROLE = "integrator";
+export const REVIEWER_ROLE = "reviewer";
+
 export interface Task {
   id: string;
   title: string;
@@ -43,8 +63,69 @@ export interface Task {
   lease_until: number | null;
   parent_task_id: string | null;
   plan_id: string | null; // [ext] link to an agent-status plan.json item (nullable)
+  // --- code-change workflow (ISH-758) -------------------------------------
+  /** "github" | "linear" | ... — the intake provider. NULL on legacy tasks. */
+  provider: string | null;
+  /** Provider-side issue id (e.g. ISH-758, owner/repo#12). NULL on legacy tasks. */
+  issue_id: string | null;
+  /** Slice of the issue this task implements; "" is the single/default slice. */
+  slice: string | null;
+  /** 1 = enforce the mandatory code-change gate (phase graph). 0 = legacy task. */
+  code_change: number;
+  /** Current workflow phase for a code-change task; NULL for legacy tasks. */
+  phase: CodePhase | null;
+  /** Monotonic rework counter within `phase` (bumped on verification/review fail). */
+  attempt: number;
+  /**
+   * Phase-derived claim role. `COALESCE(claim_role, role)` is the effective role
+   * gate, so a phase can demand `reviewer`/`integrator` without clobbering the
+   * task's declared `role`.
+   */
+  claim_role: string | null;
+  /** Linked PR / branch / head. A review PASS is invalid once `head_sha` moves. */
+  pr_url: string | null;
+  branch: string | null;
+  head_sha: string | null;
+  /** Evidence ref for the CURRENT attempt (a structured-result id or note id). */
+  result_ref: string | null;
+  /** Review profile used for duplicate-dispatch protection (e.g. "default"). */
+  review_profile: string | null;
+  /** When the mandatory gate was satisfied (TaskAccepted). */
+  accepted_at: number | null;
   created_at: number;
   updated_at: number;
+}
+
+/**
+ * One structured result (ISH-758). These are the IN-PROCESS source of truth for
+ * phase transitions — `relay send` prose is never parsed for a verdict. Stored
+ * append-only; the (task, phase, attempt, kind) uniqueness is what refuses a
+ * duplicate submission / duplicate review for the same work.
+ */
+export const RESULT_KINDS = [
+  "TaskSubmitted",
+  "VerificationResult",
+  "ReviewResult",
+  "ChildBlocked",
+  "ChildrenReady",
+  "TaskAccepted",
+] as const;
+export type ResultKind = (typeof RESULT_KINDS)[number];
+
+export interface TaskResult {
+  id: number;
+  task_id: string;
+  phase: string;
+  attempt: number;
+  kind: ResultKind;
+  worker_id: string | null;
+  passed: number | null;
+  head_sha: string | null;
+  profile: string | null;
+  evidence_ref: string | null;
+  reason: string | null;
+  payload_json: string;
+  created_at: number;
 }
 
 /**
@@ -250,11 +331,64 @@ CREATE TABLE IF NOT EXISTS tasks (
   lease_until INTEGER,
   parent_task_id TEXT,
   plan_id TEXT,
+  -- code-change workflow (ISH-758); NULL/0 on legacy tasks.
+  provider TEXT,
+  issue_id TEXT,
+  slice TEXT,
+  code_change INTEGER NOT NULL DEFAULT 0,
+  phase TEXT,
+  attempt INTEGER NOT NULL DEFAULT 0,
+  claim_role TEXT,
+  pr_url TEXT,
+  branch TEXT,
+  head_sha TEXT,
+  result_ref TEXT,
+  review_profile TEXT,
+  accepted_at INTEGER,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_state ON tasks(state);
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee ON tasks(assignee);
+-- Idempotent intake identity: at most one task per (provider, issue, slice).
+-- Partial so legacy tasks (provider NULL) are never constrained, and so the
+-- empty/default slice ("") is itself a real key.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_work_identity
+  ON tasks(provider, issue_id, slice)
+  WHERE provider IS NOT NULL AND issue_id IS NOT NULL AND slice IS NOT NULL;
+
+-- Structured workflow results (ISH-758). Append-only; the unique key refuses a
+-- duplicate submission / review / verification for the same (task, phase, attempt).
+CREATE TABLE IF NOT EXISTS task_results (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id TEXT NOT NULL,
+  phase TEXT NOT NULL DEFAULT '',
+  attempt INTEGER NOT NULL DEFAULT 0,
+  kind TEXT NOT NULL,
+  worker_id TEXT,
+  passed INTEGER,
+  head_sha TEXT,
+  profile TEXT,
+  evidence_ref TEXT,
+  reason TEXT,
+  payload_json TEXT NOT NULL DEFAULT '{}',
+  created_at INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_task_results_identity
+  ON task_results(task_id, phase, attempt, kind);
+CREATE INDEX IF NOT EXISTS idx_task_results_task ON task_results(task_id);
+-- Duplicate-dispatch protection for a review of the same PR+HEAD+profile.
+CREATE INDEX IF NOT EXISTS idx_task_results_review_head
+  ON task_results(task_id, head_sha, profile, kind);
+
+-- Small key/value control plane (ISH-758): a state transition bumps
+-- reconcile_request so the daemon wakes IMMEDIATELY instead of waiting for its
+-- periodic tick. One row, not a queue.
+CREATE TABLE IF NOT EXISTS control (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS workers (
   id TEXT PRIMARY KEY,

@@ -63,7 +63,15 @@ const REVIEW_GATE_SQL =
 // of work, so it is never offered, claimable, or counted as runnable. Derived
 // from `parent_task_id` alone — no stored flag, no extra task state.
 const CONTAINER_TASK_SQL = `NOT EXISTS (SELECT 1 FROM tasks c WHERE c.parent_task_id = t.id)`;
-const RUNNABLE_TASK_SQL = `t.state = 'queued' AND ${DEPS_DONE_SQL} AND ${REVIEW_GATE_SQL} AND ${CONTAINER_TASK_SQL}`;
+// A code-change task parked at `merge_ready` is waiting for the mandatory
+// TaskAccepted gate, not for an implementer/reviewer: it is never offered.
+const MERGE_READY_SQL = `NOT (IFNULL(t.code_change, 0) = 1 AND t.phase = 'merge_ready')`;
+const RUNNABLE_TASK_SQL = `t.state = 'queued' AND ${DEPS_DONE_SQL} AND ${REVIEW_GATE_SQL} AND ${CONTAINER_TASK_SQL} AND ${MERGE_READY_SQL}`;
+
+/** The role gate a task presents: a phase-derived `claim_role` wins over `role`. */
+export function effectiveTaskRole(task: Pick<Task, "role" | "claim_role">): string | null {
+  return task.claim_role ?? task.role;
+}
 
 /**
  * Clear a worker's quiet lease after an explicit relay action (note/submit/block/
@@ -141,7 +149,7 @@ export function claimableRunnableTasks(db: Database, workerId: string, opts: Cla
   const worker = getWorker(db, workerId);
   if (!worker) return [];
   const { matchRole, strict } = claimPolicy(worker.role, opts);
-  return runnableTasks(db).filter((t) => roleMatches(t.role, matchRole, strict));
+  return runnableTasks(db).filter((t) => roleMatches(effectiveTaskRole(t), matchRole, strict));
 }
 
 /**
@@ -152,10 +160,13 @@ export function claimableRunnableTasks(db: Database, workerId: string, opts: Cla
 export function unclaimableRunnableTasks(db: Database): Task[] {
   if (!roleStrictDefault()) return [];
   const roles = new Set(listWorkers(db).map((w) => w.role));
-  return runnableTasks(db).filter((t) => t.role !== null && !roles.has(t.role));
+  return runnableTasks(db).filter((t) => {
+    const role = effectiveTaskRole(t);
+    return role !== null && !roles.has(role);
+  });
 }
 
-function nextTaskId(db: Database): string {
+export function nextTaskId(db: Database): string {
   const r = db
     .query(`SELECT COALESCE(MAX(CAST(SUBSTR(id, 2) AS INTEGER)), 0) AS n FROM tasks WHERE id LIKE 'T%'`)
     .get() as { n: number };
@@ -321,7 +332,7 @@ export function taskDependencies(db: Database, taskId: string): string[] {
  */
 export function dependenciesMet(db: Database, task: Task): boolean {
   // A reviewer gate additionally accepts a prerequisite still in `review`.
-  const relaxed = task.role === "reviewer";
+  const relaxed = effectiveTaskRole(task) === "reviewer";
   const unmet = db
     .query(
       `SELECT COUNT(*) AS n FROM task_deps dep
@@ -350,9 +361,11 @@ export function hasChildren(db: Database, taskId: string): boolean {
  */
 export function isRunnableNow(db: Database, task: Task, reviewExists?: boolean): boolean {
   if (task.state !== "queued") return false;
+  if (task.code_change === 1 && task.phase === "merge_ready") return false; // mandatory gate
   if (hasChildren(db, task.id)) return false; // a container is a roll-up, not work
   if (!dependenciesMet(db, task)) return false;
-  if (task.role === "reviewer" && taskDependencies(db, task.id).length === 0) {
+  const role = effectiveTaskRole(task);
+  if (role === "reviewer" && taskDependencies(db, task.id).length === 0) {
     return reviewExists ?? reviewPending(db);
   }
   return true;
@@ -462,7 +475,7 @@ export function claimNext(db: Database, workerId: string, opts: ClaimOptions = {
     // in review) is never selected. Under strict, only role IS NULL or
     // role = matchRole qualify.
     const queuedSql = strict
-      ? `SELECT t.* FROM tasks t WHERE ${RUNNABLE_TASK_SQL} AND (t.role IS NULL OR t.role = ?) ORDER BY t.priority DESC, t.created_at ASC LIMIT 1`
+      ? `SELECT t.* FROM tasks t WHERE ${RUNNABLE_TASK_SQL} AND (COALESCE(t.claim_role, t.role) IS NULL OR COALESCE(t.claim_role, t.role) = ?) ORDER BY t.priority DESC, t.created_at ASC LIMIT 1`
       : `SELECT t.* FROM tasks t WHERE ${RUNNABLE_TASK_SQL} ORDER BY t.priority DESC, t.created_at ASC LIMIT 1`;
     const task = (strict ? db.query(queuedSql).get(matchRole) : db.query(queuedSql).get()) as Task | null;
 
@@ -511,14 +524,14 @@ export function claimTask(db: Database, taskId: string, workerId: string, opts: 
     // queued reviewer GATE. Naming the gate is the intended escape from the
     // T295 unclaimable state (a standing gate with nothing in review is parked
     // by design, so the owner needs one supported way to pick it up).
-    if (worker.role === "reviewer" && !(task.role === "reviewer" && task.state === "queued")) {
+    if (worker.role === "reviewer" && !(effectiveTaskRole(task) === "reviewer" && task.state === "queued")) {
       throw new Error(`reviewers take review tasks via \`relay next\`, not claim (name a queued reviewer gate to claim one explicitly)`);
     }
     if (task.state !== "queued") throw new Error(`cannot claim task in state ${task.state}`);
     const { matchRole, strict } = claimPolicy(worker.role, opts);
-    if (!roleMatches(task.role, matchRole, strict)) {
+    if (!roleMatches(effectiveTaskRole(task), matchRole, strict)) {
       throw new Error(
-        `cannot claim task ${taskId}: role '${task.role}' does not match worker role '${matchRole}' (use --any-role to override)`
+        `cannot claim task ${taskId}: role '${effectiveTaskRole(task)}' does not match worker role '${matchRole}' (use --any-role to override)`
       );
     }
     // Run gating is orthogonal to the role gate and NOT bypassable by
@@ -528,7 +541,7 @@ export function claimTask(db: Database, taskId: string, workerId: string, opts: 
         `cannot claim task ${taskId}: not yet runnable — prerequisite ${taskDependencies(db, taskId).join(", ")} is not done`
       );
     }
-    if (task.role === "reviewer" && taskDependencies(db, taskId).length === 0 && !reviewPending(db) && !opts.allowReviewerGate) {
+    if (effectiveTaskRole(task) === "reviewer" && taskDependencies(db, taskId).length === 0 && !reviewPending(db) && !opts.allowReviewerGate) {
       throw new Error(
         `cannot claim task ${taskId}: not yet runnable — a reviewer gate needs something in review, or ` +
         `declare its inputs with \`relay task depend ${taskId} <input,...>\``
@@ -865,6 +878,15 @@ export function submitTask(
   if (task.state !== "running") {
     throw new Error(`cannot submit task in state ${task.state}`);
   }
+  if (task.code_change === 1) {
+    // ISH-758 mandatory code-change gate: a code task advances by STRUCTURED
+    // phase results, never by the legacy submit shortcut (which would jump an
+    // implement task straight to review and skip verify/integration).
+    throw new Error(
+      `mandatory code-change gate: ${taskId} is a code-change task (phase '${task.phase}'); ` +
+      `use \`relay result submit ${taskId} --evidence ...\` instead of \`relay submit\`.`
+    );
+  }
   const t = now();
   if (opts.evidence) {
     db.query(`INSERT INTO task_notes (task_id, worker_id, kind, body, created_at) VALUES (?, ?, 'evidence', ?, ?)`).run(taskId, workerId, opts.evidence, t);
@@ -881,6 +903,15 @@ export function submitTask(
 export function approveTask(db: Database, taskId: string, workerId: string): Task {
   const task = getTask(db, taskId);
   if (!task) throw new Error(`unknown task: ${taskId}`);
+  if (task.code_change === 1) {
+    // ISH-758: a code-change task may only become `done` through the mandatory
+    // gate — TaskAccepted at phase `merge_ready`. A bare `relay approve` (or the
+    // RELAY_AUTO_APPROVE reconciler path) must never satisfy it.
+    throw new Error(
+      `mandatory code-change gate: ${taskId} is a code-change task (phase '${task.phase}'); ` +
+      `\`relay approve\` cannot complete it. Use \`relay result accept ${taskId}\` once it is merge_ready.`
+    );
+  }
   if (task.state !== "review") throw new Error(`cannot approve task in state ${task.state}`);
   const t = now();
   // Durable state first, in ONE transaction: the child's completion and its

@@ -1788,6 +1788,9 @@ export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<
   if (needsReviewer(view)) {
     if (autoApproveEnabled()) {
       for (const t of reviewTasks(db)) {
+        // ISH-758: auto-approve must NEVER satisfy the mandatory code-change
+        // gate. Code tasks are driven by structured ReviewResult/TaskAccepted.
+        if (t.code_change === 1) continue;
         approveTask(db, t.id, "supervisor");
         actions.push(`auto-approved:${t.id}`);
       }

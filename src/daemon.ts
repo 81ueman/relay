@@ -5,6 +5,7 @@ import { logEvent } from "./events";
 import { buildRuntime } from "./runtime/herdr";
 import type { Runtime } from "./runtime/runtime";
 import { reconcile } from "./reconciler";
+import { reconcileRequestToken } from "./workflow";
 import { startSocketServer, type SocketContext, type SocketHandle } from "./socket";
 import {
   acquireSupervisorLock,
@@ -92,8 +93,17 @@ export async function runDaemon(opts: DaemonOptions = {}): Promise<void> {
     }
 
     let lastReconcile = 0;
+    // ISH-758: a task-state transition bumps a durable token; notice it on the
+    // fast 250ms tick and reconcile immediately, instead of waiting for the
+    // periodic interval. Reading one control row is far cheaper than a full pass.
+    let lastReconcileToken = reconcileRequestToken(db);
     for (;;) {
       const nowMs = Date.now();
+      const token = reconcileRequestToken(db);
+      if (token !== lastReconcileToken) {
+        lastReconcileToken = token;
+        ctx.wakeReconcile.value = true;
+      }
       if (ctx.wakeReconcile.value || nowMs - lastReconcile >= intervalMs) {
         ctx.wakeReconcile.value = false;
         lastReconcile = nowMs;
