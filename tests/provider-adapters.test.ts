@@ -91,13 +91,26 @@ describe("GhCliGitHub (GET-only)", () => {
       })
     );
     const comments = gh.listComments({ repo: "o/r", number: 7 });
-    expect(comments.map((c) => c.body)).toEqual(["issue", "review", "inline"]);
+    expect(comments?.map((c) => c.body)).toEqual(["issue", "review", "inline"]);
   });
 
   test("a failed read returns null / empty (fail closed)", () => {
     const gh = new GhCliGitHub(scriptedExec(() => ({ ok: false, stdout: "", stderr: "no gh" })));
     expect(gh.getPullRequest({ repo: "o/r", number: 1 })).toBeNull();
-    expect(gh.listComments({ repo: "o/r", number: 1 })).toEqual([]);
+    expect(gh.listComments({ repo: "o/r", number: 1 })).toBeNull();
+  });
+
+  test("a partial endpoint failure is a FAILED read (null), never a partial list", () => {
+    // The issue-comments endpoint succeeds, the reviews endpoint fails: the
+    // stream is incomplete, so the whole read must report failure.
+    const gh = new GhCliGitHub(
+      scriptedExec((argv) => {
+        const path = argv[2] ?? "";
+        if (path.includes("/reviews")) return { ok: false, stdout: "", stderr: "502" };
+        return ok(JSON.stringify([{ user: { login: "claude" }, created_at: "t", body: "x" }]));
+      })
+    );
+    expect(gh.listComments({ repo: "o/r", number: 1 })).toBeNull();
   });
 });
 

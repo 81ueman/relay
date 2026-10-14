@@ -74,8 +74,12 @@ export interface GitHubReadOnly {
   readonly readOnly: true;
   getPullRequest(ref: PrRef): PrView | null;
   findPullRequestForBranch(repo: string, branch: string): PrView | null;
-  /** Issue comments + review bodies + inline review comments, one stream. */
-  listComments(ref: PrRef): CommentView[];
+  /**
+   * Issue comments + review bodies + inline review comments, one stream.
+   * Returns `null` when the read FAILED (any endpoint), so a caller never treats
+   * a transient provider error as "no comments".
+   */
+  listComments(ref: PrRef): CommentView[] | null;
 }
 
 export interface IssueView {
@@ -325,10 +329,18 @@ export function reconcileTaskFromProvider(db: Database, taskId: string, deps: Pr
         // review (the optimistic watermark would then look unchanged and the
         // marker would never be read).
         if (prMoved && live.phase === "review" && live.state === "review") {
-          db.query(`UPDATE tasks SET pr_updated_at = ? WHERE id = ?`).run(view.updatedAt ?? "", taskId);
-          const markers = parseReviewMarkers(deps.github.listComments(ref), { authorizedReviewers });
-          const eff = effectiveVerdictAtHead(markers, live.head_sha);
-          if (eff) actions.push(...applyMarker(db, live, eff, deps.authority ?? NO_AUTHORITY));
+          // Only record the watermark when the scan SUCCEEDED. A failed read
+          // returns null; leaving the watermark untouched makes the next poll
+          // retry the scan instead of losing a marker to a transient error.
+          const comments = deps.github.listComments(ref);
+          if (comments !== null) {
+            db.query(`UPDATE tasks SET pr_updated_at = ? WHERE id = ?`).run(view.updatedAt ?? "", taskId);
+            const markers = parseReviewMarkers(comments, { authorizedReviewers });
+            const eff = effectiveVerdictAtHead(markers, live.head_sha);
+            if (eff) actions.push(...applyMarker(db, live, eff, deps.authority ?? NO_AUTHORITY));
+          } else {
+            actions.push({ kind: "comments-unreadable", taskId, detail: ref.repo + "#" + ref.number });
+          }
         }
       }
     }

@@ -887,3 +887,51 @@ describe("round 3: a marker posted before review survives a pre-review poll", ()
     expect(getTask(db, t.id)!.phase).toBe("review");
   });
 });
+
+describe("round 4: a transient comment-read failure must not consume the watermark", () => {
+  class FlakyGitHub implements GitHubReadOnly {
+    readonly name = "flaky";
+    readonly readOnly = true as const;
+    failComments = 0;
+    constructor(private inner: FakeGitHub) {}
+    getPullRequest(ref: Parameters<GitHubReadOnly["getPullRequest"]>[0]) {
+      return this.inner.getPullRequest(ref);
+    }
+    findPullRequestForBranch(repo: string, branch: string) {
+      return this.inner.findPullRequestForBranch(repo, branch);
+    }
+    listComments(ref: Parameters<GitHubReadOnly["listComments"]>[0]) {
+      if (this.failComments > 0) {
+        this.failComments--;
+        return null; // a transient gh api failure
+      }
+      return this.inner.listComments(ref);
+    }
+  }
+
+  test("a gh api failure during the review scan is retried, not lost", async () => {
+    const t = intakeTask(db, {
+      provider: "github", issueId: "o/r#70", codeChange: true, headSha: FULL, checks: [CHECK],
+      prUrl: "https://github.com/o/r/pull/10", prRepo: "o/r",
+    });
+    await toReview(t.id);
+    expect(getTask(db, t.id)!.pr_updated_at).toBeNull();
+
+    const inner = new FakeGitHub();
+    inner.putPullRequest(githubViewAt(10, FULL, "open", "u2"));
+    inner.putComments({ repo: "o/r", number: 10 }, [
+      { author: "claude", createdAt: "2026-01-01T00:00:00Z", body: `<!-- ishiul-review head=${FULL} verdict=OK reviewer=claude -->` },
+    ]);
+    const gh = new FlakyGitHub(inner);
+    gh.failComments = 1;
+
+    // The one scan in review fails: the watermark must NOT be consumed.
+    reconcileTaskFromProvider(db, t.id, { github: gh });
+    expect(getTask(db, t.id)!.pr_updated_at).toBeNull();
+    expect(getTask(db, t.id)!.phase).toBe("review");
+
+    // Once the read recovers, the marker is applied.
+    for (let i = 0; i < 3; i++) reconcileTaskFromProvider(db, t.id, { github: gh });
+    expect(getTask(db, t.id)!.phase).toBe("integration");
+  });
+});

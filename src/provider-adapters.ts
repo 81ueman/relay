@@ -125,7 +125,7 @@ export class GhCliGitHub implements GitHubReadOnly {
     }
   }
 
-  listComments(ref: PrRef): CommentView[] {
+  listComments(ref: PrRef): CommentView[] | null {
     const out: CommentView[] = [];
     const paths = [
       `repos/${ref.repo}/issues/${ref.number}/comments`,
@@ -134,7 +134,10 @@ export class GhCliGitHub implements GitHubReadOnly {
     ];
     for (const path of paths) {
       const r = this.exec(["gh", "api", path, "--paginate"]);
-      if (!r.ok) continue;
+      // ANY endpoint failing means the stream is incomplete: report failure
+      // (null) rather than a partial list, so the caller does not treat a
+      // transient 5xx / rate-limit as "no comments" and consume the watermark.
+      if (!r.ok) return null;
       for (const obj of parseJsonStream(r.stdout)) {
         const items = Array.isArray(obj) ? obj : [obj];
         for (const c of items as Record<string, unknown>[]) {
