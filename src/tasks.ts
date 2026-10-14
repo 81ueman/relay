@@ -50,12 +50,17 @@ export const STALE_LEASE = "STALE_LEASE";
 // remedy — `relay task depend <gate> <inputs>` — actually work (T295).
 // `t.role = 'reviewer'` is NULL-safe via IFNULL: SQL three-valued logic would
 // otherwise make `NOT (NULL AND ...)` NULL and silently admit every gated task.
+// ISH-759: a code-change prerequisite counts as done only when its bound PR is
+// MERGED (or it has no PR). An internal accept is not "truly done", so a parent
+// roll-up / a dependent task does not fire on a review PASS.
+const DEP_DONE_SQL =
+  `(d.state = 'done' AND (IFNULL(d.code_change, 0) != 1 OR d.pr_url IS NULL OR d.merged_at IS NOT NULL))`;
 const DEPS_DONE_SQL = `NOT EXISTS (
   SELECT 1 FROM task_deps dep
     LEFT JOIN tasks d ON d.id = dep.depends_on
    WHERE dep.task_id = t.id
      AND (d.id IS NULL
-          OR (d.state != 'done' AND NOT (IFNULL(t.role, '') = 'reviewer' AND d.state = 'review')))
+          OR (NOT ${DEP_DONE_SQL} AND NOT (IFNULL(t.role, '') = 'reviewer' AND d.state = 'review')))
 )`;
 const REVIEW_GATE_SQL =
   `(t.role IS NOT 'reviewer'
@@ -68,7 +73,10 @@ const CONTAINER_TASK_SQL = `NOT EXISTS (SELECT 1 FROM tasks c WHERE c.parent_tas
 // A code-change task parked at `merge_ready` is waiting for the mandatory
 // TaskAccepted gate, not for an implementer/reviewer: it is never offered.
 const MERGE_READY_SQL = `NOT (IFNULL(t.code_change, 0) = 1 AND t.phase = 'merge_ready')`;
-const RUNNABLE_TASK_SQL = `t.state = 'queued' AND ${DEPS_DONE_SQL} AND ${REVIEW_GATE_SQL} AND ${CONTAINER_TASK_SQL} AND ${MERGE_READY_SQL}`;
+// ISH-759: a task whose verify phase is MECHANICAL is owned by Relay, not a
+// worker—it is never offered to the claim machine (no LLM waits on verify).
+const RELAY_OWNED_SQL = `IFNULL(t.claim_role, '') != 'relay'`;
+const RUNNABLE_TASK_SQL = `t.state = 'queued' AND ${DEPS_DONE_SQL} AND ${REVIEW_GATE_SQL} AND ${CONTAINER_TASK_SQL} AND ${MERGE_READY_SQL} AND ${RELAY_OWNED_SQL}`;
 
 /** The role gate a task presents: a phase-derived `claim_role` wins over `role`. */
 export function effectiveTaskRole(task: Pick<Task, "role" | "claim_role">): string | null {
@@ -341,7 +349,8 @@ export function dependenciesMet(db: Database, task: Task): boolean {
          LEFT JOIN tasks d ON d.id = dep.depends_on
         WHERE dep.task_id = ?
           AND (d.id IS NULL
-               OR (d.state != 'done' AND NOT (? AND d.state = 'review')))`
+               OR (NOT (d.state = 'done' AND (IFNULL(d.code_change, 0) != 1 OR d.pr_url IS NULL OR d.merged_at IS NOT NULL))
+                   AND NOT (? AND d.state = 'review')))`
     )
     .get(task.id, relaxed ? 1 : 0) as { n: number };
   return unmet.n === 0;
@@ -364,6 +373,7 @@ export function hasChildren(db: Database, taskId: string): boolean {
 export function isRunnableNow(db: Database, task: Task, reviewExists?: boolean): boolean {
   if (task.state !== "queued") return false;
   if (task.code_change === 1 && task.phase === "merge_ready") return false; // mandatory gate
+  if (effectiveTaskRole(task) === "relay") return false; // Relay-owned mechanical verify
   if (hasChildren(db, task.id)) return false; // a container is a roll-up, not work
   if (!dependenciesMet(db, task)) return false;
   const role = effectiveTaskRole(task);
@@ -596,7 +606,54 @@ export function unblockTask(db: Database, taskId: string, workerId: string): Tas
   // there is no owner to preserve — preserving a lease would hand the next
   // claim a stale fence. The follow-on `submit` therefore gets STALE_LEASE and
   // now says to re-claim (see submitTask).
-  db.query(`UPDATE tasks SET state = 'queued', assignee = NULL, lease_until = NULL, updated_at = ? WHERE id = ?`).run(t, taskId);
+  //
+  // ISH-759: a code-change task blocked at `verify` (a mechanical NOT_RUN /
+  // INCONCLUSIVE) or `review` (a review BLOCKED / a Linear HOLD) already has a
+  // structured result for the current attempt, so simply requeueing would be a
+  // permanent dead end (the phase would be skipped, claimed, and refused). A
+  // resolved block therefore continues as a FRESH ATTEMPT: route back to
+  // `implement` at attempt+1 with the head cleared, so the same Task runs
+  // implement -> verify -> review again.
+  const blockingResult =
+    task.code_change === 1
+      ? task.phase === "verify"
+        ? findTaskResult(db, taskId, "verify", task.attempt, "VerificationResult")
+        : task.phase === "review"
+          ? findTaskResult(db, taskId, "review", task.attempt, "ReviewResult")
+          : null
+      : null;
+  if (blockingResult && blockingResult.passed === 0) {
+    db.query(
+      `UPDATE tasks
+          SET state = 'queued', assignee = NULL, lease_until = NULL,
+              phase = 'implement', attempt = attempt + 1, claim_role = role,
+              head_sha = NULL, updated_at = ?
+        WHERE id = ?`
+    ).run(t, taskId);
+    logEvent(db, {
+      source: "workflow",
+      workerId,
+      taskId,
+      type: "workflow.unblock_resume",
+      payload: { fromPhase: task.phase, attempt: task.attempt + 1 },
+    });
+    requestReconcile(db, `unblock-resume:${taskId}`);
+  } else if (task.code_change === 1 && task.phase === "review") {
+    // A HOLD that landed in `review` BEFORE any review left no result, so there
+    // is nothing to supersede — but a `queued` review-phase task is claimed as
+    // `running` by `claimNext`, and `recordReview` then refuses it. Restore the
+    // state a verify PASS produces (`review`, claim_role=reviewer), which
+    // `claimNext`/`reviewTasks` keep at `review`, so the review can proceed.
+    db.query(
+      `UPDATE tasks
+          SET state = 'review', assignee = NULL, lease_until = NULL,
+              claim_role = 'reviewer', updated_at = ?
+        WHERE id = ?`
+    ).run(t, taskId);
+    requestReconcile(db, `unblock-review:${taskId}`);
+  } else {
+    db.query(`UPDATE tasks SET state = 'queued', assignee = NULL, lease_until = NULL, updated_at = ? WHERE id = ?`).run(t, taskId);
+  }
   logEvent(db, { source: "worker", workerId, taskId, type: "task.unblocked" });
   return getTask(db, taskId)!;
 }
@@ -621,13 +678,12 @@ export function unblockTask(db: Database, taskId: string, workerId: string): Tas
  * task is not ours to clobber (e.g. a reviewer approving a child after the
  * submitter already moved on).
  */
-function clearCurrentTaskOrRestoreParent(
+export function clearCurrentTaskOrRestoreParent(
   db: Database,
   workerId: string,
   releasedId: string,
   at = now()
-): void {
-  const w = getWorker(db, workerId);
+): void {  const w = getWorker(db, workerId);
   if (!w || w.current_task_id !== releasedId) return;
   const next = db
     .query(

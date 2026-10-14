@@ -6,6 +6,8 @@ import { buildRuntime } from "./runtime/herdr";
 import type { Runtime } from "./runtime/runtime";
 import { reconcile } from "./reconciler";
 import { reconcileRequestToken } from "./workflow";
+import { providerDepsFromEnv } from "./provider-adapters";
+import type { WorkflowDeps } from "./workflow-driver";
 import { startSocketServer, type SocketContext, type SocketHandle } from "./socket";
 import {
   acquireSupervisorLock,
@@ -56,6 +58,9 @@ export async function runDaemon(opts: DaemonOptions = {}): Promise<void> {
   const rt = opts.runtime ?? buildRuntime();
   const sockPath = opts.sockPath ?? defaultSockPath();
   const guard = !opts.bypassSingleton;
+  // ISH-759: read-only provider readers + authorized-reviewer config, opt-in via
+  // env. Default OFF, so provider reconciliation is a no-op unless enabled.
+  const workflowDeps: WorkflowDeps = providerDepsFromEnv();
 
   let lock: SupervisorLock | null = null;
   let sock: SocketHandle | null = null;
@@ -108,7 +113,7 @@ export async function runDaemon(opts: DaemonOptions = {}): Promise<void> {
         ctx.wakeReconcile.value = false;
         lastReconcile = nowMs;
         try {
-          const { view, actions } = await reconcile(db, rt);
+          const { view, actions } = await reconcile(db, rt, undefined, workflowDeps);
           if (actions.length > 0) {
             console.error(
               `[relay] reconcile status=${view.status} runnable=${view.runnable} working=${view.working} actions=${actions.join(",")}`

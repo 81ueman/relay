@@ -86,6 +86,33 @@ export interface Task {
   pr_url: string | null;
   branch: string | null;
   head_sha: string | null;
+  /**
+   * ISH-759 provider binding: the PR's repo (`owner/name`), base ref + resolved
+   * base SHA, and the diff ref (`base...head`). Recorded so a review/verify
+   * result is bound to the exact revision it judged, not a re-resolved one.
+   */
+  pr_repo: string | null;
+  pr_base: string | null;
+  pr_base_sha: string | null;
+  pr_diff: string | null;
+  /**
+   * ISH-759: the standard commands Relay runs MECHANICALLY in the verify phase,
+   * as a JSON `CheckSpec[]`. NULL/`[]` means verify falls back to the manual
+   * worker path (legacy ISH-758 behaviour).
+   */
+  checks_json: string | null;
+  /**
+   * ISH-759: the per-task worktree Relay runs mechanical verify in. Mechanical
+   * verify only PASSes when `git rev-parse HEAD` in this cwd equals `head_sha`,
+   * so commands run against the recorded revision, not the daemon's checkout.
+   */
+  worktree: string | null;
+  /** ISH-759: last time this task's provider state was polled (throttle). */
+  provider_polled_at: number | null;
+  /** ISH-759: the PR `updatedAt` last seen (fetch comments only when it moves). */
+  pr_updated_at: string | null;
+  /** ISH-759: when the bound PR was confirmed merged (the true "done"). */
+  merged_at: number | null;
   /** Evidence ref for the CURRENT attempt (a structured-result id or note id). */
   result_ref: string | null;
   /** Review profile used for duplicate-dispatch protection (e.g. "default"). */
@@ -103,14 +130,30 @@ export interface Task {
  * duplicate submission / duplicate review for the same work.
  */
 export const RESULT_KINDS = [
+  /** an implement/integration attempt was handed in (ISH-759 "ImplementationSubmitted"). */
   "TaskSubmitted",
   "VerificationResult",
   "ReviewResult",
   "ChildBlocked",
   "ChildrenReady",
   "TaskAccepted",
+  /**
+   * ISH-759: the bound PR was confirmed MERGED on GitHub at the recorded head.
+   * This is the only signal that makes a code-change task "truly done" for the
+   * provider; a review PASS or an internal TaskAccepted is not a merge.
+   */
+  "TaskMerged",
 ] as const;
 export type ResultKind = (typeof RESULT_KINDS)[number];
+
+/**
+ * ISH-759 mechanical verification outcome. `pass`/`fail` are process exit
+ * results; `not_run` is a REQUIRED check that could not be executed and
+ * `inconclusive` a check whose result could not be trusted. The latter two BLOCK
+ * (never PASS) so a NOT_RUN required test can never satisfy the gate.
+ */
+export const VERIFY_OUTCOMES = ["pass", "fail", "not_run", "inconclusive"] as const;
+export type VerifyOutcome = (typeof VERIFY_OUTCOMES)[number];
 
 export interface TaskResult {
   id: number;
@@ -342,6 +385,16 @@ CREATE TABLE IF NOT EXISTS tasks (
   pr_url TEXT,
   branch TEXT,
   head_sha TEXT,
+  -- ISH-759 provider binding + mechanical-verify spec.
+  pr_repo TEXT,
+  pr_base TEXT,
+  pr_base_sha TEXT,
+  pr_diff TEXT,
+  checks_json TEXT,
+  worktree TEXT,
+  provider_polled_at INTEGER,
+  pr_updated_at TEXT,
+  merged_at INTEGER,
   result_ref TEXT,
   review_profile TEXT,
   accepted_at INTEGER,

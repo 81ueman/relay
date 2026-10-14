@@ -4,6 +4,7 @@ import { defaultSockPath } from "./db";
 import { logEvent } from "./events";
 import { resolveKind } from "./harness";
 import { handleErrorSignal, handleIdleSignal, reconcile } from "./reconciler";
+import { providerDepsFromEnv } from "./provider-adapters";
 import type { HerdrIdentity, Runtime } from "./runtime/runtime";
 import { contextLimitTokens } from "./scheduler";
 import { attachSession, detachSession, gateEvent, getSession, managedWorkerForSession, releaseUnhostedBinding } from "./sessions";
@@ -284,7 +285,7 @@ export async function handleSocketMessage(msg: SocketMessage, ctx: SocketContext
     const outcome = handleErrorSignal(db, workerId, err.slice(0, 500));
     ctx.wakeReconcile.value = true; // suspect/dead candidate: reconcile now
     // Run one immediate pass so crash recovery doesn't wait for the tick.
-    const { actions } = await reconcile(db, runtime).catch((e) => ({ actions: [`error:${String(e).slice(0, 100)}`] }));
+    const { actions } = await reconcile(db, runtime, undefined, providerDepsFromEnv()).catch((e) => ({ actions: [`error:${String(e).slice(0, 100)}`] }));
     void outcome;
     return { ok: true, reconciled: actions };
   }

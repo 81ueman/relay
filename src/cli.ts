@@ -24,7 +24,9 @@ import {
   submitTask, taskCounts, taskDependencies, taskChildren, setTaskParent, unblockTask,
   unclaimableRunnableTasks, addNote, setTaskPlan, waitTask,
 } from "./tasks";
-import { acceptTask, intakeTask, recordReview, recordVerification, submitPhase } from "./workflow";
+import { acceptTask, confirmMerged, intakeTask, recordReview, recordVerification, runMechanicalVerification, submitPhase, taskChecks } from "./workflow";
+import { defaultRunner, type CheckSpec } from "./verify";
+import { providerDepsFromEnv } from "./provider-adapters";
 import {
   bindSession, findWorkerBySession, getWorker, listWorkers,
   quietActive, registerWorker, retireWorker, setWorkerState, touchSeen, unretireWorker,
@@ -67,7 +69,7 @@ Usage:
   relay runtime list [--worker <id>] [--state <state>]
 
   relay task add "description" [--title T] [--acceptance A] [--priority N] [--role R] [--parent T1] [--plan <plan-id>] [--depends-on T1,T2]
-  relay task intake --provider P --issue ID [--slice S] [--title T] [--code-change] [--pr URL] [--branch B] [--head SHA]
+  relay task intake --provider P --issue ID [--slice S] [--title T] [--code-change] [--pr URL] [--branch B] [--head SHA] [--repo R] [--base REF] [--check name=cmd ...] [--worktree DIR]
   relay task link <task-id> <plan-id>
   relay task unlink <task-id>
   relay task depend <task-id> <dep-id...> | --clear
@@ -76,8 +78,10 @@ Usage:
 
   relay result submit <task-id> [--evidence E] [--head SHA] [--lease N] [--worker <id>]
   relay result verify <task-id> --pass|--fail [--evidence E] [--head SHA] [--worker <id>]
-  relay result review <task-id> --pass|--fail [--head SHA] [--profile P] [--reason R] [--worker <id>]
+  relay result review <task-id> --pass|--fail|--blocked [--head SHA] [--profile P] [--reason R] [--supersedes <result-id>] [--reviewer <id>] [--worker <id>]
+  relay result merged <task-id> [--head SHA] [--repo R] [--reason R]
   relay result accept <task-id> [--worker <id>]
+  relay verify <task-id> [--cwd <dir>] [--head SHA]   # mechanical verify (Relay runs the commands)
 
   relay next [--worker <id>] [--role <r>] [--any-role]
   relay claim <task-id> [--worker <id>] [--role <r>] [--any-role]
@@ -224,20 +228,26 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
   },
   "task intake": {
     about:
-      "Idempotent code-change intake, keyed by (provider, issue ID, slice). Replaying the same intake returns the SAME task; a different --slice of the same issue is a DIFFERENT task. --code-change marks it as a code-change task, which enforces the mandatory phase gate (implement -> verify -> review -> integration -> merge_ready -> accepted); `relay approve`/RELAY_AUTO_APPROVE can never complete it. --pr/--branch/--head link the PR; a review PASS is invalid once the head moves.",
+      "Idempotent code-change intake, keyed by (provider, issue ID, slice). Replaying the same intake returns the SAME task; a different --slice of the same issue is a DIFFERENT task. --code-change marks it as a code-change task, which enforces the mandatory phase gate (implement -> verify -> review -> integration -> merge_ready -> merged); `relay approve`/RELAY_AUTO_APPROVE can never complete it. --pr/--branch/--head/--repo/--base link the PR; a review PASS is invalid once the head moves. --check name=command (repeatable) makes verify MECHANICAL: Relay runs the command in --worktree and only passes when that checkout's `git rev-parse HEAD` equals --head (no LLM waits).",
     usage: [
-      "relay task intake --provider P --issue ID [--slice S] [--title T] [--role R] [--priority N] [--parent T1] [--code-change] [--pr URL] [--branch B] [--head SHA]",
+      "relay task intake --provider P --issue ID [--slice S] [--title T] [--role R] [--priority N] [--parent T1] [--code-change] [--pr URL] [--branch B] [--head SHA] [--repo R] [--base REF] [--check name=cmd ...] [--worktree DIR]",
     ],
   },
   result: {
     about:
-      "Record a STRUCTURED workflow result and advance the task's phase (the source of truth — `relay send` prose is never parsed for a verdict). submit advances implement/integration; verify and review record a pass/fail; accept is the only way a code-change task becomes done (it must be at merge_ready). Duplicate/stale results are refused.",
+      "Record a STRUCTURED workflow result and advance the task's phase (the source of truth — `relay send` prose is never parsed for a verdict). submit advances implement/integration; verify and review record an outcome; review --blocked parks the task for a human; merged confirms a real GitHub merge (the only 'truly done' signal for a task with a PR); accept is the only way a code-change task becomes terminal internally (it must be at merge_ready). Duplicate/stale results are refused, and an unresolved NG at the same HEAD is never cleared by a later OK alone.",
     usage: [
       "relay result submit <task-id> [--evidence E] [--head SHA] [--lease N] [--worker <id>]",
       "relay result verify <task-id> --pass|--fail [--evidence E] [--head SHA] [--worker <id>]",
-      "relay result review <task-id> --pass|--fail [--head SHA] [--profile P] [--reason R] [--worker <id>]",
+      "relay result review <task-id> --pass|--fail|--blocked [--head SHA] [--profile P] [--reason R] [--supersedes <result-id>] [--reviewer <id>] [--worker <id>]",
+      "relay result merged <task-id> [--head SHA] [--repo R] [--reason R]",
       "relay result accept <task-id> [--worker <id>]",
     ],
+  },
+  verify: {
+    about:
+      "Run a task's mechanical-verify checks (the standard commands recorded at intake) and advance the phase from the PROCESS EXIT RESULT: pass -> review, fail -> implement FIX, a required NOT_RUN/INCONCLUSIVE -> BLOCKED. The daemon does this automatically for a Relay-owned verify phase; this entrypoint is for an explicit run.",
+    usage: ["relay verify <task-id> [--cwd <dir>] [--head SHA]"],
   },
   "task list": { about: "List tasks (id, state, priority, role, assignee, plan, depends, title).", usage: ["relay task list [--state <state>]"] },
   "task show": { about: "Print one task as JSON (includes depends_on). Notes go to stderr so stdout stays parseable; --json emits ONE document with the task, its dependencies and its notes.", usage: ["relay task show <id> [--json]"] },
@@ -404,6 +414,29 @@ function flagValues(args: string[], name: string): string[] {
     i++;
   }
   return out.map((s) => s.trim()).filter((s) => s.length > 0);
+}
+
+/** Like flagValues but WITHOUT comma-splitting (for command strings). */
+function flagRepeated(args: string[], name: string): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] !== name) continue;
+    const v = args[i + 1];
+    if (v !== undefined && !v.startsWith("-")) out.push(v);
+    i++;
+  }
+  return out;
+}
+
+/** Parse repeatable `--check name=command` flags into mechanical-verify specs. */
+function parseCheckFlags(values: string[]): CheckSpec[] {
+  const out: CheckSpec[] = [];
+  for (const v of values) {
+    const eq = v.indexOf("=");
+    if (eq <= 0) throw new Error(`--check must be name=command (got '${v}')`);
+    out.push({ name: v.slice(0, eq).trim(), command: v.slice(eq + 1).trim(), required: true });
+  }
+  return out;
 }
 
 function resolveWorkerId(db: ReturnType<typeof openDb>, explicit?: string): string {
@@ -936,6 +969,12 @@ async function main(): Promise<void> {
             prUrl: flag(rest, "--pr") ?? undefined,
             branch: flag(rest, "--branch") ?? undefined,
             headSha: flag(rest, "--head") ?? undefined,
+            prRepo: flag(rest, "--repo") ?? undefined,
+            prBase: flag(rest, "--base") ?? undefined,
+            prBaseSha: flag(rest, "--base-sha") ?? undefined,
+            prDiff: flag(rest, "--diff") ?? undefined,
+            checks: parseCheckFlags(flagRepeated(rest, "--check")),
+            worktree: flag(rest, "--worktree") ?? undefined,
           });
           console.log(
             `${t.id} ${t.code_change === 1 ? `code-change phase=${t.phase}` : "task"} provider=${t.provider} issue=${t.issue_id} slice=${t.slice === "" ? "-" : t.slice} state=${t.state}`
@@ -1124,21 +1163,62 @@ async function main(): Promise<void> {
         } else if (sub === "review") {
           const passed = hasFlag(rest, "--pass");
           const failed = hasFlag(rest, "--fail");
-          if (passed === failed) throw new Error("relay result review requires exactly one of --pass / --fail");
+          const blocked = hasFlag(rest, "--blocked");
+          const chosen = [passed, failed, blocked].filter(Boolean).length;
+          if (chosen !== 1) {
+            throw new Error("relay result review requires exactly one of --pass / --fail / --blocked");
+          }
+          const supersedesRaw = flag(rest, "--supersedes");
           const t = recordReview(db, id, workerId, {
-            verdict: passed ? "pass" : "fail",
+            verdict: passed ? "pass" : failed ? "fix" : "blocked",
             headSha: flag(rest, "--head") ?? undefined,
             profile: flag(rest, "--profile") ?? undefined,
             reason: flag(rest, "--reason") ?? undefined,
             evidence: flag(rest, "--evidence") ?? undefined,
+            externalReviewer: flag(rest, "--reviewer") ?? undefined,
+            source: flag(rest, "--source") ?? undefined,
+            supersedesResultId: supersedesRaw !== undefined ? Number(supersedesRaw) : undefined,
           });
           console.log(`${t.id} -> phase=${t.phase} state=${t.state}`);
+        } else if (sub === "merged") {
+          const t = confirmMerged(db, id, {
+            headSha: flag(rest, "--head") ?? undefined,
+            repo: flag(rest, "--repo") ?? undefined,
+            actor: flag(rest, "--worker") ? resolveWorkerId(db, flag(rest, "--worker")) : "cli",
+            reason: flag(rest, "--reason") ?? undefined,
+          });
+          console.log(`${t.id} -> merged_at=${t.merged_at} phase=${t.phase} state=${t.state}`);
         } else if (sub === "accept") {
           const t = acceptTask(db, id, workerId);
           console.log(`${t.id} -> done (accepted)`);
         } else {
           throw new Error(`unknown result subcommand: ${sub}`);
         }
+        break;
+      }
+
+      case "verify": {
+        // ISH-759: run a task's standard commands mechanically and advance from
+        // the process exit result. Normally the daemon does this automatically;
+        // this entrypoint is for an explicit/manual run.
+        const rest = argv.slice(1);
+        const id = positionals(rest)[0];
+        if (!id) throw new Error("usage: relay verify <task-id> [--cwd <dir>] [--head SHA]");
+        const task = getTask(db, id);
+        if (!task) throw new Error(`unknown task: ${id}`);
+        const checks = taskChecks(task);
+        if (checks.length === 0) throw new Error(`task ${id} has no mechanical checks (intake it with --check name=command)`);
+        const cwd = flag(rest, "--cwd") ?? task.worktree ?? process.env.RELAY_VERIFY_CWD ?? process.cwd();
+        const { task: after, outcome, checks: executed, stale } = await runMechanicalVerification(db, id, {
+          checks,
+          runner: defaultRunner,
+          cwd,
+          headSha: flag(rest, "--head") ?? undefined,
+        });
+        for (const c of executed) {
+          console.log(`check ${c.name}: ${c.outcome}${c.exitCode === null ? "" : ` (exit ${c.exitCode})`}`);
+        }
+        console.log(`${after.id} verify=${outcome}${stale ? " stale-discarded" : ""} -> phase=${after.phase} state=${after.state}`);
         break;
       }
 
@@ -1584,7 +1664,7 @@ async function main(): Promise<void> {
         } else if (type === "session.error" && workerId) {
           const err = typeof payload === "object" && payload !== null ? JSON.stringify(payload) : String(payload);
           console.log(handleErrorSignal(db, workerId, err));
-          const { actions } = await reconcile(db, rt);
+          const { actions } = await reconcile(db, rt, undefined, providerDepsFromEnv());
           console.log(`reconciled:${actions.join(",") || "noop"}`);
         } else if (type === "permission.asked" && workerId) {
           touchSeen(db, workerId);

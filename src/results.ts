@@ -91,6 +91,38 @@ export function findSubmissionForAttempt(db: Database, taskId: string, attempt: 
   );
 }
 
+/** Every ReviewResult recorded at an exact head, oldest first. */
+export function listReviewsAtHead(db: Database, taskId: string, headSha: string | null): TaskResult[] {
+  if (!headSha) return [];
+  return db
+    .query(
+      `SELECT * FROM task_results
+        WHERE task_id = ? AND kind = 'ReviewResult' AND head_sha = ?
+        ORDER BY id ASC`
+    )
+    .all(taskId, headSha) as TaskResult[];
+}
+
+/**
+ * ISH-759: an NG at this HEAD that no LATER review at the same head has cleared.
+ * A later OK at the same head does not, by itself, clear it — the pass must
+ * explicitly supersede the NG (see `recordReview({supersedesResultId})`).
+ */
+export function findUnresolvedNgAtHead(db: Database, taskId: string, headSha: string | null): TaskResult | null {
+  const reviews = listReviewsAtHead(db, taskId, headSha);
+  const last = reviews[reviews.length - 1];
+  return last && last.passed === 0 ? last : null;
+}
+
+/** The TaskMerged result for a task, if the bound PR was confirmed merged. */
+export function findMergedResult(db: Database, taskId: string): TaskResult | null {
+  return (
+    (db
+      .query(`SELECT * FROM task_results WHERE task_id = ? AND kind = 'TaskMerged' ORDER BY id DESC LIMIT 1`)
+      .get(taskId) as TaskResult | null) ?? null
+  );
+}
+
 export function insertTaskResult(db: Database, r: TaskResultInput): TaskResult {
   const t = now();
   const row = db
