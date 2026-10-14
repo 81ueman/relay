@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   aggregateOutcome,
+  defaultRunner,
   isBlockingOutcome,
   parseChecks,
   runChecks,
@@ -105,5 +106,30 @@ describe("runChecks with a read-only fake runner", () => {
     const r = await runChecks([spec("typecheck", "bun run typecheck")], throwing, "/work");
     expect(r.outcome).toBe("not_run");
     expect(r.checks[0].outcome).toBe("not_run");
+  });
+});
+
+describe("defaultRunner hard timeout (finding 5)", () => {
+  test("a hung command with a live grandchild is killed as a group and returns not_run fast", async () => {
+    // `sleep` is a grandchild of bash; it holds the stdout pipe open. Without a
+    // process-group kill the reader would block until sleep exits (~4s).
+    const started = Date.now();
+    const r = await defaultRunner.run(
+      { name: "slow", command: "sleep 4; echo done", required: true, timeoutMs: 300 },
+      { cwd: process.cwd() }
+    );
+    const elapsed = Date.now() - started;
+    expect(r.outcome).toBe("not_run");
+    expect(r.output).toContain("timed out");
+    expect(elapsed).toBeLessThan(2000);
+  });
+
+  test("a fast command still reports its real exit result", async () => {
+    const ok = await defaultRunner.run({ name: "ok", command: "true", required: true }, { cwd: process.cwd() });
+    expect(ok.outcome).toBe("pass");
+    expect(ok.exitCode).toBe(0);
+    const bad = await defaultRunner.run({ name: "bad", command: "false", required: true }, { cwd: process.cwd() });
+    expect(bad.outcome).toBe("fail");
+    expect(bad.exitCode).toBe(1);
   });
 });

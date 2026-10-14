@@ -256,12 +256,21 @@ implement --TaskSubmitted--> verify --VerificationResult--> review
 ```
 
 - **Mechanical verify, no LLM wait.** Intake the standard commands with
-  `--check name=command` (repeatable). When a task reaches `verify`, Relay runs
-  them itself and reads the **process exit result**: pass → review,
-  fail → implement FIX, and a **required** `not_run`/`inconclusive` → BLOCKED
-  (never PASS). The verify phase is Relay-owned (`claim_role=relay`), so the
-  claim machine never offers it to a worker. Without `--check`, verify stays the
-  manual worker path. `relay verify <task>` runs the same checks explicitly.
+  `--check name=command` (repeatable) and the checkout with `--worktree DIR`. When
+  a task reaches `verify`, Relay runs them itself and reads the **process exit
+  result**. Before running it confirms that `git rev-parse HEAD` in the worktree
+  equals the recorded `head_sha`; a missing/unreadable/mismatched head records
+  `not_run` and BLOCKS — a PASS is never credited to a tree the commands did not
+  run against. pass → review, fail → implement FIX, a **required**
+  `not_run`/`inconclusive` → BLOCKED. The verify phase is Relay-owned
+  (`claim_role=relay`), so the claim machine never offers it to a worker. Each
+  command has a hard timeout: it runs in its own process group and the whole tree
+  is killed on timeout, so a hung check cannot stall the daemon. Without `--check`,
+  verify stays the manual worker path. `relay verify <task>` runs the same checks.
+- **A block is resumable.** `relay unblock` on a code task blocked at `verify` (a
+  NOT_RUN/INCONCLUSIVE) or `review` (a review BLOCKED or a Linear HOLD) routes the
+  SAME task back to `implement` at `attempt+1` with the head cleared, so it is not
+  a dead end; a review with no stored result just resumes at `review`.
 - **Independent review.** VERIFY PASS moves the task to `review` and the ordinary
   reviewer wake dispatches an idle reviewer in the same reconcile pass. The
   reviewer must hold `REVIEWER_ROLE` (or the review claim) and may not be the
@@ -272,16 +281,24 @@ implement --TaskSubmitted--> verify --VerificationResult--> review
   alone** (it must `--supersedes <result-id>` explicitly).
 - **Provider reconciliation is read-only / fail-closed.** With a bound PR, Relay
   polls open/synchronize/merged: a head move invalidates the review, and a
-  `merged` PR at the recorded head records `TaskMerged`. Review verdicts are
-  absorbed from `lane.sh`'s `<!-- ishiul-review head=<sha> verdict=OK|NG|HOLD
-  reviewer=<id> -->` markers, but only from an authorized reviewer identity — a
-  reviewer's TurnEnded, a GitHub **label**, and a self-claimed comment are **not**
-  an approval. Any real provider write (comment/label), Linear write, or merge
-  requires an explicit point-of-use `ProviderAuthority` grant (ISH-288); the
-  default is deny.
+  `merged` PR at the recorded head records `TaskMerged`. A real merge is the
+  **only** "truly done" for a task with a PR: an internal accept does not satisfy
+  `ChildrenReady`, and a dependent task is not runnable until a PR-bound
+  prerequisite is merged. Review verdicts are absorbed from `lane.sh`'s
+  `<!-- ishiul-review head=<sha> verdict=OK|NG|HOLD reviewer=<id> -->` markers, but
+  only from an authorized reviewer identity — a reviewer's TurnEnded, a GitHub
+  **label**, and a self-claimed comment are **not** an approval. A real merge is
+  the only thing that completes an issue.
+- **Providers are opt-in GET-only readers.** `RELAY_PROVIDER_GITHUB=gh` uses the
+  `gh` CLI (read verbs only), `RELAY_PROVIDER_LINEAR=api` + `LINEAR_API_TOKEN`
+  uses a read-only GraphQL query, and `RELAY_REVIEW_AUTHORIZED=a,b` sets the
+  authorized marker authors. Default OFF (no provider, fail-closed). Any real
+  provider write (comment/label), Linear write, or merge requires an explicit
+  point-of-use `ProviderAuthority` grant (ISH-288); the default is deny.
 - **Gateway is notified only for judgment.** `ChildrenReady` (all direct children
-  accepted) and `ChildBlocked` (a blocked child) reach the fixed Gateway worker;
-  ordinary FIX/PASS never wake it. The Gateway is never a per-phase coordinator.
+  truly complete) and `ChildBlocked` (a blocked child) reach the fixed Gateway
+  worker; ordinary FIX/PASS never wake it. The Gateway is never a per-phase
+  coordinator.
 
 ### Historical cleanup: `relay gc`
 

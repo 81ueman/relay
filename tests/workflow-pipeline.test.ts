@@ -6,8 +6,8 @@ import type { Database } from "bun:sqlite";
 import { openDb } from "../src/db";
 import { MockRuntime } from "../src/runtime/runtime";
 import { reconcile } from "../src/reconciler";
-import { claimNext, claimTask, getTask, runnableTasks } from "../src/tasks";
-import { registerWorker } from "../src/workers";
+import { addTask, claimNext, claimTask, getTask, runnableTasks, unblockTask } from "../src/tasks";
+import { getWorker, registerWorker } from "../src/workers";
 import {
   acceptTask,
   codeChangeGateSatisfied,
@@ -82,12 +82,34 @@ function countMessages(recipient: string, kind: string): number {
   ).n;
 }
 
+/** Run mechanical verify with the task's own head as the bound head (test fake). */
+async function mechanical(
+  id: string,
+  outcome: ExecutedCheck["outcome"],
+  opts: { onRun?: () => void; head?: string } = {}
+) {
+  return runMechanicalVerification(db, id, {
+    checks: taskChecks(getTask(db, id)!),
+    runner: outcomeRunner(outcome, opts.onRun),
+    cwd: "/work",
+    headProbe: () => opts.head ?? getTask(db, id)!.head_sha,
+  });
+}
+
 /** Drive implement -> mechanical verify(pass) -> review, leaving the task in review. */
 async function toReview(id: string, runner?: CommandRunner): Promise<void> {
   claimTask(db, id, "impl");
   submitPhase(db, id, "impl", { headSha: getTask(db, id)!.head_sha ?? undefined });
-  const t = getTask(db, id)!;
-  await runMechanicalVerification(db, id, { checks: taskChecks(t), runner: runner ?? outcomeRunner("pass"), cwd: "/work" });
+  if (runner) {
+    await runMechanicalVerification(db, id, {
+      checks: taskChecks(getTask(db, id)!),
+      runner,
+      cwd: "/work",
+      headProbe: () => getTask(db, id)!.head_sha,
+    });
+  } else {
+    await mechanical(id, "pass");
+  }
 }
 
 describe("mechanical verification: Relay runs the commands, no LLM waits", () => {
@@ -113,7 +135,7 @@ describe("mechanical verification: Relay runs the commands, no LLM waits", () =>
     const t = intakeTask(db, { provider: "github", issueId: "o/r#3", codeChange: true, headSha: FULL, checks: [CHECK] });
     claimTask(db, t.id, "impl");
     submitPhase(db, t.id, "impl", { headSha: FULL });
-    const r = await runMechanicalVerification(db, t.id, { checks: taskChecks(getTask(db, t.id)!), runner: outcomeRunner("fail"), cwd: "/work" });
+    const r = await mechanical(t.id, "fail");
     expect(r.outcome).toBe("fail");
     expect(r.task.phase).toBe("implement");
     expect(r.task.state).toBe("queued");
@@ -127,7 +149,7 @@ describe("mechanical verification: Relay runs the commands, no LLM waits", () =>
     const t = intakeTask(db, { provider: "github", issueId: "o/r#4", codeChange: true, headSha: FULL, checks: [CHECK] });
     claimTask(db, t.id, "impl");
     submitPhase(db, t.id, "impl", { headSha: FULL });
-    const r = await runMechanicalVerification(db, t.id, { checks: taskChecks(getTask(db, t.id)!), runner: outcomeRunner("not_run"), cwd: "/work" });
+    const r = await mechanical(t.id, "not_run");
     expect(r.outcome).toBe("not_run");
     expect(r.task.state).toBe("blocked_human");
     expect(findTaskResult(db, t.id, "verify", 0, "VerificationResult")!.passed).toBe(0);
@@ -139,7 +161,7 @@ describe("mechanical verification: Relay runs the commands, no LLM waits", () =>
     const t = intakeTask(db, { provider: "github", issueId: "o/r#5", codeChange: true, headSha: FULL, checks: [CHECK] });
     claimTask(db, t.id, "impl");
     submitPhase(db, t.id, "impl", { headSha: FULL });
-    const r = await runMechanicalVerification(db, t.id, { checks: taskChecks(getTask(db, t.id)!), runner: outcomeRunner("inconclusive"), cwd: "/work" });
+    const r = await mechanical(t.id, "inconclusive");
     expect(r.outcome).toBe("inconclusive");
     expect(r.task.state).toBe("blocked_human");
   });
@@ -148,9 +170,8 @@ describe("mechanical verification: Relay runs the commands, no LLM waits", () =>
     const t = intakeTask(db, { provider: "github", issueId: "o/r#6", codeChange: true, headSha: FULL, checks: [CHECK] });
     claimTask(db, t.id, "impl");
     submitPhase(db, t.id, "impl", { headSha: FULL });
-    // Head moves WHILE the check runs.
-    const runner = outcomeRunner("pass", () => linkTask(db, t.id, { headSha: MOVED }));
-    const r = await runMechanicalVerification(db, t.id, { checks: taskChecks(getTask(db, t.id)!), runner, cwd: "/work" });
+    // Head moves WHILE the check runs; the probe binds to FULL (the start head).
+    const r = await mechanical(t.id, "pass", { head: FULL, onRun: () => linkTask(db, t.id, { headSha: MOVED }) });
     expect(r.stale).toBe(true);
     expect(r.outcome).toBe("pass");
     const live = getTask(db, t.id)!;
@@ -191,7 +212,7 @@ describe("review verdicts: PASS / FIX / BLOCKED", () => {
     // second attempt on a MOVED head, this time BLOCKED
     claimTask(db, t.id, "impl");
     submitPhase(db, t.id, "impl", { headSha: MOVED });
-    await runMechanicalVerification(db, t.id, { checks: taskChecks(getTask(db, t.id)!), runner: outcomeRunner("pass"), cwd: "/work" });
+    await mechanical(t.id, "pass");
     claimNext(db, "rev");
     process.env.RELAY_HUMAN = "gateway";
     registerWorker(db, "gateway", { role: "planner" });
@@ -208,7 +229,7 @@ describe("review verdicts: PASS / FIX / BLOCKED", () => {
     // Re-implement + re-verify the SAME head (a body-only fix does not move it).
     claimTask(db, t.id, "impl");
     submitPhase(db, t.id, "impl", { headSha: FULL });
-    await runMechanicalVerification(db, t.id, { checks: taskChecks(getTask(db, t.id)!), runner: outcomeRunner("pass"), cwd: "/work" });
+    await mechanical(t.id, "pass");
     claimNext(db, "rev");
     expect(findUnresolvedNgAtHead(db, t.id, FULL)).not.toBeNull();
     // A DIFFERENT profile's OK cannot silently clear the NG.
@@ -363,7 +384,7 @@ describe("the reconciler drives verify and providers event-driven", () => {
     claimTask(db, t.id, "impl");
     submitPhase(db, t.id, "impl", { headSha: FULL });
     const rt = new MockRuntime();
-    const deps: WorkflowDeps = { verifyRunner: outcomeRunner("pass"), verifyCwd: "/work" };
+    const deps: WorkflowDeps = { verifyRunner: outcomeRunner("pass"), verifyCwd: "/work", verifyHeadProbe: () => FULL };
     const { actions } = await reconcile(db, rt, Date.now(), deps);
     expect(actions.some((a) => a.startsWith("verify-pass:"))).toBe(true);
     expect(getTask(db, t.id)!.phase).toBe("review");
@@ -393,5 +414,210 @@ describe("read-only authority default", () => {
   test("provider reconciliation with no authority never performs a merge", () => {
     expect(NO_AUTHORITY.merge).toBe(false);
     expect(() => confirmMerged(db, "T404")).toThrow(/unknown task/);
+  });
+});
+
+describe("finding 1: mechanical verify binds to the recorded head", () => {
+  test("a checkout HEAD != the task head BLOCKS (never PASS)", async () => {
+    const t = intakeTask(db, { provider: "github", issueId: "o/r#20", codeChange: true, headSha: FULL, checks: [CHECK] });
+    claimTask(db, t.id, "impl");
+    submitPhase(db, t.id, "impl", { headSha: FULL });
+    // The runner's cwd HEAD is MOVED, not the recorded FULL head.
+    const r = await mechanical(t.id, "pass", { head: MOVED });
+    expect(r.outcome).toBe("not_run");
+    const live = getTask(db, t.id)!;
+    expect(live.state).toBe("blocked_human");
+    expect(live.phase).toBe("verify");
+    const vr = findTaskResult(db, t.id, "verify", 0, "VerificationResult")!;
+    expect(vr.passed).toBe(0);
+    expect(vr.reason).toContain("checkout HEAD");
+  });
+
+  test("the driver uses the task's worktree and its probe", async () => {
+    const t = intakeTask(db, { provider: "github", issueId: "o/r#21", codeChange: true, headSha: FULL, checks: [CHECK] });
+    db.query(`UPDATE tasks SET worktree = ? WHERE id = ?`).run("/wt", t.id);
+    claimTask(db, t.id, "impl");
+    submitPhase(db, t.id, "impl", { headSha: FULL });
+    const actions = await runPendingMechanicalVerifications(db, {
+      verifyRunner: outcomeRunner("pass"),
+      verifyHeadProbe: () => MOVED, // wrong head -> not_run
+    });
+    expect(actions).toContain(`verify-not_run:${t.id}`);
+    expect(getTask(db, t.id)!.state).toBe("blocked_human");
+  });
+});
+
+describe("finding 2: a blocked mechanical verify is resumable", () => {
+  test("unblock routes back to a fresh implement attempt, then re-verifies", async () => {
+    const t = intakeTask(db, { provider: "github", issueId: "o/r#22", codeChange: true, headSha: FULL, checks: [CHECK] });
+    claimTask(db, t.id, "impl");
+    submitPhase(db, t.id, "impl", { headSha: FULL });
+    await mechanical(t.id, "not_run");
+    expect(getTask(db, t.id)!.state).toBe("blocked_human");
+
+    const resumed = unblockTask(db, t.id, "impl");
+    expect(resumed.state).toBe("queued");
+    expect(resumed.phase).toBe("implement");
+    expect(resumed.attempt).toBe(1);
+    expect(resumed.head_sha).toBeNull();
+
+    // The fresh attempt can run implement -> verify -> review again.
+    claimTask(db, t.id, "impl");
+    submitPhase(db, t.id, "impl", { headSha: FULL });
+    await mechanical(t.id, "pass");
+    expect(getTask(db, t.id)!.phase).toBe("review");
+  });
+});
+
+describe("finding 3: a review BLOCKED / Linear HOLD is resumable", () => {
+  test("unblock routes a review BLOCKED back to a fresh attempt", async () => {
+    const t = intakeTask(db, { provider: "github", issueId: "o/r#23", codeChange: true, headSha: FULL, checks: [CHECK] });
+    await toReview(t.id);
+    claimNext(db, "rev");
+    recordReview(db, t.id, "rev", { verdict: "blocked", headSha: FULL, reason: "need human" });
+    expect(getTask(db, t.id)!.state).toBe("blocked_human");
+    expect(getTask(db, t.id)!.phase).toBe("review");
+
+    const resumed = unblockTask(db, t.id, "rev");
+    expect(resumed.phase).toBe("implement");
+    expect(resumed.attempt).toBe(1);
+    expect(resumed.head_sha).toBeNull();
+    // A fresh attempt is claimable and reviewable (no stale ReviewResult dead end).
+    claimTask(db, t.id, "impl");
+    submitPhase(db, t.id, "impl", { headSha: FULL });
+    await mechanical(t.id, "pass");
+    expect(claimNext(db, "rev")?.id).toBe(t.id);
+  });
+
+  test("a Linear HOLD on a review task resumes on unblock", async () => {
+    process.env.RELAY_HUMAN = "gateway";
+    registerWorker(db, "gateway", { role: "planner" });
+    const t = intakeTask(db, { provider: "linear", issueId: "ISH-999", codeChange: true, headSha: FULL, checks: [CHECK] });
+    await toReview(t.id);
+    const lin = new FakeLinear();
+    lin.putIssue({ id: "ISH-999", state: "In Progress", labels: ["hold"], updatedAt: "2026-01-01T00:00:00Z" });
+    reconcileTaskFromProvider(db, t.id, { linear: lin });
+    expect(getTask(db, t.id)!.state).toBe("blocked_human");
+
+    // A review with NO stored result resumes in place (review stays review).
+    const resumed = unblockTask(db, t.id, "gateway");
+    expect(resumed.phase).toBe("review");
+    expect(resumed.state).toBe("queued");
+    expect(claimNext(db, "rev")?.id).toBe(t.id);
+  });
+});
+
+describe("finding 4: quietBlock releases the owning worker", () => {
+  test("a Linear HOLD on a running task clears the worker's current_task_id", async () => {
+    const t = intakeTask(db, { provider: "linear", issueId: "ISH-1000", codeChange: true, headSha: FULL });
+    claimTask(db, t.id, "impl");
+    expect(getWorker(db, "impl")!.current_task_id).toBe(t.id);
+
+    const lin = new FakeLinear();
+    lin.putIssue({ id: "ISH-1000", state: "In Progress", labels: ["hold"], updatedAt: "2026-01-01T00:00:00Z" });
+    reconcileTaskFromProvider(db, t.id, { linear: lin });
+
+    expect(getTask(db, t.id)!.state).toBe("blocked_human");
+    const w = getWorker(db, "impl")!;
+    expect(w.current_task_id).toBeNull();
+    expect(w.state).toBe("idle");
+  });
+});
+
+describe("finding 6: the merge gate is enforced where done is decided", () => {
+  /** Walk a code child (with a PR) all the way to an internal accept. */
+  async function acceptCodeChild(id: string): Promise<void> {
+    await toReview(id);
+    claimNext(db, "rev");
+    recordReview(db, id, "rev", { verdict: "pass", headSha: FULL });
+    claimTask(db, id, "integ");
+    submitPhase(db, id, "integ");
+    acceptTask(db, id, "integ");
+  }
+
+  test("children_ready waits for the real merge of a PR-bound child", async () => {
+    process.env.RELAY_HUMAN = "gateway";
+    registerWorker(db, "gateway", { role: "planner" });
+    const parent = intakeTask(db, { provider: "github", issueId: "o/r#30", codeChange: true, headSha: FULL, checks: [CHECK] });
+    const c1 = intakeTask(db, {
+      provider: "github", issueId: "o/r#30", slice: "a", codeChange: true, headSha: FULL, checks: [CHECK],
+      parentTaskId: parent.id, prUrl: "https://github.com/o/r/pull/1", prRepo: "o/r",
+    });
+    const c2 = intakeTask(db, {
+      provider: "github", issueId: "o/r#30", slice: "b", codeChange: true, headSha: FULL, checks: [CHECK],
+      parentTaskId: parent.id, prUrl: "https://github.com/o/r/pull/2", prRepo: "o/r",
+    });
+    await acceptCodeChild(c1.id);
+    await acceptCodeChild(c2.id);
+    // Both internally accepted; neither merged -> NOT children_ready.
+    expect(countMessages("gateway", "children_ready")).toBe(0);
+    confirmMerged(db, c1.id, { headSha: FULL, repo: "o/r" });
+    expect(countMessages("gateway", "children_ready")).toBe(0); // c2 still unmerged
+    confirmMerged(db, c2.id, { headSha: FULL, repo: "o/r" });
+    expect(countMessages("gateway", "children_ready")).toBe(1); // now truly done
+  });
+
+  test("a PR-bound code dependency is not satisfied until merged", async () => {
+    const dep = intakeTask(db, {
+      provider: "github", issueId: "o/r#31", codeChange: true, headSha: FULL,
+      prUrl: "https://github.com/o/r/pull/3", prRepo: "o/r",
+    });
+    const dependent = addTask(db, { title: "dependent", dependsOn: [dep.id] });
+    // Force the dep to an accepted-but-unmerged state.
+    db.query(`UPDATE tasks SET state = 'done', phase = 'merge_ready' WHERE id = ?`).run(dep.id);
+    expect(runnableTasks(db).some((t) => t.id === dependent.id)).toBe(false);
+    // Now confirm the merge: the dependency is satisfied.
+    confirmMerged(db, dep.id, { headSha: FULL, repo: "o/r" });
+    expect(runnableTasks(db).some((t) => t.id === dependent.id)).toBe(true);
+  });
+});
+
+describe("finding 6: marker application uses the live head and dedupes", () => {
+  test("an abbreviated marker SHA applies against the live full head", async () => {
+    const t = intakeTask(db, {
+      provider: "github", issueId: "o/r#32", codeChange: true, headSha: FULL, checks: [CHECK],
+      prUrl: "https://github.com/o/r/pull/4", prRepo: "o/r",
+    });
+    await toReview(t.id);
+    const gh = new FakeGitHub();
+    gh.putPullRequest({
+      ref: { repo: "o/r", number: 4 }, url: "https://github.com/o/r/pull/4", state: "open", isDraft: false,
+      headRefName: "b", headSha: FULL, baseRef: "main", baseSha: "0".repeat(40), mergeable: "mergeable",
+      labels: [], updatedAt: "2026-01-01T00:00:00Z",
+    });
+    gh.putComments({ repo: "o/r", number: 4 }, [
+      { author: "claude", createdAt: "2026-01-01T00:00:00Z", body: `<!-- ishiul-review head=${FULL.slice(0, 7)} verdict=OK reviewer=claude -->` },
+    ]);
+    const actions = reconcileTaskFromProvider(db, t.id, { github: gh, authorizedReviewers: ["claude"] });
+    expect(actions.some((a) => a.kind === "review-pass")).toBe(true);
+    const result = db.query(`SELECT * FROM task_results WHERE task_id = ? AND kind='ReviewResult'`).get(t.id) as { head_sha: string };
+    expect(result.head_sha).toBe(FULL); // the live FULL head, not the abbreviation
+  });
+
+  test("an unappliable marker logs marker_not_applied once across passes", async () => {
+    const t = intakeTask(db, {
+      provider: "github", issueId: "o/r#33", codeChange: true, headSha: FULL, checks: [CHECK],
+      prUrl: "https://github.com/o/r/pull/5", prRepo: "o/r",
+    });
+    await toReview(t.id);
+    // First, an authorized NG at H (routes to implement, head cleared).
+    claimNext(db, "rev");
+    recordReview(db, t.id, "rev", { verdict: "fix", headSha: FULL });
+    // Back to review at the same head: a stale OK marker cannot apply (duplicate).
+    db.query(`UPDATE tasks SET phase='review', state='review', claim_role='reviewer', assignee=NULL WHERE id = ?`).run(t.id);
+    const gh = new FakeGitHub();
+    gh.putPullRequest({
+      ref: { repo: "o/r", number: 5 }, url: "https://github.com/o/r/pull/5", state: "open", isDraft: false,
+      headRefName: "b", headSha: FULL, baseRef: "main", baseSha: "0".repeat(40), mergeable: "mergeable",
+      labels: [], updatedAt: "2026-01-01T00:00:00Z",
+    });
+    gh.putComments({ repo: "o/r", number: 5 }, [
+      { author: "claude", createdAt: "2026-01-01T00:00:00Z", body: `<!-- ishiul-review head=${FULL} verdict=OK reviewer=claude -->` },
+    ]);
+    for (let i = 0; i < 3; i++) reconcileTaskFromProvider(db, t.id, { github: gh, authorizedReviewers: ["claude"] });
+    const n = db
+      .query(`SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'workflow.marker_not_applied'`)
+      .get(t.id) as { n: number };
+    expect(n.n).toBe(1);
   });
 });
