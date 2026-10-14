@@ -282,7 +282,9 @@ export function reconcileTaskFromProvider(db: Database, taskId: string, deps: Pr
   const actions: ProviderAction[] = [];
   const authorizedReviewers = deps.authorizedReviewers ?? [DEFAULT_REVIEW_OWNER];
 
-  if (task.provider === "github" && deps.github) {
+  // A PR may be bound whatever the intake provider is (e.g. a Linear issue with
+  // a GitHub PR), so consult GitHub whenever a pr_url/pr_repo+branch exists.
+  if (deps.github && (task.pr_url || (task.pr_repo && task.branch))) {
     let ref = parsePrUrl(task.pr_url, task.pr_repo);
     if (!ref && task.branch && task.pr_repo) {
       const byBranch = deps.github.findPullRequestForBranch(task.pr_repo, task.branch);
@@ -311,8 +313,16 @@ export function reconcileTaskFromProvider(db: Database, taskId: string, deps: Pr
           actions.push(...confirmMergeFromView(db, getTask(db, taskId)!, view));
         }
 
+        // Comments cost three `gh api` calls, so fetch them only when the PR
+        // actually moved (updatedAt/head changed since the last poll).
         const live = getTask(db, taskId)!;
-        if (live.phase === "review" && live.state === "review") {
+        const prMoved =
+          (view.updatedAt ?? "") !== (before.pr_updated_at ?? "") ||
+          view.headSha !== (before.head_sha ?? "");
+        if ((view.updatedAt ?? "") !== (before.pr_updated_at ?? "")) {
+          db.query(`UPDATE tasks SET pr_updated_at = ? WHERE id = ?`).run(view.updatedAt ?? "", taskId);
+        }
+        if (prMoved && live.phase === "review" && live.state === "review") {
           const markers = parseReviewMarkers(deps.github.listComments(ref), { authorizedReviewers });
           const eff = effectiveVerdictAtHead(markers, live.head_sha);
           if (eff) actions.push(...applyMarker(db, live, eff, deps.authority ?? NO_AUTHORITY));
@@ -347,11 +357,33 @@ function confirmMergeFromView(db: Database, task: Task, view: PrView): ProviderA
     return [{ kind: "merged", taskId: task.id, detail: view.headSha }];
   } catch (e) {
     if (String(e).includes(HEAD_MISMATCH) || String(e).includes("CODE_CHANGE_GATE")) {
-      logEvent(db, { source: "workflow", taskId: task.id, type: "workflow.merge_not_credited", payload: { error: String(e) } });
+      // Log ONCE per (task, head): an uncreditable merge must not spam the event
+      // log on every throttle window.
+      const head = view.headSha || task.head_sha || "none";
+      if (!mergeNotCreditedLogged(db, task.id, head)) {
+        logEvent(db, {
+          source: "workflow",
+          taskId: task.id,
+          type: "workflow.merge_not_credited",
+          payload: { head, error: String(e).slice(0, 300) },
+        });
+      }
       return [{ kind: "merge-not-credited", taskId: task.id, detail: String(e).slice(0, 160) }];
     }
     throw e;
   }
+}
+
+/** True when a merge_not_credited event already exists for (task, head). */
+function mergeNotCreditedLogged(db: Database, taskId: string, head: string): boolean {
+  const row = db
+    .query(
+      `SELECT 1 AS x FROM events
+        WHERE task_id = ? AND type = 'workflow.merge_not_credited' AND payload_json LIKE ?
+        LIMIT 1`
+    )
+    .get(taskId, `%"head":"${head}"%`);
+  return !!row;
 }
 
 /** Apply an authorized verdict marker as a structured ReviewResult. */

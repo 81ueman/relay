@@ -238,6 +238,8 @@ function migrate(db: Database): void {
       ["pr_diff", "TEXT"],
       ["checks_json", "TEXT"],
       ["worktree", "TEXT"],
+      ["provider_polled_at", "INTEGER"],
+      ["pr_updated_at", "TEXT"],
       ["merged_at", "INTEGER"],
       ["result_ref", "TEXT"],
       ["review_profile", "TEXT"],

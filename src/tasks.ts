@@ -638,6 +638,19 @@ export function unblockTask(db: Database, taskId: string, workerId: string): Tas
       payload: { fromPhase: task.phase, attempt: task.attempt + 1 },
     });
     requestReconcile(db, `unblock-resume:${taskId}`);
+  } else if (task.code_change === 1 && task.phase === "review") {
+    // A HOLD that landed in `review` BEFORE any review left no result, so there
+    // is nothing to supersede — but a `queued` review-phase task is claimed as
+    // `running` by `claimNext`, and `recordReview` then refuses it. Restore the
+    // state a verify PASS produces (`review`, claim_role=reviewer), which
+    // `claimNext`/`reviewTasks` keep at `review`, so the review can proceed.
+    db.query(
+      `UPDATE tasks
+          SET state = 'review', assignee = NULL, lease_until = NULL,
+              claim_role = 'reviewer', updated_at = ?
+        WHERE id = ?`
+    ).run(t, taskId);
+    requestReconcile(db, `unblock-review:${taskId}`);
   } else {
     db.query(`UPDATE tasks SET state = 'queued', assignee = NULL, lease_until = NULL, updated_at = ? WHERE id = ?`).run(t, taskId);
   }

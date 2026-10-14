@@ -55,17 +55,30 @@ export function pendingMechanicalVerifications(db: Database): Task[] {
   return candidates.filter((t) => !findTaskResult(db, t.id, "verify", t.attempt, "VerificationResult"));
 }
 
-/** Code tasks with a provider binding that may need reconciling this pass. */
+/**
+ * Code tasks with a provider binding that may need reconciling this pass.
+ * A task bound to a PR is still polled after it is `done` until the merge is
+ * confirmed (`merged_at` set), so an accept-then-merge flow still credits.
+ */
 export function providerBoundTasks(db: Database): Task[] {
   return db
     .query(
       `SELECT * FROM tasks
         WHERE code_change = 1 AND provider IS NOT NULL
           AND (pr_url IS NOT NULL OR issue_id IS NOT NULL)
-          AND state NOT IN ('done', 'failed')
+          AND (
+            state NOT IN ('done', 'failed')
+            OR (state = 'done' AND pr_url IS NOT NULL AND merged_at IS NULL)
+          )
         ORDER BY priority DESC, created_at ASC`
     )
     .all() as Task[];
+}
+
+/** Minimum spacing between provider polls of one task (default 60s). */
+export function providerPollMs(): number {
+  const v = Number(process.env.RELAY_PROVIDER_POLL_MS ?? "60000");
+  return Number.isFinite(v) && v >= 0 ? v : 60000;
 }
 
 /**
@@ -109,13 +122,19 @@ export async function runPendingMechanicalVerifications(
 export function reconcileProviderBound(db: Database, deps: WorkflowDeps): string[] {
   if (!deps.github && !deps.linear) return [];
   const actions: string[] = [];
+  const nowMs = Date.now();
+  const pollMs = providerPollMs();
   for (const t of providerBoundTasks(db)) {
+    // Throttle: a provider poll makes real, rate-limited API calls, so skip a
+    // task polled within the interval. `0` disables the throttle (tests).
+    if (pollMs > 0 && t.provider_polled_at !== null && nowMs - t.provider_polled_at < pollMs) continue;
     const taken = reconcileTaskFromProvider(db, t.id, {
       github: deps.github,
       linear: deps.linear,
       authorizedReviewers: deps.authorizedReviewers,
       authority: deps.authority ?? NO_AUTHORITY,
     });
+    db.query(`UPDATE tasks SET provider_polled_at = ? WHERE id = ?`).run(nowMs, t.id);
     for (const a of taken) actions.push(`${a.kind}:${a.taskId}`);
   }
   return actions;

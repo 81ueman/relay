@@ -26,11 +26,15 @@ export interface ExecResult {
   stdout: string;
   stderr: string;
 }
-export type Exec = (argv: string[]) => ExecResult;
+export type Exec = (argv: string[], opts?: { stdin?: Uint8Array }) => ExecResult;
 
-export const defaultExec: Exec = (argv) => {
+export const defaultExec: Exec = (argv, opts) => {
   try {
-    const p = Bun.spawnSync(argv, { stdout: "pipe", stderr: "pipe" });
+    const p = Bun.spawnSync(argv, {
+      stdout: "pipe",
+      stderr: "pipe",
+      stdin: opts?.stdin ?? "ignore",
+    });
     return { ok: p.exitCode === 0, stdout: p.stdout.toString(), stderr: p.stderr.toString() };
   } catch (e) {
     return { ok: false, stdout: "", stderr: String(e) };
@@ -207,12 +211,17 @@ export class LinearApiReadOnly implements LinearReadOnly {
   getIssue(id: string): IssueView | null {
     const query = "query($id:String!){issue(id:$id){id state{name} labels{nodes{name}}}}";
     const payload = JSON.stringify({ query, variables: { id } });
-    const r = this.exec([
-      "curl", "-s", "-X", "POST", this.endpoint,
-      "-H", `Authorization: ${this.token}`,
-      "-H", "Content-Type: application/json",
-      "-d", payload,
-    ]);
+    // The token travels on STDIN (`-H @-`), never on argv, so it is not visible
+    // to other local users via `ps`.
+    const r = this.exec(
+      [
+        "curl", "-s", "-X", "POST", this.endpoint,
+        "-H", "@-",
+        "-H", "Content-Type: application/json",
+        "-d", payload,
+      ],
+      { stdin: new TextEncoder().encode(`Authorization: ${this.token}\n`) }
+    );
     if (!r.ok) return null;
     try {
       const j = JSON.parse(r.stdout) as LinearGraphQLJson;

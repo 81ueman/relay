@@ -107,6 +107,10 @@ export interface Task {
    * so commands run against the recorded revision, not the daemon's checkout.
    */
   worktree: string | null;
+  /** ISH-759: last time this task's provider state was polled (throttle). */
+  provider_polled_at: number | null;
+  /** ISH-759: the PR `updatedAt` last seen (fetch comments only when it moves). */
+  pr_updated_at: string | null;
   /** ISH-759: when the bound PR was confirmed merged (the true "done"). */
   merged_at: number | null;
   /** Evidence ref for the CURRENT attempt (a structured-result id or note id). */
@@ -388,6 +392,8 @@ CREATE TABLE IF NOT EXISTS tasks (
   pr_diff TEXT,
   checks_json TEXT,
   worktree TEXT,
+  provider_polled_at INTEGER,
+  pr_updated_at TEXT,
   merged_at INTEGER,
   result_ref TEXT,
   review_profile TEXT,

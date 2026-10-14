@@ -1155,10 +1155,15 @@ export function confirmMerged(db: Database, taskId: string, opts: MergedOptions 
   if (!task) throw new Error(`unknown task: ${taskId}`);
   if (!isCodeTask(task)) throw new Error(`${WORKFLOW_ERROR}: ${taskId} is not a code-change task`);
   const phase = phaseOf(task);
-  if (phase !== "merge_ready" && task.state !== "done") {
+  // A merge may be observed any time AFTER the review passed (integration,
+  // merge_ready) or once the task is internally accepted. A merge seen while the
+  // task is still in review/implement is NOT credited (the reviewed head is not
+  // settled yet) and is logged as not-credited instead.
+  const postReview = phase === "integration" || phase === "merge_ready" || task.state === "done";
+  if (!postReview) {
     throw new Error(
       `${GATE_ERROR}: cannot confirm a merge for ${taskId} at phase '${phase}' state '${task.state}'; ` +
-      `a merge is credited only to a merge-ready (or accepted) task`
+      `a merge is credited only after the review passed (integration/merge_ready/accepted)`
     );
   }
   const mergedHead = opts.headSha ?? task.head_sha;
