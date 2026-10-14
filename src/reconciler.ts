@@ -46,6 +46,7 @@ import {
 } from "./scheduler";
 import { BOOTSTRAP_PROMPT } from "./runtime/herdr";
 import { processReminders } from "./reminders";
+import { EMPTY_WORKFLOW_DEPS, processWorkflow, type WorkflowDeps } from "./workflow-driver";
 import type { Session } from "./sessions";
 import type { WorkerRuntime } from "./schema";
 import {
@@ -1490,7 +1491,7 @@ async function renudgeIdleAssigneesOfRunningTasks(
 }
 
 /** One deterministic reconcile pass. Safe to run every 1-2s. */
-export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<ReconcileResult> {
+export async function reconcile(db: Database, rt: Runtime, at = now(), deps: WorkflowDeps = EMPTY_WORKFLOW_DEPS): Promise<ReconcileResult> {
   const actions: string[] = [];
 
   // 0. Quiet leases: clear a stale one (the worker no longer holds that task) or
@@ -1722,6 +1723,13 @@ export async function reconcile(db: Database, rt: Runtime, at = now()): Promise<
       }
     }
   }
+
+  // 3b. ISH-759 event-driven workflow: run any pending MECHANICAL verification
+  //     (Relay runs the standard commands; no LLM waits) and reconcile provider
+  //     state (PR head/merge, Linear HOLD, an authorized review marker) against
+  //     the Relay task. Runs BEFORE the wake sections so a task that just moved
+  //     to review is dispatched to a reviewer in the same pass.
+  actions.push(...(await processWorkflow(db, deps)));
 
   // 4. Runnable work exists => make sure every idle worker that could take some
   //    is nudged. The old gate required `working === 0`; with a parallel fleet
