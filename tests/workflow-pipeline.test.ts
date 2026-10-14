@@ -22,9 +22,11 @@ import {
   submitPhase,
   taskChecks,
 } from "../src/workflow";
-import { FakeGitHub, FakeLinear, NO_AUTHORITY, reconcileTaskFromProvider, type PrView } from "../src/providers";
+import { FakeGitHub, FakeLinear, NO_AUTHORITY, reconcileTaskFromProvider, type GitHubReadOnly, type PrView } from "../src/providers";
 import {
   pendingMechanicalVerifications,
+  providerBoundTasks,
+  reconcileProviderBound,
   runPendingMechanicalVerifications,
   type WorkflowDeps,
 } from "../src/workflow-driver";
@@ -54,6 +56,7 @@ beforeEach(() => {
 afterEach(() => {
   delete process.env.RELAY_AUTO_APPROVE;
   delete process.env.RELAY_HUMAN;
+  delete process.env.RELAY_PROVIDER_POLL_MS;
   db.close();
   rmSync(dir, { recursive: true, force: true });
 });
@@ -322,6 +325,8 @@ describe("provider reconciliation binds state without writing", () => {
     gh.putComments({ repo: "o/r", number: 1 }, [
       { author: "claude", createdAt: "2026-01-01T00:00:00Z", body: `<!-- ishiul-review head=${FULL} verdict=OK reviewer=claude -->` },
     ]);
+    // A new real comment moves the PR; simulate that so comments are refetched.
+    db.query(`UPDATE tasks SET pr_updated_at = NULL WHERE id = ?`).run(t.id);
     const actions = reconcileTaskFromProvider(db, t.id, { github: gh, authorizedReviewers: ["claude"] });
     expect(actions.some((a) => a.kind === "review-pass")).toBe(true);
     expect(getTask(db, t.id)!.phase).toBe("integration");
@@ -499,11 +504,13 @@ describe("finding 3: a review BLOCKED / Linear HOLD is resumable", () => {
     reconcileTaskFromProvider(db, t.id, { linear: lin });
     expect(getTask(db, t.id)!.state).toBe("blocked_human");
 
-    // A review with NO stored result resumes in place (review stays review).
+    // A review with NO stored result resumes AT review (state=review), not
+    // queued: claimNext then keeps it at review so recordReview can run.
     const resumed = unblockTask(db, t.id, "gateway");
     expect(resumed.phase).toBe("review");
-    expect(resumed.state).toBe("queued");
+    expect(resumed.state).toBe("review");
     expect(claimNext(db, "rev")?.id).toBe(t.id);
+    expect(getTask(db, t.id)!.state).toBe("review");
   });
 });
 
@@ -614,10 +621,214 @@ describe("finding 6: marker application uses the live head and dedupes", () => {
     gh.putComments({ repo: "o/r", number: 5 }, [
       { author: "claude", createdAt: "2026-01-01T00:00:00Z", body: `<!-- ishiul-review head=${FULL} verdict=OK reviewer=claude -->` },
     ]);
-    for (let i = 0; i < 3; i++) reconcileTaskFromProvider(db, t.id, { github: gh, authorizedReviewers: ["claude"] });
+    for (let i = 0; i < 3; i++) {
+      // Force a comment fetch each pass (as if the PR kept moving) so the dedupe
+      // — not the comment-fetch throttle — is what limits the event.
+      db.query(`UPDATE tasks SET pr_updated_at = NULL WHERE id = ?`).run(t.id);
+      reconcileTaskFromProvider(db, t.id, { github: gh, authorizedReviewers: ["claude"] });
+    }
     const n = db
       .query(`SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'workflow.marker_not_applied'`)
       .get(t.id) as { n: number };
     expect(n.n).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Round-2 findings
+// ---------------------------------------------------------------------------
+
+function githubViewAt(
+  number: number,
+  headSha: string,
+  state: PrView["state"] = "open",
+  updatedAt = "2026-01-01T00:00:00Z"
+): PrView {
+  return {
+    ref: { repo: "o/r", number },
+    url: `https://github.com/o/r/pull/${number}`,
+    state,
+    isDraft: false,
+    headRefName: "devin/ish759",
+    headSha,
+    baseRef: "main",
+    baseSha: "0".repeat(40),
+    mergeable: "mergeable",
+    labels: [],
+    updatedAt,
+  };
+}
+
+describe("round 2: a Linear HOLD on review resumes at review", () => {
+  test("HOLD -> unblock -> review PASS", async () => {
+    process.env.RELAY_HUMAN = "gateway";
+    registerWorker(db, "gateway", { role: "planner" });
+    const t = intakeTask(db, { provider: "linear", issueId: "ISH-2000", codeChange: true, headSha: FULL, checks: [CHECK] });
+    await toReview(t.id);
+    expect(getTask(db, t.id)!.state).toBe("review");
+
+    const lin = new FakeLinear();
+    lin.putIssue({ id: "ISH-2000", state: "In Progress", labels: ["hold"], updatedAt: "2026-01-01T00:00:00Z" });
+    reconcileTaskFromProvider(db, t.id, { linear: lin });
+    expect(getTask(db, t.id)!.state).toBe("blocked_human");
+
+    // Unblock with NO stored review: must resume at `review`, not `queued`.
+    const resumed = unblockTask(db, t.id, "gateway");
+    expect(resumed.state).toBe("review");
+    expect(resumed.phase).toBe("review");
+    expect(resumed.claim_role).toBe("reviewer");
+
+    // claimNext keeps a state=review task at review (not running), so the review
+    // can be recorded.
+    const claimed = claimNext(db, "rev");
+    expect(claimed?.id).toBe(t.id);
+    expect(getTask(db, t.id)!.state).toBe("review");
+    const done = recordReview(db, t.id, "rev", { verdict: "pass", headSha: FULL });
+    expect(done.phase).toBe("integration");
+  });
+});
+
+describe("round 2: the merge gate is reachable in normal flows", () => {
+  async function toAccepted(id: string): Promise<void> {
+    await toReview(id);
+    claimNext(db, "rev");
+    recordReview(db, id, "rev", { verdict: "pass", headSha: FULL });
+    claimTask(db, id, "integ");
+    submitPhase(db, id, "integ");
+    acceptTask(db, id, "integ");
+  }
+
+  test("accept -> merge: a done, unmerged task is still polled and credited", async () => {
+    const t = intakeTask(db, {
+      provider: "github", issueId: "o/r#40", codeChange: true, headSha: FULL, checks: [CHECK],
+      prUrl: "https://github.com/o/r/pull/1", prRepo: "o/r",
+    });
+    await toAccepted(t.id);
+    expect(getTask(db, t.id)!.state).toBe("done");
+    expect(getTask(db, t.id)!.merged_at).toBeNull();
+    expect(providerBoundTasks(db).some((x) => x.id === t.id)).toBe(true); // done+unmerged still polled
+
+    const gh = new FakeGitHub();
+    gh.putPullRequest(githubViewAt(1, FULL, "merged"));
+    const actions = reconcileProviderBound(db, { github: gh });
+    expect(actions).toContain(`merged:${t.id}`);
+    expect(getTask(db, t.id)!.merged_at).not.toBeNull();
+    expect(providerBoundTasks(db).some((x) => x.id === t.id)).toBe(false); // merged -> no longer polled
+  });
+
+  test("merge -> accept: a merge observed in integration is credited, accept still completes", async () => {
+    const t = intakeTask(db, {
+      provider: "github", issueId: "o/r#41", codeChange: true, headSha: FULL, checks: [CHECK],
+      prUrl: "https://github.com/o/r/pull/2", prRepo: "o/r",
+    });
+    await toReview(t.id);
+    claimNext(db, "rev");
+    recordReview(db, t.id, "rev", { verdict: "pass", headSha: FULL });
+    expect(getTask(db, t.id)!.phase).toBe("integration");
+
+    const gh = new FakeGitHub();
+    gh.putPullRequest(githubViewAt(2, FULL, "merged"));
+    const actions = reconcileTaskFromProvider(db, t.id, { github: gh });
+    expect(actions.some((a) => a.kind === "merged")).toBe(true);
+    expect(getTask(db, t.id)!.merged_at).not.toBeNull();
+
+    claimTask(db, t.id, "integ");
+    submitPhase(db, t.id, "integ");
+    const done = acceptTask(db, t.id, "integ");
+    expect(done.state).toBe("done");
+    expect(codeChangeGateSatisfied(done)).toBe(true);
+  });
+
+  test("linear + PR: a Linear-intaken task's GitHub merge is observed", async () => {
+    const t = intakeTask(db, {
+      provider: "linear", issueId: "ISH-2001", codeChange: true, headSha: FULL, checks: [CHECK],
+      prUrl: "https://github.com/o/r/pull/3", prRepo: "o/r",
+    });
+    await toReview(t.id);
+    claimNext(db, "rev");
+    recordReview(db, t.id, "rev", { verdict: "pass", headSha: FULL });
+    claimTask(db, t.id, "integ");
+    submitPhase(db, t.id, "integ");
+
+    const gh = new FakeGitHub();
+    gh.putPullRequest(githubViewAt(3, FULL, "merged"));
+    const lin = new FakeLinear();
+    lin.putIssue({ id: "ISH-2001", state: "In Progress", labels: [], updatedAt: "2026-01-01T00:00:00Z" });
+    const actions = reconcileTaskFromProvider(db, t.id, { github: gh, linear: lin });
+    expect(actions.some((a) => a.kind === "merged")).toBe(true);
+    expect(getTask(db, t.id)!.merged_at).not.toBeNull();
+  });
+
+  test("merge_not_credited is logged once per (task, head)", async () => {
+    const t = intakeTask(db, {
+      provider: "github", issueId: "o/r#42", codeChange: true, headSha: FULL, checks: [CHECK],
+      prUrl: "https://github.com/o/r/pull/4", prRepo: "o/r",
+    });
+    await toReview(t.id); // state review: a merge is not credited yet
+    const gh = new FakeGitHub();
+    gh.putPullRequest(githubViewAt(4, FULL, "merged"));
+    for (let i = 0; i < 3; i++) {
+      db.query(`UPDATE tasks SET pr_updated_at = NULL WHERE id = ?`).run(t.id);
+      reconcileTaskFromProvider(db, t.id, { github: gh });
+    }
+    const n = db
+      .query(`SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'workflow.merge_not_credited'`)
+      .get(t.id) as { n: number };
+    expect(n.n).toBe(1);
+  });
+});
+
+describe("round 2: provider polling is throttled and comment fetch is change-gated", () => {
+  function countingGitHub(view: () => PrView) {
+    const calls = { pr: 0, comments: 0 };
+    const gh: GitHubReadOnly = {
+      name: "counting",
+      readOnly: true,
+      getPullRequest: () => {
+        calls.pr++;
+        return view();
+      },
+      findPullRequestForBranch: () => null,
+      listComments: () => {
+        calls.comments++;
+        return [];
+      },
+    };
+    return { gh, calls };
+  }
+
+  test("reconcileProviderBound skips a recently-polled task", async () => {
+    const t = intakeTask(db, {
+      provider: "github", issueId: "o/r#50", codeChange: true, headSha: FULL, checks: [CHECK],
+      prUrl: "https://github.com/o/r/pull/5", prRepo: "o/r",
+    });
+    await toReview(t.id);
+    const { gh, calls } = countingGitHub(() => githubViewAt(5, FULL));
+    reconcileProviderBound(db, { github: gh });
+    const afterFirst = calls.pr;
+    expect(afterFirst).toBeGreaterThan(0);
+    reconcileProviderBound(db, { github: gh });
+    expect(calls.pr).toBe(afterFirst); // throttled: no second poll
+    // With the throttle disabled, the next poll runs.
+    process.env.RELAY_PROVIDER_POLL_MS = "0";
+    reconcileProviderBound(db, { github: gh });
+    expect(calls.pr).toBeGreaterThan(afterFirst);
+  });
+
+  test("comments are fetched only when the PR updatedAt/head moves", async () => {
+    const t = intakeTask(db, {
+      provider: "github", issueId: "o/r#51", codeChange: true, headSha: FULL, checks: [CHECK],
+      prUrl: "https://github.com/o/r/pull/6", prRepo: "o/r",
+    });
+    await toReview(t.id);
+    let updatedAt = "2026-01-01T00:00:00Z";
+    const { gh, calls } = countingGitHub(() => githubViewAt(6, FULL, "open", updatedAt));
+    reconcileTaskFromProvider(db, t.id, { github: gh });
+    expect(calls.comments).toBe(1); // first fetch
+    reconcileTaskFromProvider(db, t.id, { github: gh });
+    expect(calls.comments).toBe(1); // unchanged -> no fetch
+    updatedAt = "2026-01-02T00:00:00Z";
+    reconcileTaskFromProvider(db, t.id, { github: gh });
+    expect(calls.comments).toBe(2); // moved -> fetch again
   });
 });

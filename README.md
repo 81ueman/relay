@@ -268,9 +268,12 @@ implement --TaskSubmitted--> verify --VerificationResult--> review
   is killed on timeout, so a hung check cannot stall the daemon. Without `--check`,
   verify stays the manual worker path. `relay verify <task>` runs the same checks.
 - **A block is resumable.** `relay unblock` on a code task blocked at `verify` (a
-  NOT_RUN/INCONCLUSIVE) or `review` (a review BLOCKED or a Linear HOLD) routes the
-  SAME task back to `implement` at `attempt+1` with the head cleared, so it is not
-  a dead end; a review with no stored result just resumes at `review`.
+  NOT_RUN/INCONCLUSIVE) or `review` (a review BLOCKED) routes the SAME task back
+  to `implement` at `attempt+1` with the head cleared. A HOLD that landed in
+  `review` before any review (e.g. a Linear HOLD) has no result to supersede, so
+  it resumes **at `review`** (`state=review`, the state a verify PASS produces,
+  which `claimNext` keeps at `review`) — never as a `queued` review-phase task
+  that a claim would drive to `running`.
 - **Independent review.** VERIFY PASS moves the task to `review` and the ordinary
   reviewer wake dispatches an idle reviewer in the same reconcile pass. The
   reviewer must hold `REVIEWER_ROLE` (or the review claim) and may not be the
@@ -281,18 +284,25 @@ implement --TaskSubmitted--> verify --VerificationResult--> review
   alone** (it must `--supersedes <result-id>` explicitly).
 - **Provider reconciliation is read-only / fail-closed.** With a bound PR, Relay
   polls open/synchronize/merged: a head move invalidates the review, and a
-  `merged` PR at the recorded head records `TaskMerged`. A real merge is the
-  **only** "truly done" for a task with a PR: an internal accept does not satisfy
-  `ChildrenReady`, and a dependent task is not runnable until a PR-bound
-  prerequisite is merged. Review verdicts are absorbed from `lane.sh`'s
+  `merged` PR at the recorded head records `TaskMerged`. A merge is credited
+  whenever it is observed after the review passed — in `integration`,
+  `merge_ready`, or **after** accept (a done, unmerged task is still polled) — and
+  for **any** intake provider (a Linear issue with a GitHub PR is polled too). A
+  real merge is the **only** "truly done" for a task with a PR: an internal accept
+  does not satisfy `ChildrenReady`, and a dependent task is not runnable until a
+  PR-bound prerequisite is merged. Review verdicts are absorbed from `lane.sh`'s
   `<!-- ishiul-review head=<sha> verdict=OK|NG|HOLD reviewer=<id> -->` markers, but
   only from an authorized reviewer identity — a reviewer's TurnEnded, a GitHub
-  **label**, and a self-claimed comment are **not** an approval. A real merge is
-  the only thing that completes an issue.
+  **label**, and a self-claimed comment are **not** an approval. Repeated
+  `merge_not_credited` / `marker_not_applied` events are logged once per
+  (task, head / marker).
 - **Providers are opt-in GET-only readers.** `RELAY_PROVIDER_GITHUB=gh` uses the
   `gh` CLI (read verbs only), `RELAY_PROVIDER_LINEAR=api` + `LINEAR_API_TOKEN`
-  uses a read-only GraphQL query, and `RELAY_REVIEW_AUTHORIZED=a,b` sets the
-  authorized marker authors. Default OFF (no provider, fail-closed). Any real
+  uses a read-only GraphQL query (the token rides **stdin**, never argv), and
+  `RELAY_REVIEW_AUTHORIZED=a,b` sets the authorized marker authors. Default OFF
+  (no provider, fail-closed). Each task is polled at most once per
+  `RELAY_PROVIDER_POLL_MS` (default 60s) and comments are fetched only when the PR
+  `updatedAt`/head moved, so the reader stays within GitHub's rate limit. Any real
   provider write (comment/label), Linear write, or merge requires an explicit
   point-of-use `ProviderAuthority` grant (ISH-288); the default is deny.
 - **Gateway is notified only for judgment.** `ChildrenReady` (all direct children

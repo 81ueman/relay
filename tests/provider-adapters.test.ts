@@ -11,8 +11,8 @@ import {
 // Finding 6: the real adapters are read-only and unit-tested through an injected
 // command executor (no `gh`, no network).
 
-function scriptedExec(script: (argv: string[]) => ExecResult): Exec {
-  return (argv) => script(argv);
+function scriptedExec(script: (argv: string[], opts?: { stdin?: Uint8Array }) => ExecResult): Exec {
+  return (argv, opts) => script(argv, opts);
 }
 
 const ok = (stdout: string): ExecResult => ({ ok: true, stdout, stderr: "" });
@@ -102,22 +102,30 @@ describe("GhCliGitHub (GET-only)", () => {
 });
 
 describe("LinearApiReadOnly (GET-only GraphQL query)", () => {
-  test("maps an issue and only ever POSTs a query", () => {
-    let sent = "";
+  test("maps an issue and only ever POSTs a query; the token rides stdin, never argv", () => {
+    let argv: string[] = [];
+    let stdin = "";
     const lin = new LinearApiReadOnly(
       "tok",
-      scriptedExec((argv) => {
-        sent = argv.join(" ");
-        return ok(JSON.stringify({ data: { issue: { id: "ISH-1", state: { name: "In Progress" }, labels: { nodes: [{ name: "hold" }] } } } }));
+      scriptedExec((a, opts) => {
+        argv = a;
+        stdin = opts?.stdin ? new TextDecoder().decode(opts.stdin) : "";
+        return ok(
+          JSON.stringify({ data: { issue: { id: "ISH-1", state: { name: "In Progress" }, labels: { nodes: [{ name: "hold" }] } } } })
+        );
       })
     );
     const issue = lin.getIssue("ISH-1")!;
     expect(lin.readOnly).toBe(true);
     expect(issue.state).toBe("In Progress");
     expect(issue.labels).toEqual(["hold"]);
+    const sent = argv.join(" ");
     expect(sent).toContain("query");
     expect(sent).not.toContain("mutation");
-    expect(sent).toContain("Authorization: tok");
+    // The token is NOT on argv (not readable via ps); it rides stdin.
+    expect(sent).not.toContain("tok");
+    expect(argv).toContain("@-");
+    expect(stdin).toContain("Authorization: tok");
   });
 
   test("fails closed on a bad body", () => {
