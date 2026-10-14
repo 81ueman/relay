@@ -3,17 +3,27 @@ import { now } from "./db";
 import { logEvent } from "./events";
 import { requestReconcile } from "./control";
 import {
-  findReviewForHead,
+  findMergedResult,
   findPassingReview,
+  findReviewForHead,
   findSubmissionForAttempt,
   findTaskResult,
+  findUnresolvedNgAtHead,
   insertTaskResult,
   notifyGatewayTo,
 } from "./results";
-import type { CodePhase, ResultKind, Task, TaskState } from "./schema";
+import type { CodePhase, ResultKind, Task, TaskState, VerifyOutcome } from "./schema";
 import { INTEGRATOR_ROLE, REVIEWER_ROLE } from "./schema";
-import { getTask, nextTaskId, resolveHumanInterface, taskChildren } from "./tasks";
+import { getTask, nextTaskId, recordChildBlocked, resolveHumanInterface, taskChildren } from "./tasks";
 import { clearCurrentTask, getWorker, normalizeWorkerAfterTaskRelease, touchProgress } from "./workers";
+import {
+  parseChecks,
+  runChecks,
+  serializeChecks,
+  type CheckSpec,
+  type CommandRunner,
+  type ExecutedCheck,
+} from "./verify";
 
 /**
  * ISH-758 minimal event-driven workflow core.
@@ -35,6 +45,17 @@ export const AUTHORITY_ERROR = "AUTHORITY";
 export const STALE_ATTEMPT = "STALE_ATTEMPT";
 export const DUPLICATE_DISPATCH = "DUPLICATE_DISPATCH";
 export const HEAD_MISMATCH = "HEAD_MISMATCH";
+/** ISH-759: a later OK at a head with an unresolved NG is refused. */
+export const UNRESOLVED_NG = "UNRESOLVED_NG";
+/** ISH-759: a result/nonce that no longer matches the live task (head moved). */
+export const STALE_RESULT = "STALE_RESULT";
+
+/**
+ * ISH-759: the pseudo-role Relay itself takes while it MECHANICALLY verifies a
+ * task. No worker has this role, so a Relay-run verify phase is never offered to
+ * the claim machine (`RUNNABLE_TASK_SQL` excludes it) — no LLM waits on it.
+ */
+export const RELAY_ROLE = "relay";
 
 /** The default review profile; a second profile is a genuinely different review. */
 export const DEFAULT_REVIEW_PROFILE = "default";
@@ -42,7 +63,7 @@ export const DEFAULT_REVIEW_PROFILE = "default";
 // Re-exported so callers (daemon/tests) have one workflow entrypoint.
 export { requestReconcile, reconcileRequestToken } from "./control";
 export { recordChildBlocked } from "./tasks";
-export { findTaskResult, findReviewForHead, findPassingReview } from "./results";
+export { findTaskResult, findReviewForHead, findPassingReview, findUnresolvedNgAtHead, findMergedResult } from "./results";
 
 // ---------------------------------------------------------------------------
 // Phase graph + authority
@@ -254,6 +275,12 @@ export interface IntakeInput {
   prUrl?: string;
   branch?: string;
   headSha?: string;
+  prRepo?: string;
+  prBase?: string;
+  prBaseSha?: string;
+  prDiff?: string;
+  /** The standard commands Relay runs mechanically in the verify phase. */
+  checks?: CheckSpec[];
   dependsOn?: string[];
 }
 
@@ -292,17 +319,31 @@ export function intakeTask(db: Database, input: IntakeInput): Task {
 
   const existing = findTaskByWorkIdentity(db, provider, issueId, slice);
   if (existing) {
-    return linkTask(db, existing.id, {
+    const linked = linkTask(db, existing.id, {
       prUrl: input.prUrl,
       branch: input.branch,
       headSha: input.headSha,
+      prRepo: input.prRepo,
+      prBase: input.prBase,
+      prBaseSha: input.prBaseSha,
+      prDiff: input.prDiff,
     });
+    // A replayed intake may add the mechanical verify spec the first one lacked.
+    if (input.checks && input.checks.length > 0) {
+      db.query(`UPDATE tasks SET checks_json = ?, updated_at = ? WHERE id = ? AND code_change = 1`).run(
+        serializeChecks(input.checks),
+        now(),
+        existing.id
+      );
+    }
+    return getTask(db, linked.id)!;
   }
 
   const t = now();
   const codeChange = input.codeChange === true;
   const id = nextTaskId(db);
   const dependsOn = [...new Set((input.dependsOn ?? []).map((d) => d.trim()).filter(Boolean))];
+  const checksJson = input.checks && input.checks.length > 0 ? serializeChecks(input.checks) : null;
   try {
     db.transaction(() => {
       db.query(
@@ -310,11 +351,13 @@ export function intakeTask(db: Database, input: IntakeInput): Task {
            (id, title, description, acceptance, state, priority, role, assignee,
             lease_token, lease_until, parent_task_id, plan_id,
             provider, issue_id, slice, code_change, phase, attempt, claim_role,
-            pr_url, branch, head_sha, result_ref, review_profile, accepted_at,
+            pr_url, branch, head_sha, pr_repo, pr_base, pr_base_sha, pr_diff,
+            checks_json, result_ref, review_profile, accepted_at,
             created_at, updated_at)
          VALUES (?, ?, ?, ?, 'queued', ?, ?, NULL, 0, NULL, ?, NULL,
                  ?, ?, ?, ?, ?, 0, NULL,
-                 ?, ?, ?, NULL, NULL, NULL, ?, ?)`
+                 ?, ?, ?, ?, ?, ?, ?,
+                 ?, NULL, NULL, NULL, ?, ?)`
       ).run(
         id,
         input.title ?? input.description ?? `${issueId}${slice ? `/${slice}` : ""}`,
@@ -331,6 +374,11 @@ export function intakeTask(db: Database, input: IntakeInput): Task {
         input.prUrl ?? null,
         input.branch ?? null,
         input.headSha ?? null,
+        input.prRepo ?? null,
+        input.prBase ?? null,
+        input.prBaseSha ?? null,
+        input.prDiff ?? null,
+        checksJson,
         t,
         t
       );
@@ -370,7 +418,15 @@ const REVIEW_PINNED_PHASES: CodePhase[] = ["review", "integration", "merge_ready
 export function linkTask(
   db: Database,
   taskId: string,
-  link: { prUrl?: string | null; branch?: string | null; headSha?: string | null }
+  link: {
+    prUrl?: string | null;
+    branch?: string | null;
+    headSha?: string | null;
+    prRepo?: string | null;
+    prBase?: string | null;
+    prBaseSha?: string | null;
+    prDiff?: string | null;
+  }
 ): Task {
   const task = getTask(db, taskId);
   if (!task) throw new Error(`unknown task: ${taskId}`);
@@ -390,16 +446,26 @@ export function linkTask(
   const prUrl = link.prUrl ?? task.pr_url;
   const branch = link.branch ?? task.branch;
   const headSha = link.headSha ?? task.head_sha;
+  const prRepo = link.prRepo ?? task.pr_repo;
+  const prBase = link.prBase ?? task.pr_base;
+  const prBaseSha = link.prBaseSha ?? task.pr_base_sha;
+  const prDiff = link.prDiff ?? task.pr_diff;
   const headChanged = headSha !== task.head_sha;
-  if (!headChanged && prUrl === task.pr_url && branch === task.branch) return task;
+  const linkChanged =
+    headChanged ||
+    prUrl !== task.pr_url ||
+    branch !== task.branch ||
+    prRepo !== task.pr_repo ||
+    prBase !== task.pr_base ||
+    prBaseSha !== task.pr_base_sha ||
+    prDiff !== task.pr_diff;
+  if (!linkChanged) return task;
   const updated = db.transaction(() => {
-    db.query(`UPDATE tasks SET pr_url = ?, branch = ?, head_sha = ?, updated_at = ? WHERE id = ?`).run(
-      prUrl,
-      branch,
-      headSha,
-      now(),
-      taskId
-    );
+    db.query(
+      `UPDATE tasks
+          SET pr_url = ?, branch = ?, head_sha = ?, pr_repo = ?, pr_base = ?, pr_base_sha = ?, pr_diff = ?, updated_at = ?
+        WHERE id = ?`
+    ).run(prUrl, branch, headSha, prRepo, prBase, prBaseSha, prDiff, now(), taskId);
     let next = getTask(db, taskId)!;
     const phase = derivePhase(task);
     if (headChanged && isCodeTask(task) && phase && REVIEW_PINNED_PHASES.includes(phase)) {
@@ -414,6 +480,24 @@ export function linkTask(
 // ---------------------------------------------------------------------------
 // Transitions (structured results are the source of truth)
 // ---------------------------------------------------------------------------
+
+/** The standard commands Relay runs mechanically for this task (may be empty). */
+export function taskChecks(task: Pick<Task, "checks_json">): CheckSpec[] {
+  return parseChecks(task.checks_json);
+}
+
+/** True when verify is Mechanical (Relay runs the commands) rather than manual. */
+export function hasMechanicalChecks(task: Pick<Task, "checks_json">): boolean {
+  return taskChecks(task).length > 0;
+}
+
+/**
+ * True when the task is being MECHANICALLY verified by Relay right now: a code
+ * task at `verify` whose claim role is Relay's own (no worker owns it).
+ */
+export function isRelayVerifying(task: Pick<Task, "code_change" | "phase" | "claim_role">): boolean {
+  return task.code_change === 1 && task.phase === "verify" && task.claim_role === RELAY_ROLE;
+}
 
 export interface SubmitOptions {
   evidence?: string;
@@ -454,6 +538,10 @@ export function submitPhase(db: Database, taskId: string, workerId: string, opts
 
   assertNoResult(db, taskId, phase, task.attempt, "TaskSubmitted");
   const next = nextPhase(phase)!;
+  // ISH-759: a task whose verify is MECHANICAL is owned by Relay, not a worker —
+  // claim with Relay's own pseudo-role so the claim machine never offers it.
+  const nextClaimRole =
+    next === "verify" && hasMechanicalChecks(task) ? RELAY_ROLE : claimRoleForPhase(next, task.role);
   const updated = db.transaction(() => {
     const result = insertTaskResult(db, {
       taskId,
@@ -467,7 +555,7 @@ export function submitPhase(db: Database, taskId: string, workerId: string, opts
     const u = applyPhase(db, task, next, {
       state: next === "review" ? "review" : "queued",
       attempt: task.attempt,
-      claimRole: claimRoleForPhase(next, task.role),
+      claimRole: nextClaimRole,
       headSha: opts.headSha !== undefined ? opts.headSha : undefined,
       resultRef: `result:${result.id}`,
     });
@@ -558,12 +646,187 @@ export function recordVerification(
   return updated;
 }
 
+// ---------------------------------------------------------------------------
+// ISH-759 mechanical verification (Relay runs the commands; no LLM waits)
+// ---------------------------------------------------------------------------
+
+export interface MechanicalVerifyOptions {
+  checks: CheckSpec[];
+  runner: CommandRunner;
+  /** Working directory for the commands (the task's worktree). */
+  cwd: string;
+  /** The head this verification judges; a moved head discards the run. */
+  headSha?: string;
+  /** Actor label for events (default: relay). */
+  actor?: string;
+}
+
+/**
+ * Quietly block a task for a human without a wake storm: state -> blocked_human,
+ * ownership released, one ChildBlocked result, and the Gateway told at most once.
+ * The block occurrence identity is the bumped lease token (see recordChildBlocked).
+ */
+export function quietBlock(db: Database, task: Task, reason: string, actor: string): Task {
+  const t = now();
+  db.transaction(() => {
+    db.query(
+      `UPDATE tasks
+          SET state = 'blocked_human', assignee = NULL, lease_until = NULL,
+              lease_token = lease_token + 1, updated_at = ?
+        WHERE id = ?`
+    ).run(t, task.id);
+    db.query(
+      `INSERT INTO task_notes (task_id, worker_id, kind, body, created_at) VALUES (?, ?, 'blocked_human', ?, ?)`
+    ).run(task.id, actor, reason, t);
+  })();
+  recordChildBlocked(db, task.id, actor, reason, { notifyGateway: true });
+  requestReconcile(db, `blocked:${task.id}`);
+  return getTask(db, task.id)!;
+}
+
+/**
+ * Run a task's standard commands and advance the phase from the PROCESS EXIT
+ * RESULT — no LLM is waited on. PASS -> review (independent reviewer is
+ * dispatched by the ordinary claim/wake machine). FAIL -> implement FIX at a new
+ * attempt. NOT_RUN / INCONCLUSIVE for a REQUIRED check -> BLOCKED (never PASS).
+ *
+ * The run is bound to the head it STARTED on: if the task's head/phase/attempt
+ * changed while the commands ran, the result is discarded as stale and nothing
+ * advances (an old-HEAD result can never become PASS).
+ */
+export async function runMechanicalVerification(
+  db: Database,
+  taskId: string,
+  opts: MechanicalVerifyOptions
+): Promise<{ task: Task; outcome: VerifyOutcome; checks: ExecutedCheck[]; stale: boolean }> {
+  const task = getTask(db, taskId);
+  if (!task) throw new Error(`unknown task: ${taskId}`);
+  if (!isCodeTask(task)) throw new Error(`${WORKFLOW_ERROR}: ${taskId} is not a code-change task`);
+  if (phaseOf(task) !== "verify") {
+    throw new Error(`${WORKFLOW_ERROR}: cannot mechanically verify ${taskId} in phase '${phaseOf(task)}'`);
+  }
+  const actor = opts.actor ?? RELAY_ROLE;
+  const head = opts.headSha ?? task.head_sha;
+  const { outcome, checks } = await runChecks(opts.checks, opts.runner, opts.cwd);
+
+  // Re-read: the run may have raced a head move / a rework. Only advance if the
+  // task is STILL the verify/attempt/head we started on.
+  const live = getTask(db, taskId)!;
+  const stale =
+    live.phase !== "verify" ||
+    live.attempt !== task.attempt ||
+    (live.head_sha ?? null) !== (task.head_sha ?? null) ||
+    (opts.headSha !== undefined && (live.head_sha ?? null) !== (head ?? null));
+  if (stale) {
+    logEvent(db, {
+      source: "workflow",
+      taskId,
+      type: "workflow.verify_stale_discarded",
+      payload: { outcome, startedHead: task.head_sha, liveHead: live.head_sha, livePhase: live.phase, liveAttempt: live.attempt },
+    });
+    return { task: live, outcome, checks, stale: true };
+  }
+  if (findTaskResult(db, taskId, "verify", task.attempt, "VerificationResult")) {
+    throw new Error(`${DUPLICATE_DISPATCH}: VerificationResult already recorded for ${taskId} attempt ${task.attempt}`);
+  }
+
+  const evidence = checks
+    .map((c) => `${c.name}=${c.outcome}${c.exitCode === null ? "" : `(exit ${c.exitCode})`}`)
+    .join(" ");
+  const payload = { outcome, checks: checks.map((c) => ({ ...c })) };
+
+  if (outcome === "pass") {
+    const updated = db.transaction(() => {
+      const result = insertTaskResult(db, {
+        taskId,
+        phase: "verify",
+        attempt: task.attempt,
+        kind: "VerificationResult",
+        workerId: actor,
+        passed: true,
+        headSha: head,
+        evidenceRef: evidence,
+        payload,
+      });
+      return applyPhase(db, task, "review", {
+        state: "review",
+        attempt: task.attempt,
+        claimRole: REVIEWER_ROLE,
+        resultRef: `result:${result.id}`,
+      });
+    })();
+    requestReconcile(db, `verified:${taskId}`);
+    return { task: updated, outcome, checks, stale: false };
+  }
+
+  if (outcome === "fail") {
+    const updated = db.transaction(() => {
+      const result = insertTaskResult(db, {
+        taskId,
+        phase: "verify",
+        attempt: task.attempt,
+        kind: "VerificationResult",
+        workerId: actor,
+        passed: false,
+        headSha: head,
+        evidenceRef: evidence,
+        reason: evidence,
+        payload,
+      });
+      return applyPhase(db, task, "implement", {
+        state: "queued",
+        attempt: task.attempt + 1,
+        claimRole: claimRoleForPhase("implement", task.role),
+        clearHead: true,
+        resultRef: `result:${result.id}`,
+      });
+    })();
+    requestReconcile(db, `verify-failed:${taskId}`);
+    return { task: updated, outcome, checks, stale: false };
+  }
+
+  // not_run / inconclusive for a required check: BLOCK, do not PASS. The
+  // VerificationResult records the outcome for evidence, then the task blocks.
+  db.transaction(() => {
+    insertTaskResult(db, {
+      taskId,
+      phase: "verify",
+      attempt: task.attempt,
+      kind: "VerificationResult",
+      workerId: actor,
+      passed: false,
+      headSha: head,
+      evidenceRef: evidence,
+      reason: `${outcome}: ${evidence}`,
+      payload,
+    });
+  })();
+  const blocked = quietBlock(db, getTask(db, taskId)!, `mechanical verify ${outcome}: ${evidence}`, actor);
+  return { task: blocked, outcome, checks, stale: false };
+}
+
 export interface ReviewOptions {
-  verdict: "pass" | "fail";
+  /** `fail` is accepted as an alias of `fix` (ISH-758 vocabulary). */
+  verdict: "pass" | "fix" | "fail" | "blocked";
   headSha?: string;
   profile?: string;
   reason?: string;
   evidence?: string;
+  /**
+   * The external reviewer's identity (a provider author), when the review came
+   * from a GitHub verdict marker rather than a Relay worker. The worker-row
+   * authority check is skipped for it — the identity was already validated
+   * against the provider's authorized-reviewer set by `src/providers.ts`.
+   */
+  externalReviewer?: string;
+  /** Source label for the result payload (e.g. "github-marker"). */
+  source?: string;
+  /**
+   * ISH-759: explicitly SUPERSEDE an unresolved NG at this head by naming its
+   * result id. Without it, a PASS at a head that still carries an NG is refused
+   * (an unresolved NG never becomes PASS from a later OK alone).
+   */
+  supersedesResultId?: number;
 }
 
 /**
@@ -571,9 +834,20 @@ export interface ReviewOptions {
  * reviewed head must match the task's current head, and a ReviewResult for the
  * same (task, head, profile) is refused as a duplicate dispatch.
  *
+ * ISH-759 verdicts:
+ *   pass    -> integration (a merge-ready candidate; acceptance still required)
+ *   fix/fail-> implement FIX at a new attempt on the SAME task
+ *   blocked -> a quiet human block (Gateway told once)
+ *
+ * An UNRESOLVED NG at the same HEAD is never cleared by a later OK alone: a pass
+ * at a head that still carries an NG is refused unless it names the NG it
+ * supersedes (`supersedesResultId`).
+ *
  * Authority: the reviewer must hold the REVIEWER_ROLE (or the review claim taken
  * via `relay next`), and may not be the worker that recorded the TaskSubmitted
- * for this attempt.
+ * for this attempt. A provider-derived review (`externalReviewer`) skips the
+ * worker-row lookup; the identity was validated against the provider's
+ * authorized-reviewer set by `src/providers.ts`.
  */
 export function recordReview(db: Database, taskId: string, reviewerId: string, opts: ReviewOptions): Task {
   const task = getTask(db, taskId);
@@ -583,23 +857,35 @@ export function recordReview(db: Database, taskId: string, reviewerId: string, o
   if (task.state !== "review" || phase !== "review") {
     throw new Error(`${WORKFLOW_ERROR}: cannot record a review for ${taskId} (state ${task.state}, phase ${phase})`);
   }
-  const reviewer = getWorker(db, reviewerId);
-  if (!reviewer) throw new Error(`unknown worker: ${reviewerId}`);
-  const holdsClaim = task.assignee === reviewerId;
-  if (reviewer.role !== REVIEWER_ROLE && !holdsClaim) {
-    throw new Error(
-      `${AUTHORITY_ERROR}: ${reviewerId} (role '${reviewer.role}') may not review ${taskId}; ` +
-      `need role '${REVIEWER_ROLE}' or the review claim taken via \`relay next\``
-    );
-  }
-  const submission = findSubmissionForAttempt(db, taskId, task.attempt);
-  if (submission && submission.worker_id === reviewerId) {
-    throw new Error(
-      `${AUTHORITY_ERROR}: ${reviewerId} recorded the TaskSubmitted for ${taskId} attempt ${task.attempt} and may not review its own work`
-    );
-  }
-  if (task.assignee && task.assignee !== reviewerId) {
-    throw new Error(`${WORKFLOW_ERROR}: review of ${taskId} is held by ${task.assignee}, not ${reviewerId}`);
+  const external = opts.externalReviewer?.trim();
+  const identity = external ?? reviewerId;
+  if (external) {
+    if (!external) throw new Error(`${AUTHORITY_ERROR}: an external review needs a reviewer identity`);
+    logEvent(db, {
+      source: "workflow",
+      taskId,
+      type: "workflow.external_review",
+      payload: { reviewer: external, source: opts.source ?? null, verdict: opts.verdict },
+    });
+  } else {
+    const reviewer = getWorker(db, reviewerId);
+    if (!reviewer) throw new Error(`unknown worker: ${reviewerId}`);
+    const holdsClaim = task.assignee === reviewerId;
+    if (reviewer.role !== REVIEWER_ROLE && !holdsClaim) {
+      throw new Error(
+        `${AUTHORITY_ERROR}: ${reviewerId} (role '${reviewer.role}') may not review ${taskId}; ` +
+        `need role '${REVIEWER_ROLE}' or the review claim taken via \`relay next\``
+      );
+    }
+    const submission = findSubmissionForAttempt(db, taskId, task.attempt);
+    if (submission && submission.worker_id === reviewerId) {
+      throw new Error(
+        `${AUTHORITY_ERROR}: ${reviewerId} recorded the TaskSubmitted for ${taskId} attempt ${task.attempt} and may not review its own work`
+      );
+    }
+    if (task.assignee && task.assignee !== reviewerId) {
+      throw new Error(`${WORKFLOW_ERROR}: review of ${taskId} is held by ${task.assignee}, not ${reviewerId}`);
+    }
   }
   const profile = (opts.profile ?? task.review_profile ?? DEFAULT_REVIEW_PROFILE).trim() || DEFAULT_REVIEW_PROFILE;
 
@@ -616,7 +902,25 @@ export function recordReview(db: Database, taskId: string, reviewerId: string, o
   if (findReviewForHead(db, taskId, head, profile)) {
     throw new Error(`${DUPLICATE_DISPATCH}: ${taskId} head ${head} already has a review (profile '${profile}')`);
   }
+  // Unresolved NG at this head: a later OK must explicitly supersede it. Checked
+  // after duplicate-dispatch so a re-review of the same profile is still a
+  // DUPLICATE_DISPATCH; a *different profile's* later OK hits this rule instead.
+  if (opts.verdict === "pass") {
+    const ng = findUnresolvedNgAtHead(db, taskId, head);
+    if (ng && ng.id !== opts.supersedesResultId) {
+      throw new Error(
+        `${UNRESOLVED_NG}: ${taskId} head ${head ?? "none"} still carries an unresolved NG (result ${ng.id}); ` +
+        `a later OK alone does not clear it — fix the head or supersede the NG explicitly`
+      );
+    }
+  }
   assertNoResult(db, taskId, phase, task.attempt, "ReviewResult");
+
+  const basePayload = {
+    source: opts.source ?? (external ? "external" : "worker"),
+    reviewer: identity,
+    ...(opts.supersedesResultId ? { supersedes: opts.supersedesResultId } : {}),
+  };
 
   if (opts.verdict === "pass") {
     const updated = db.transaction(() => {
@@ -625,12 +929,13 @@ export function recordReview(db: Database, taskId: string, reviewerId: string, o
         phase,
         attempt: task.attempt,
         kind: "ReviewResult",
-        workerId: reviewerId,
+        workerId: identity,
         passed: true,
         headSha: head,
         profile,
         reason: opts.reason ?? null,
         evidenceRef: opts.evidence ?? null,
+        payload: basePayload,
       });
       const u = applyPhase(db, task, "integration", {
         state: "queued",
@@ -638,25 +943,54 @@ export function recordReview(db: Database, taskId: string, reviewerId: string, o
         claimRole: INTEGRATOR_ROLE,
         resultRef: `result:${result.id}`,
       });
-      releaseWorker(db, reviewerId, taskId);
+      if (!external) releaseWorker(db, reviewerId, taskId);
       return u;
     })();
     requestReconcile(db, `review-pass:${taskId}`);
     return updated;
   }
 
+  if (opts.verdict === "blocked") {
+    const updated = db.transaction(() => {
+      const result = insertTaskResult(db, {
+        taskId,
+        phase,
+        attempt: task.attempt,
+        kind: "ReviewResult",
+        workerId: identity,
+        passed: false,
+        headSha: head,
+        profile,
+        reason: opts.reason ?? null,
+        evidenceRef: opts.evidence ?? null,
+        payload: { ...basePayload, blocked: true },
+      });
+      return getTask(db, taskId)!;
+    })();
+    if (!external) releaseWorker(db, reviewerId, taskId);
+    const blocked = quietBlock(
+      db,
+      updated,
+      `review BLOCKED${opts.reason ? `: ${opts.reason}` : ""} (head ${head ?? "none"})`,
+      identity
+    );
+    return blocked;
+  }
+
+  // fix (alias fail): rework on the SAME task at a new attempt, head cleared.
   const updated = db.transaction(() => {
     const result = insertTaskResult(db, {
       taskId,
       phase,
       attempt: task.attempt,
       kind: "ReviewResult",
-      workerId: reviewerId,
+      workerId: identity,
       passed: false,
       headSha: head,
       profile,
       reason: opts.reason ?? null,
       evidenceRef: opts.evidence ?? null,
+      payload: basePayload,
     });
     const u = applyPhase(db, task, "implement", {
       state: "queued",
@@ -665,10 +999,10 @@ export function recordReview(db: Database, taskId: string, reviewerId: string, o
       clearHead: true,
       resultRef: `result:${result.id}`,
     });
-    releaseWorker(db, reviewerId, taskId);
+    if (!external) releaseWorker(db, reviewerId, taskId);
     return u;
   })();
-  requestReconcile(db, `review-fail:${taskId}`);
+  requestReconcile(db, `review-fix:${taskId}`);
   return updated;
 }
 
@@ -739,14 +1073,74 @@ export function acceptTask(db: Database, taskId: string, actor: string): Task {
   return updated;
 }
 
+export interface MergedOptions {
+  /** The head GitHub reports as merged. A different head is not this work. */
+  headSha?: string;
+  repo?: string;
+  actor?: string;
+  reason?: string;
+}
+
+/**
+ * ISH-759: confirm the bound PR was actually MERGED on the provider. This is the
+ * ONLY signal that a code-change task is "truly done" for the issue; a review
+ * PASS or an internal TaskAccepted is explicitly NOT a merge.
+ *
+ * Read-only w.r.t. GitHub (we observe a merge that already happened, we never
+ * perform one). The merged head must match the recorded head, so an old-HEAD
+ * merge can never be credited to the current attempt. Idempotent.
+ */
+export function confirmMerged(db: Database, taskId: string, opts: MergedOptions = {}): Task {
+  const task = getTask(db, taskId);
+  if (!task) throw new Error(`unknown task: ${taskId}`);
+  if (!isCodeTask(task)) throw new Error(`${WORKFLOW_ERROR}: ${taskId} is not a code-change task`);
+  const phase = phaseOf(task);
+  if (phase !== "merge_ready" && task.state !== "done") {
+    throw new Error(
+      `${GATE_ERROR}: cannot confirm a merge for ${taskId} at phase '${phase}' state '${task.state}'; ` +
+      `a merge is credited only to a merge-ready (or accepted) task`
+    );
+  }
+  const mergedHead = opts.headSha ?? task.head_sha;
+  if (task.head_sha && mergedHead && mergedHead !== task.head_sha) {
+    throw new Error(
+      `${HEAD_MISMATCH}: merged head ${mergedHead} != task head ${task.head_sha} for ${taskId}; not this work`
+    );
+  }
+  if (findMergedResult(db, taskId)) return task; // exactly once
+  const t = now();
+  const updated = db.transaction(() => {
+    insertTaskResult(db, {
+      taskId,
+      phase,
+      attempt: task.attempt,
+      kind: "TaskMerged",
+      workerId: opts.actor ?? null,
+      headSha: mergedHead,
+      reason: opts.reason ?? null,
+      payload: { repo: opts.repo ?? task.pr_repo, head: mergedHead },
+    });
+    db.query(`UPDATE tasks SET merged_at = ?, updated_at = ? WHERE id = ?`).run(t, t, taskId);
+    return getTask(db, taskId)!;
+  })();
+  requestReconcile(db, `merged:${taskId}`);
+  return updated;
+}
+
 // ---------------------------------------------------------------------------
 // Child roll-up: the Gateway is notified only when needed
 // ---------------------------------------------------------------------------
 
-/** True once a code task has satisfied its mandatory gate. */
+/**
+ * True once a code task has satisfied its mandatory gate AND, when bound to a
+ * real PR, been confirmed MERGED. A review PASS or an internal accept alone is
+ * not "truly done" for a task that has a PR.
+ */
 export function codeChangeGateSatisfied(task: Task): boolean {
   if (!isCodeTask(task)) return true;
-  return derivePhase(task) === "merge_ready" && task.state === "done";
+  if (!(derivePhase(task) === "merge_ready" && task.state === "done")) return false;
+  if (task.pr_url && task.merged_at === null) return false;
+  return true;
 }
 
 /**

@@ -68,7 +68,10 @@ const CONTAINER_TASK_SQL = `NOT EXISTS (SELECT 1 FROM tasks c WHERE c.parent_tas
 // A code-change task parked at `merge_ready` is waiting for the mandatory
 // TaskAccepted gate, not for an implementer/reviewer: it is never offered.
 const MERGE_READY_SQL = `NOT (IFNULL(t.code_change, 0) = 1 AND t.phase = 'merge_ready')`;
-const RUNNABLE_TASK_SQL = `t.state = 'queued' AND ${DEPS_DONE_SQL} AND ${REVIEW_GATE_SQL} AND ${CONTAINER_TASK_SQL} AND ${MERGE_READY_SQL}`;
+// ISH-759: a task whose verify phase is MECHANICAL is owned by Relay, not a
+// worker—it is never offered to the claim machine (no LLM waits on verify).
+const RELAY_OWNED_SQL = `IFNULL(t.claim_role, '') != 'relay'`;
+const RUNNABLE_TASK_SQL = `t.state = 'queued' AND ${DEPS_DONE_SQL} AND ${REVIEW_GATE_SQL} AND ${CONTAINER_TASK_SQL} AND ${MERGE_READY_SQL} AND ${RELAY_OWNED_SQL}`;
 
 /** The role gate a task presents: a phase-derived `claim_role` wins over `role`. */
 export function effectiveTaskRole(task: Pick<Task, "role" | "claim_role">): string | null {
@@ -364,6 +367,7 @@ export function hasChildren(db: Database, taskId: string): boolean {
 export function isRunnableNow(db: Database, task: Task, reviewExists?: boolean): boolean {
   if (task.state !== "queued") return false;
   if (task.code_change === 1 && task.phase === "merge_ready") return false; // mandatory gate
+  if (effectiveTaskRole(task) === "relay") return false; // Relay-owned mechanical verify
   if (hasChildren(db, task.id)) return false; // a container is a roll-up, not work
   if (!dependenciesMet(db, task)) return false;
   const role = effectiveTaskRole(task);

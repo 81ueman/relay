@@ -231,6 +231,13 @@ function migrate(db: Database): void {
       ["pr_url", "TEXT"],
       ["branch", "TEXT"],
       ["head_sha", "TEXT"],
+      // ISH-759 provider binding + mechanical-verify spec + merge confirmation.
+      ["pr_repo", "TEXT"],
+      ["pr_base", "TEXT"],
+      ["pr_base_sha", "TEXT"],
+      ["pr_diff", "TEXT"],
+      ["checks_json", "TEXT"],
+      ["merged_at", "INTEGER"],
       ["result_ref", "TEXT"],
       ["review_profile", "TEXT"],
       ["accepted_at", "INTEGER"],
