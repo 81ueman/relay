@@ -218,6 +218,31 @@ function migrate(db: Database): void {
       db.exec("ALTER TABLE tasks ADD COLUMN plan_id TEXT;");
     }
     db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_plan ON tasks(plan_id);");
+    // Code-change workflow columns (ISH-758). Additive + nullable/0-default so a
+    // pre-existing DB keeps every legacy task on the legacy machine.
+    const taskCols: [string, string][] = [
+      ["provider", "TEXT"],
+      ["issue_id", "TEXT"],
+      ["slice", "TEXT"],
+      ["code_change", "INTEGER NOT NULL DEFAULT 0"],
+      ["phase", "TEXT"],
+      ["attempt", "INTEGER NOT NULL DEFAULT 0"],
+      ["claim_role", "TEXT"],
+      ["pr_url", "TEXT"],
+      ["branch", "TEXT"],
+      ["head_sha", "TEXT"],
+      ["result_ref", "TEXT"],
+      ["review_profile", "TEXT"],
+      ["accepted_at", "INTEGER"],
+    ];
+    for (const [col, type] of taskCols) {
+      if (!columnExists(db, "tasks", col)) db.exec(`ALTER TABLE tasks ADD COLUMN ${col} ${type};`);
+    }
+    db.exec(
+      `CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_work_identity
+         ON tasks(provider, issue_id, slice)
+         WHERE provider IS NOT NULL AND issue_id IS NOT NULL AND slice IS NOT NULL;`
+    );
   }
   // Per-spawn attach token (generation fencing for managed attaches).
   if (columnExists(db, "worker_runtimes", "id") && !columnExists(db, "worker_runtimes", "attach_token")) {

@@ -13,6 +13,8 @@ import {
 } from "./workers";
 import type { Task, TaskState, WorkerState } from "./schema";
 import { RELAY_TAG, sendMessage } from "./messages";
+import { requestReconcile } from "./control";
+import { findTaskResult, insertTaskResult, notifyGatewayTo } from "./results";
 
 export const STALE_LEASE = "STALE_LEASE";
 
@@ -63,7 +65,15 @@ const REVIEW_GATE_SQL =
 // of work, so it is never offered, claimable, or counted as runnable. Derived
 // from `parent_task_id` alone — no stored flag, no extra task state.
 const CONTAINER_TASK_SQL = `NOT EXISTS (SELECT 1 FROM tasks c WHERE c.parent_task_id = t.id)`;
-const RUNNABLE_TASK_SQL = `t.state = 'queued' AND ${DEPS_DONE_SQL} AND ${REVIEW_GATE_SQL} AND ${CONTAINER_TASK_SQL}`;
+// A code-change task parked at `merge_ready` is waiting for the mandatory
+// TaskAccepted gate, not for an implementer/reviewer: it is never offered.
+const MERGE_READY_SQL = `NOT (IFNULL(t.code_change, 0) = 1 AND t.phase = 'merge_ready')`;
+const RUNNABLE_TASK_SQL = `t.state = 'queued' AND ${DEPS_DONE_SQL} AND ${REVIEW_GATE_SQL} AND ${CONTAINER_TASK_SQL} AND ${MERGE_READY_SQL}`;
+
+/** The role gate a task presents: a phase-derived `claim_role` wins over `role`. */
+export function effectiveTaskRole(task: Pick<Task, "role" | "claim_role">): string | null {
+  return task.claim_role ?? task.role;
+}
 
 /**
  * Clear a worker's quiet lease after an explicit relay action (note/submit/block/
@@ -141,7 +151,7 @@ export function claimableRunnableTasks(db: Database, workerId: string, opts: Cla
   const worker = getWorker(db, workerId);
   if (!worker) return [];
   const { matchRole, strict } = claimPolicy(worker.role, opts);
-  return runnableTasks(db).filter((t) => roleMatches(t.role, matchRole, strict));
+  return runnableTasks(db).filter((t) => roleMatches(effectiveTaskRole(t), matchRole, strict));
 }
 
 /**
@@ -152,10 +162,13 @@ export function claimableRunnableTasks(db: Database, workerId: string, opts: Cla
 export function unclaimableRunnableTasks(db: Database): Task[] {
   if (!roleStrictDefault()) return [];
   const roles = new Set(listWorkers(db).map((w) => w.role));
-  return runnableTasks(db).filter((t) => t.role !== null && !roles.has(t.role));
+  return runnableTasks(db).filter((t) => {
+    const role = effectiveTaskRole(t);
+    return role !== null && !roles.has(role);
+  });
 }
 
-function nextTaskId(db: Database): string {
+export function nextTaskId(db: Database): string {
   const r = db
     .query(`SELECT COALESCE(MAX(CAST(SUBSTR(id, 2) AS INTEGER)), 0) AS n FROM tasks WHERE id LIKE 'T%'`)
     .get() as { n: number };
@@ -321,7 +334,7 @@ export function taskDependencies(db: Database, taskId: string): string[] {
  */
 export function dependenciesMet(db: Database, task: Task): boolean {
   // A reviewer gate additionally accepts a prerequisite still in `review`.
-  const relaxed = task.role === "reviewer";
+  const relaxed = effectiveTaskRole(task) === "reviewer";
   const unmet = db
     .query(
       `SELECT COUNT(*) AS n FROM task_deps dep
@@ -350,9 +363,11 @@ export function hasChildren(db: Database, taskId: string): boolean {
  */
 export function isRunnableNow(db: Database, task: Task, reviewExists?: boolean): boolean {
   if (task.state !== "queued") return false;
+  if (task.code_change === 1 && task.phase === "merge_ready") return false; // mandatory gate
   if (hasChildren(db, task.id)) return false; // a container is a roll-up, not work
   if (!dependenciesMet(db, task)) return false;
-  if (task.role === "reviewer" && taskDependencies(db, task.id).length === 0) {
+  const role = effectiveTaskRole(task);
+  if (role === "reviewer" && taskDependencies(db, task.id).length === 0) {
     return reviewExists ?? reviewPending(db);
   }
   return true;
@@ -462,7 +477,7 @@ export function claimNext(db: Database, workerId: string, opts: ClaimOptions = {
     // in review) is never selected. Under strict, only role IS NULL or
     // role = matchRole qualify.
     const queuedSql = strict
-      ? `SELECT t.* FROM tasks t WHERE ${RUNNABLE_TASK_SQL} AND (t.role IS NULL OR t.role = ?) ORDER BY t.priority DESC, t.created_at ASC LIMIT 1`
+      ? `SELECT t.* FROM tasks t WHERE ${RUNNABLE_TASK_SQL} AND (COALESCE(t.claim_role, t.role) IS NULL OR COALESCE(t.claim_role, t.role) = ?) ORDER BY t.priority DESC, t.created_at ASC LIMIT 1`
       : `SELECT t.* FROM tasks t WHERE ${RUNNABLE_TASK_SQL} ORDER BY t.priority DESC, t.created_at ASC LIMIT 1`;
     const task = (strict ? db.query(queuedSql).get(matchRole) : db.query(queuedSql).get()) as Task | null;
 
@@ -511,14 +526,14 @@ export function claimTask(db: Database, taskId: string, workerId: string, opts: 
     // queued reviewer GATE. Naming the gate is the intended escape from the
     // T295 unclaimable state (a standing gate with nothing in review is parked
     // by design, so the owner needs one supported way to pick it up).
-    if (worker.role === "reviewer" && !(task.role === "reviewer" && task.state === "queued")) {
+    if (worker.role === "reviewer" && !(effectiveTaskRole(task) === "reviewer" && task.state === "queued")) {
       throw new Error(`reviewers take review tasks via \`relay next\`, not claim (name a queued reviewer gate to claim one explicitly)`);
     }
     if (task.state !== "queued") throw new Error(`cannot claim task in state ${task.state}`);
     const { matchRole, strict } = claimPolicy(worker.role, opts);
-    if (!roleMatches(task.role, matchRole, strict)) {
+    if (!roleMatches(effectiveTaskRole(task), matchRole, strict)) {
       throw new Error(
-        `cannot claim task ${taskId}: role '${task.role}' does not match worker role '${matchRole}' (use --any-role to override)`
+        `cannot claim task ${taskId}: role '${effectiveTaskRole(task)}' does not match worker role '${matchRole}' (use --any-role to override)`
       );
     }
     // Run gating is orthogonal to the role gate and NOT bypassable by
@@ -528,7 +543,7 @@ export function claimTask(db: Database, taskId: string, workerId: string, opts: 
         `cannot claim task ${taskId}: not yet runnable — prerequisite ${taskDependencies(db, taskId).join(", ")} is not done`
       );
     }
-    if (task.role === "reviewer" && taskDependencies(db, taskId).length === 0 && !reviewPending(db) && !opts.allowReviewerGate) {
+    if (effectiveTaskRole(task) === "reviewer" && taskDependencies(db, taskId).length === 0 && !reviewPending(db) && !opts.allowReviewerGate) {
       throw new Error(
         `cannot claim task ${taskId}: not yet runnable — a reviewer gate needs something in review, or ` +
         `declare its inputs with \`relay task depend ${taskId} <input,...>\``
@@ -865,6 +880,15 @@ export function submitTask(
   if (task.state !== "running") {
     throw new Error(`cannot submit task in state ${task.state}`);
   }
+  if (task.code_change === 1) {
+    // ISH-758 mandatory code-change gate: a code task advances by STRUCTURED
+    // phase results, never by the legacy submit shortcut (which would jump an
+    // implement task straight to review and skip verify/integration).
+    throw new Error(
+      `mandatory code-change gate: ${taskId} is a code-change task (phase '${task.phase}'); ` +
+      `use \`relay result submit ${taskId} --evidence ...\` instead of \`relay submit\`.`
+    );
+  }
   const t = now();
   if (opts.evidence) {
     db.query(`INSERT INTO task_notes (task_id, worker_id, kind, body, created_at) VALUES (?, ?, 'evidence', ?, ?)`).run(taskId, workerId, opts.evidence, t);
@@ -881,6 +905,15 @@ export function submitTask(
 export function approveTask(db: Database, taskId: string, workerId: string): Task {
   const task = getTask(db, taskId);
   if (!task) throw new Error(`unknown task: ${taskId}`);
+  if (task.code_change === 1) {
+    // ISH-758: a code-change task may only become `done` through the mandatory
+    // gate — TaskAccepted at phase `merge_ready`. A bare `relay approve` (or the
+    // RELAY_AUTO_APPROVE reconciler path) must never satisfy it.
+    throw new Error(
+      `mandatory code-change gate: ${taskId} is a code-change task (phase '${task.phase}'); ` +
+      `\`relay approve\` cannot complete it. Use \`relay result accept ${taskId}\` once it is merge_ready.`
+    );
+  }
   if (task.state !== "review") throw new Error(`cannot approve task in state ${task.state}`);
   const t = now();
   // Durable state first, in ONE transaction: the child's completion and its
@@ -1052,8 +1085,19 @@ function notifyHumanBlocked(db: Database, task: Task, actor: string, reason: str
  * Blocked-child roll-up (one hop only): the immediate parent gets a durable
  * `child_blocked` note (+ `children_blocked` when ALL direct children are
  * blocked) and, when it has an assignee, an immediate message to that worker.
+ *
+ * `skipMessageTo` suppresses the assignee message when that recipient is ALSO the
+ * structured Gateway (a code-change child), so one block never notifies the
+ * Gateway twice.
  */
-function bubbleChildBlocked(db: Database, child: Task, actor: string, reason: string, at: number): void {
+function bubbleChildBlocked(
+  db: Database,
+  child: Task,
+  actor: string,
+  reason: string,
+  at: number,
+  opts: { skipMessageTo?: string | null } = {}
+): void {
   const parentId = child.parent_task_id;
   if (!parentId) return;
   const parent = getTask(db, parentId);
@@ -1077,7 +1121,7 @@ function bubbleChildBlocked(db: Database, child: Task, actor: string, reason: st
     ).run(parentId, actor, `${RELAY_TAG}All direct children of ${parentId} are blocked (${counts.blocked}/${counts.total}).`, at);
   }
 
-  if (parent.assignee) {
+  if (parent.assignee && parent.assignee !== opts.skipMessageTo) {
     sendMessage(db, "relay", parent.assignee, body, { kind: "child_blocked", taskId: parentId });
     if (allBlocked) {
       sendMessage(db, "relay", parent.assignee, `${RELAY_TAG}All direct children of ${parentId} are blocked (${counts.blocked}/${counts.total}).`, {
@@ -1093,6 +1137,51 @@ function bubbleChildBlocked(db: Database, child: Task, actor: string, reason: st
     payload: { child: child.id, state: child.state, allBlocked, assignee: parent.assignee ?? null },
   });
 }
+
+/**
+ * ISH-758: record a blocked child as a STRUCTURED ChildBlocked result, once per
+ * BLOCK OCCURRENCE. `blockTask` bumps `lease_token` on every block, so the
+ * (phase='blocked', attempt=lease_token) identity distinguishes two blocks of the
+ * same attempt (e.g. block -> unblock -> block); keying on the task/phase/attempt
+ * alone silently dropped the second, decision-needed block.
+ *
+ * `notifyGateway` gates the human notification: policy is that `blocked_internal`
+ * never pings the human (the parent-assignee roll-up owns it), while a
+ * `blocked_human` block reaches the Gateway exactly once.
+ *
+ * Returns true when this call produced the notification.
+ */
+export function recordChildBlocked(
+  db: Database,
+  childId: string,
+  actor: string,
+  reason: string,
+  opts: { notifyGateway?: boolean } = {}
+): boolean {
+  const child = getTask(db, childId);
+  if (!child) throw new Error(`unknown task: ${childId}`);
+  const notify = opts.notifyGateway !== false;
+  // `blocked` + lease_token is the block-occurrence identity (lease_token is
+  // bumped by every block), so each new block records/notifies exactly once.
+  const phase = "blocked";
+  const occurrence = child.lease_token;
+  if (findTaskResult(db, childId, phase, occurrence, "ChildBlocked")) return false;
+  insertTaskResult(db, {
+    taskId: childId,
+    phase,
+    attempt: occurrence,
+    kind: "ChildBlocked",
+    workerId: actor,
+    reason,
+    payload: { taskPhase: child.phase ?? null, state: child.state, leaseToken: child.lease_token },
+  });
+  if (!notify) return false;
+  const parentId = child.parent_task_id;
+  const target = parentId ? getTask(db, parentId) ?? child : child;
+  const recipient = resolveHumanInterface(db, target);
+  return notifyGatewayTo(db, recipient, target, `${childId} is blocked${reason ? `: ${reason}` : ""}.`, "child_blocked");
+}
+
 
 export function rejectTask(db: Database, taskId: string, workerId: string, reason: string): Task {
   const task = getTask(db, taskId);
@@ -1147,11 +1236,26 @@ export function blockTask(db: Database, taskId: string, workerId: string, reason
     clearQuietLogged(db, workerId, taskId);
     logEvent(db, { source: "worker", workerId, taskId, type: human ? "task.blocked_human" : "task.blocked_internal", payload: { reason } });
     // One-hop roll-up: the immediate parent assignee must learn a child is stuck.
-    bubbleChildBlocked(db, getTask(db, taskId)!, workerId, reason, t);
-    // T337: a HUMAN block also reaches the human interface (or shouts if none
-    // resolves). blocked_internal never pings the human.
-    if (human) notifyHumanBlocked(db, getTask(db, taskId)!, workerId, reason, t);
+    const child = getTask(db, taskId)!;
+    const codeChild = child.code_change === 1;
+    const gateway = resolveHumanInterface(db, child);
+    // Policy: only a HUMAN block reaches the Gateway. A code-change blocked_human
+    // is delivered as the structured ChildBlocked result (exactly once per block);
+    // the legacy human prose path is skipped for it so the Gateway is not told
+    // twice, and the parent-assignee peer message is suppressed when it would
+    // target the same Gateway. blocked_internal never pings the human: it is left
+    // to the parent-assignee roll-up.
+    const gatewayBlock = codeChild && human;
+    bubbleChildBlocked(db, child, workerId, reason, t, { skipMessageTo: gatewayBlock ? gateway : null });
+    if (codeChild) {
+      recordChildBlocked(db, taskId, workerId, reason, { notifyGateway: human });
+    } else if (human) {
+      // T337: a HUMAN block also reaches the human interface (or shouts if none
+      // resolves). blocked_internal never pings the human.
+      notifyHumanBlocked(db, child, workerId, reason, t);
+    }
   })();
+  requestReconcile(db, `block:${taskId}`);
   return getTask(db, taskId)!;
 }
 
