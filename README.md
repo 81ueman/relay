@@ -239,6 +239,50 @@ relay task depend T153 --clear                                        # remove t
   are visible instead of looking stranded or unclaimable.
 - Cycles and unknown prerequisites are refused at insert time.
 
+## Code-change workflow (implement → verify → review → FIX/merge)
+
+A **code-change** task (`relay task intake ... --code-change`) is driven by Relay
+through a fixed phase machine. Structured results are the source of truth;
+`relay send` prose is never parsed for a verdict, and `relay approve` /
+`RELAY_AUTO_APPROVE` can never satisfy the gate.
+
+```
+implement --TaskSubmitted--> verify --VerificationResult--> review
+  review --ReviewResult PASS--> integration --TaskSubmitted--> merge_ready
+  review --ReviewResult FIX-->  implement (new attempt, same task)
+  review --ReviewResult BLOCKED / verify NOT_RUN / INCONCLUSIVE --> blocked_human
+  merge_ready --TaskAccepted--> done   (Relay-internal acceptance)
+  merged (GitHub) --> TaskMerged       (the ONLY "truly done" for a task with a PR)
+```
+
+- **Mechanical verify, no LLM wait.** Intake the standard commands with
+  `--check name=command` (repeatable). When a task reaches `verify`, Relay runs
+  them itself and reads the **process exit result**: pass → review,
+  fail → implement FIX, and a **required** `not_run`/`inconclusive` → BLOCKED
+  (never PASS). The verify phase is Relay-owned (`claim_role=relay`), so the
+  claim machine never offers it to a worker. Without `--check`, verify stays the
+  manual worker path. `relay verify <task>` runs the same checks explicitly.
+- **Independent review.** VERIFY PASS moves the task to `review` and the ordinary
+  reviewer wake dispatches an idle reviewer in the same reconcile pass. The
+  reviewer must hold `REVIEWER_ROLE` (or the review claim) and may not be the
+  worker that submitted the attempt; a reviewer has **no write/merge** authority.
+- **HEAD is the review identity.** A PASS must name the current `head_sha`; a
+  moved head sends the task back to review. The same PR+HEAD+profile is reviewed
+  once, and an **unresolved NG at the same HEAD is never cleared by a later OK
+  alone** (it must `--supersedes <result-id>` explicitly).
+- **Provider reconciliation is read-only / fail-closed.** With a bound PR, Relay
+  polls open/synchronize/merged: a head move invalidates the review, and a
+  `merged` PR at the recorded head records `TaskMerged`. Review verdicts are
+  absorbed from `lane.sh`'s `<!-- ishiul-review head=<sha> verdict=OK|NG|HOLD
+  reviewer=<id> -->` markers, but only from an authorized reviewer identity — a
+  reviewer's TurnEnded, a GitHub **label**, and a self-claimed comment are **not**
+  an approval. Any real provider write (comment/label), Linear write, or merge
+  requires an explicit point-of-use `ProviderAuthority` grant (ISH-288); the
+  default is deny.
+- **Gateway is notified only for judgment.** `ChildrenReady` (all direct children
+  accepted) and `ChildBlocked` (a blocked child) reach the fixed Gateway worker;
+  ordinary FIX/PASS never wake it. The Gateway is never a per-phase coordinator.
+
 ### Historical cleanup: `relay gc`
 
 There was no supported purge for old worker/runtime/session/task rows (fleet
