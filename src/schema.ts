@@ -101,6 +101,12 @@ export interface Task {
    * worker path (legacy ISH-758 behaviour).
    */
   checks_json: string | null;
+  /**
+   * ISH-759: the per-task worktree Relay runs mechanical verify in. Mechanical
+   * verify only PASSes when `git rev-parse HEAD` in this cwd equals `head_sha`,
+   * so commands run against the recorded revision, not the daemon's checkout.
+   */
+  worktree: string | null;
   /** ISH-759: when the bound PR was confirmed merged (the true "done"). */
   merged_at: number | null;
   /** Evidence ref for the CURRENT attempt (a structured-result id or note id). */
@@ -381,6 +387,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   pr_base_sha TEXT,
   pr_diff TEXT,
   checks_json TEXT,
+  worktree TEXT,
   merged_at INTEGER,
   result_ref TEXT,
   review_profile TEXT,

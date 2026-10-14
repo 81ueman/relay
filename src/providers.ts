@@ -359,27 +359,48 @@ function applyMarker(db: Database, task: Task, marker: ReviewMarker, authority: 
   // Structuring a verdict is not a provider write; it needs no authority.
   void authority;
   const verdict = marker.verdict === "OK" ? "pass" : marker.verdict === "NG" ? "fix" : "blocked";
+  // Pass the LIVE FULL head recorded on the task, not the (possibly abbreviated)
+  // marker SHA: recordReview compares heads exactly. `headsMatch` already proved
+  // the marker names this head.
+  const liveHead = task.head_sha ?? marker.headSha;
   try {
     recordReview(db, task.id, `provider:${marker.reviewer}`, {
       verdict,
-      headSha: marker.headSha,
+      headSha: liveHead,
       reason: marker.body.slice(0, 2000),
       evidence: `marker:${marker.author}@${marker.createdAt}`,
       externalReviewer: marker.reviewer,
       source: "github-marker",
     });
-    return [{ kind: `review-${verdict}`, taskId: task.id, detail: `${marker.verdict}@${marker.headSha.slice(0, 10)}` }];
+    return [{ kind: `review-${verdict}`, taskId: task.id, detail: `${marker.verdict}@${liveHead.slice(0, 10)}` }];
   } catch (e) {
     // Duplicate / unresolved-NG / stale-head refusals are expected and are NOT
-    // failures: they are the guards doing their job.
-    logEvent(db, {
-      source: "workflow",
-      taskId: task.id,
-      type: "workflow.marker_not_applied",
-      payload: { verdict: marker.verdict, head: marker.headSha, error: String(e).slice(0, 300) },
-    });
+    // failures: they are the guards doing their job. Log ONCE per
+    // (task, marker identity) so an unappliable marker does not spam the event
+    // log on every reconcile pass.
+    const markerKey = `${marker.author}@${marker.headSha}@${marker.verdict}`;
+    if (!markerNotAppliedLogged(db, task.id, markerKey)) {
+      logEvent(db, {
+        source: "workflow",
+        taskId: task.id,
+        type: "workflow.marker_not_applied",
+        payload: { markerKey, verdict: marker.verdict, head: marker.headSha, error: String(e).slice(0, 300) },
+      });
+    }
     return [{ kind: "marker-not-applied", taskId: task.id, detail: String(e).slice(0, 120) }];
   }
+}
+
+/** True when a marker_not_applied event already exists for this marker identity. */
+function markerNotAppliedLogged(db: Database, taskId: string, markerKey: string): boolean {
+  const row = db
+    .query(
+      `SELECT 1 AS x FROM events
+        WHERE task_id = ? AND type = 'workflow.marker_not_applied' AND payload_json LIKE ?
+        LIMIT 1`
+    )
+    .get(taskId, `%"markerKey":"${markerKey}"%`);
+  return !!row;
 }
 
 // ---------------------------------------------------------------------------

@@ -14,9 +14,17 @@ import {
 } from "./results";
 import type { CodePhase, ResultKind, Task, TaskState, VerifyOutcome } from "./schema";
 import { INTEGRATOR_ROLE, REVIEWER_ROLE } from "./schema";
-import { getTask, nextTaskId, recordChildBlocked, resolveHumanInterface, taskChildren } from "./tasks";
+import {
+  clearCurrentTaskOrRestoreParent,
+  getTask,
+  nextTaskId,
+  recordChildBlocked,
+  resolveHumanInterface,
+  taskChildren,
+} from "./tasks";
 import { clearCurrentTask, getWorker, normalizeWorkerAfterTaskRelease, touchProgress } from "./workers";
 import {
+  gitHead,
   parseChecks,
   runChecks,
   serializeChecks,
@@ -281,6 +289,8 @@ export interface IntakeInput {
   prDiff?: string;
   /** The standard commands Relay runs mechanically in the verify phase. */
   checks?: CheckSpec[];
+  /** The per-task worktree mechanical verify runs in. */
+  worktree?: string;
   dependsOn?: string[];
 }
 
@@ -336,6 +346,13 @@ export function intakeTask(db: Database, input: IntakeInput): Task {
         existing.id
       );
     }
+    if (input.worktree) {
+      db.query(`UPDATE tasks SET worktree = COALESCE(worktree, ?), updated_at = ? WHERE id = ? AND code_change = 1`).run(
+        input.worktree,
+        now(),
+        existing.id
+      );
+    }
     return getTask(db, linked.id)!;
   }
 
@@ -352,12 +369,12 @@ export function intakeTask(db: Database, input: IntakeInput): Task {
             lease_token, lease_until, parent_task_id, plan_id,
             provider, issue_id, slice, code_change, phase, attempt, claim_role,
             pr_url, branch, head_sha, pr_repo, pr_base, pr_base_sha, pr_diff,
-            checks_json, result_ref, review_profile, accepted_at,
+            checks_json, worktree, result_ref, review_profile, accepted_at,
             created_at, updated_at)
          VALUES (?, ?, ?, ?, 'queued', ?, ?, NULL, 0, NULL, ?, NULL,
                  ?, ?, ?, ?, ?, 0, NULL,
                  ?, ?, ?, ?, ?, ?, ?,
-                 ?, NULL, NULL, NULL, ?, ?)`
+                 ?, ?, NULL, NULL, NULL, ?, ?)`
       ).run(
         id,
         input.title ?? input.description ?? `${issueId}${slice ? `/${slice}` : ""}`,
@@ -379,6 +396,7 @@ export function intakeTask(db: Database, input: IntakeInput): Task {
         input.prBaseSha ?? null,
         input.prDiff ?? null,
         checksJson,
+        input.worktree ?? null,
         t,
         t
       );
@@ -653,10 +671,16 @@ export function recordVerification(
 export interface MechanicalVerifyOptions {
   checks: CheckSpec[];
   runner: CommandRunner;
-  /** Working directory for the commands (the task's worktree). */
+  /** Working directory for the commands (the task's recorded worktree). */
   cwd: string;
   /** The head this verification judges; a moved head discards the run. */
   headSha?: string;
+  /**
+   * Reads the checkout's HEAD at `cwd`. Defaults to `git rev-parse HEAD`. A
+   * mismatch with the recorded head BLOCKS (never PASS): the commands did not
+   * run against the revision we would record.
+   */
+  headProbe?: (cwd: string) => string | null;
   /** Actor label for events (default: relay). */
   actor?: string;
 }
@@ -668,6 +692,7 @@ export interface MechanicalVerifyOptions {
  */
 export function quietBlock(db: Database, task: Task, reason: string, actor: string): Task {
   const t = now();
+  const prev = task.assignee;
   db.transaction(() => {
     db.query(
       `UPDATE tasks
@@ -678,6 +703,13 @@ export function quietBlock(db: Database, task: Task, reason: string, actor: stri
     db.query(
       `INSERT INTO task_notes (task_id, worker_id, kind, body, created_at) VALUES (?, ?, 'blocked_human', ?, ?)`
     ).run(task.id, actor, reason, t);
+    // Release the owning worker EXACTLY like blockTask: clear (or restore its
+    // parent) and normalize it, so it is not left `working` on a task it no
+    // longer holds (the Linear-HOLD-on-a-running-task case).
+    if (prev) {
+      clearCurrentTaskOrRestoreParent(db, prev, task.id, t);
+      normalizeWorkerAfterTaskRelease(db, prev, t);
+    }
   })();
   recordChildBlocked(db, task.id, actor, reason, { notifyGateway: true });
   requestReconcile(db, `blocked:${task.id}`);
@@ -707,7 +739,34 @@ export async function runMechanicalVerification(
   }
   const actor = opts.actor ?? RELAY_ROLE;
   const head = opts.headSha ?? task.head_sha;
-  const { outcome, checks } = await runChecks(opts.checks, opts.runner, opts.cwd);
+  const probe = opts.headProbe ?? gitHead;
+
+  // BIND THE RUN TO THE RECORDED HEAD. The commands run in a checkout; before
+  // trusting any result we confirm that checkout IS the recorded revision. A
+  // missing recorded head, an unreadable checkout, or a mismatch BLOCKS (never
+  // PASS) — otherwise a PASS would be credited to a head the commands never saw.
+  const treeHead = probe(opts.cwd);
+  let bindingError: string | null = null;
+  if (!head) {
+    bindingError = "no recorded head_sha to bind the run to";
+  } else if (!treeHead) {
+    bindingError = `cwd '${opts.cwd}' is not a readable git checkout (git rev-parse HEAD failed)`;
+  } else if (treeHead !== head) {
+    bindingError = `checkout HEAD ${treeHead} != recorded head ${head}`;
+  }
+
+  let outcome: VerifyOutcome;
+  let checks: ExecutedCheck[];
+  if (bindingError) {
+    outcome = "not_run";
+    checks = [
+      { name: "head-binding", required: true, outcome: "not_run", exitCode: null, output: bindingError, durationMs: 0 },
+    ];
+  } else {
+    const run = await runChecks(opts.checks, opts.runner, opts.cwd);
+    outcome = run.outcome;
+    checks = run.checks;
+  }
 
   // Re-read: the run may have raced a head move / a rework. Only advance if the
   // task is STILL the verify/attempt/head we started on.
@@ -787,6 +846,7 @@ export async function runMechanicalVerification(
 
   // not_run / inconclusive for a required check: BLOCK, do not PASS. The
   // VerificationResult records the outcome for evidence, then the task blocks.
+  const blockReason = bindingError ?? `${outcome}: ${evidence}`;
   db.transaction(() => {
     insertTaskResult(db, {
       taskId,
@@ -797,11 +857,11 @@ export async function runMechanicalVerification(
       passed: false,
       headSha: head,
       evidenceRef: evidence,
-      reason: `${outcome}: ${evidence}`,
+      reason: bindingError ?? `${outcome}: ${evidence}`,
       payload,
     });
   })();
-  const blocked = quietBlock(db, getTask(db, taskId)!, `mechanical verify ${outcome}: ${evidence}`, actor);
+  const blocked = quietBlock(db, getTask(db, taskId)!, `mechanical verify ${outcome}: ${blockReason}`, actor);
   return { task: blocked, outcome, checks, stale: false };
 }
 
@@ -1121,7 +1181,12 @@ export function confirmMerged(db: Database, taskId: string, opts: MergedOptions 
       payload: { repo: opts.repo ?? task.pr_repo, head: mergedHead },
     });
     db.query(`UPDATE tasks SET merged_at = ?, updated_at = ? WHERE id = ?`).run(t, t, taskId);
-    return getTask(db, taskId)!;
+    const next = getTask(db, taskId)!;
+    // A confirmed merge may be the last thing a parent's children were waiting
+    // for (a code child counts as complete only once merged), so re-run the
+    // children-ready roll-up here too.
+    notifyParentAccepted(db, next);
+    return next;
   })();
   requestReconcile(db, `merged:${taskId}`);
   return updated;
@@ -1144,9 +1209,21 @@ export function codeChangeGateSatisfied(task: Task): boolean {
 }
 
 /**
+ * True when a task counts as COMPLETE for a roll-up / dependency: `done` AND,
+ * for a code task with a bound PR, the real merge confirmed. An internal accept
+ * is not enough (ISH-759).
+ */
+export function taskComplete(task: Task): boolean {
+  if (task.state !== "done") return false;
+  if (!isCodeTask(task)) return true;
+  return task.pr_url === null || task.merged_at !== null;
+}
+
+/**
  * On acceptance, tell the parent's Gateway ONLY when ALL direct children are
- * accepted (children-ready aggregation). Recorded as a durable ChildrenReady
- * result so it fires exactly once. Runs inside the caller's transaction.
+ * COMPLETE (children-ready aggregation). A code child with an unmerged PR does
+ * NOT count as complete. Recorded as a durable ChildrenReady result so it fires
+ * exactly once. Runs inside the caller's transaction.
  */
 function notifyParentAccepted(db: Database, child: Task): void {
   const parentId = child.parent_task_id;
@@ -1155,7 +1232,7 @@ function notifyParentAccepted(db: Database, child: Task): void {
   if (!parent) return;
   const kids = taskChildren(db, parentId);
   if (kids.length === 0) return;
-  if (!kids.every((k) => k.state === "done")) return; // not ready yet
+  if (!kids.every((k) => taskComplete(k))) return; // not all complete yet
   if (findTaskResult(db, parentId, "", 0, "ChildrenReady")) return; // already told
   insertTaskResult(db, {
     taskId: parentId,

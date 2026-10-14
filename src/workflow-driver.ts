@@ -27,8 +27,13 @@ import {
 export interface WorkflowDeps {
   /** The read-only command runner used by mechanical verify (default: real). */
   verifyRunner?: CommandRunner;
-  /** Working directory for mechanical verify commands (the task's worktree). */
+  /**
+   * Fallback working directory for mechanical verify when a task records no
+   * `worktree`. Prefer the per-task worktree; this is only a default.
+   */
   verifyCwd?: string;
+  /** Reads a checkout's HEAD for the pre-run binding check (default: git). */
+  verifyHeadProbe?: (cwd: string) => string | null;
   github?: GitHubReadOnly;
   linear?: LinearReadOnly;
   authorizedReviewers?: string[];
@@ -73,12 +78,20 @@ export async function runPendingMechanicalVerifications(
 ): Promise<string[]> {
   const actions: string[] = [];
   const runner = deps.verifyRunner ?? defaultRunner;
-  const cwd = deps.verifyCwd ?? process.env.RELAY_VERIFY_CWD ?? process.cwd();
+  const fallbackCwd = deps.verifyCwd ?? process.env.RELAY_VERIFY_CWD ?? process.cwd();
   for (const t of pendingMechanicalVerifications(db)) {
     const checks = taskChecks(t);
     if (checks.length === 0) continue; // nothing mechanical to run
+    // Bind the run to the TASK's own worktree when recorded, so the commands run
+    // against the recorded revision rather than the daemon's checkout.
+    const cwd = t.worktree ?? fallbackCwd;
     try {
-      const { outcome, stale } = await runMechanicalVerification(db, t.id, { checks, runner, cwd });
+      const { outcome, stale } = await runMechanicalVerification(db, t.id, {
+        checks,
+        runner,
+        cwd,
+        headProbe: deps.verifyHeadProbe,
+      });
       actions.push(stale ? `verify-stale:${t.id}` : `verify-${outcome}:${t.id}`);
     } catch (e) {
       actions.push(`verify-error:${t.id}`);

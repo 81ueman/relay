@@ -26,6 +26,7 @@ import {
 } from "./tasks";
 import { acceptTask, confirmMerged, intakeTask, recordReview, recordVerification, runMechanicalVerification, submitPhase, taskChecks } from "./workflow";
 import { defaultRunner, type CheckSpec } from "./verify";
+import { providerDepsFromEnv } from "./provider-adapters";
 import {
   bindSession, findWorkerBySession, getWorker, listWorkers,
   quietActive, registerWorker, retireWorker, setWorkerState, touchSeen, unretireWorker,
@@ -68,7 +69,7 @@ Usage:
   relay runtime list [--worker <id>] [--state <state>]
 
   relay task add "description" [--title T] [--acceptance A] [--priority N] [--role R] [--parent T1] [--plan <plan-id>] [--depends-on T1,T2]
-  relay task intake --provider P --issue ID [--slice S] [--title T] [--code-change] [--pr URL] [--branch B] [--head SHA] [--repo R] [--base REF] [--check name=cmd ...]
+  relay task intake --provider P --issue ID [--slice S] [--title T] [--code-change] [--pr URL] [--branch B] [--head SHA] [--repo R] [--base REF] [--check name=cmd ...] [--worktree DIR]
   relay task link <task-id> <plan-id>
   relay task unlink <task-id>
   relay task depend <task-id> <dep-id...> | --clear
@@ -227,9 +228,9 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
   },
   "task intake": {
     about:
-      "Idempotent code-change intake, keyed by (provider, issue ID, slice). Replaying the same intake returns the SAME task; a different --slice of the same issue is a DIFFERENT task. --code-change marks it as a code-change task, which enforces the mandatory phase gate (implement -> verify -> review -> integration -> merge_ready -> merged); `relay approve`/RELAY_AUTO_APPROVE can never complete it. --pr/--branch/--head/--repo/--base link the PR; a review PASS is invalid once the head moves. --check name=command (repeatable) makes verify MECHANICAL: Relay runs the command and uses the process exit result (no LLM waits).",
+      "Idempotent code-change intake, keyed by (provider, issue ID, slice). Replaying the same intake returns the SAME task; a different --slice of the same issue is a DIFFERENT task. --code-change marks it as a code-change task, which enforces the mandatory phase gate (implement -> verify -> review -> integration -> merge_ready -> merged); `relay approve`/RELAY_AUTO_APPROVE can never complete it. --pr/--branch/--head/--repo/--base link the PR; a review PASS is invalid once the head moves. --check name=command (repeatable) makes verify MECHANICAL: Relay runs the command in --worktree and only passes when that checkout's `git rev-parse HEAD` equals --head (no LLM waits).",
     usage: [
-      "relay task intake --provider P --issue ID [--slice S] [--title T] [--role R] [--priority N] [--parent T1] [--code-change] [--pr URL] [--branch B] [--head SHA] [--repo R] [--base REF] [--check name=cmd ...]",
+      "relay task intake --provider P --issue ID [--slice S] [--title T] [--role R] [--priority N] [--parent T1] [--code-change] [--pr URL] [--branch B] [--head SHA] [--repo R] [--base REF] [--check name=cmd ...] [--worktree DIR]",
     ],
   },
   result: {
@@ -973,6 +974,7 @@ async function main(): Promise<void> {
             prBaseSha: flag(rest, "--base-sha") ?? undefined,
             prDiff: flag(rest, "--diff") ?? undefined,
             checks: parseCheckFlags(flagRepeated(rest, "--check")),
+            worktree: flag(rest, "--worktree") ?? undefined,
           });
           console.log(
             `${t.id} ${t.code_change === 1 ? `code-change phase=${t.phase}` : "task"} provider=${t.provider} issue=${t.issue_id} slice=${t.slice === "" ? "-" : t.slice} state=${t.state}`
@@ -1206,7 +1208,7 @@ async function main(): Promise<void> {
         if (!task) throw new Error(`unknown task: ${id}`);
         const checks = taskChecks(task);
         if (checks.length === 0) throw new Error(`task ${id} has no mechanical checks (intake it with --check name=command)`);
-        const cwd = flag(rest, "--cwd") ?? process.env.RELAY_VERIFY_CWD ?? process.cwd();
+        const cwd = flag(rest, "--cwd") ?? task.worktree ?? process.env.RELAY_VERIFY_CWD ?? process.cwd();
         const { task: after, outcome, checks: executed, stale } = await runMechanicalVerification(db, id, {
           checks,
           runner: defaultRunner,
@@ -1662,7 +1664,7 @@ async function main(): Promise<void> {
         } else if (type === "session.error" && workerId) {
           const err = typeof payload === "object" && payload !== null ? JSON.stringify(payload) : String(payload);
           console.log(handleErrorSignal(db, workerId, err));
-          const { actions } = await reconcile(db, rt);
+          const { actions } = await reconcile(db, rt, undefined, providerDepsFromEnv());
           console.log(`reconciled:${actions.join(",") || "noop"}`);
         } else if (type === "permission.asked" && workerId) {
           touchSeen(db, workerId);

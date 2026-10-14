@@ -237,6 +237,7 @@ function migrate(db: Database): void {
       ["pr_base_sha", "TEXT"],
       ["pr_diff", "TEXT"],
       ["checks_json", "TEXT"],
+      ["worktree", "TEXT"],
       ["merged_at", "INTEGER"],
       ["result_ref", "TEXT"],
       ["review_profile", "TEXT"],
