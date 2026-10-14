@@ -832,3 +832,58 @@ describe("round 2: provider polling is throttled and comment fetch is change-gat
     expect(calls.comments).toBe(2); // moved -> fetch again
   });
 });
+
+describe("round 3: a marker posted before review survives a pre-review poll", () => {
+  function okMarkerComment() {
+    return [
+      {
+        author: "claude",
+        createdAt: "2026-01-01T00:00:00Z",
+        body: `<!-- ishiul-review head=${FULL} verdict=OK reviewer=claude -->`,
+      },
+    ];
+  }
+
+  test("poll in verify does not consume the watermark; the marker applies in review", async () => {
+    const t = intakeTask(db, {
+      provider: "github", issueId: "o/r#60", codeChange: true, headSha: FULL, checks: [CHECK],
+      prUrl: "https://github.com/o/r/pull/7", prRepo: "o/r",
+    });
+    claimTask(db, t.id, "impl");
+    submitPhase(db, t.id, "impl", { headSha: FULL });
+    expect(getTask(db, t.id)!.phase).toBe("verify");
+
+    // The reviewer already marked the pushed head (updatedAt=u2) BEFORE the task
+    // reached review (e.g. before `relay result submit`, or mid-verify).
+    const gh = new FakeGitHub();
+    gh.putPullRequest(githubViewAt(7, FULL, "open", "u2"));
+    gh.putComments({ repo: "o/r", number: 7 }, okMarkerComment());
+
+    // Poll while in verify: the comment scan does NOT run, so the watermark must
+    // NOT advance (otherwise the marker is silently consumed).
+    reconcileTaskFromProvider(db, t.id, { github: gh });
+    expect(getTask(db, t.id)!.pr_updated_at).toBeNull();
+    expect(getTask(db, t.id)!.phase).toBe("verify");
+
+    await mechanical(t.id, "pass");
+    expect(getTask(db, t.id)!.phase).toBe("review");
+
+    // Three polls with the SAME PR unchanged: the marker must be read and applied.
+    for (let i = 0; i < 3; i++) reconcileTaskFromProvider(db, t.id, { github: gh });
+    expect(getTask(db, t.id)!.phase).toBe("integration");
+  });
+
+  test("the watermark advances once the comment scan actually runs", async () => {
+    const t = intakeTask(db, {
+      provider: "github", issueId: "o/r#61", codeChange: true, headSha: FULL, checks: [CHECK],
+      prUrl: "https://github.com/o/r/pull/8", prRepo: "o/r",
+    });
+    await toReview(t.id);
+    const gh = new FakeGitHub();
+    gh.putPullRequest(githubViewAt(8, FULL, "open", "u5"));
+    gh.putComments({ repo: "o/r", number: 8 }, []); // no marker yet
+    reconcileTaskFromProvider(db, t.id, { github: gh });
+    expect(getTask(db, t.id)!.pr_updated_at).toBe("u5"); // scanned -> watermark set
+    expect(getTask(db, t.id)!.phase).toBe("review");
+  });
+});

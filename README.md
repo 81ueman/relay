@@ -302,9 +302,11 @@ implement --TaskSubmitted--> verify --VerificationResult--> review
   `RELAY_REVIEW_AUTHORIZED=a,b` sets the authorized marker authors. Default OFF
   (no provider, fail-closed). Each task is polled at most once per
   `RELAY_PROVIDER_POLL_MS` (default 60s) and comments are fetched only when the PR
-  `updatedAt`/head moved, so the reader stays within GitHub's rate limit. Any real
-  provider write (comment/label), Linear write, or merge requires an explicit
-  point-of-use `ProviderAuthority` grant (ISH-288); the default is deny.
+  `updatedAt`/head moved; the "comments scanned" watermark advances only when a
+  scan actually ran, so a marker posted before the task reached `review` is still
+  read once it does. Any real provider write (comment/label), Linear write, or
+  merge requires an explicit point-of-use `ProviderAuthority` grant (ISH-288); the
+  default is deny.
 - **Gateway is notified only for judgment.** `ChildrenReady` (all direct children
   truly complete) and `ChildBlocked` (a blocked child) reach the fixed Gateway
   worker; ordinary FIX/PASS never wake it. The Gateway is never a per-phase

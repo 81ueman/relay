@@ -314,15 +314,18 @@ export function reconcileTaskFromProvider(db: Database, taskId: string, deps: Pr
         }
 
         // Comments cost three `gh api` calls, so fetch them only when the PR
-        // actually moved (updatedAt/head changed since the last poll).
+        // actually moved (updatedAt/head changed since the last comment scan).
         const live = getTask(db, taskId)!;
         const prMoved =
           (view.updatedAt ?? "") !== (before.pr_updated_at ?? "") ||
           view.headSha !== (before.head_sha ?? "");
-        if ((view.updatedAt ?? "") !== (before.pr_updated_at ?? "")) {
-          db.query(`UPDATE tasks SET pr_updated_at = ? WHERE id = ?`).run(view.updatedAt ?? "", taskId);
-        }
+        // The watermark means "comments scanned up to here": advance it ONLY when
+        // the scan actually runs. Advancing on a poll while the task is in
+        // implement/verify would consume a marker posted before the task reached
+        // review (the optimistic watermark would then look unchanged and the
+        // marker would never be read).
         if (prMoved && live.phase === "review" && live.state === "review") {
+          db.query(`UPDATE tasks SET pr_updated_at = ? WHERE id = ?`).run(view.updatedAt ?? "", taskId);
           const markers = parseReviewMarkers(deps.github.listComments(ref), { authorizedReviewers });
           const eff = effectiveVerdictAtHead(markers, live.head_sha);
           if (eff) actions.push(...applyMarker(db, live, eff, deps.authority ?? NO_AUTHORITY));
