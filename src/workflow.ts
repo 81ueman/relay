@@ -363,6 +363,9 @@ const REVIEW_PINNED_PHASES: CodePhase[] = ["review", "integration", "merge_ready
  * HEAD is the review's identity: if the task is already at/past review and the
  * HEAD changes, the prior review no longer applies — the task is sent back to
  * review at a new attempt (a PASS can never survive a moved HEAD).
+ *
+ * A TERMINAL task (done/failed, or already accepted) is NEVER re-opened by a
+ * link/replay: its outcome is settled, so the update is ignored entirely.
  */
 export function linkTask(
   db: Database,
@@ -371,6 +374,19 @@ export function linkTask(
 ): Task {
   const task = getTask(db, taskId);
   if (!task) throw new Error(`unknown task: ${taskId}`);
+  const terminal = task.state === "done" || task.state === "failed" || task.accepted_at !== null;
+  if (terminal) {
+    // Do not touch a settled task, and never invalidateReview it back to review.
+    if (link.headSha !== undefined && link.headSha !== task.head_sha) {
+      logEvent(db, {
+        source: "workflow",
+        taskId,
+        type: "workflow.link_ignored_terminal",
+        payload: { state: task.state, acceptedAt: task.accepted_at, fromHead: task.head_sha, toHead: link.headSha },
+      });
+    }
+    return task;
+  }
   const prUrl = link.prUrl ?? task.pr_url;
   const branch = link.branch ?? task.branch;
   const headSha = link.headSha ?? task.head_sha;

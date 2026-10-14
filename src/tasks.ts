@@ -1139,27 +1139,43 @@ function bubbleChildBlocked(
 }
 
 /**
- * ISH-758: record a blocked child as a STRUCTURED ChildBlocked result and reach
- * the Gateway exactly once. Called from `blockTask` for code-change tasks inside
- * the block's own transaction; the legacy prose paths are skipped for those so
- * the Gateway is never notified twice for one block.
+ * ISH-758: record a blocked child as a STRUCTURED ChildBlocked result, once per
+ * BLOCK OCCURRENCE. `blockTask` bumps `lease_token` on every block, so the
+ * (phase='blocked', attempt=lease_token) identity distinguishes two blocks of the
+ * same attempt (e.g. block -> unblock -> block); keying on the task/phase/attempt
+ * alone silently dropped the second, decision-needed block.
  *
- * Returns true when this call produced the notification (false when a prior one
- * already exists for this task/phase/attempt).
+ * `notifyGateway` gates the human notification: policy is that `blocked_internal`
+ * never pings the human (the parent-assignee roll-up owns it), while a
+ * `blocked_human` block reaches the Gateway exactly once.
+ *
+ * Returns true when this call produced the notification.
  */
-export function recordChildBlocked(db: Database, childId: string, actor: string, reason: string): boolean {
+export function recordChildBlocked(
+  db: Database,
+  childId: string,
+  actor: string,
+  reason: string,
+  opts: { notifyGateway?: boolean } = {}
+): boolean {
   const child = getTask(db, childId);
   if (!child) throw new Error(`unknown task: ${childId}`);
-  const phase = child.phase ?? "";
-  if (findTaskResult(db, childId, phase, child.attempt, "ChildBlocked")) return false;
+  const notify = opts.notifyGateway !== false;
+  // `blocked` + lease_token is the block-occurrence identity (lease_token is
+  // bumped by every block), so each new block records/notifies exactly once.
+  const phase = "blocked";
+  const occurrence = child.lease_token;
+  if (findTaskResult(db, childId, phase, occurrence, "ChildBlocked")) return false;
   insertTaskResult(db, {
     taskId: childId,
     phase,
-    attempt: child.attempt,
+    attempt: occurrence,
     kind: "ChildBlocked",
     workerId: actor,
     reason,
+    payload: { taskPhase: child.phase ?? null, state: child.state, leaseToken: child.lease_token },
   });
+  if (!notify) return false;
   const parentId = child.parent_task_id;
   const target = parentId ? getTask(db, parentId) ?? child : child;
   const recipient = resolveHumanInterface(db, target);
@@ -1223,13 +1239,16 @@ export function blockTask(db: Database, taskId: string, workerId: string, reason
     const child = getTask(db, taskId)!;
     const codeChild = child.code_change === 1;
     const gateway = resolveHumanInterface(db, child);
-    // For a code-change child the structured ChildBlocked result is the Gateway
-    // notification (exactly once); the legacy prose paths are skipped so the
-    // Gateway is never told twice. The parent-assignee peer roll-up is kept, but
-    // its message is suppressed when it would target the same Gateway.
-    bubbleChildBlocked(db, child, workerId, reason, t, { skipMessageTo: codeChild ? gateway : null });
+    // Policy: only a HUMAN block reaches the Gateway. A code-change blocked_human
+    // is delivered as the structured ChildBlocked result (exactly once per block);
+    // the legacy human prose path is skipped for it so the Gateway is not told
+    // twice, and the parent-assignee peer message is suppressed when it would
+    // target the same Gateway. blocked_internal never pings the human: it is left
+    // to the parent-assignee roll-up.
+    const gatewayBlock = codeChild && human;
+    bubbleChildBlocked(db, child, workerId, reason, t, { skipMessageTo: gatewayBlock ? gateway : null });
     if (codeChild) {
-      recordChildBlocked(db, taskId, workerId, reason);
+      recordChildBlocked(db, taskId, workerId, reason, { notifyGateway: human });
     } else if (human) {
       // T337: a HUMAN block also reaches the human interface (or shouts if none
       // resolves). blocked_internal never pings the human.

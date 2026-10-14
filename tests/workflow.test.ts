@@ -6,7 +6,7 @@ import type { Database } from "bun:sqlite";
 import { openDb } from "../src/db";
 import { MockRuntime } from "../src/runtime/runtime";
 import { reconcile } from "../src/reconciler";
-import { addTask, approveTask, blockTask, claimNext, claimTask, getTask, runnableTasks, submitTask } from "../src/tasks";
+import { addTask, approveTask, blockTask, claimNext, claimTask, getTask, runnableTasks, submitTask, unblockTask } from "../src/tasks";
 import { registerWorker } from "../src/workers";
 import {
   acceptTask,
@@ -52,6 +52,15 @@ afterEach(() => {
   db.close();
   rmSync(dir, { recursive: true, force: true });
 });
+
+/** Count durable messages of one kind to one recipient. */
+function countMessages(recipient: string, kind: string): number {
+  return (
+    db.query(`SELECT COUNT(*) AS n FROM messages WHERE recipient = ? AND kind = ?`).get(recipient, kind) as {
+      n: number;
+    }
+  ).n;
+}
 
 /** Walk a fresh code task all the way to merge_ready via real phase results. */
 function toMergeReady(id: string): void {
@@ -357,7 +366,9 @@ describe("ChildBlocked is produced by the block path (finding 4)", () => {
     claimTask(db, t.id, "impl");
     blockTask(db, t.id, "impl", "no credentials", true);
     expect(getTask(db, t.id)!.state).toBe("blocked_human");
-    expect(findTaskResult(db, t.id, "implement", 0, "ChildBlocked")).not.toBeNull();
+    // Identity is the block occurrence (phase 'blocked' + lease_token), not the
+    // workflow phase/attempt.
+    expect(findTaskResult(db, t.id, "blocked", getTask(db, t.id)!.lease_token, "ChildBlocked")).not.toBeNull();
     const blocked = db
       .query(`SELECT COUNT(*) AS n FROM messages WHERE recipient = 'gateway' AND kind = 'child_blocked'`)
       .get() as { n: number };
@@ -374,11 +385,52 @@ describe("ChildBlocked is produced by the block path (finding 4)", () => {
     db.query(`UPDATE tasks SET assignee = 'gateway' WHERE id = ?`).run(parent.id);
     const child = intakeTask(db, { provider: "linear", issueId: "ISH-38", codeChange: true, parentTaskId: parent.id });
     claimTask(db, child.id, "impl");
-    blockTask(db, child.id, "impl", "stuck", false);
+    blockTask(db, child.id, "impl", "stuck", true);
     const blocked = db
       .query(`SELECT COUNT(*) AS n FROM messages WHERE recipient = 'gateway' AND kind = 'child_blocked'`)
       .get() as { n: number };
     expect(blocked.n).toBe(1); // structured path only; peer roll-up suppressed
+  });
+});
+
+describe("block -> Gateway policy (re-review finding 2)", () => {
+  test("a second human block in the same attempt is notified (block -> unblock -> block)", () => {
+    process.env.RELAY_HUMAN = "human";
+    const t = intakeTask(db, { provider: "linear", issueId: "ISH-41", codeChange: true });
+    claimTask(db, t.id, "impl");
+    blockTask(db, t.id, "impl", "reason A", true);
+    expect(countMessages("human", "child_blocked")).toBe(1);
+
+    unblockTask(db, t.id, "impl");
+    claimTask(db, t.id, "impl");
+    blockTask(db, t.id, "impl", "reason B", true);
+    // The second, decision-needed block must reach the human too.
+    expect(countMessages("human", "child_blocked")).toBe(2);
+  });
+
+  test("blocked_internal does not message the Gateway", () => {
+    process.env.RELAY_HUMAN = "human";
+    const t = intakeTask(db, { provider: "linear", issueId: "ISH-42", codeChange: true });
+    claimTask(db, t.id, "impl");
+    blockTask(db, t.id, "impl", "internal snag", false);
+    expect(getTask(db, t.id)!.state).toBe("blocked_internal");
+    expect(countMessages("human", "child_blocked")).toBe(0);
+    expect(countMessages("human", "blocked_human")).toBe(0);
+  });
+});
+
+describe("a terminal task is never re-opened by a link/replay (re-review finding 1)", () => {
+  test("an intake replay with a new head after accept leaves the task done", () => {
+    const t = intakeTask(db, { provider: "linear", issueId: "ISH-40", codeChange: true, headSha: "aaa" });
+    toMergeReady(t.id);
+    expect(acceptTask(db, t.id, "integ").state).toBe("done");
+
+    const replayed = intakeTask(db, { provider: "linear", issueId: "ISH-40", codeChange: true, headSha: "zzz" });
+    expect(replayed.id).toBe(t.id);
+    expect(replayed.state).toBe("done");
+    expect(replayed.phase).toBe("merge_ready");
+    expect(replayed.accepted_at).not.toBeNull();
+    expect(replayed.head_sha).toBe("aaa"); // the head update is ignored on a settled task
   });
 });
 
