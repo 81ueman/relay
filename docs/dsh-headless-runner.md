@@ -7,7 +7,7 @@ attach. One Run = one process = one coding attempt.
 This is implemented in `src/dsh-runner.ts` and driven from the CLI:
 
 ```sh
-relay run start <task-id> [--cwd DIR] [--prompt TEXT] [--permission MODE] [--timeout 30m] [--wait] [--json]
+relay run start <task-id> [--cwd DIR] [--prompt TEXT] [--permission MODE] [--timeout 30m] [--json]
 relay run list [--task <id>] [--json]
 relay run show <run-id> [--json]
 relay run logs <run-id> [--tail N]
@@ -60,10 +60,15 @@ never shared `/tmp`):
 | `events.jsonl` | Relay's own lifecycle JSONL: `run.started`, one `stdout`/`stderr` per line, `run.fast_exit`, `run.cancelled`/`run.timeout`, `run.exited` |
 
 The durable Run row (`runs` table) records id / task / phase / attempt /
-generation / cwd / branch / HEAD / pid / exit code / signal / dsh session id
-(when a `session-<uuid>` token appears in the output) / start+end time / output
-and evidence refs. It is keyed to the Task; it is **not** a second workflow state
-machine — the Task's `phase`/`attempt` stays the truth.
+generation / cwd / branch / **base_head_sha (the pre-run HEAD) / head_sha (the
+PRODUCED HEAD, re-read from the worktree at Run end)** / pid / exit code / signal
+/ dsh session id (when a `session-<uuid>` token appears in the output) /
+start+end time / output and evidence refs. It is keyed to the Task; it is **not**
+a second workflow state machine — the Task's `phase`/`attempt` stays the truth.
+
+`relay run start` (the only form; there is no detached mode yet) **waits** for
+the Run to reach a terminal state before returning, so the final state/exit is
+always written to SQLite before the CLI's DB handle closes.
 
 Cancel and timeout kill the whole **process group** (`Bun.spawn({detached:true})`
 + `kill(-pid)`), so a grandchild holding a pipe open cannot outlive the Run.
@@ -88,13 +93,25 @@ relay run submit <run-id> [--evidence E] [--summary S]
 
 `acceptRunSubmission` refuses (never advances) when the Run is not a clean
 `exited`/exit-0 process (failed, signalled, cancelled, timeout, still running),
-when the submission names a different task/phase/attempt/branch/HEAD than the Run
-recorded at start, or when the **live** Task has moved (phase/attempt/branch/HEAD
-changed since the Run started — a stale Run can never advance the current
-attempt). On success it records the ordinary `TaskSubmitted` structured result
-and advances `implement`/`integration` via the existing workflow
-(`submitImplementationFromRun`), which is the same phase machine every other
-submission uses.
+when the submission names a different task/phase/attempt than the Run recorded,
+or when the **live** Task has moved: its branch is bound to a different branch,
+or its head is bound to a revision other than the Run's **start** head
+(`base_head_sha`). A task with no linked branch/head **yet** (the normal
+implement phase — the branch is not linked until a PR exists) **adopts** the
+Run's produced branch and HEAD, so a clean Run from a real git worktree with no
+linked branch/HEAD is submittable.
+
+The submission binds to the **produced** HEAD: dsh is asked to commit, so at Run
+end Relay re-reads `git rev-parse HEAD` in the worktree and records it as
+`head_sha` (`base_head_sha` keeps the pre-run fence). `relay run submit` validates
+against that produced head, and on success writes it to `task.head_sha` /
+`TaskSubmitted.head_sha` — so mechanical verify and review judge the revision the
+Run actually committed, not the pre-run one. A chain of adoptions means a task
+with no `--branch/--head` still ends up correctly bound after its first Run.
+
+On success `submitImplementationFromRun` records the ordinary `TaskSubmitted`
+structured result and advances `implement`/`integration` via the existing
+workflow — the same phase machine every other submission uses.
 
 ## Verified / not verified
 

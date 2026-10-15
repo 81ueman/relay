@@ -319,12 +319,15 @@ A coding attempt can run as **one `dsh --profile headless` process** — no Herd
 pane, TUI, `dsh web` server, wake plugin, or manual attach (`relay run start`,
 `list`, `show`, `logs`, `cancel`, `submit`). stdout (final text) and stderr
 (reasoning) are stored under `<control-plane>/runs/<run-id>/`; the durable `runs`
-row is keyed to the Task (it is not a second workflow state). Cancel/timeout kill
-the whole process group. Permissions stay in the worktree
+row is keyed to the Task (it is not a second workflow state) and records both the
+pre-run `base_head_sha` and the PRODUCED HEAD re-read in the worktree at Run end
+(dsh is asked to commit). `relay run start` waits for a terminal state.
+Cancel/timeout kill the whole process group. Permissions stay in the worktree
 (`DSH_PERMISSION_MODE=workspace-write`). A process `exit 0` or the final text is
 **not** a submission — only a structured `relay run submit` bound to the current
-Run/Task/phase/attempt/branch/HEAD advances the Task; a non-zero/cancelled/stale
-Run never does. This covers one Run's launch/observe/terminate only; worktrees,
+Run/Task/phase/attempt/branch/HEAD advances the Task (a task with no linked
+branch/HEAD yet adopts the Run's; the recorded head is the produced one); a
+non-zero/cancelled/stale Run never does. This covers one Run's launch/observe/terminate only; worktrees,
 single-writer control and FIX re-entry are ISH-760. See
 [`docs/dsh-headless-runner.md`](docs/dsh-headless-runner.md) for the pinned
 `dsh` CLI contract and the exact file/output format.

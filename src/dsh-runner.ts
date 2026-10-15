@@ -147,8 +147,10 @@ interface InsertRunInput {
   attempt: number;
   generation: number;
   cwd: string;
+  /** The branch at Run start (the produced branch is written on exit). */
   branch: string | null;
-  headSha: string | null;
+  /** The HEAD at Run start (the base/staleness fence). */
+  baseHeadSha: string | null;
   prompt: string;
   specPath: string;
   outputDir: string;
@@ -159,12 +161,14 @@ interface InsertRunInput {
 
 function insertRun(db: Database, r: InsertRunInput): Run {
   const t = now();
+  // `head_sha` (the PRODUCED head) is NULL until the Run ends and the cwd is
+  // re-read; `base_head_sha` is the pre-run fence.
   db.query(
     `INSERT INTO runs
-       (id, task_id, phase, attempt, generation, cwd, branch, head_sha, prompt,
+       (id, task_id, phase, attempt, generation, cwd, branch, head_sha, base_head_sha, prompt,
         spec_path, output_dir, state, stdout_path, stderr_path, events_path,
         fast_exit, started_at, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'starting', ?, ?, ?, 0, ?, ?, ?)`
+     VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, 'starting', ?, ?, ?, 0, ?, ?, ?)`
   ).run(
     r.id,
     r.taskId,
@@ -173,7 +177,7 @@ function insertRun(db: Database, r: InsertRunInput): Run {
     r.generation,
     r.cwd,
     r.branch,
-    r.headSha,
+    r.baseHeadSha,
     r.prompt,
     r.specPath,
     r.outputDir,
@@ -190,6 +194,8 @@ function insertRun(db: Database, r: InsertRunInput): Run {
 interface RunPatch {
   state?: RunState;
   pid?: number;
+  branch?: string | null;
+  head_sha?: string | null;
   exit_code?: number | null;
   signal?: string | null;
   session_id?: string | null;
@@ -207,6 +213,8 @@ function updateRun(db: Database, id: string, patch: RunPatch): Run {
   };
   if (patch.state !== undefined) put("state", patch.state);
   if (patch.pid !== undefined) put("pid", patch.pid);
+  if (patch.branch !== undefined) put("branch", patch.branch);
+  if (patch.head_sha !== undefined) put("head_sha", patch.head_sha);
   if (patch.exit_code !== undefined) put("exit_code", patch.exit_code);
   if (patch.signal !== undefined) put("signal", patch.signal);
   if (patch.session_id !== undefined) put("session_id", patch.session_id);
@@ -338,7 +346,7 @@ export async function startDshRun(db: Database, opts: StartRunOptions): Promise<
     generation: task.attempt,
     cwd,
     branch,
-    headSha: head,
+    baseHeadSha: head,
     prompt,
     specPath,
     outputDir: runDir,
@@ -347,12 +355,12 @@ export async function startDshRun(db: Database, opts: StartRunOptions): Promise<
     eventsPath,
   });
 
-  events({ t: "run.started", runId, taskId: task.id, phase, attempt: task.attempt, cwd, branch, head, permissionMode });
+  events({ t: "run.started", runId, taskId: task.id, phase, attempt: task.attempt, cwd, branch, baseHead: head, permissionMode });
   logEvent(db, {
     source: "dsh-runner",
     taskId: task.id,
     type: "dsh.run.started",
-    payload: { runId, phase, attempt: task.attempt, cwd, branch, head, permissionMode },
+    payload: { runId, phase, attempt: task.attempt, cwd, branch, baseHead: head, permissionMode },
   });
 
   const argv = [dshBin, "--profile", "headless", prompt];
@@ -417,6 +425,11 @@ export async function startDshRun(db: Database, opts: StartRunOptions): Promise<
     if (timeout) clearTimeout(timeout);
     settled = true;
 
+    // The PRODUCED revision: dsh is asked to commit, so re-read the worktree
+    // AFTER the process ends. `run.base_head_sha` keeps the pre-run fence.
+    const producedBranch = gitBranch(cwd);
+    const producedHead = gitHead(cwd);
+
     const durationMs = now() - run.started_at;
     const fast = durationMs < fastExitMs;
     // An external `relay run cancel` marks the row before signalling, so honour
@@ -430,9 +443,11 @@ export async function startDshRun(db: Database, opts: StartRunOptions): Promise<
     else state = exitCode === 0 ? "exited" : "failed";
 
     if (fast) events({ t: "run.fast_exit", durationMs, exitCode });
-    events({ t: "run.exited", state, exitCode, durationMs, fast, sessionId });
+    events({ t: "run.exited", state, exitCode, durationMs, fast, sessionId, baseHead: run.base_head_sha, producedHead });
     const finalRun = updateRun(db, runId, {
       state,
+      branch: producedBranch,
+      head_sha: producedHead,
       exit_code: exitCode,
       signal: reason,
       session_id: sessionId,
@@ -444,7 +459,7 @@ export async function startDshRun(db: Database, opts: StartRunOptions): Promise<
       source: "dsh-runner",
       taskId: task.id,
       type: `dsh.run.${state}`,
-      payload: { runId, exitCode, durationMs, fast, sessionId },
+      payload: { runId, exitCode, durationMs, fast, sessionId, baseHead: run.base_head_sha, producedHead },
     });
     return finalRun;
   })();
@@ -502,10 +517,13 @@ export function rejectSubmission(reason: string): never {
  *   - the Run is missing, or its state is not a clean `exited` with code 0
  *     (failed / signal / cancelled / timeout / still running);
  *   - the submission names a different task/phase/attempt/branch/HEAD than the
- *     Run recorded at start;
- *   - the LIVE task has moved (phase/attempt/branch/HEAD changed since the Run
- *     started) — a stale Run can never advance the current attempt.
- * A process `exit 0` or the Run's final stdout text does NOT call this.
+ *     Run recorded;
+ *   - the LIVE task has moved: its phase/attempt changed, its branch is bound to
+ *     a different branch, or its head is bound to a revision other than the Run's
+ *     START head.
+ * A task with no linked branch/head YET (the normal implement phase) adopts the
+ * Run's produced branch/head; the Run's own `base_head_sha` is the staleness
+ * fence. A process `exit 0` or the Run's final stdout text does NOT call this.
  */
 export function acceptRunSubmission(db: Database, sub: RunSubmission): Run {
   const run = getRun(db, sub.runId);
@@ -539,11 +557,22 @@ export function acceptRunSubmission(db: Database, sub: RunSubmission): Run {
       `run ${run.id} is stale: task ${task.id} is now phase '${task.phase ?? "none"}' attempt ${task.attempt}`
     );
   }
-  if ((task.branch ?? null) !== (run.branch ?? null)) {
-    rejectSubmission(`run ${run.id} is stale: task branch is now ${task.branch ?? "none"}, run was ${run.branch ?? "none"}`);
+  // Branch: a task with no branch yet ADOPTS the Run's (the normal implement
+  // case — the branch is not linked until a PR is); an already-bound task must
+  // match what the Run produced.
+  if (task.branch !== null && task.branch !== run.branch) {
+    rejectSubmission(
+      `run ${run.id} is stale: task branch is ${task.branch ?? "none"}, run produced ${run.branch ?? "none"}`
+    );
   }
-  if ((task.head_sha ?? null) !== (run.head_sha ?? null)) {
-    rejectSubmission(`run ${run.id} is stale: task head is now ${task.head_sha ?? "none"}, run was ${run.head_sha ?? "none"}`);
+  // HEAD fence: the Run started at `run.base_head_sha`. A task whose head is
+  // already bound to a DIFFERENT revision has moved since the Run started, so
+  // the Run can never advance the current attempt. A NULL task head is "not yet
+  // bound" and adopts the Run's produced head.
+  if (task.head_sha !== null && (run.base_head_sha ?? null) !== task.head_sha) {
+    rejectSubmission(
+      `run ${run.id} is stale: task head is ${task.head_sha}, run started at ${run.base_head_sha ?? "none"}`
+    );
   }
 
   const impl: RunImplementation = {
@@ -551,7 +580,10 @@ export function acceptRunSubmission(db: Database, sub: RunSubmission): Run {
     phase: run.phase,
     attempt: run.attempt,
     branch: run.branch,
+    // The PRODUCED head (the revision the Run committed); `baseHeadSha` is the
+    // pre-run fence the workflow checks against the task.
     headSha: run.head_sha,
+    baseHeadSha: run.base_head_sha,
     summary: sub.summary,
     evidence: sub.evidence ?? `run:${run.id}`,
   };

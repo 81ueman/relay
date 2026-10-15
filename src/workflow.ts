@@ -596,8 +596,18 @@ export interface RunImplementation {
   phase?: string;
   /** The attempt the Run started at (must equal the task's current attempt). */
   attempt?: number;
+  /** The branch the Run produced (adopted by a task with none). */
   branch?: string | null;
+  /**
+   * The HEAD the Run PRODUCED (recorded on the Task / TaskSubmitted). dsh is
+   * asked to commit, so this is the post-run revision, not the start revision.
+   */
   headSha?: string | null;
+  /**
+   * The HEAD the Run STARTED at — the staleness fence. A task already bound to
+   * a different head has moved since the Run began and is refused.
+   */
+  baseHeadSha?: string | null;
   summary?: string;
   /** Output/evidence ref (the Run's output dir). */
   evidence?: string;
@@ -629,33 +639,53 @@ export function submitImplementationFromRun(db: Database, taskId: string, impl: 
   if (impl.attempt !== undefined && impl.attempt !== task.attempt) {
     throw new Error(`${STALE_RESULT}: run ${impl.runId} started at attempt ${impl.attempt}, task ${taskId} is attempt ${task.attempt}`);
   }
-  if (impl.branch !== undefined && impl.branch !== task.branch) {
-    throw new Error(`${STALE_RESULT}: run ${impl.runId} was bound to branch ${impl.branch ?? "none"}, task ${taskId} is ${task.branch ?? "none"}`);
+  // Branch: a task with none ADOPTS the Run's branch; an already-bound task must
+  // match what the Run produced. (A NULL task branch is the normal implement
+  // phase — the branch is not linked until a PR exists.)
+  if (impl.branch !== undefined && task.branch !== null && (impl.branch ?? null) !== task.branch) {
+    throw new Error(
+      `${STALE_RESULT}: run ${impl.runId} produced branch ${impl.branch ?? "none"}, task ${taskId} is ${task.branch ?? "none"}`
+    );
   }
-  if (impl.headSha !== undefined && impl.headSha !== task.head_sha) {
-    throw new Error(`${HEAD_MISMATCH}: run ${impl.runId} was bound to head ${impl.headSha ?? "none"}, task ${taskId} is ${task.head_sha ?? "none"}`);
+  // HEAD fence vs produced head: the Run started at `baseHeadSha`; a task whose
+  // head is already bound to a different revision has moved since the Run began.
+  const baseHead = impl.baseHeadSha !== undefined ? impl.baseHeadSha : impl.headSha;
+  if (task.head_sha !== null && (baseHead ?? null) !== task.head_sha) {
+    throw new Error(
+      `${HEAD_MISMATCH}: run ${impl.runId} started at head ${baseHead ?? "none"}, task ${taskId} is bound to ${task.head_sha}`
+    );
   }
+  const producedHead = impl.headSha ?? null;
+  // Adopt the Run's branch onto the task ONLY when the task has none.
+  const adoptBranch = task.branch === null && impl.branch ? impl.branch : null;
   assertNoResult(db, taskId, phase, task.attempt, "TaskSubmitted");
 
   const next = nextPhase(phase)!;
   const nextClaimRole =
     next === "verify" && hasMechanicalChecks(task) ? RELAY_ROLE : claimRoleForPhase(next, task.role);
   const updated = db.transaction(() => {
+    if (adoptBranch) {
+      db.query(`UPDATE tasks SET branch = ?, updated_at = ? WHERE id = ?`).run(adoptBranch, now(), taskId);
+    }
     const result = insertTaskResult(db, {
       taskId,
       phase,
       attempt: task.attempt,
       kind: "TaskSubmitted",
       workerId: `dsh-run:${impl.runId}`,
-      headSha: task.head_sha,
+      // The revision the Run PRODUCED (not the pre-run head).
+      headSha: producedHead,
       evidenceRef: impl.evidence ?? `run:${impl.runId}`,
       reason: impl.summary ?? null,
-      payload: { runId: impl.runId, source: "dsh-headless" },
+      payload: { runId: impl.runId, source: "dsh-headless", baseHead: impl.baseHeadSha ?? null },
     });
     return applyPhase(db, task, next, {
       state: next === "review" ? "review" : "queued",
       attempt: task.attempt,
       claimRole: nextClaimRole,
+      // Record the produced head on the task so verify/review judge the same
+      // revision the Run committed (submitPhase does this with opts.headSha).
+      headSha: producedHead,
       resultRef: `result:${result.id}`,
     });
   })();

@@ -367,8 +367,15 @@ export interface Run {
   attempt: number;
   generation: number;
   cwd: string;
+  /**
+   * The branch/HEAD the Run is bound to. `head_sha` is the PRODUCED head
+   * (`git rev-parse HEAD` in the cwd at Run end — dsh is asked to commit), not
+   * the pre-run revision; `base_head_sha` is the START head, kept as the
+   * base/staleness fence. Both are NULL in a non-git cwd.
+   */
   branch: string | null;
   head_sha: string | null;
+  base_head_sha: string | null;
   prompt: string;
   spec_path: string | null;
   output_dir: string;
@@ -700,6 +707,7 @@ CREATE TABLE IF NOT EXISTS runs (
   cwd TEXT NOT NULL,
   branch TEXT,
   head_sha TEXT,
+  base_head_sha TEXT,
   prompt TEXT NOT NULL DEFAULT '',
   spec_path TEXT,
   output_dir TEXT NOT NULL,

@@ -306,6 +306,11 @@ function migrate(db: Database): void {
       db.exec("ALTER TABLE sessions ADD COLUMN last_compacted_at INTEGER;");
     }
   }
+  // ISH-803 Runs: base_head_sha (the pre-run HEAD fence) was added after the
+  // runs table first shipped, so a DB created by that build needs the column.
+  if (columnExists(db, "runs", "id") && !columnExists(db, "runs", "base_head_sha")) {
+    db.exec("ALTER TABLE runs ADD COLUMN base_head_sha TEXT;");
+  }
   // NOTE: (worker_id, generation) is kept unique by application logic (the
   // monotonic `nextGeneration` helper), not by a DB constraint. Legacy rows may
   // legitimately share a generation (e.g. an active row plus a protected stale

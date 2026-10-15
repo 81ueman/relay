@@ -95,7 +95,7 @@ Usage:
   relay release <task-id> [--worker <id>]
   relay wait <task-id> --for <30s|2m|1h> "reason" [--worker <id>]
 
-  relay run start <task-id> [--cwd DIR] [--prompt TEXT] [--permission MODE] [--timeout 30m] [--wait] [--json]
+  relay run start <task-id> [--cwd DIR] [--prompt TEXT] [--permission MODE] [--timeout 30m] [--json]
   relay run list [--task <id>] [--json]
   relay run show <run-id> [--json]          # a headless dsh Run (no Herdr)
   relay run logs <run-id> [--tail N]
@@ -147,9 +147,9 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
   },
   run: {
     about:
-      "ISH-803 one-shot headless dsh Runs: 1 Run = 1 `dsh --profile headless` process = 1 coding attempt, in the Task's worktree, with NO Herdr pane/TUI/`dsh web`/wake/attach. stdout (final text) and stderr (reasoning) are stored under <control-plane>/runs/<run-id>/. A process `exit 0` does NOT complete anything — only `relay run submit` (a structured submission bound to the Run/Task/phase/attempt/branch/HEAD) advances the Task. Permissions are the worktree: $DSH_PERMISSION_MODE=workspace-write by default.",
+      "ISH-803 one-shot headless dsh Runs: 1 Run = 1 `dsh --profile headless` process = 1 coding attempt, in the Task's worktree, with NO Herdr pane/TUI/`dsh web`/wake/attach. stdout (final text) and stderr (reasoning) are stored under <control-plane>/runs/<run-id>/. A process `exit 0` does NOT complete anything — only `relay run submit` (a structured submission bound to the Run/Task/phase/attempt/branch/HEAD) advances the Task. `start` waits for the Run to reach a terminal state (there is no detached mode yet). Permissions are the worktree: $DSH_PERMISSION_MODE=workspace-write by default.",
     usage: [
-      "relay run start <task-id> [--cwd DIR] [--prompt TEXT] [--permission MODE] [--timeout 30m] [--wait] [--json]",
+      "relay run start <task-id> [--cwd DIR] [--prompt TEXT] [--permission MODE] [--timeout 30m] [--json]",
       "relay run list [--task <id>] [--limit N] [--json]",
       "relay run show <run-id> [--json]",
       "relay run logs <run-id> [--tail N]",
@@ -1489,7 +1489,7 @@ async function main(): Promise<void> {
           const id = positionals(rest)[0];
           if (!id) {
             throw new Error(
-              "usage: relay run start <task-id> [--cwd DIR] [--prompt TEXT] [--permission MODE] [--timeout 30m] [--wait] [--json]"
+              "usage: relay run start <task-id> [--cwd DIR] [--prompt TEXT] [--permission MODE] [--timeout 30m] [--json]"
             );
           }
           const timeoutRaw = flag(rest, "--timeout");
@@ -1501,24 +1501,17 @@ async function main(): Promise<void> {
             permissionMode: flag(rest, "--permission") ?? undefined,
             timeoutMs: timeoutRaw ? parseDuration(timeoutRaw) : undefined,
           });
-          const r0 = getRun(db, handle.id)!;
-          if (hasFlag(rest, "--wait")) {
-            const r = await handle.wait();
-            if (hasFlag(rest, "--json")) {
-              console.log(JSON.stringify(r, null, 2));
-            } else {
-              console.log(`${r.id} -> state=${r.state} exit=${r.exit_code ?? "-"} pid=${r.pid ?? "-"}`);
-              console.log(`output: ${r.output_dir}`);
-            }
-            if (r.state !== "exited") process.exitCode = 1;
-            break;
-          }
+          // ALWAYS await the Run BEFORE the DB is closed: the completion closure
+          // writes the final state to SQLite, so returning early would close the
+          // handle under it (RangeError) and leave the Run `running` forever.
+          const r = await handle.wait();
           if (hasFlag(rest, "--json")) {
-            console.log(JSON.stringify(r0, null, 2));
+            console.log(JSON.stringify(r, null, 2));
           } else {
-            console.log(`${handle.id} state=${r0.state} task=${r0.task_id} phase=${r0.phase}/${r0.attempt}`);
-            console.log(`output: ${r0.output_dir}`);
+            console.log(`${r.id} -> state=${r.state} exit=${r.exit_code ?? "-"} pid=${r.pid ?? "-"}`);
+            console.log(`output: ${r.output_dir}`);
           }
+          if (r.state !== "exited") process.exitCode = 1;
           break;
         }
         if (sub === "show") {

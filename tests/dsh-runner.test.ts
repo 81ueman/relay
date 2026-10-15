@@ -1,5 +1,6 @@
 import { describe, expect, test, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, existsSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, existsSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Database } from "bun:sqlite";
@@ -119,6 +120,35 @@ function newTask(): { id: string; cwd: string; outputRoot: string } {
     worktree: cwd,
   });
   return { id: t.id, cwd, outputRoot: join(dir, "runs") };
+}
+
+function git(cwd: string, ...args: string[]): string {
+  return execFileSync("git", ["-C", cwd, ...args], { encoding: "utf-8" }).trim();
+}
+
+/**
+ * A code-change task whose worktree is a REAL `git init` repo with one commit
+ * and NO linked branch/HEAD — the normal implement-phase state the non-git
+ * `newTask()` could not exercise (both sides were NULL there).
+ */
+function newGitTask(): { id: string; cwd: string; outputRoot: string; baseHead: string; branch: string } {
+  const cwd = mkdtempSync(join(tmpdir(), "relay-dsh-git-"));
+  git(cwd, "init", "-q");
+  git(cwd, "config", "user.email", "relay@test");
+  git(cwd, "config", "user.name", "relay-test");
+  writeFileSync(join(cwd, "README.md"), "base\n");
+  git(cwd, "add", "README.md");
+  git(cwd, "commit", "-q", "-m", "base");
+  const baseHead = git(cwd, "rev-parse", "HEAD");
+  const branch = git(cwd, "rev-parse", "--abbrev-ref", "HEAD");
+  const t = intakeTask(db, {
+    provider: "test",
+    issueId: `ISH-803-git-${issueSeq++}`,
+    codeChange: true,
+    title: "implement the thing",
+    worktree: cwd,
+  });
+  return { id: t.id, cwd, outputRoot: join(dir, "runs"), baseHead, branch };
 }
 
 function readEvents(runId: string): any[] {
@@ -295,6 +325,98 @@ describe("one-shot headless dsh Run lifecycle", () => {
     expect(r2.state).toBe("exited");
     expect(listRuns(db, { taskId: a.id })[0].id).toBe(h1.id);
     expect(listRuns(db, { taskId: b.id })[0].id).toBe(h2.id);
+  });
+});
+
+describe("real git worktree: base/produced HEAD binding (findings 1 & 2)", () => {
+  test("a clean Run with no linked branch/HEAD is submittable (adopts the Run's)", async () => {
+    const { id, cwd, outputRoot, baseHead, branch } = newGitTask();
+    const spawner = new FakeSpawner();
+    spawner.onSpawn = (p) => {
+      p.writeOut("implemented (no commit)\n");
+      p.finish(0);
+    };
+    const h = await startDshRun(db, { taskId: id, spawner, outputRoot, cwd, fastExitMs: 0 });
+    const run = await h.wait();
+    expect(run.base_head_sha).toBe(baseHead);
+    expect(run.head_sha).toBe(baseHead); // no commit: produced == base
+    // The task has NO branch/head yet: the submission must still be accepted.
+    const accepted = acceptRunSubmission(db, { runId: run.id });
+    expect(accepted.state).toBe("submitted");
+    const task = getTask(db, id)!;
+    expect(task.phase).toBe("verify");
+    expect(task.head_sha).toBe(baseHead);
+    expect(task.branch).toBe(branch);
+    expect(findTaskResult(db, id, "implement", 0, "TaskSubmitted")!.head_sha).toBe(baseHead);
+  });
+
+  test("the submission binds to the HEAD the Run PRODUCED (dsh commits)", async () => {
+    const { id, cwd, outputRoot, baseHead } = newGitTask();
+    let produced = "";
+    const spawner = new FakeSpawner();
+    spawner.onSpawn = (p) => {
+      writeFileSync(join(cwd, "change.txt"), "change\n");
+      git(cwd, "add", "change.txt");
+      git(cwd, "commit", "-q", "-m", "the change");
+      produced = git(cwd, "rev-parse", "HEAD");
+      p.writeOut("committed\n");
+      p.finish(0);
+    };
+    const h = await startDshRun(db, { taskId: id, spawner, outputRoot, cwd, fastExitMs: 0 });
+    const run = await h.wait();
+    expect(run.base_head_sha).toBe(baseHead);
+    expect(run.head_sha).toBe(produced);
+    expect(produced).not.toBe(baseHead);
+
+    // `--head` must name the PRODUCED head; the pre-run head is refused.
+    expect(() => acceptRunSubmission(db, { runId: run.id, headSha: baseHead })).toThrow(/bound to head/);
+    const accepted = acceptRunSubmission(db, { runId: run.id, headSha: produced });
+    expect(accepted.state).toBe("submitted");
+
+    // The produced head is recorded on the Task AND TaskSubmitted (so verify /
+    // review judge the committed revision, not the pre-run one).
+    const task = getTask(db, id)!;
+    expect(task.head_sha).toBe(produced);
+    expect(task.phase).toBe("verify");
+    expect(findTaskResult(db, id, "implement", 0, "TaskSubmitted")!.head_sha).toBe(produced);
+  });
+
+  test("a task head bound elsewhere than the Run's start is refused (base fence)", async () => {
+    const { id, cwd, outputRoot, baseHead } = newGitTask();
+    // The task is already bound to a different revision than the Run starts at.
+    linkTask(db, id, { headSha: "0000000000000000000000000000000000000000" });
+    const spawner = new FakeSpawner();
+    spawner.onSpawn = (p) => p.finish(0);
+    const h = await startDshRun(db, { taskId: id, spawner, outputRoot, cwd });
+    const run = await h.wait();
+    expect(run.base_head_sha).toBe(baseHead);
+    expect(() => acceptRunSubmission(db, { runId: run.id })).toThrow(/stale: task head/);
+    expect(findTaskResult(db, id, "implement", 0, "TaskSubmitted")).toBeNull();
+  });
+});
+
+describe("relay run start always reaches a terminal state (finding 3)", () => {
+  test("the CLI waits for the Run before closing the DB", async () => {
+    const { id, cwd } = newGitTask();
+    const binDir = mkdtempSync(join(tmpdir(), "relay-dsh-bin-"));
+    const bin = join(binDir, "dsh-fake.sh");
+    writeFileSync(bin, "#!/bin/sh\necho final\nsleep 0.2\necho done\nexit 0\n");
+    chmodSync(bin, 0o755);
+    const cli = join(import.meta.dir, "..", "src", "cli.ts");
+    const p = Bun.spawnSync(["bun", cli, "run", "start", id, "--cwd", cwd], {
+      env: { ...process.env, RELAY_DB: process.env.RELAY_DB!, RELAY_DSH_BIN: bin },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const out = p.stdout.toString();
+    const err = p.stderr.toString();
+    expect(p.exitCode).toBe(0);
+    expect(out).toContain("state=exited");
+    expect(err).not.toContain("closed database");
+    // The durable row is terminal, not stuck at `running`.
+    const row = getRun(db, listRuns(db, { taskId: id })[0].id)!;
+    expect(row.state).toBe("exited");
+    expect(row.exit_code).toBe(0);
   });
 });
 
