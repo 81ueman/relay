@@ -111,7 +111,11 @@ with no `--branch/--head` still ends up correctly bound after its first Run.
 
 On success `submitImplementationFromRun` records the ordinary `TaskSubmitted`
 structured result and advances `implement`/`integration` via the existing
-workflow — the same phase machine every other submission uses.
+workflow — the same phase machine every other submission uses. An **integration**
+Run whose produced head differs from the reviewed head does **not** advance:
+exactly like `submitPhase`, it calls `invalidateReview` and sends the task back
+to `review` at a new attempt, so it can never reach `merge_ready` with an
+unreviewed head (which would dead-end at the accept gate).
 
 ## Verified / not verified
 

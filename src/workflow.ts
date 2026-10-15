@@ -622,6 +622,11 @@ export interface RunImplementation {
  * its authority is the Run binding the caller validated against the `runs` row
  * and re-validated here against the live Task. It still refuses a submission
  * whose phase/attempt/branch/HEAD no longer match the task.
+ *
+ * An INTEGRATION Run whose produced head differs from the reviewed head calls
+ * `invalidateReview` (exactly like `submitPhase`) and sends the task back to
+ * `review` at a new attempt — it never advances to `merge_ready` with an
+ * unreviewed head.
  */
 export function submitImplementationFromRun(db: Database, taskId: string, impl: RunImplementation): Task {
   const task = getTask(db, taskId);
@@ -658,6 +663,21 @@ export function submitImplementationFromRun(db: Database, taskId: string, impl: 
   const producedHead = impl.headSha ?? null;
   // Adopt the Run's branch onto the task ONLY when the task has none.
   const adoptBranch = task.branch === null && impl.branch ? impl.branch : null;
+  // An INTEGRATION Run that commits a DIFFERENT head invalidates the review that
+  // PASSed the previous head. Mirror `submitPhase`: send the task BACK to review
+  // at a new attempt instead of advancing to `merge_ready` with an unreviewed
+  // head — a `merge_ready` task whose head no longer matches its passing review
+  // dead-ends (the gate refuses to accept it and nothing re-routes it).
+  if (phase === "integration" && (producedHead ?? null) !== (task.head_sha ?? null)) {
+    const invalidated = db.transaction(() => {
+      if (adoptBranch) {
+        db.query(`UPDATE tasks SET branch = ?, updated_at = ? WHERE id = ?`).run(adoptBranch, now(), taskId);
+      }
+      return invalidateReview(db, task, producedHead, "integration-head-changed");
+    })();
+    requestReconcile(db, `head-changed:${taskId}`);
+    return invalidated;
+  }
   assertNoResult(db, taskId, phase, task.attempt, "TaskSubmitted");
 
   const next = nextPhase(phase)!;

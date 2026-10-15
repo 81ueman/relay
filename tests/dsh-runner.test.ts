@@ -5,8 +5,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Database } from "bun:sqlite";
 import { openDb } from "../src/db";
-import { intakeTask, findTaskResult, linkTask } from "../src/workflow";
-import { getTask } from "../src/tasks";
+import {
+  findTaskResult,
+  intakeTask,
+  linkTask,
+  recordReview,
+  recordVerification,
+} from "../src/workflow";
+import { claimNext, claimTask, getTask } from "../src/tasks";
+import { registerWorker } from "../src/workers";
 import {
   acceptRunSubmission,
   getRun,
@@ -392,6 +399,78 @@ describe("real git worktree: base/produced HEAD binding (findings 1 & 2)", () =>
     expect(run.base_head_sha).toBe(baseHead);
     expect(() => acceptRunSubmission(db, { runId: run.id })).toThrow(/stale: task head/);
     expect(findTaskResult(db, id, "implement", 0, "TaskSubmitted")).toBeNull();
+  });
+});
+
+describe("integration-phase Run with a moved head re-reviews (round-3)", () => {
+  test("a committing integration Run lands in review at attempt+1, NOT merge_ready", async () => {
+    for (const [wid, role] of [
+      ["w-impl", "worker"],
+      ["w-ver", "worker"],
+      ["w-rev", "reviewer"],
+      ["w-int", "integrator"],
+    ] as const) {
+      registerWorker(db, wid, { role });
+    }
+    const { id, cwd, outputRoot, baseHead } = newGitTask();
+
+    // IMPLEMENT via a headless Run (no commit): the task adopts the Run's branch/head.
+    const implSpawner = new FakeSpawner();
+    implSpawner.onSpawn = (p) => {
+      p.writeOut("impl\n");
+      p.finish(0);
+    };
+    const implRun = await startDshRun(db, { taskId: id, spawner: implSpawner, outputRoot, cwd, fastExitMs: 0 });
+    await implRun.wait();
+    acceptRunSubmission(db, { runId: implRun.id });
+    expect(getTask(db, id)!.phase).toBe("verify");
+
+    // verify PASS -> review PASS at the produced head -> integration.
+    claimTask(db, id, "w-ver");
+    recordVerification(db, id, "w-ver", { passed: true });
+    expect(getTask(db, id)!.phase).toBe("review");
+    expect(claimNext(db, "w-rev")?.id).toBe(id);
+    recordReview(db, id, "w-rev", { verdict: "pass", headSha: baseHead });
+    expect(getTask(db, id)!.phase).toBe("integration");
+
+    // The integrator claims integration, then an integration Run COMMITS H1.
+    claimTask(db, id, "w-int");
+    const before = getTask(db, id)!;
+    expect(before.phase).toBe("integration");
+    expect(before.head_sha).toBe(baseHead);
+
+    let produced = "";
+    const intSpawner = new FakeSpawner();
+    intSpawner.onSpawn = (p) => {
+      writeFileSync(join(cwd, "merge.txt"), "merged\n");
+      git(cwd, "add", "merge.txt");
+      git(cwd, "commit", "-q", "-m", "integration change");
+      produced = git(cwd, "rev-parse", "HEAD");
+      p.writeOut("integration committed\n");
+      p.finish(0);
+    };
+    const intRun = await startDshRun(db, { taskId: id, spawner: intSpawner, outputRoot, cwd, fastExitMs: 0 });
+    const run = await intRun.wait();
+    expect(run.base_head_sha).toBe(baseHead);
+    expect(run.head_sha).toBe(produced);
+    expect(produced).not.toBe(baseHead);
+
+    const submitted = acceptRunSubmission(db, { runId: run.id });
+    expect(submitted.state).toBe("submitted");
+
+    // It must NOT land in merge_ready with an unreviewed head.
+    const after = getTask(db, id)!;
+    expect(after.phase).toBe("review");
+    expect(after.state).toBe("review");
+    expect(after.attempt).toBe(before.attempt + 1);
+    expect(after.head_sha).toBe(produced);
+    expect(after.phase).not.toBe("merge_ready");
+    // No integration TaskSubmitted advanced it; the review was invalidated.
+    expect(findTaskResult(db, id, "integration", before.attempt, "TaskSubmitted")).toBeNull();
+    const invalidated = db
+      .query(`SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'workflow.review_invalidated'`)
+      .get(id) as { n: number };
+    expect(invalidated.n).toBeGreaterThan(0);
   });
 });
 
