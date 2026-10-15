@@ -344,7 +344,11 @@ same worktree + findings + a NEW Run** — no session continuation.
 
 **Single-writer** is enforced in the runner: while a Run is non-terminal, another
 launch into the same worktree/branch is refused (`DUPLICATE_WRITER`) until the
-previous Run's end/cancel row exists; **different** worktrees/branches may run in
+previous Run's end/cancel row exists. The existence check and the Run INSERT are
+one `BEGIN IMMEDIATE` transaction, so the guard is **atomic across processes**
+(two concurrent `relay run launch`/`start` processes cannot both be admitted), and
+`launchTaskRun` refuses **before** pinning the brief so a rejected launch never
+touches the live writer's worktree. **Different** worktrees/branches may run in
 parallel, even on the same files. A Run is **not** a submission: `relay run
 submit` is the only thing that advances the Task, and it refuses a stale/late/
 superseded Run (by Task/phase/attempt/**generation**/branch/HEAD). `relay run

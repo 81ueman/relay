@@ -59,10 +59,19 @@ HEAD, with stdout / stderr / events under `<control-plane>/runs/<run-id>/`.
 **Single-writer is enforced in `startDshRun`** (so no entrypoint can bypass it): a
 launch is refused with `DUPLICATE_WRITER` while another Run is still
 `starting`/`running` on the **same worktree** (resolved path) or the **same
-branch**. A Run's own durable end/cancel row is the confirmation that releases the
-writer. Runs in **different** worktrees/branches are allowed to run in parallel,
-even when they touch the same files; only when a real conflict appears does the
-Gateway decide the fix and Relay re-verifies/re-reviews at the changed HEAD.
+branch**. The existence check and the Run INSERT happen in **one
+`BEGIN IMMEDIATE` transaction**, so the guard is atomic **across processes** — two
+concurrent `relay run launch`/`start` processes cannot both be admitted (the
+second blocks/gets `BUSY`, then observes the first committed row and is refused).
+A Run's own durable end/cancel row is the confirmation that releases the writer.
+Runs in **different** worktrees/branches are allowed to run in parallel, even when
+they touch the same files; only when a real conflict appears does the Gateway
+decide the fix and Relay re-verifies/re-reviews at the changed HEAD.
+
+`launchTaskRun` also refuses a duplicate writer **before pinning the brief**, so a
+launch that will be rejected never writes into the worktree the live Run owns —
+the pinned brief always keeps matching the Run that holds the worktree. The atomic
+guard inside `startDshRun` remains authoritative.
 
 ## FIX = same worktree + previous findings + a new Run
 
@@ -131,7 +140,10 @@ covers the same ground with a fake process and asserts every rejection case.
 
 - **Verified** (`bun test`, `bun run smoke:run-lifecycle`): worktree create/select/
   own; brief pinning; single-writer rejection (same worktree/branch) vs parallel
-  different worktrees; FIX reuse + findings inheritance; submitter binding
+  different worktrees — including a real **cross-process** race (two concurrent
+  launch processes admit exactly one writer) and that a **refused** launch leaves
+  the live Run's pinned brief unchanged; FIX reuse + findings inheritance;
+  submitter binding
   (moved head, superseded/late Run); safe cleanup (merge, abort, open PR, dirty,
   human workspace) with evidence retention; the CLI paths `run worktree|launch|
   cleanup`.

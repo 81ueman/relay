@@ -1,5 +1,5 @@
 import { describe, expect, test, beforeEach, afterEach } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,7 +8,7 @@ import { openDb } from "../src/db";
 import { getTask, claimTask, claimNext } from "../src/tasks";
 import { registerWorker } from "../src/workers";
 import { intakeTask, recordReview, recordVerification } from "../src/workflow";
-import { getRun, type DshProcess, type DshSpawner } from "../src/dsh-runner";
+import { getRun, listRuns, type DshProcess, type DshSpawner } from "../src/dsh-runner";
 import {
   applyWorkspaceCleanup,
   buildRunBrief,
@@ -225,6 +225,68 @@ describe("single-writer: one disposable Run per phase/attempt", () => {
     expect(findActiveWriter(db, { cwd: lb.worktree, branch: lb.branch })).toBeNull();
     la.handle.cancel();
   });
+
+  test("a refused launch does NOT overwrite the live writer's pinned brief (finding 2)", async () => {
+    const id = newTask();
+    const slow = new FakeSpawner(); // never finishes: the first Run stays live
+    const first = await launchTaskRun(db, id, { repo, spawner: slow, outputRoot: outputRoot() });
+    const briefBefore = readFileSync(first.briefPath, "utf-8");
+    expect(briefBefore).toContain("implement the thing");
+
+    // A would-be second launcher changes the Task so a FRESH brief WOULD differ.
+    db.query(`UPDATE tasks SET title = ?, updated_at = ? WHERE id = ?`).run("CHANGED title", Date.now(), id);
+
+    await expect(
+      launchTaskRun(db, id, { repo, spawner: new FakeSpawner(), outputRoot: outputRoot() })
+    ).rejects.toThrow(new RegExp(DUPLICATE_WRITER));
+
+    // The brief the LIVE Run was launched with is byte-for-byte unchanged.
+    const briefAfter = readFileSync(first.briefPath, "utf-8");
+    expect(briefAfter).toBe(briefBefore);
+    expect(briefAfter).not.toContain("CHANGED title");
+
+    slow.procs[0].finish(0);
+    await first.handle.wait();
+  });
+});
+
+describe("single-writer is atomic ACROSS PROCESSES (finding 1)", () => {
+  test("two concurrent launch processes admit exactly one writer", async () => {
+    const id = newTask();
+    const binding = ensureTaskWorktree(db, id, { repo });
+
+    // A fake dsh that HOLDS the worktree, so the loser observes the live row.
+    const binDir = join(dir, "bin");
+    mkdirSync(binDir, { recursive: true });
+    const dsh = join(binDir, "dsh-race");
+    writeFileSync(dsh, "#!/bin/sh\nsleep 1.5\nexit 0\n");
+    chmodSync(dsh, 0o755);
+
+    const fixture = join(import.meta.dir, "fixtures", "ish760-race.ts");
+    const repoRoot = join(import.meta.dir, "..");
+    const env = {
+      ...process.env,
+      RELAY_DB: process.env.RELAY_DB!,
+      TASK_ID: id,
+      WORKTREE: binding.worktree,
+      OUTPUT_ROOT: outputRoot(),
+      DSH_BIN: dsh,
+      // A start barrier: both processes hit the guard at ~the same instant.
+      GO_AT: String(Date.now() + 1200),
+    };
+    const spawn = () => Bun.spawn(["bun", fixture], { cwd: repoRoot, env, stdout: "pipe", stderr: "pipe" });
+    const p1 = spawn();
+    const p2 = spawn();
+    const outs = await Promise.all([new Response(p1.stdout).text(), new Response(p2.stdout).text()]);
+    const codes = await Promise.all([p1.exited, p2.exited]);
+
+    const admitted = outs.filter((o) => /^ADMITTED /m.test(o));
+    const refused = outs.filter((o) => /DUPLICATE_WRITER/.test(o));
+    expect(codes).toEqual([0, 0]);
+    expect(admitted).toHaveLength(1);
+    expect(refused).toHaveLength(1);
+    expect(listRuns(db, { taskId: id })).toHaveLength(1);
+  }, 20000);
 });
 
 describe("FIX: same worktree + previous findings + a new Run (no session continuation)", () => {

@@ -7,6 +7,7 @@ import { logEvent } from "./events";
 import type { Run, Task, TaskResult } from "./schema";
 import { getTask } from "./tasks";
 import {
+  assertNoActiveWriter,
   buildTaskPrompt,
   findActiveWriter,
   getRun,
@@ -367,6 +368,13 @@ export async function launchTaskRun(db: Database, taskId: string, opts: LaunchRu
     throw new Error(`${WORKTREE_ERROR}: task ${taskId} is not a code-change task`);
   }
   const binding = ensureTaskWorktree(db, taskId, opts);
+
+  // ISH-760 (review round 1, finding 2): refuse a duplicate writer BEFORE
+  // pinning the brief, so a REFUSED launch never writes into the worktree a live
+  // Run owns (the brief must keep matching the Run that holds the worktree). The
+  // race-free BEGIN IMMEDIATE guard inside `startDshRun` stays authoritative.
+  assertNoActiveWriter(db, { cwd: binding.worktree, branch: binding.branch });
+
   const fresh = getTask(db, taskId)!;
   const findings = inheritFindings(db, fresh);
   const brief = buildRunBrief(db, fresh, { worktree: binding.worktree, branch: binding.branch, findings });

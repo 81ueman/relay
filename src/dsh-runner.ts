@@ -173,6 +173,28 @@ export function findActiveWriter(db: Database, q: ActiveWriterQuery): Run | null
   return null;
 }
 
+/** The DUPLICATE_WRITER error for a conflicting live Run. */
+export function activeWriterError(conflict: Run, cwd: string, branch: string | null): Error {
+  const why =
+    resolve(conflict.cwd) === resolve(cwd)
+      ? `run ${conflict.id} is still '${conflict.state}' in this worktree (${cwd})`
+      : `run ${conflict.id} is still '${conflict.state}' on branch ${branch ?? "none"}`;
+  return new Error(
+    `${DUPLICATE_WRITER}: ${why}; wait for it to end or \`relay run cancel ${conflict.id}\` before launching another writer`
+  );
+}
+
+/**
+ * Throw `DUPLICATE_WRITER` when a live Run already holds `cwd`/`branch`. A
+ * best-effort pre-check for a fast refusal; the AUTHORITATIVE, race-free guard is
+ * `insertRunIfNoActiveWriter` (one `BEGIN IMMEDIATE` transaction around the check
+ * and the INSERT).
+ */
+export function assertNoActiveWriter(db: Database, q: ActiveWriterQuery): void {
+  const conflict = findActiveWriter(db, q);
+  if (conflict) throw activeWriterError(conflict, q.cwd, q.branch ?? null);
+}
+
 interface InsertRunInput {
   id: string;
   taskId: string;
@@ -222,6 +244,24 @@ function insertRun(db: Database, r: InsertRunInput): Run {
     t
   );
   return getRun(db, r.id)!;
+}
+
+/**
+ * ISH-760 single-writer, ATOMIC across processes: the existence check
+ * (`assertNoActiveWriter`) and the `INSERT` happen in ONE `BEGIN IMMEDIATE`
+ * transaction. Two concurrent `relay run launch`/`start` processes cannot both
+ * be admitted: the second `BEGIN IMMEDIATE` blocks (or gets SQLITE_BUSY) until
+ * the first COMMITs, then its SELECT observes the first row and it is refused.
+ * A deferred transaction would NOT close this window (the read happens before the
+ * write lock), so the IMMEDIATE form is required.
+ */
+function insertRunIfNoActiveWriter(db: Database, r: InsertRunInput): Run {
+  return db
+    .transaction(() => {
+      assertNoActiveWriter(db, { cwd: r.cwd, branch: r.branch });
+      return insertRun(db, r);
+    })
+    .immediate();
 }
 
 interface RunPatch {
@@ -354,17 +394,10 @@ export async function startDshRun(db: Database, opts: StartRunOptions): Promise<
   // ISH-760 single writer: do not launch the next writer into a worktree/branch
   // whose previous Run has not ENDED (its durable row is not yet terminal).
   // Different worktrees/branches are allowed to run in parallel. The Run's own
-  // end/cancel is the confirmation that releases the writer.
-  const conflict = findActiveWriter(db, { cwd, branch });
-  if (conflict) {
-    const why =
-      resolve(conflict.cwd) === resolve(cwd)
-        ? `run ${conflict.id} is still '${conflict.state}' in this worktree (${cwd})`
-        : `run ${conflict.id} is still '${conflict.state}' on branch ${branch ?? "none"}`;
-    throw new Error(
-      `${DUPLICATE_WRITER}: ${why}; wait for it to end or \`relay run cancel ${conflict.id}\` before launching another writer`
-    );
-  }
+  // end/cancel is the confirmation that releases the writer. This is a FAST
+  // pre-check only; the authoritative race-free guard is the BEGIN IMMEDIATE
+  // insert below.
+  assertNoActiveWriter(db, { cwd, branch });
 
   const dshBin = opts.dshBin ?? process.env.RELAY_DSH_BIN ?? "dsh";
   const permissionMode = opts.permissionMode ?? DEFAULT_PERMISSION_MODE;
@@ -387,7 +420,7 @@ export async function startDshRun(db: Database, opts: StartRunOptions): Promise<
     appendFileSync(eventsPath, `${JSON.stringify({ ts: now(), ...e })}\n`);
   };
 
-  const run = insertRun(db, {
+  const run = insertRunIfNoActiveWriter(db, {
     id: runId,
     taskId: task.id,
     phase,
