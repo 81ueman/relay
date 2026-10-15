@@ -12,7 +12,7 @@ import {
   recordReview,
   recordVerification,
 } from "../src/workflow";
-import { claimNext, claimTask, getTask } from "../src/tasks";
+import { claimNext, claimTask, cancelTask, getTask } from "../src/tasks";
 import { registerWorker } from "../src/workers";
 import {
   acceptRunSubmission,
@@ -551,5 +551,63 @@ describe("structured submission is the only thing that advances a Task", () => {
     h.cancel();
     const run = await h.wait();
     expect(() => acceptRunSubmission(db, { runId: run.id })).toThrow(/clean exit 0/);
+  });
+});
+
+// ISH-808 round 2: the Run path must treat `cancelled` (any terminal state) as
+// CLOSED. `cancelTask` leaves `phase`/`attempt` untouched, so without these
+// guards a Run could move a cancelled code-change task back to queued/verify.
+describe("ISH-808: a cancelled task is terminal on the Run path", () => {
+  test("startDshRun on a cancelled task is refused before any writer starts", async () => {
+    const { id, outputRoot } = newTask();
+    const spawner = new FakeSpawner();
+    cancelTask(db, id, "w", "superseded");
+    expect(getTask(db, id)!.state).toBe("cancelled");
+
+    await expect(startDshRun(db, { taskId: id, outputRoot, spawner })).rejects.toThrow(/terminal/);
+
+    expect(getTask(db, id)!.state).toBe("cancelled");
+    expect(spawner.procs.length).toBe(0); // no dsh process, no runs row
+    expect(listRuns(db, { taskId: id }).length).toBe(0);
+  });
+
+  test("a Run that settles exit 0 cannot be submitted after the task is cancelled", async () => {
+    const { id, outputRoot } = newTask();
+    const spawner = new FakeSpawner();
+    let proc!: FakeProcess;
+    spawner.onSpawn = (p) => (proc = p);
+    const h = await startDshRun(db, { taskId: id, spawner, outputRoot });
+    proc.writeOut("done\n");
+    proc.finish(0);
+    await h.wait();
+    expect(getRun(db, h.id)!.state).toBe("exited");
+
+    cancelTask(db, id, "w", "superseded");
+
+    expect(() => acceptRunSubmission(db, { runId: h.id })).toThrow(/terminal/);
+    // The task stays cancelled — never queued/verify again.
+    expect(getTask(db, id)!.state).toBe("cancelled");
+    expect(findTaskResult(db, id, "implement", 0, "TaskSubmitted")).toBeNull();
+  });
+
+  test("cancelTask marks an ACTIVE run cancelled, so a late exit 0 is refused", async () => {
+    const { id, outputRoot } = newTask();
+    const spawner = new FakeSpawner();
+    let proc!: FakeProcess;
+    spawner.onSpawn = (p) => (proc = p);
+    const h = await startDshRun(db, { taskId: id, spawner, outputRoot });
+    expect(getRun(db, h.id)!.state).toBe("running");
+
+    cancelTask(db, id, "w", "obsolete");
+    expect(getRun(db, h.id)!.state).toBe("cancelled"); // marked at the source
+
+    // The process finishes 0 AFTER the cancel: the settle path must keep it cancelled.
+    proc.writeOut("done\n");
+    proc.finish(0);
+    await h.wait();
+    expect(getRun(db, h.id)!.state).toBe("cancelled");
+
+    expect(() => acceptRunSubmission(db, { runId: h.id })).toThrow(/RUN_SUBMISSION_REJECTED/);
+    expect(getTask(db, id)!.state).toBe("cancelled");
   });
 });

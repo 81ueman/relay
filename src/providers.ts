@@ -1,6 +1,7 @@
 import type { Database } from "bun:sqlite";
 import { logEvent } from "./events";
 import type { Task } from "./schema";
+import { isTerminalTaskState } from "./schema";
 import { getTask } from "./tasks";
 import {
   AUTHORITY_ERROR,
@@ -350,7 +351,7 @@ export function reconcileTaskFromProvider(db: Database, taskId: string, deps: Pr
     const issue = deps.linear.getIssue(task.issue_id);
     if (issue) {
       const live = getTask(db, taskId)!;
-      if (linearHolds(issue) && live.state !== "blocked_human") {
+      if (linearHolds(issue) && live.state !== "blocked_human" && !isTerminalTaskState(live.state)) {
         quietBlock(db, live, `Linear HOLD (${issue.state}${issue.labels.length ? `: ${issue.labels.join(",")}` : ""})`, "provider:linear");
         actions.push({ kind: "linear-hold", taskId, detail: issue.state });
       }

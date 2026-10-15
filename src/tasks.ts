@@ -1367,10 +1367,11 @@ function bubbleChildCancelled(db: Database, child: Task, actor: string, reason: 
  * Defined from every non-terminal state (queued / running / review /
  * blocked_*): ownership and lease are released like a block, the reason is
  * durable twice (a `cancel` note on the task + a `task.cancelled` event), and
- * the immediate parent gets a one-hop `child_cancelled` roll-up. `done`/`failed`
- * are already terminal and are REFUSED — rewriting them would invalidate an
- * already-bubbled `child_done`. Idempotent: cancelling an already-cancelled task
- * is an audited no-op, never a second transition.
+ * the immediate parent gets a one-hop `child_cancelled` roll-up. In-flight
+ * code-change Runs for the task are marked `cancelled` so a late `exit 0` cannot
+ * resurrect it. `done`/`failed` are already terminal and are REFUSED — rewriting
+ * them would invalidate an already-bubbled `child_done`. Idempotent: cancelling
+ * an already-cancelled task is an audited no-op, never a second transition.
  *
  * A `cancelled` task is not `queued`, so it is automatically excluded from
  * `relay next` / claim (RUNNABLE_TASK_SQL), from wake (runnable-based), from
@@ -1408,6 +1409,14 @@ export function cancelTask(db: Database, taskId: string, workerId: string, reaso
     normalizeWorkerAfterTaskRelease(db, workerId, t);
     touchProgress(db, workerId, t);
     clearQuietLogged(db, workerId, taskId);
+    // ISH-808: neutralize any IN-FLIGHT Run for this task. Marking it cancelled
+    // makes the settle path record `cancelled` even if the process later exits 0,
+    // so a late result can never be submitted (acceptRunSubmission additionally
+    // refuses a terminal task — this closes the race at the source).
+    db.query(
+      `UPDATE runs SET state = 'cancelled', signal = 'cancelled', ended_at = ?, updated_at = ?
+        WHERE task_id = ? AND state IN ('starting','running')`
+    ).run(t, t, taskId);
     logEvent(db, { source: "worker", workerId, taskId, type: "task.cancelled", payload: { reason, fromState } });
     bubbleChildCancelled(db, getTask(db, taskId)!, workerId, reason, t);
   })();

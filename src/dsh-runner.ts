@@ -5,6 +5,7 @@ import { defaultDbPath, now } from "./db";
 import { logEvent } from "./events";
 import { getTask } from "./tasks";
 import type { Run, RunState, Task } from "./schema";
+import { isTerminalTaskState } from "./schema";
 import { gitHead } from "./verify";
 import { submitImplementationFromRun, type RunImplementation } from "./workflow";
 
@@ -378,6 +379,13 @@ async function pumpLines(stream: ReadableStream<Uint8Array>, onLine: (line: stri
 export async function startDshRun(db: Database, opts: StartRunOptions): Promise<DshRunHandle> {
   const task = getTask(db, opts.taskId);
   if (!task) throw new Error(`unknown task: ${opts.taskId}`);
+  // ISH-808: a cancelled task (or any other terminal state) is CLOSED. A Run
+  // must not start for it — its phase is left untouched by `cancelTask`, so the
+  // phase check below would otherwise admit a fresh writer and let its result
+  // move the task back out of `cancelled`.
+  if (isTerminalTaskState(task.state)) {
+    throw new Error(`cannot start a Run for ${task.id}: task is terminal (state=${task.state})`);
+  }
   if (task.code_change !== 1) {
     throw new Error(`task ${task.id} is not a code-change task; a headless Run implements a code task`);
   }
@@ -646,6 +654,11 @@ export function acceptRunSubmission(db: Database, sub: RunSubmission): Run {
 
   const task = getTask(db, run.task_id);
   if (!task) rejectSubmission(`run ${run.id} references missing task ${run.task_id}`);
+  // ISH-808: a terminal task is CLOSED. An in-flight Run's `exit 0` (or a Run
+  // started before the cancel) must never resurrect it into queued/review.
+  if (isTerminalTaskState(task.state)) {
+    rejectSubmission(`run ${run.id} cannot advance task ${task.id}: it is terminal (state=${task.state})`);
+  }
   if (task.phase !== run.phase || task.attempt !== run.attempt) {
     rejectSubmission(
       `run ${run.id} is stale: task ${task.id} is now phase '${task.phase ?? "none"}' attempt ${task.attempt}`
