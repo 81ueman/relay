@@ -584,6 +584,85 @@ export function submitPhase(db: Database, taskId: string, workerId: string, opts
   return updated;
 }
 
+/**
+ * ISH-803: the binding a headless dsh Run's structured submission carries. The
+ * Run row is the process record; the Task/phase/attempt/branch/HEAD below are
+ * re-validated against the LIVE task so a submission for a Run whose HEAD/phase
+ * has moved is refused (STALE_RESULT / HEAD_MISMATCH) instead of advancing it.
+ */
+export interface RunImplementation {
+  runId: string;
+  /** The phase the Run started in (must equal the task's current phase). */
+  phase?: string;
+  /** The attempt the Run started at (must equal the task's current attempt). */
+  attempt?: number;
+  branch?: string | null;
+  headSha?: string | null;
+  summary?: string;
+  /** Output/evidence ref (the Run's output dir). */
+  evidence?: string;
+}
+
+/**
+ * Record a TaskSubmitted that came from a bound dsh Run and advance the phase.
+ *
+ * This is the ONLY path by which a headless Run advances a Task: a process
+ * `exit 0` or the Run's final stdout text does NOT call it. Unlike `submitPhase`
+ * it does not demand a worker-row lease (a headless Run is not a Herdr worker);
+ * its authority is the Run binding the caller validated against the `runs` row
+ * and re-validated here against the live Task. It still refuses a submission
+ * whose phase/attempt/branch/HEAD no longer match the task.
+ */
+export function submitImplementationFromRun(db: Database, taskId: string, impl: RunImplementation): Task {
+  const task = getTask(db, taskId);
+  if (!task) throw new Error(`unknown task: ${taskId}`);
+  if (!isCodeTask(task)) throw new Error(`${WORKFLOW_ERROR}: ${taskId} is not a code-change task`);
+  const phase = phaseOf(task);
+  if (phase !== "implement" && phase !== "integration") {
+    throw new Error(
+      `${WORKFLOW_ERROR}: cannot submit a Run for ${taskId} in phase '${phase}' (submit applies to implement/integration)`
+    );
+  }
+  if (impl.phase !== undefined && impl.phase !== phase) {
+    throw new Error(`${STALE_RESULT}: run ${impl.runId} started in phase '${impl.phase}', task ${taskId} is '${phase}'`);
+  }
+  if (impl.attempt !== undefined && impl.attempt !== task.attempt) {
+    throw new Error(`${STALE_RESULT}: run ${impl.runId} started at attempt ${impl.attempt}, task ${taskId} is attempt ${task.attempt}`);
+  }
+  if (impl.branch !== undefined && impl.branch !== task.branch) {
+    throw new Error(`${STALE_RESULT}: run ${impl.runId} was bound to branch ${impl.branch ?? "none"}, task ${taskId} is ${task.branch ?? "none"}`);
+  }
+  if (impl.headSha !== undefined && impl.headSha !== task.head_sha) {
+    throw new Error(`${HEAD_MISMATCH}: run ${impl.runId} was bound to head ${impl.headSha ?? "none"}, task ${taskId} is ${task.head_sha ?? "none"}`);
+  }
+  assertNoResult(db, taskId, phase, task.attempt, "TaskSubmitted");
+
+  const next = nextPhase(phase)!;
+  const nextClaimRole =
+    next === "verify" && hasMechanicalChecks(task) ? RELAY_ROLE : claimRoleForPhase(next, task.role);
+  const updated = db.transaction(() => {
+    const result = insertTaskResult(db, {
+      taskId,
+      phase,
+      attempt: task.attempt,
+      kind: "TaskSubmitted",
+      workerId: `dsh-run:${impl.runId}`,
+      headSha: task.head_sha,
+      evidenceRef: impl.evidence ?? `run:${impl.runId}`,
+      reason: impl.summary ?? null,
+      payload: { runId: impl.runId, source: "dsh-headless" },
+    });
+    return applyPhase(db, task, next, {
+      state: next === "review" ? "review" : "queued",
+      attempt: task.attempt,
+      claimRole: nextClaimRole,
+      resultRef: `result:${result.id}`,
+    });
+  })();
+  requestReconcile(db, `run-submit:${taskId}:${next}`);
+  return updated;
+}
+
 export interface VerifyOptions {
   passed: boolean;
   evidence?: string;

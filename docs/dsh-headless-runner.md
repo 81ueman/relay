@@ -1,0 +1,109 @@
+# Headless dsh Run (ISH-803)
+
+Relay can run a **coding attempt as one `dsh --profile headless` process** — no
+Herdr pane, no TUI, no `dsh web` server, no Cordis wake plugin, and no manual
+attach. One Run = one process = one coding attempt.
+
+This is implemented in `src/dsh-runner.ts` and driven from the CLI:
+
+```sh
+relay run start <task-id> [--cwd DIR] [--prompt TEXT] [--permission MODE] [--timeout 30m] [--wait] [--json]
+relay run list [--task <id>] [--json]
+relay run show <run-id> [--json]
+relay run logs <run-id> [--tail N]
+relay run cancel <run-id>
+relay run submit <run-id> [--evidence E] [--summary S]
+```
+
+The older `integrations/dsh-relay/` bridge is for the **long-lived** `dsh
+web`/SDK (`worker.wake.await -> followup()`); a one-shot headless attempt is
+launched directly instead — the bridge is not extended and not used here.
+
+## Pinned CLI contract
+
+Confirmed against the installed tool, not guessed:
+
+- `dsh --version` → **`0.1.5-rc.1`** (bundle `@deepseek-ai/dsh-headless`
+  `0.1.5-rc.2`), checked with the real `dsh --help` and `dsh --profile headless
+  --help`.
+- The app is `dsh --profile headless <task...>`; multiple words are joined by
+  spaces. `-h/--help` prints usage and exits 0; a missing task is a usage error.
+- **stdout**: the final assistant text, then a newline. *Observed deviation on
+  this machine:* the locally installed `@gausszhou/dsh-opencode-session-id`
+  plugin (mounted by this profile) also prints a `[opencode-session-id] mounted:
+  ...` banner to stdout at boot, before the final text. The runner therefore
+  records **every** stdout line as a `stdout` event and never parses stdout as a
+  protocol.
+- **stderr**: streamed provider *reasoning* (prefixed `dsh: reasoning:` on its own
+  line) and errors (`dsh: <code>: <message>`).
+- **exit code**: `0` only when the turn ended with reason `completed`; any other
+  outcome exits `1`.
+- **No `--json`/JSONL flag exists in this version** and there is no
+  machine-readable event field to parse, so the runner treats stdout/stderr as
+  text and writes its **own** lifecycle JSONL (see below). This deliberately
+  avoids implementing unverified options/fields.
+- Relevant environment variables observed in the profile config: `DSH_HOME`
+  (profiles/sessions root), `DSH_PERMISSION_MODE`, `DSH_TOOLS_MODE`,
+  `DEEPSEEK_API_KEY`. The runner only sets `DSH_PERMISSION_MODE` (plus
+  `RELAY_RUN_ID` / `RELAY_TASK_ID` for attribution).
+
+## Process and output
+
+Starting a Run writes, under the control plane (`<dir-of-state.db>/runs/<run-id>/`,
+never shared `/tmp`):
+
+| file | contents |
+| -- | -- |
+| `spec.md` | the task text handed to dsh (title / description / acceptance) |
+| `stdout.log` | the dsh stdout lines (final assistant text) |
+| `stderr.log` | the dsh stderr lines (reasoning/errors) |
+| `events.jsonl` | Relay's own lifecycle JSONL: `run.started`, one `stdout`/`stderr` per line, `run.fast_exit`, `run.cancelled`/`run.timeout`, `run.exited` |
+
+The durable Run row (`runs` table) records id / task / phase / attempt /
+generation / cwd / branch / HEAD / pid / exit code / signal / dsh session id
+(when a `session-<uuid>` token appears in the output) / start+end time / output
+and evidence refs. It is keyed to the Task; it is **not** a second workflow state
+machine — the Task's `phase`/`attempt` stays the truth.
+
+Cancel and timeout kill the whole **process group** (`Bun.spawn({detached:true})`
++ `kill(-pid)`), so a grandchild holding a pipe open cannot outlive the Run.
+
+## Permission boundary
+
+The Run is confined to its worktree: `DSH_PERMISSION_MODE` defaults to
+**`workspace-write`** with `workspaceRoot = process.cwd()` (the Task worktree),
+so file writes stay inside that directory. The runner never grants
+`danger-full-access` and never hands the Run a review-approval socket/API. An
+explicit `--permission`/`RELAY_DSH_*` override is the operator's choice.
+
+## `exit 0` is not a submission
+
+A clean exit 0 (or the final stdout text) **does not** complete the Task or
+advance the phase. The only path that advances a Task is a structured
+submission bound to the current Run/Task/phase/attempt/branch/HEAD:
+
+```sh
+relay run submit <run-id> [--evidence E] [--summary S]
+```
+
+`acceptRunSubmission` refuses (never advances) when the Run is not a clean
+`exited`/exit-0 process (failed, signalled, cancelled, timeout, still running),
+when the submission names a different task/phase/attempt/branch/HEAD than the Run
+recorded at start, or when the **live** Task has moved (phase/attempt/branch/HEAD
+changed since the Run started — a stale Run can never advance the current
+attempt). On success it records the ordinary `TaskSubmitted` structured result
+and advances `implement`/`integration` via the existing workflow
+(`submitImplementationFromRun`), which is the same phase machine every other
+submission uses.
+
+## Verified / not verified
+
+- Verified: the fake-process suite (`tests/dsh-runner.test.ts`) covers normal,
+  non-zero exit, spawn failure, process crash, cancel, timeout, malformed stdout,
+  two concurrent Runs in different cwds, and every submission-rejection case; and
+  one real local `dsh --profile headless` smoke
+  (`RELAY_DSH_SMOKE=1 bun test tests/dsh-smoke.test.ts`) runs one process and
+  observes exit 0.
+- NOT verified here: anything beyond **one** Run's launch/observe/terminate. Task
+  worktree creation, multi-writer control and FIX re-entry are ISH-760, not this
+  module.

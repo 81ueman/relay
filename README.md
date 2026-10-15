@@ -313,6 +313,22 @@ implement --TaskSubmitted--> verify --VerificationResult--> review
   worker; ordinary FIX/PASS never wake it. The Gateway is never a per-phase
   coordinator.
 
+### Headless dsh Runs (no Herdr)
+
+A coding attempt can run as **one `dsh --profile headless` process** — no Herdr
+pane, TUI, `dsh web` server, wake plugin, or manual attach (`relay run start`,
+`list`, `show`, `logs`, `cancel`, `submit`). stdout (final text) and stderr
+(reasoning) are stored under `<control-plane>/runs/<run-id>/`; the durable `runs`
+row is keyed to the Task (it is not a second workflow state). Cancel/timeout kill
+the whole process group. Permissions stay in the worktree
+(`DSH_PERMISSION_MODE=workspace-write`). A process `exit 0` or the final text is
+**not** a submission — only a structured `relay run submit` bound to the current
+Run/Task/phase/attempt/branch/HEAD advances the Task; a non-zero/cancelled/stale
+Run never does. This covers one Run's launch/observe/terminate only; worktrees,
+single-writer control and FIX re-entry are ISH-760. See
+[`docs/dsh-headless-runner.md`](docs/dsh-headless-runner.md) for the pinned
+`dsh` CLI contract and the exact file/output format.
+
 ### Historical cleanup: `relay gc`
 
 There was no supported purge for old worker/runtime/session/task rows (fleet
@@ -1397,11 +1413,13 @@ The alt-screen + pause/scroll behaviour is verified in a real tmux emulator
 ```text
 src/cli.ts  daemon.ts  db.ts  schema.ts  scheduler.ts  reconciler.ts
     sessions.ts  socket.ts  messages.ts  tasks.ts  workers.ts  events.ts
-    runtimes.ts  mail-policy.ts  harness.ts  wake-outbox.ts
+    runtimes.ts  mail-policy.ts  harness.ts  wake-outbox.ts  dsh-runner.ts
+docs/dsh-headless-runner.md
     runtime/{runtime,herdr}.ts
     dashboard/{command,model,render,affinity,herdr,doctor}.ts
 .opencode/plugins/relay.ts  integrations/herdr/{herdr-plugin.toml,focus-pane.ts}
 integrations/dsh-relay/{lib/{index,core.mjs},cordis.patch.yml,package.json}
 skills/agent-worker/SKILL.md  skills/parallel-worktrees/SKILL.md
 tests/{integration,contract,lifecycle,herdr,release,dashboard,dashboard-affinity}.test.ts
+tests/{dsh-runner,dsh-smoke}.test.ts
 ```
