@@ -336,6 +336,66 @@ export interface DbEvent {
 }
 
 /**
+ * ISH-803: the lifecycle of one headless dsh Run (1 Run = 1 process = 1 coding
+ * attempt). This is deliberately NOT a second workflow state machine: the Task's
+ * `phase`/`attempt` remains the workflow truth, and a Run records the PROCESS
+ * attempt and its artifacts. `submitted` means a structured submission was
+ * accepted for this Run (which is what advanced the Task) — a clean `exit 0`
+ * alone stops at `exited`.
+ */
+export const RUN_STATES = [
+  "starting",
+  "running",
+  "exited",
+  "failed",
+  "cancelled",
+  "timeout",
+  "submitted",
+] as const;
+export type RunState = (typeof RUN_STATES)[number];
+
+/**
+ * One headless dsh Run. Bound at start to (task, phase, attempt, branch, HEAD)
+ * and to the files under `output_dir` (stdout/stderr/events/spec) plus the OS
+ * process (pid). No Herdr pane, TUI, `dsh web` server or wake subscription is
+ * involved; the Run is disposable and the Task is durable.
+ */
+export interface Run {
+  id: string;
+  task_id: string;
+  phase: string;
+  attempt: number;
+  generation: number;
+  cwd: string;
+  /**
+   * The branch/HEAD the Run is bound to. `head_sha` is the PRODUCED head
+   * (`git rev-parse HEAD` in the cwd at Run end — dsh is asked to commit), not
+   * the pre-run revision; `base_head_sha` is the START head, kept as the
+   * base/staleness fence. Both are NULL in a non-git cwd.
+   */
+  branch: string | null;
+  head_sha: string | null;
+  base_head_sha: string | null;
+  prompt: string;
+  spec_path: string | null;
+  output_dir: string;
+  state: RunState;
+  pid: number | null;
+  exit_code: number | null;
+  signal: string | null;
+  session_id: string | null;
+  stdout_path: string | null;
+  stderr_path: string | null;
+  events_path: string | null;
+  error: string | null;
+  fast_exit: number;
+  started_at: number;
+  ended_at: number | null;
+  created_at: number;
+  updated_at: number;
+}
+
+/**
  * [ext] One attributed token/cost DELTA. The plugin forwards a session's
  * session-lifetime CUMULATIVE usage (`session.usage`); the daemon turns each
  * new reading into the difference from the previous one and records it here,
@@ -630,4 +690,42 @@ CREATE TABLE IF NOT EXISTS reminders (
   enabled INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS idx_reminders_due ON reminders(enabled, last_sent_at);
+
+-- ISH-803: one-shot headless dsh Run. A Run is a disposable execution attempt
+-- (1 Run = 1 process = 1 coding attempt), bound at start to
+-- Task/phase/attempt/branch/HEAD. stdout/stderr/events are files under
+-- <control-plane>/runs/<run_id>/ (NOT shared /tmp). The Task's phase/attempt
+-- stays the workflow truth; this table records the process attempt and its
+-- artifacts. A clean exit 0 sets state='exited' and advances NOTHING — only
+-- a structured submission bound to this Run (relay run submit) does.
+CREATE TABLE IF NOT EXISTS runs (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL,
+  phase TEXT NOT NULL,
+  attempt INTEGER NOT NULL DEFAULT 0,
+  generation INTEGER NOT NULL DEFAULT 0,
+  cwd TEXT NOT NULL,
+  branch TEXT,
+  head_sha TEXT,
+  base_head_sha TEXT,
+  prompt TEXT NOT NULL DEFAULT '',
+  spec_path TEXT,
+  output_dir TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT 'starting',
+  pid INTEGER,
+  exit_code INTEGER,
+  signal TEXT,
+  session_id TEXT,
+  stdout_path TEXT,
+  stderr_path TEXT,
+  events_path TEXT,
+  error TEXT,
+  fast_exit INTEGER NOT NULL DEFAULT 0,
+  started_at INTEGER NOT NULL,
+  ended_at INTEGER,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_runs_task ON runs(task_id, phase, attempt);
+CREATE INDEX IF NOT EXISTS idx_runs_state ON runs(state);
 `;

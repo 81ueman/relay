@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { defaultDbPath, defaultSockPath, initControlPlane, now, openDb, outsideRepoDefault, STATE_DIR } from "./db";
 import {
   applyDbMove, configPath, describeDb, findLegacyDb, planDbMove, readConfig, resolveDb,
@@ -26,6 +26,7 @@ import {
 } from "./tasks";
 import { acceptTask, confirmMerged, intakeTask, recordReview, recordVerification, runMechanicalVerification, submitPhase, taskChecks } from "./workflow";
 import { defaultRunner, type CheckSpec } from "./verify";
+import { acceptRunSubmission, getRun, listRuns, startDshRun } from "./dsh-runner";
 import { providerDepsFromEnv } from "./provider-adapters";
 import {
   bindSession, findWorkerBySession, getWorker, listWorkers,
@@ -94,6 +95,13 @@ Usage:
   relay release <task-id> [--worker <id>]
   relay wait <task-id> --for <30s|2m|1h> "reason" [--worker <id>]
 
+  relay run start <task-id> [--cwd DIR] [--prompt TEXT] [--permission MODE] [--timeout 30m] [--json]
+  relay run list [--task <id>] [--json]
+  relay run show <run-id> [--json]          # a headless dsh Run (no Herdr)
+  relay run logs <run-id> [--tail N]
+  relay run cancel <run-id>
+  relay run submit <run-id> [--evidence E] [--summary S]   # structured submission (exit 0 alone does NOT submit)
+
   relay send <worker-id> "message" [--task <tid>] [--kind <k>]
   relay inbox [--worker <id>] [--claim] [--ack <msg-id>]
 
@@ -136,6 +144,18 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
   init: {
     about: "Create .relay/state.db (WAL) and the control-plane schema in the current directory.",
     usage: ["relay init"],
+  },
+  run: {
+    about:
+      "ISH-803 one-shot headless dsh Runs: 1 Run = 1 `dsh --profile headless` process = 1 coding attempt, in the Task's worktree, with NO Herdr pane/TUI/`dsh web`/wake/attach. stdout (final text) and stderr (reasoning) are stored under <control-plane>/runs/<run-id>/. A process `exit 0` does NOT complete anything — only `relay run submit` (a structured submission bound to the Run/Task/phase/attempt/branch/HEAD) advances the Task. `start` waits for the Run to reach a terminal state (there is no detached mode yet). Permissions are the worktree: $DSH_PERMISSION_MODE=workspace-write by default.",
+    usage: [
+      "relay run start <task-id> [--cwd DIR] [--prompt TEXT] [--permission MODE] [--timeout 30m] [--json]",
+      "relay run list [--task <id>] [--limit N] [--json]",
+      "relay run show <run-id> [--json]",
+      "relay run logs <run-id> [--tail N]",
+      "relay run cancel <run-id>",
+      "relay run submit <run-id> [--evidence E] [--summary S] [--head SHA]",
+    ],
   },
   db: {
     about:
@@ -363,7 +383,7 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
   },
 };
 
-const GROUP_COMMANDS = new Set(["worker", "session", "task", "event", "remind"]);
+const GROUP_COMMANDS = new Set(["worker", "session", "task", "event", "remind", "run"]);
 
 function commandUsage(path: string[]): string {
   for (let n = path.length; n >= 1; n--) {
@@ -543,6 +563,9 @@ const VALUE_FLAGS = new Set([
   "--dir", "--worktree", "--pane", "--tab", "--workspace", "--type", "--payload",
   "--ack", "--depends-on", "--older-than", "--base", "--label", "--since", "--by",
   "--every",
+  // ISH-803 headless Run flags.
+  "--head", "--phase", "--attempt", "--branch", "--summary", "--permission",
+  "--timeout", "--prompt", "--tail",
 ]);
 
 /** Positional args only, skipping flags and their (known) values, e.g. ["T12","reason"]. */
@@ -1438,6 +1461,134 @@ async function main(): Promise<void> {
         for (const s of plan.skipped) console.log(`  ${s.kind} ${s.id}: ${s.reason}`);
         if (!plan.applied) console.log("nothing was deleted (dry-run)");
         break;
+      }
+
+      case "run": {
+        const sub = argv[1];
+        const rest = argv.slice(2);
+        const outputRoot = join(dirname(defaultDbPath()), "runs");
+        if (!sub || sub === "list") {
+          const limitRaw = flag(rest, "--limit");
+          const runs = listRuns(db, {
+            taskId: flag(rest, "--task") ?? undefined,
+            limit: limitRaw ? Number(limitRaw) : undefined,
+          });
+          if (hasFlag(rest, "--json")) {
+            console.log(JSON.stringify(runs, null, 2));
+            break;
+          }
+          if (runs.length === 0) console.log("(no runs)");
+          for (const r of runs) {
+            console.log(
+              `${r.id}  ${r.state.padEnd(9)}  task=${r.task_id}  phase=${r.phase}/${r.attempt}  exit=${r.exit_code ?? "-"}  pid=${r.pid ?? "-"}  ${r.cwd}`
+            );
+          }
+          break;
+        }
+        if (sub === "start") {
+          const id = positionals(rest)[0];
+          if (!id) {
+            throw new Error(
+              "usage: relay run start <task-id> [--cwd DIR] [--prompt TEXT] [--permission MODE] [--timeout 30m] [--json]"
+            );
+          }
+          const timeoutRaw = flag(rest, "--timeout");
+          const handle = await startDshRun(db, {
+            taskId: id,
+            cwd: flag(rest, "--cwd") ?? undefined,
+            prompt: flag(rest, "--prompt") ?? undefined,
+            outputRoot,
+            permissionMode: flag(rest, "--permission") ?? undefined,
+            timeoutMs: timeoutRaw ? parseDuration(timeoutRaw) : undefined,
+          });
+          // ALWAYS await the Run BEFORE the DB is closed: the completion closure
+          // writes the final state to SQLite, so returning early would close the
+          // handle under it (RangeError) and leave the Run `running` forever.
+          const r = await handle.wait();
+          if (hasFlag(rest, "--json")) {
+            console.log(JSON.stringify(r, null, 2));
+          } else {
+            console.log(`${r.id} -> state=${r.state} exit=${r.exit_code ?? "-"} pid=${r.pid ?? "-"}`);
+            console.log(`output: ${r.output_dir}`);
+          }
+          if (r.state !== "exited") process.exitCode = 1;
+          break;
+        }
+        if (sub === "show") {
+          const id = positionals(rest)[0];
+          if (!id) throw new Error("usage: relay run show <run-id> [--json]");
+          const r = getRun(db, id);
+          if (!r) throw new Error(`unknown run: ${id}`);
+          if (hasFlag(rest, "--json")) {
+            console.log(JSON.stringify(r, null, 2));
+            break;
+          }
+          for (const [k, v] of Object.entries(r)) console.log(`${k}: ${v ?? "-"}`);
+          break;
+        }
+        if (sub === "logs") {
+          const id = positionals(rest)[0];
+          if (!id) throw new Error("usage: relay run logs <run-id> [--tail N]");
+          const r = getRun(db, id);
+          if (!r) throw new Error(`unknown run: ${id}`);
+          const tailRaw = flag(rest, "--tail");
+          const n = tailRaw ? Number(tailRaw) : 50;
+          for (const [label, p] of [
+            ["stdout", r.stdout_path],
+            ["stderr", r.stderr_path],
+          ] as const) {
+            if (!p || !existsSync(p)) continue;
+            const lines = readFileSync(p, "utf-8").split("\n");
+            console.log(`--- ${label} (${p}) ---`);
+            console.log(lines.slice(Math.max(0, lines.length - 1 - n)).join("\n"));
+          }
+          break;
+        }
+        if (sub === "cancel") {
+          const id = positionals(rest)[0];
+          if (!id) throw new Error("usage: relay run cancel <run-id>");
+          const r = getRun(db, id);
+          if (!r) throw new Error(`unknown run: ${id}`);
+          if (r.state !== "running" && r.state !== "starting") {
+            console.log(`${id} is ${r.state}; nothing to cancel`);
+            break;
+          }
+          // Mark the request in the row BEFORE signalling so the process that
+          // owns the Run records it as `cancelled`, not a bare signal failure.
+          db.query(`UPDATE runs SET signal = 'cancelled', updated_at = ? WHERE id = ?`).run(now(), id);
+          if (r.pid) {
+            try {
+              process.kill(-r.pid, "SIGTERM");
+            } catch {
+              try {
+                process.kill(r.pid, "SIGTERM");
+              } catch {
+                /* already gone */
+              }
+            }
+          }
+          console.log(`${id} cancel signalled (pid ${r.pid ?? "-"})`);
+          break;
+        }
+        if (sub === "submit") {
+          const id = positionals(rest)[0];
+          if (!id) throw new Error("usage: relay run submit <run-id> [--evidence E] [--summary S]");
+          const attemptRaw = flag(rest, "--attempt");
+          const r = acceptRunSubmission(db, {
+            runId: id,
+            taskId: flag(rest, "--task") ?? undefined,
+            phase: flag(rest, "--phase") ?? undefined,
+            attempt: attemptRaw !== undefined ? Number(attemptRaw) : undefined,
+            branch: flag(rest, "--branch") ?? undefined,
+            headSha: flag(rest, "--head") ?? undefined,
+            summary: flag(rest, "--summary") ?? undefined,
+            evidence: flag(rest, "--evidence") ?? undefined,
+          });
+          const t = getTask(db, r.task_id);
+          console.log(`${r.id} accepted -> task ${r.task_id} phase=${t?.phase} state=${t?.state}`);
+          break;
+        }
+        throw new Error(`unknown run subcommand: ${sub} (try: start|list|show|logs|cancel|submit)`);
       }
 
       case "status": {

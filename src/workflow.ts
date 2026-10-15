@@ -584,6 +584,135 @@ export function submitPhase(db: Database, taskId: string, workerId: string, opts
   return updated;
 }
 
+/**
+ * ISH-803: the binding a headless dsh Run's structured submission carries. The
+ * Run row is the process record; the Task/phase/attempt/branch/HEAD below are
+ * re-validated against the LIVE task so a submission for a Run whose HEAD/phase
+ * has moved is refused (STALE_RESULT / HEAD_MISMATCH) instead of advancing it.
+ */
+export interface RunImplementation {
+  runId: string;
+  /** The phase the Run started in (must equal the task's current phase). */
+  phase?: string;
+  /** The attempt the Run started at (must equal the task's current attempt). */
+  attempt?: number;
+  /** The branch the Run produced (adopted by a task with none). */
+  branch?: string | null;
+  /**
+   * The HEAD the Run PRODUCED (recorded on the Task / TaskSubmitted). dsh is
+   * asked to commit, so this is the post-run revision, not the start revision.
+   */
+  headSha?: string | null;
+  /**
+   * The HEAD the Run STARTED at — the staleness fence. A task already bound to
+   * a different head has moved since the Run began and is refused.
+   */
+  baseHeadSha?: string | null;
+  summary?: string;
+  /** Output/evidence ref (the Run's output dir). */
+  evidence?: string;
+}
+
+/**
+ * Record a TaskSubmitted that came from a bound dsh Run and advance the phase.
+ *
+ * This is the ONLY path by which a headless Run advances a Task: a process
+ * `exit 0` or the Run's final stdout text does NOT call it. Unlike `submitPhase`
+ * it does not demand a worker-row lease (a headless Run is not a Herdr worker);
+ * its authority is the Run binding the caller validated against the `runs` row
+ * and re-validated here against the live Task. It still refuses a submission
+ * whose phase/attempt/branch/HEAD no longer match the task.
+ *
+ * An INTEGRATION Run whose produced head differs from the reviewed head calls
+ * `invalidateReview` (exactly like `submitPhase`) and sends the task back to
+ * `review` at a new attempt — it never advances to `merge_ready` with an
+ * unreviewed head.
+ */
+export function submitImplementationFromRun(db: Database, taskId: string, impl: RunImplementation): Task {
+  const task = getTask(db, taskId);
+  if (!task) throw new Error(`unknown task: ${taskId}`);
+  if (!isCodeTask(task)) throw new Error(`${WORKFLOW_ERROR}: ${taskId} is not a code-change task`);
+  const phase = phaseOf(task);
+  if (phase !== "implement" && phase !== "integration") {
+    throw new Error(
+      `${WORKFLOW_ERROR}: cannot submit a Run for ${taskId} in phase '${phase}' (submit applies to implement/integration)`
+    );
+  }
+  if (impl.phase !== undefined && impl.phase !== phase) {
+    throw new Error(`${STALE_RESULT}: run ${impl.runId} started in phase '${impl.phase}', task ${taskId} is '${phase}'`);
+  }
+  if (impl.attempt !== undefined && impl.attempt !== task.attempt) {
+    throw new Error(`${STALE_RESULT}: run ${impl.runId} started at attempt ${impl.attempt}, task ${taskId} is attempt ${task.attempt}`);
+  }
+  // Branch: a task with none ADOPTS the Run's branch; an already-bound task must
+  // match what the Run produced. (A NULL task branch is the normal implement
+  // phase — the branch is not linked until a PR exists.)
+  if (impl.branch !== undefined && task.branch !== null && (impl.branch ?? null) !== task.branch) {
+    throw new Error(
+      `${STALE_RESULT}: run ${impl.runId} produced branch ${impl.branch ?? "none"}, task ${taskId} is ${task.branch ?? "none"}`
+    );
+  }
+  // HEAD fence vs produced head: the Run started at `baseHeadSha`; a task whose
+  // head is already bound to a different revision has moved since the Run began.
+  const baseHead = impl.baseHeadSha !== undefined ? impl.baseHeadSha : impl.headSha;
+  if (task.head_sha !== null && (baseHead ?? null) !== task.head_sha) {
+    throw new Error(
+      `${HEAD_MISMATCH}: run ${impl.runId} started at head ${baseHead ?? "none"}, task ${taskId} is bound to ${task.head_sha}`
+    );
+  }
+  const producedHead = impl.headSha ?? null;
+  // Adopt the Run's branch onto the task ONLY when the task has none.
+  const adoptBranch = task.branch === null && impl.branch ? impl.branch : null;
+  // An INTEGRATION Run that commits a DIFFERENT head invalidates the review that
+  // PASSed the previous head. Mirror `submitPhase`: send the task BACK to review
+  // at a new attempt instead of advancing to `merge_ready` with an unreviewed
+  // head — a `merge_ready` task whose head no longer matches its passing review
+  // dead-ends (the gate refuses to accept it and nothing re-routes it).
+  if (phase === "integration" && (producedHead ?? null) !== (task.head_sha ?? null)) {
+    const invalidated = db.transaction(() => {
+      if (adoptBranch) {
+        db.query(`UPDATE tasks SET branch = ?, updated_at = ? WHERE id = ?`).run(adoptBranch, now(), taskId);
+      }
+      return invalidateReview(db, task, producedHead, "integration-head-changed");
+    })();
+    requestReconcile(db, `head-changed:${taskId}`);
+    return invalidated;
+  }
+  assertNoResult(db, taskId, phase, task.attempt, "TaskSubmitted");
+
+  const next = nextPhase(phase)!;
+  const nextClaimRole =
+    next === "verify" && hasMechanicalChecks(task) ? RELAY_ROLE : claimRoleForPhase(next, task.role);
+  const updated = db.transaction(() => {
+    if (adoptBranch) {
+      db.query(`UPDATE tasks SET branch = ?, updated_at = ? WHERE id = ?`).run(adoptBranch, now(), taskId);
+    }
+    const result = insertTaskResult(db, {
+      taskId,
+      phase,
+      attempt: task.attempt,
+      kind: "TaskSubmitted",
+      workerId: `dsh-run:${impl.runId}`,
+      // The revision the Run PRODUCED (not the pre-run head).
+      headSha: producedHead,
+      evidenceRef: impl.evidence ?? `run:${impl.runId}`,
+      reason: impl.summary ?? null,
+      payload: { runId: impl.runId, source: "dsh-headless", baseHead: impl.baseHeadSha ?? null },
+    });
+    return applyPhase(db, task, next, {
+      state: next === "review" ? "review" : "queued",
+      attempt: task.attempt,
+      claimRole: nextClaimRole,
+      // Record the produced head on the task so verify/review judge the same
+      // revision the Run committed (submitPhase does this with opts.headSha).
+      headSha: producedHead,
+      resultRef: `result:${result.id}`,
+    });
+  })();
+  requestReconcile(db, `run-submit:${taskId}:${next}`);
+  return updated;
+}
+
 export interface VerifyOptions {
   passed: boolean;
   evidence?: string;
