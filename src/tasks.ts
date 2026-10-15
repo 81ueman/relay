@@ -12,11 +12,19 @@ import {
   touchProgress,
 } from "./workers";
 import type { Task, TaskState, WorkerState } from "./schema";
+import { TERMINAL_TASK_STATES } from "./schema";
 import { RELAY_TAG, sendMessage } from "./messages";
 import { requestReconcile } from "./control";
 import { findTaskResult, insertTaskResult, notifyGatewayTo } from "./results";
 
 export const STALE_LEASE = "STALE_LEASE";
+
+/**
+ * Terminal task states as an SQL `IN (...) / NOT IN (...)` list (ISH-808): the
+ * single place a query asserts "this task's lifecycle is over". Shares the
+ * definition with `isTerminalTaskState` so SQL and TypeScript cannot drift.
+ */
+const TERMINAL_STATE_SQL = TERMINAL_TASK_STATES.map((s) => `'${s}'`).join(",");
 
 // ---------------------------------------------------------------------------
 // Runnable gating (declared prerequisites + the reviewer gate)
@@ -899,7 +907,7 @@ export function notesClaimingApproval(
   db: Database
 ): { task: Task; note: { worker_id: string | null; kind: string; body: string; created_at: number } }[] {
   const open = db
-    .query(`SELECT * FROM tasks WHERE state NOT IN ('done','failed') ORDER BY updated_at DESC`)
+    .query(`SELECT * FROM tasks WHERE state NOT IN (${TERMINAL_STATE_SQL}) ORDER BY updated_at DESC`)
     .all() as Task[];
   const out: { task: Task; note: { worker_id: string | null; kind: string; body: string; created_at: number } }[] = [];
   for (const task of open) {
@@ -1316,6 +1324,99 @@ export function blockTask(db: Database, taskId: string, workerId: string, reason
 }
 
 /**
+ * ISH-808: one-hop roll-up of a CANCELLED child, mirroring bubbleChildDone /
+ * bubbleChildBlocked. A parent waiting on this subtree must learn that its child
+ * was CLOSED without becoming `done` — otherwise the missing `child_done` reads
+ * as a stalled child. Records a durable `child_cancelled` note on the IMMEDIATE
+ * parent and, when the parent has an assignee, an immediate message. No
+ * recursion, no automatic parent state change.
+ *
+ * Deliberately does NOT touch the `children_done` aggregation (which is
+ * done-only): a cancelled child is closed, not completed, so the parent is told
+ * but never told "all children done".
+ */
+function bubbleChildCancelled(db: Database, child: Task, actor: string, reason: string, at: number): void {
+  const parentId = child.parent_task_id;
+  if (!parentId) return;
+  const parent = getTask(db, parentId);
+  if (!parent) return; // dangling parent: the child is still cancelled
+  const body = `${RELAY_TAG}${child.id} cancelled${reason ? `: ${reason}` : ""}`;
+  db.query(
+    `INSERT INTO task_notes (task_id, worker_id, kind, body, created_at) VALUES (?, ?, 'child_cancelled', ?, ?)`
+  ).run(parentId, actor, body, at);
+  if (parent.assignee) {
+    sendMessage(db, "relay", parent.assignee, body, { kind: "child_cancelled", taskId: parentId });
+  }
+  logEvent(db, {
+    source: "supervisor",
+    taskId: parentId,
+    type: "task.child_cancelled",
+    payload: { child: child.id, reason, assignee: parent.assignee ?? null },
+  });
+}
+
+/**
+ * ISH-808: close a task into the explicit terminal state `cancelled`.
+ *
+ * This is the one operation that ends work which will NOT be `done`:
+ * superseded, duplicate, obsolete, or policy-changed. It is deliberately
+ * distinct from `done` (approved work) and from the `blocked_*` parks
+ * (reversible holds), and it never routes through reject/approve — so it cannot
+ * mis-transition a task to `done`/`failed`.
+ *
+ * Defined from every non-terminal state (queued / running / review /
+ * blocked_*): ownership and lease are released like a block, the reason is
+ * durable twice (a `cancel` note on the task + a `task.cancelled` event), and
+ * the immediate parent gets a one-hop `child_cancelled` roll-up. `done`/`failed`
+ * are already terminal and are REFUSED — rewriting them would invalidate an
+ * already-bubbled `child_done`. Idempotent: cancelling an already-cancelled task
+ * is an audited no-op, never a second transition.
+ *
+ * A `cancelled` task is not `queued`, so it is automatically excluded from
+ * `relay next` / claim (RUNNABLE_TASK_SQL), from wake (runnable-based), from
+ * Unclaimable (runnable-based), and — via TERMINAL_TASK_STATES — from Attention
+ * and the unfinished count.
+ */
+export function cancelTask(db: Database, taskId: string, workerId: string, reason: string): Task {
+  const task = getTask(db, taskId);
+  if (!task) throw new Error(`unknown task: ${taskId}`);
+  if (task.state === "cancelled") {
+    // Idempotent: the close already happened. Audit the retry, change nothing
+    // (no second note, no re-bubble, no lease bump).
+    logEvent(db, { source: "worker", workerId, taskId, type: "task.cancel_ignored", payload: { reason } });
+    return task;
+  }
+  if (task.state === "done" || task.state === "failed") {
+    throw new Error(`cannot cancel task in terminal state ${task.state}`);
+  }
+  const fromState = task.state;
+  const t = now();
+  db.transaction(() => {
+    db.query(`INSERT INTO task_notes (task_id, worker_id, kind, body, created_at) VALUES (?, ?, 'cancel', ?, ?)`).run(
+      taskId, workerId, reason, t
+    );
+    // Same ownership release as `block`: no stale assignee/lease survives.
+    db.query(
+      `UPDATE tasks SET state = 'cancelled', assignee = NULL, lease_until = NULL, lease_token = lease_token + 1, updated_at = ? WHERE id = ?`
+    ).run(t, taskId);
+    if (task.assignee) {
+      clearCurrentTaskOrRestoreParent(db, task.assignee, taskId, t);
+      normalizeWorkerAfterTaskRelease(db, task.assignee, t);
+      clearQuietLogged(db, task.assignee, taskId);
+    }
+    clearCurrentTaskOrRestoreParent(db, workerId, taskId, t);
+    normalizeWorkerAfterTaskRelease(db, workerId, t);
+    touchProgress(db, workerId, t);
+    clearQuietLogged(db, workerId, taskId);
+    logEvent(db, { source: "worker", workerId, taskId, type: "task.cancelled", payload: { reason, fromState } });
+    bubbleChildCancelled(db, getTask(db, taskId)!, workerId, reason, t);
+  })();
+  // The cancelled task left the runnable/roll-up surface: re-derive counts.
+  requestReconcile(db, `cancel:${taskId}`);
+  return getTask(db, taskId)!;
+}
+
+/**
  * Default liveness predicate for lease expiry. A worker counts as ALIVE (so its
  * running task's lapse is NOT treated as a crash) when its row exists, its state
  * is not `dead`/`stalled`, and it has been seen/progressed within the grace
@@ -1402,6 +1503,6 @@ export function hasClaimableReview(db: Database): boolean {
 }
 
 export function unfinishedCount(db: Database): number {
-  const r = db.query(`SELECT COUNT(*) AS n FROM tasks WHERE state != 'done' AND state != 'failed'`).get() as { n: number };
+  const r = db.query(`SELECT COUNT(*) AS n FROM tasks WHERE state NOT IN (${TERMINAL_STATE_SQL})`).get() as { n: number };
   return r.n;
 }

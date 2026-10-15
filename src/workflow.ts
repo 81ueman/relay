@@ -13,7 +13,7 @@ import {
   notifyGatewayTo,
 } from "./results";
 import type { CodePhase, ResultKind, Task, TaskState, VerifyOutcome } from "./schema";
-import { INTEGRATOR_ROLE, REVIEWER_ROLE } from "./schema";
+import { INTEGRATOR_ROLE, REVIEWER_ROLE, isTerminalTaskState } from "./schema";
 import {
   clearCurrentTaskOrRestoreParent,
   getTask,
@@ -448,7 +448,7 @@ export function linkTask(
 ): Task {
   const task = getTask(db, taskId);
   if (!task) throw new Error(`unknown task: ${taskId}`);
-  const terminal = task.state === "done" || task.state === "failed" || task.accepted_at !== null;
+  const terminal = isTerminalTaskState(task.state) || task.accepted_at !== null;
   if (terminal) {
     // Do not touch a settled task, and never invalidateReview it back to review.
     if (link.headSha !== undefined && link.headSha !== task.head_sha) {

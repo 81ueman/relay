@@ -29,7 +29,7 @@ import { getWorker } from "./workers";
 
 /** Task-state groups the UI renders, in display order. */
 export const TASK_GROUPS = [
-  "queued", "running", "review", "blocked_human", "blocked_internal", "done", "failed",
+  "queued", "running", "review", "blocked_human", "blocked_internal", "done", "failed", "cancelled",
 ] as const;
 
 export interface WebTask {
@@ -450,6 +450,7 @@ export function renderIndexHtml(): string {
   .state.review, .state.queued, .state.waiting_input { color: #f1c40f; }
   .state.dead, .state.stalled, .state.blocked_human, .state.blocked_internal, .state.failed { color: #ff6b6b; }
   .state.done { color: #8aa0b8; }
+  .state.cancelled { color: #8aa0b8; text-decoration: line-through; }
   form.send { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
   input, select, button { font: inherit; background: #0b0f14; color: #d6deeb;
                           border: 1px solid #2c405a; border-radius: 6px; padding: 5px 8px; }

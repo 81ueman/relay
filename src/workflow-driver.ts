@@ -1,6 +1,7 @@
 import type { Database } from "bun:sqlite";
 import { findTaskResult } from "./results";
 import type { Task } from "./schema";
+import { TERMINAL_TASK_STATES } from "./schema";
 import { getTask } from "./tasks";
 import { defaultRunner, type CommandRunner } from "./verify";
 import { runMechanicalVerification, taskChecks } from "./workflow";
@@ -11,6 +12,9 @@ import {
   type LinearReadOnly,
   type ProviderAuthority,
 } from "./providers";
+
+/** Terminal task states as an SQL `IN`/`NOT IN` list (done/failed/cancelled). */
+const TERMINAL_STATE_SQL = TERMINAL_TASK_STATES.map((s) => `'${s}'`).join(",");
 
 /**
  * ISH-759 workflow driver: the daemon-side glue that turns a structured result
@@ -67,7 +71,7 @@ export function providerBoundTasks(db: Database): Task[] {
         WHERE code_change = 1 AND provider IS NOT NULL
           AND (pr_url IS NOT NULL OR issue_id IS NOT NULL)
           AND (
-            state NOT IN ('done', 'failed')
+            state NOT IN (${TERMINAL_STATE_SQL})
             OR (state = 'done' AND pr_url IS NOT NULL AND merged_at IS NULL)
           )
         ORDER BY priority DESC, created_at ASC`

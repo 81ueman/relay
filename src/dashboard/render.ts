@@ -17,6 +17,7 @@ const A = {
 const TASK_COLOR: Record<string, keyof typeof A> = {
   running: "green", queued: "cyan", review: "yellow",
   blocked_human: "red", blocked_internal: "magenta", failed: "red", done: "gray",
+  cancelled: "gray",
 };
 const WORKER_COLOR: Record<string, keyof typeof A> = {
   working: "green", idle: "gray", waiting_input: "yellow", stalled: "red", dead: "red", starting: "cyan",
@@ -106,7 +107,7 @@ export function renderDashboard(view: DashboardView, opts: RenderOptions = {}): 
   const s = view.summary;
   const parts = [`${s.total} tasks`, `${s.done} done`];
   if (s.groups) parts.push(`${s.groups} groups`);
-  for (const st of ["running", "queued", "review", "blocked_human", "blocked_internal", "failed"]) {
+  for (const st of ["running", "queued", "review", "blocked_human", "blocked_internal", "failed", "cancelled"]) {
     if (s.counts[st]) parts.push(`${s.counts[st]} ${st}`);
   }
   lines.push(trim(parts.join("   "), width));
@@ -179,7 +180,7 @@ function renderWork(lines: string[], forest: DashboardTaskNode[], width: number,
     if (avail - dwidth(role) - 8 < dwidth(tail)) tail = "";
     const title = trim(n.title, Math.max(1, avail - dwidth(role) - dwidth(tail)));
     const line = `${n.id.padEnd(8)} ${tag} ${tree}${title}${role}${tail}`;
-    lines.push(n.state === "done" ? c(line, "dim") : line);
+    lines.push(n.state === "done" || n.state === "cancelled" ? c(line, "dim") : line);
     if (n.children.length) emitGroup(n.children, childPrefix, false);
   };
 
