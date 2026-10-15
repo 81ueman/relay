@@ -11,6 +11,7 @@
     "install:local": "bun scripts/install.sh",
     "test": "bun test",
     "typecheck": "tsc --noEmit",
+    "smoke:run-lifecycle": "bun scripts/ish760-smoke.ts",
     "daemon": "bun src/cli.ts daemon",
     "formal": "formal/run-tlc.sh Relay",
     "formal:safety": "formal/run-tlc.sh RelaySafety",

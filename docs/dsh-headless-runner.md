@@ -126,5 +126,5 @@ unreviewed head (which would dead-end at the accept gate).
   (`RELAY_DSH_SMOKE=1 bun test tests/dsh-smoke.test.ts`) runs one process and
   observes exit 0.
 - NOT verified here: anything beyond **one** Run's launch/observe/terminate. Task
-  worktree creation, multi-writer control and FIX re-entry are ISH-760, not this
-  module.
+  worktree creation, multi-writer control and FIX re-entry are ISH-760 — see
+  [`run-lifecycle.md`](run-lifecycle.md).
