@@ -1,6 +1,6 @@
 import type { Database } from "bun:sqlite";
 import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { defaultDbPath, now } from "./db";
 import { logEvent } from "./events";
 import { getTask } from "./tasks";
@@ -138,6 +138,39 @@ export function listRuns(
   }
   const sql = `SELECT * FROM runs ${where.length ? `WHERE ${where.join(" AND ")}` : ""} ORDER BY created_at DESC, rowid DESC LIMIT ?`;
   return db.query(sql).all(...args, limit) as Run[];
+}
+
+/** ISH-760: a second writer into the same worktree/branch is refused. */
+export const DUPLICATE_WRITER = "DUPLICATE_WRITER";
+
+export interface ActiveWriterQuery {
+  /** The worktree the candidate writer would run in. */
+  cwd: string;
+  /** The branch the candidate writer would write (null when not a git checkout). */
+  branch?: string | null;
+  /** Ignore this Run (e.g. the row being re-checked). */
+  excludeRunId?: string;
+}
+
+/**
+ * ISH-760 single-writer: the non-terminal Run that already holds a writer on the
+ * SAME worktree (by resolved cwd) or the SAME branch. Two Runs in DIFFERENT
+ * worktrees/branches never conflict, even when they touch the same files — the
+ * spec permits that parallel case and only rejects a duplicate writer on one
+ * branch/worktree.
+ */
+export function findActiveWriter(db: Database, q: ActiveWriterQuery): Run | null {
+  const cwd = resolve(q.cwd);
+  const rows = db
+    .query(`SELECT * FROM runs WHERE state IN ('starting','running') ORDER BY created_at DESC, rowid DESC`)
+    .all() as Run[];
+  for (const r of rows) {
+    if (q.excludeRunId && r.id === q.excludeRunId) continue;
+    const sameWorktree = resolve(r.cwd) === cwd;
+    const sameBranch = !!(q.branch && r.branch && q.branch === r.branch);
+    if (sameWorktree || sameBranch) return r;
+  }
+  return null;
 }
 
 interface InsertRunInput {
@@ -317,6 +350,22 @@ export async function startDshRun(db: Database, opts: StartRunOptions): Promise<
   const prompt = opts.prompt ?? buildTaskPrompt(task);
   const branch = gitBranch(cwd);
   const head = gitHead(cwd);
+
+  // ISH-760 single writer: do not launch the next writer into a worktree/branch
+  // whose previous Run has not ENDED (its durable row is not yet terminal).
+  // Different worktrees/branches are allowed to run in parallel. The Run's own
+  // end/cancel is the confirmation that releases the writer.
+  const conflict = findActiveWriter(db, { cwd, branch });
+  if (conflict) {
+    const why =
+      resolve(conflict.cwd) === resolve(cwd)
+        ? `run ${conflict.id} is still '${conflict.state}' in this worktree (${cwd})`
+        : `run ${conflict.id} is still '${conflict.state}' on branch ${branch ?? "none"}`;
+    throw new Error(
+      `${DUPLICATE_WRITER}: ${why}; wait for it to end or \`relay run cancel ${conflict.id}\` before launching another writer`
+    );
+  }
+
   const dshBin = opts.dshBin ?? process.env.RELAY_DSH_BIN ?? "dsh";
   const permissionMode = opts.permissionMode ?? DEFAULT_PERMISSION_MODE;
   const spawner = opts.spawner ?? bunDshSpawner;
@@ -533,6 +582,18 @@ export function acceptRunSubmission(db: Database, sub: RunSubmission): Run {
     rejectSubmission(
       `run ${run.id} is '${run.state}'${run.exit_code === null ? "" : ` (exit ${run.exit_code})`}; only a clean exit 0 can be submitted`
     );
+  }
+  // ISH-760: the Run must be the CURRENT writer for its (task, phase, attempt).
+  // A newer Run for the same work supersedes it, so a late result from an older
+  // Run can never advance the Task.
+  const latest = db
+    .query(
+      `SELECT id FROM runs WHERE task_id = ? AND phase = ? AND attempt = ?
+         ORDER BY created_at DESC, rowid DESC LIMIT 1`
+    )
+    .get(run.task_id, run.phase, run.attempt) as { id: string } | null;
+  if (latest && latest.id !== run.id) {
+    rejectSubmission(`run ${run.id} was superseded by ${latest.id} for ${run.task_id} ${run.phase}/${run.attempt}`);
   }
   if (sub.taskId !== undefined && sub.taskId !== run.task_id) {
     rejectSubmission(`run ${run.id} belongs to task ${run.task_id}, not ${sub.taskId}`);

@@ -27,6 +27,11 @@ import {
 import { acceptTask, confirmMerged, intakeTask, recordReview, recordVerification, runMechanicalVerification, submitPhase, taskChecks } from "./workflow";
 import { defaultRunner, type CheckSpec } from "./verify";
 import { acceptRunSubmission, getRun, listRuns, startDshRun } from "./dsh-runner";
+import {
+  applyWorkspaceCleanup,
+  ensureTaskWorktree,
+  launchTaskRun,
+} from "./run-lifecycle";
 import { providerDepsFromEnv } from "./provider-adapters";
 import {
   bindSession, findWorkerBySession, getWorker, listWorkers,
@@ -96,6 +101,9 @@ Usage:
   relay wait <task-id> --for <30s|2m|1h> "reason" [--worker <id>]
 
   relay run start <task-id> [--cwd DIR] [--prompt TEXT] [--permission MODE] [--timeout 30m] [--json]
+  relay run launch <task-id> [--timeout 30m] [--permission MODE] [--json]   # ensure worktree + pin brief + ONE dsh Run
+  relay run worktree <task-id> [--branch B] [--base REF] [--path DIR] [--json]
+  relay run cleanup <task-id> [--abort REASON] [--apply] [--force] [--json]
   relay run list [--task <id>] [--json]
   relay run show <run-id> [--json]          # a headless dsh Run (no Herdr)
   relay run logs <run-id> [--tail N]
@@ -147,9 +155,13 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
   },
   run: {
     about:
-      "ISH-803 one-shot headless dsh Runs: 1 Run = 1 `dsh --profile headless` process = 1 coding attempt, in the Task's worktree, with NO Herdr pane/TUI/`dsh web`/wake/attach. stdout (final text) and stderr (reasoning) are stored under <control-plane>/runs/<run-id>/. A process `exit 0` does NOT complete anything — only `relay run submit` (a structured submission bound to the Run/Task/phase/attempt/branch/HEAD) advances the Task. `start` waits for the Run to reach a terminal state (there is no detached mode yet). Permissions are the worktree: $DSH_PERMISSION_MODE=workspace-write by default.",
+      "ISH-803 one-shot headless dsh Runs: 1 Run = 1 `dsh --profile headless` process = 1 coding attempt, in the Task's worktree, with NO Herdr pane/TUI/`dsh web`/wake/attach. stdout (final text) and stderr (reasoning) are stored under <control-plane>/runs/<run-id>/. A process `exit 0` does NOT complete anything — only `relay run submit` (a structured submission bound to the Run/Task/phase/attempt/branch/HEAD) advances the Task. `start` waits for the Run to reach a terminal state (there is no detached mode yet). Permissions are the worktree: $DSH_PERMISSION_MODE=workspace-write by default. " +
+      "ISH-760 adds the Task lifecycle: `launch` owns ONE branch+worktree per Task, pins the task spec + verification steps + prior findings into the worktree BEFORE launch, and runs ONE disposable dsh Run per phase/attempt (a FIX is the SAME worktree + findings + a NEW Run). A second writer on the same worktree/branch is refused until the previous Run ends; different worktrees/branches may run in parallel. `worktree` creates/selects the worktree; `cleanup` reclaims it only when safe (real merge or --abort, no open PR, no active writer, no uncommitted changes, relay-owned) and retains the run logs.",
     usage: [
       "relay run start <task-id> [--cwd DIR] [--prompt TEXT] [--permission MODE] [--timeout 30m] [--json]",
+      "relay run launch <task-id> [--timeout 30m] [--permission MODE] [--json]",
+      "relay run worktree <task-id> [--branch B] [--base REF] [--path DIR] [--json]",
+      "relay run cleanup <task-id> [--abort REASON] [--apply] [--force] [--json]",
       "relay run list [--task <id>] [--limit N] [--json]",
       "relay run show <run-id> [--json]",
       "relay run logs <run-id> [--tail N]",
@@ -566,6 +578,8 @@ const VALUE_FLAGS = new Set([
   // ISH-803 headless Run flags.
   "--head", "--phase", "--attempt", "--branch", "--summary", "--permission",
   "--timeout", "--prompt", "--tail",
+  // ISH-760 worktree/cleanup flags.
+  "--abort", "--path",
 ]);
 
 /** Positional args only, skipping flags and their (known) values, e.g. ["T12","reason"]. */
@@ -1588,7 +1602,76 @@ async function main(): Promise<void> {
           console.log(`${r.id} accepted -> task ${r.task_id} phase=${t?.phase} state=${t?.state}`);
           break;
         }
-        throw new Error(`unknown run subcommand: ${sub} (try: start|list|show|logs|cancel|submit)`);
+        if (sub === "worktree") {
+          // ISH-760: create/select and OWN the single branch + worktree for a Task.
+          const id = positionals(rest)[0];
+          if (!id) throw new Error("usage: relay run worktree <task-id> [--branch B] [--base REF] [--path DIR] [--json]");
+          const b = ensureTaskWorktree(db, id, {
+            branch: flag(rest, "--branch") ?? undefined,
+            base: flag(rest, "--base") ?? undefined,
+            path: flag(rest, "--path") ?? undefined,
+          });
+          if (hasFlag(rest, "--json")) {
+            console.log(JSON.stringify(b, null, 2));
+            break;
+          }
+          console.log(`${id} worktree=${b.worktree} branch=${b.branch} ${b.created ? "(created)" : "(reused)"}`);
+          break;
+        }
+        if (sub === "launch") {
+          // ISH-760 lifecycle entrypoint: ensure worktree -> pin brief (task +
+          // checks + prior findings) -> ONE disposable dsh Run. A duplicate
+          // writer on the same worktree/branch is refused by the runner.
+          const id = positionals(rest)[0];
+          if (!id) throw new Error("usage: relay run launch <task-id> [--timeout 30m] [--permission MODE] [--json]");
+          const timeoutRaw = flag(rest, "--timeout");
+          const launched = await launchTaskRun(db, id, {
+            timeoutMs: timeoutRaw ? parseDuration(timeoutRaw) : undefined,
+            permissionMode: flag(rest, "--permission") ?? undefined,
+          });
+          const r = await launched.handle.wait();
+          if (hasFlag(rest, "--json")) {
+            console.log(
+              JSON.stringify(
+                { run: r, worktree: launched.worktree, branch: launched.branch, findings: launched.findings },
+                null,
+                2
+              )
+            );
+          } else {
+            console.log(`${r.id} -> state=${r.state} exit=${r.exit_code ?? "-"}`);
+            console.log(`worktree: ${launched.worktree} (branch ${launched.branch})`);
+            console.log(
+              `brief: ${launched.briefPath}${launched.findings.length ? ` (${launched.findings.length} prior finding(s))` : ""}`
+            );
+            console.log(`output: ${r.output_dir}`);
+            console.log("note: exit 0 is NOT a submission; advance the task with `relay run submit <run-id>`");
+          }
+          if (r.state !== "exited") process.exitCode = 1;
+          break;
+        }
+        if (sub === "cleanup") {
+          // ISH-760 safe cleanup: merged or explicit abort, no open PR, no active
+          // writer, no uncommitted changes, relay-owned. Run logs are retained.
+          const id = positionals(rest)[0];
+          if (!id) throw new Error("usage: relay run cleanup <task-id> [--abort REASON] [--apply] [--force] [--json]");
+          const plan = applyWorkspaceCleanup(db, id, {
+            apply: hasFlag(rest, "--apply"),
+            force: hasFlag(rest, "--force"),
+            abort: flag(rest, "--abort") ?? undefined,
+          });
+          if (hasFlag(rest, "--json")) {
+            console.log(JSON.stringify(plan, null, 2));
+            break;
+          }
+          const verdict = plan.apply ? (plan.removed ? "REMOVED" : plan.remove ? "would remove" : "skipped") : "dry-run (pass --apply)";
+          console.log(`relay run cleanup ${id} — ${verdict}`);
+          console.log(`  worktree: ${plan.worktree ?? "-"}  branch: ${plan.branch ?? "-"}`);
+          console.log(`  retained runs (evidence): ${plan.retainedRuns}`);
+          for (const reason of plan.reasons) console.log(`  skip: ${reason}`);
+          break;
+        }
+        throw new Error(`unknown run subcommand: ${sub} (try: start|launch|worktree|cleanup|list|show|logs|cancel|submit)`);
       }
 
       case "status": {

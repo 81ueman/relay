@@ -327,10 +327,32 @@ Cancel/timeout kill the whole process group. Permissions stay in the worktree
 **not** a submission — only a structured `relay run submit` bound to the current
 Run/Task/phase/attempt/branch/HEAD advances the Task (a task with no linked
 branch/HEAD yet adopts the Run's; the recorded head is the produced one); a
-non-zero/cancelled/stale Run never does. This covers one Run's launch/observe/terminate only; worktrees,
-single-writer control and FIX re-entry are ISH-760. See
+non-zero/cancelled/stale Run never does. This covers one Run's launch/observe/terminate only; the
+Task worktree (create/select/own), single-writer control and FIX re-entry are
+ISH-760 — see [`docs/run-lifecycle.md`](docs/run-lifecycle.md). See
 [`docs/dsh-headless-runner.md`](docs/dsh-headless-runner.md) for the pinned
 `dsh` CLI contract and the exact file/output format.
+
+### Task worktree + Run lifecycle, single-writer (ISH-760)
+
+`relay run launch` is the Task lifecycle entrypoint (still no Herdr pane/attach):
+it **owns one branch + worktree per Task** (`relay run worktree`, under
+`<control-plane>/worktrees/`, never shared `/tmp`), **pins the Run brief** (task
+text + verification steps + the **previous findings**) into the worktree BEFORE
+launch, and runs **one disposable dsh Run per phase/attempt**. A **FIX is the
+same worktree + findings + a NEW Run** — no session continuation.
+
+**Single-writer** is enforced in the runner: while a Run is non-terminal, another
+launch into the same worktree/branch is refused (`DUPLICATE_WRITER`) until the
+previous Run's end/cancel row exists; **different** worktrees/branches may run in
+parallel, even on the same files. A Run is **not** a submission: `relay run
+submit` is the only thing that advances the Task, and it refuses a stale/late/
+superseded Run (by Task/phase/attempt/**generation**/branch/HEAD). `relay run
+cleanup` reclaims a worktree only when it is **safe** (a real merge or `--abort`,
+no open PR, no active writer, no uncommitted changes, relay-owned) and always
+**retains the run logs** as evidence. One-command fixture smoke:
+`bun run smoke:run-lifecycle`. See
+[`docs/run-lifecycle.md`](docs/run-lifecycle.md).
 
 ### Historical cleanup: `relay gc`
 
@@ -1417,12 +1439,13 @@ The alt-screen + pause/scroll behaviour is verified in a real tmux emulator
 src/cli.ts  daemon.ts  db.ts  schema.ts  scheduler.ts  reconciler.ts
     sessions.ts  socket.ts  messages.ts  tasks.ts  workers.ts  events.ts
     runtimes.ts  mail-policy.ts  harness.ts  wake-outbox.ts  dsh-runner.ts
-docs/dsh-headless-runner.md
+    run-lifecycle.ts
+docs/dsh-headless-runner.md  docs/run-lifecycle.md
     runtime/{runtime,herdr}.ts
     dashboard/{command,model,render,affinity,herdr,doctor}.ts
 .opencode/plugins/relay.ts  integrations/herdr/{herdr-plugin.toml,focus-pane.ts}
 integrations/dsh-relay/{lib/{index,core.mjs},cordis.patch.yml,package.json}
 skills/agent-worker/SKILL.md  skills/parallel-worktrees/SKILL.md
 tests/{integration,contract,lifecycle,herdr,release,dashboard,dashboard-affinity}.test.ts
-tests/{dsh-runner,dsh-smoke}.test.ts
+tests/{dsh-runner,dsh-smoke,run-lifecycle}.test.ts
 ```
