@@ -8,6 +8,7 @@ import { claimTask, getTask } from "../src/tasks";
 import { registerWorker } from "../src/workers";
 import { intakeTask, recordReview, recordVerification, submitPhase } from "../src/workflow";
 import {
+  DEFAULT_REVIEW_OWNER,
   FakeGitHub,
   rollupChecks,
   type CheckRunView,
@@ -590,5 +591,55 @@ describe("merge gate: gathering the facts + the daemon pass (read-only)", () => 
     expect(actions.some((a) => a.startsWith("merge-gate-ready:"))).toBe(false);
     // And afterwards the gate is definitively not READY.
     expect(checkMergeGate(db, t.id, { github: gh, checks: gh, authority: GRANT })!.status).toBe("BLOCKED");
+  });
+
+  test("#1 (round-3) a base retarget accepts a FRESH PASS at the same head but not the stale marker", async () => {
+    process.env.RELAY_PROVIDER_POLL_MS = "0";
+    const ref = { repo: "o/r", number: 1 };
+    const gh = new FakeGitHub();
+    // The PR was retargeted to release-1 after the review judged main, and an OLD
+    // authorized OK marker for the same head sits in the review thread.
+    gh.putPullRequest(view({ baseRef: "release-1" }));
+    gh.putChecks(ref, HEAD, CHECKS);
+    gh.putComments(ref, [
+      {
+        author: DEFAULT_REVIEW_OWNER,
+        createdAt: "2026-01-01T00:00:00Z",
+        body: `<!-- ishiul-review head=${HEAD} verdict=OK reviewer=claude -->`,
+      },
+    ]);
+
+    const t = intakeTask(db, {
+      provider: "github",
+      issueId: "o/r#11",
+      codeChange: true,
+      headSha: HEAD,
+      prUrl: "https://github.com/o/r/pull/1",
+      prRepo: "o/r",
+      branch: "feat/x",
+      prBase: "main",
+      prBaseSha: BASE,
+    });
+    toMergeReady(t.id); // records a PASS at attempt 0, base "main"
+
+    // Retarget -> the provider pass invalidates the review (attempt 1, SAME head).
+    await processWorkflow(db, { github: gh, checks: gh, authority: GRANT, authorizedReviewers: [DEFAULT_REVIEW_OWNER] });
+    expect(getTask(db, t.id)!.phase).toBe("review");
+    expect(getTask(db, t.id)!.state).toBe("review");
+    expect(getTask(db, t.id)!.attempt).toBe(1);
+    expect(getTask(db, t.id)!.pr_base).toBe("release-1");
+
+    // The STALE pre-retarget marker alone must NOT re-apply: the task stays in
+    // review (without the createdAt filter it would jump back to integration).
+    expect(checkMergeGate(db, t.id, { github: gh, checks: gh, authority: GRANT })!.status).not.toBe("READY");
+
+    // A FRESH independent PASS at the SAME head is ACCEPTED (no deadlock)...
+    const fresh = recordReview(db, t.id, "rev", { verdict: "pass", headSha: HEAD });
+    expect(fresh.phase).toBe("integration");
+    claimTask(db, t.id, "integ");
+    submitPhase(db, t.id, "integ");
+    expect(getTask(db, t.id)!.phase).toBe("merge_ready");
+    // ...and the gate is READY again for the retargeted base.
+    expect(checkMergeGate(db, t.id, { github: gh, checks: gh, authority: GRANT })!.status).toBe("READY");
   });
 });

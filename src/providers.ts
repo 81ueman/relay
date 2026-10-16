@@ -248,6 +248,38 @@ export function effectiveVerdictAtHead(markers: ReviewMarker[], liveHead: string
 }
 
 /**
+ * ISH-761: the newest BASE-RETARGET (`reason = "base-changed"`) invalidation
+ * timestamp for a task at the given head (0 when none). A base-branch retarget
+ * invalidates the review while keeping the same HEAD; a review marker posted
+ * at/before that time judged the OLD base's diff and must NOT be re-applied to the
+ * new attempt. A HEAD-change invalidation (`head-changed`) has a different reason,
+ * so a marker at the (unchanged) head after a pure rework is still attempted (and
+ * refused as a duplicate), preserving the marker-dedupe behaviour.
+ */
+export function latestReviewInvalidationAt(db: Database, taskId: string, head: string | null): number {
+  const row = db
+    .query(
+      `SELECT MAX(timestamp) AS t FROM events
+        WHERE task_id = ? AND type = 'workflow.review_invalidated'
+          AND json_extract(payload_json, '$.reason') = 'base-changed'
+          AND json_extract(payload_json, '$.toHead') IS ?`
+    )
+    .get(taskId, head) as { t: number | null } | null;
+  return row?.t ?? 0;
+}
+
+/**
+ * True when a marker was posted strictly AFTER the invalidation. An unparseable
+ * `createdAt` in the presence of an invalidation is treated as STALE (fail closed)
+ * rather than risking the resurrection of an old verdict.
+ */
+export function markerAfterInvalidation(m: ReviewMarker, invalidatedAt: number): boolean {
+  if (invalidatedAt <= 0) return true;
+  const at = Date.parse(m.createdAt);
+  return Number.isFinite(at) ? at > invalidatedAt : false;
+}
+
+/**
  * Why a candidate signal is (not) an approval. A `structured` ReviewResult and
  * an authorized `review-marker` are approvals; a `turn-ended` (a reviewer's
  * session went idle), a `label`, and a `self-claim` (a comment from an
@@ -428,7 +460,13 @@ export function reconcileTaskFromProvider(db: Database, taskId: string, deps: Pr
           const comments = deps.github.listComments(ref);
           if (comments !== null) {
             db.query(`UPDATE tasks SET pr_updated_at = ? WHERE id = ?`).run(view.updatedAt ?? "", taskId);
-            const markers = parseReviewMarkers(comments, { authorizedReviewers });
+            // A marker posted BEFORE the review was invalidated judged the OLD diff
+            // (e.g. the pre-retarget base) and must not be re-applied at the same
+            // head after the invalidation re-opened the review.
+            const invalidatedAt = latestReviewInvalidationAt(db, taskId, live.head_sha);
+            const markers = parseReviewMarkers(comments, { authorizedReviewers }).filter((m) =>
+              markerAfterInvalidation(m, invalidatedAt)
+            );
             const eff = effectiveVerdictAtHead(markers, live.head_sha);
             if (eff) actions.push(...applyMarker(db, live, eff, deps.authority ?? NO_AUTHORITY));
           } else {

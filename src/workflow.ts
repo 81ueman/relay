@@ -1116,9 +1116,15 @@ export function recordReview(db: Database, taskId: string, reviewerId: string, o
   if (opts.verdict === "pass" && task.head_sha && !opts.headSha) {
     throw new Error(`${HEAD_MISMATCH}: a PASS must name the reviewed HEAD (task ${taskId} is at ${task.head_sha})`);
   }
-  // Duplicate dispatch: the same PR+HEAD+profile is reviewed once.
-  if (findReviewForHead(db, taskId, head, profile)) {
-    throw new Error(`${DUPLICATE_DISPATCH}: ${taskId} head ${head} already has a review (profile '${profile}')`);
+  // Duplicate dispatch: the same PR+HEAD+base+profile is reviewed once. The base
+  // is part of the identity because a base-branch retarget keeps the HEAD but
+  // changes the diff the review judged; without it, a retarget would deadlock the
+  // task in review (every fresh review refused as a duplicate of the old HEAD).
+  const base = task.pr_base ?? null;
+  if (findReviewForHead(db, taskId, head, profile, base)) {
+    throw new Error(
+      `${DUPLICATE_DISPATCH}: ${taskId} head ${head} base ${base ?? "none"} already has a review (profile '${profile}')`
+    );
   }
   // Unresolved NG at this head: a later OK must explicitly supersede it. Checked
   // after duplicate-dispatch so a re-review of the same profile is still a
@@ -1137,6 +1143,8 @@ export function recordReview(db: Database, taskId: string, reviewerId: string, o
   const basePayload = {
     source: opts.source ?? (external ? "external" : "worker"),
     reviewer: identity,
+    // The base BRANCH this review judged — part of the duplicate-dispatch identity.
+    base,
     ...(opts.supersedesResultId ? { supersedes: opts.supersedesResultId } : {}),
   };
 
@@ -1429,7 +1437,9 @@ export function canStartPhase(db: Database, taskId: string, phase: CodePhase, at
   if (!task || !isCodeTask(task)) return false;
   if ((task.phase ?? derivePhase(task)) !== phase) return false;
   if (task.attempt !== attempt) return false;
-  if (phase === "review") return !findReviewForHead(db, taskId, task.head_sha, task.review_profile ?? DEFAULT_REVIEW_PROFILE);
+  if (phase === "review") {
+    return !findReviewForHead(db, taskId, task.head_sha, task.review_profile ?? DEFAULT_REVIEW_PROFILE, task.pr_base ?? null);
+  }
   return !findTaskResult(db, taskId, phase, attempt, "TaskSubmitted");
 }
 

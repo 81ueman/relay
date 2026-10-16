@@ -46,12 +46,25 @@ export function findTaskResult(
   );
 }
 
-/** Any ReviewResult already recorded for this exact PR head + review profile. */
+/**
+ * Any ReviewResult already recorded for this exact PR head + review profile.
+ *
+ * `base` scopes the guard to the base BRANCH the review judged. A base-branch
+ * retarget keeps the same HEAD, so keying only on (head, profile) would refuse
+ * every fresh review at that head forever (the deadlock). Keying on the recorded
+ * base lets a fresh review of the retargeted diff in, while a rework that did NOT
+ * move the head or the base is still refused as a duplicate dispatch.
+ *
+ * A null base on EITHER side is a WILDCARD: a task with no recorded base (or a
+ * review recorded before the base was known) still matches on (head, profile), so
+ * this only distinguishes two genuinely different, recorded base branches.
+ */
 export function findReviewForHead(
   db: Database,
   taskId: string,
   headSha: string | null,
-  profile: string
+  profile: string,
+  base: string | null = null
 ): TaskResult | null {
   if (!headSha) return null;
   return (
@@ -59,9 +72,14 @@ export function findReviewForHead(
       .query(
         `SELECT * FROM task_results
           WHERE task_id = ? AND kind = 'ReviewResult' AND head_sha = ? AND profile = ?
+            AND (
+                 json_extract(payload_json, '$.base') IS NULL
+              OR ? IS NULL
+              OR json_extract(payload_json, '$.base') = ?
+            )
           ORDER BY id ASC LIMIT 1`
       )
-      .get(taskId, headSha, profile) as TaskResult | null) ?? null
+      .get(taskId, headSha, profile, base, base) as TaskResult | null) ?? null
   );
 }
 

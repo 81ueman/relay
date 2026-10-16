@@ -324,7 +324,9 @@ required SQLite evidence, and prints ONE structured decision — `READY`,
 - **GitHub (re-fetched, never assumed).** OPEN / non-draft (an owner-designated
   draft is retained, still not ready), the PR head must equal the recorded
   `head_sha` (a missing recorded head is `HEAD_UNKNOWN`; a retargeted base branch
-  is `BASE_CHANGED` and also invalidates the review in the provider pass, while a
+  is `BASE_CHANGED` and also invalidates the review in the provider pass without
+  moving the head — a FRESH review at that same head is then accepted, keyed on
+  (head, base, profile), and a pre-retarget marker is not re-applied — while a
   base-*SHA* move alone is not), and mergeability is
   judged. A `conflicting` PR raises
   **`IntegrationRequired`** to the Gateway (a routing decision: fix the new HEAD,
