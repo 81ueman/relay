@@ -1,0 +1,27 @@
+$ sbx exec ish822-poc bash -lc '<git-over-ssh via forwarded agent>'
+=== key file present? (expect: none) ===
+ls: cannot access '/home/agent/.ssh': No such file or directory
+=== forwarded agent ===
+SSH_AUTH_SOCK=/run/ssh-agent.sock
+srw-rw-rw- 1 root root 0 Oct 16 15:38 /run/ssh-agent.sock
+256 SHA256:NS4st6T1s3gkrUQddXYITu8oQiQEivnQ4ZmzconHi3I mathmathds@gmail.com (ED25519)
+=== git ls-remote over SSH ===
+Connection closed by 20.27.177.113 port 22
+fatal: Could not read from remote repository.
+
+Please make sure you have the correct access rights
+and the repository exists.
+exit=128
+=== git fetch over SSH into a scratch repo ===
+Connection closed by 20.27.177.113 port 22
+fatal: Could not read from remote repository.
+
+Please make sure you have the correct access rights
+and the repository exists.
+fetch exit=128
+fatal: ambiguous argument 'FETCH_HEAD': unknown revision or path not in the working tree.
+Use '--' to separate paths from revisions, like this:
+'git <command> [<revision>...] -- [<file>...]'
+=== try a REAL ssh with the key file absent (proves agent, not file) ===
+Connection closed by 20.27.177.113 port 22
+EXIT=0

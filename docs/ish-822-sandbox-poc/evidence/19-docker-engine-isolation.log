@@ -1,0 +1,24 @@
+=== HOST docker state ===
+host containers:       27
+host images:       23
+host socket: unix:///Users/81ueman/.orbstack/run/docker.sock
+-- does the host know a container named ish822-sbx-probe? --
+
+$ sbx exec ish822-poc bash -lc '<docker engine isolation>'
+=== sandbox docker socket ===
+srw-rw---- 1 root docker 0 Oct 16 15:38 /var/run/docker.sock
+/run/docker.sock
+=== sandbox containers BEFORE ===
+0
+=== run a container INSIDE the sandbox ===
+Status: Downloaded newer image for alpine:latest
+d532134d122da4238292ed468ea0a67797d208627f25c9aa3b367a28ea79471a
+=== sandbox sees its own container ===
+ish822-sbx-probe alpine Up Less than a second
+=== can the sandbox reach the host OrbStack socket? (expect: no) ===
+ls: cannot access '/Users/81ueman/.orbstack/run/docker.sock': No such file or directory
+=== general shell / sudo ===
+sudo-ok
+aarch64
+=== HOST re-check: is the sandbox container visible on the host? (expect: NO) ===
+host containers now:       27

@@ -1,0 +1,9 @@
+total 32
+drwxr-xr-x@     8 81ueman  staff      256 Oct 17 00:27 .
+drwx------@ 31393 81ueman  staff  1004576 Oct 17 00:36 ..
+-rw-r--r--@     1 81ueman  staff       34 Oct 17 00:27 .env
+drwxr-xr-x@    13 81ueman  staff      416 Oct 17 00:36 .git
+-rw-r--r--@     1 81ueman  staff       28 Oct 17 00:27 .gitignore
+-rw-r--r--@     1 81ueman  staff       35 Oct 17 00:27 README.md
+drwxr-xr-x@     3 81ueman  staff       96 Oct 17 00:27 src
+-rw-r--r--@     1 81ueman  staff       35 Oct 17 00:27 untracked-sentinel.txt
