@@ -27,6 +27,7 @@ import {
 import { acceptTask, confirmMerged, intakeTask, recordReview, recordVerification, runMechanicalVerification, submitPhase, taskChecks } from "./workflow";
 import { defaultRunner, type CheckSpec } from "./verify";
 import { acceptRunSubmission, getRun, listRuns, startDshRun } from "./dsh-runner";
+import { signalRunProcess } from "./run-signal";
 import {
   applyWorkspaceCleanup,
   ensureTaskWorktree,
@@ -1589,17 +1590,7 @@ async function main(): Promise<void> {
           // Mark the request in the row BEFORE signalling so the process that
           // owns the Run records it as `cancelled`, not a bare signal failure.
           db.query(`UPDATE runs SET signal = 'cancelled', updated_at = ? WHERE id = ?`).run(now(), id);
-          if (r.pid) {
-            try {
-              process.kill(-r.pid, "SIGTERM");
-            } catch {
-              try {
-                process.kill(r.pid, "SIGTERM");
-              } catch {
-                /* already gone */
-              }
-            }
-          }
+          signalRunProcess(r.pid);
           console.log(`${id} cancel signalled (pid ${r.pid ?? "-"})`);
           break;
         }

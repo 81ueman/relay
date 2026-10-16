@@ -16,6 +16,8 @@ import { claimNext, claimTask, cancelTask, getTask } from "../src/tasks";
 import { registerWorker } from "../src/workers";
 import {
   acceptRunSubmission,
+  assertNoActiveWriter,
+  findActiveWriter,
   getRun,
   listRuns,
   startDshRun,
@@ -590,23 +592,45 @@ describe("ISH-808: a cancelled task is terminal on the Run path", () => {
     expect(findTaskResult(db, id, "implement", 0, "TaskSubmitted")).toBeNull();
   });
 
-  test("cancelTask marks an ACTIVE run cancelled, so a late exit 0 is refused", async () => {
-    const { id, outputRoot } = newTask();
+  test("cancelTask keeps a live Run visible to the single-writer fence and stops its process", async () => {
+    const { id, cwd, outputRoot } = newTask();
     const spawner = new FakeSpawner();
     let proc!: FakeProcess;
     spawner.onSpawn = (p) => (proc = p);
-    const h = await startDshRun(db, { taskId: id, spawner, outputRoot });
+    const h = await startDshRun(db, { taskId: id, spawner, outputRoot, cwd });
     expect(getRun(db, h.id)!.state).toBe("running");
+    expect(findActiveWriter(db, { cwd })?.id).toBe(h.id);
 
-    cancelTask(db, id, "w", "obsolete");
-    expect(getRun(db, h.id)!.state).toBe("cancelled"); // marked at the source
+    // Stub process.kill so the test never touches a real OS pid, and record the
+    // signal cancelTask sends (the Run's process is what must be stopped).
+    const calls: { pid: number; signal: string | number | undefined }[] = [];
+    const realKill = process.kill;
+    (process as unknown as { kill: unknown }).kill = (pid: number, signal?: string | number) => {
+      calls.push({ pid, signal });
+      return true;
+    };
+    try {
+      cancelTask(db, id, "w", "obsolete");
+    } finally {
+      (process as unknown as { kill: unknown }).kill = realKill;
+    }
 
-    // The process finishes 0 AFTER the cancel: the settle path must keep it cancelled.
-    proc.writeOut("done\n");
+    // The process GROUP was signalled (negative pid = -pid, SIGTERM).
+    expect(calls.some((c) => c.signal === "SIGTERM" && c.pid === -proc.pid)).toBe(true);
+    // The ROW is not rewritten: the Run is still `running` with a cancel signal,
+    // so the single-writer fence still refuses a second writer.
+    const live = getRun(db, h.id)!;
+    expect(live.state).toBe("running");
+    expect(live.signal).toBe("cancelled");
+    expect(findActiveWriter(db, { cwd })?.id).toBe(h.id);
+    // The single-writer fence still REFUSES a second writer on this worktree.
+    expect(() => assertNoActiveWriter(db, { cwd })).toThrow(/DUPLICATE_WRITER/);
+    await expect(startDshRun(db, { taskId: id, spawner, outputRoot, cwd })).rejects.toThrow(/terminal/);
+
+    // The process finally exits 0: the settle path records `cancelled`.
     proc.finish(0);
     await h.wait();
     expect(getRun(db, h.id)!.state).toBe("cancelled");
-
     expect(() => acceptRunSubmission(db, { runId: h.id })).toThrow(/RUN_SUBMISSION_REJECTED/);
     expect(getTask(db, id)!.state).toBe("cancelled");
   });

@@ -15,6 +15,7 @@ import type { Task, TaskState, WorkerState } from "./schema";
 import { TERMINAL_TASK_STATES } from "./schema";
 import { RELAY_TAG, sendMessage } from "./messages";
 import { requestReconcile } from "./control";
+import { signalRunProcess } from "./run-signal";
 import { findTaskResult, insertTaskResult, notifyGatewayTo } from "./results";
 
 export const STALE_LEASE = "STALE_LEASE";
@@ -1368,10 +1369,12 @@ function bubbleChildCancelled(db: Database, child: Task, actor: string, reason: 
  * blocked_*): ownership and lease are released like a block, the reason is
  * durable twice (a `cancel` note on the task + a `task.cancelled` event), and
  * the immediate parent gets a one-hop `child_cancelled` roll-up. In-flight
- * code-change Runs for the task are marked `cancelled` so a late `exit 0` cannot
- * resurrect it. `done`/`failed` are already terminal and are REFUSED — rewriting
- * them would invalidate an already-bubbled `child_done`. Idempotent: cancelling
- * an already-cancelled task is an audited no-op, never a second transition.
+ * code-change Runs for the task are asked to cancel (signal committed, process
+ * group stopped) so a late `exit 0` cannot resurrect it, while the Run stays
+ * visible to the single-writer fence until it actually exits. `done`/`failed`
+ * are already terminal and are REFUSED — rewriting them would invalidate an
+ * already-bubbled `child_done`. Idempotent: cancelling an already-cancelled task
+ * is an audited no-op, never a second transition.
  *
  * A `cancelled` task is not `queued`, so it is automatically excluded from
  * `relay next` / claim (RUNNABLE_TASK_SQL), from wake (runnable-based), from
@@ -1392,6 +1395,9 @@ export function cancelTask(db: Database, taskId: string, workerId: string, reaso
   }
   const fromState = task.state;
   const t = now();
+  // Runs to signal AFTER the durable cancel commits (a crash in between leaves a
+  // Run that still settles as cancelled).
+  const runsToStop: { id: string; pid: number | null }[] = [];
   db.transaction(() => {
     db.query(`INSERT INTO task_notes (task_id, worker_id, kind, body, created_at) VALUES (?, ?, 'cancel', ?, ?)`).run(
       taskId, workerId, reason, t
@@ -1409,17 +1415,25 @@ export function cancelTask(db: Database, taskId: string, workerId: string, reaso
     normalizeWorkerAfterTaskRelease(db, workerId, t);
     touchProgress(db, workerId, t);
     clearQuietLogged(db, workerId, taskId);
-    // ISH-808: neutralize any IN-FLIGHT Run for this task. Marking it cancelled
-    // makes the settle path record `cancelled` even if the process later exits 0,
-    // so a late result can never be submitted (acceptRunSubmission additionally
-    // refuses a terminal task — this closes the race at the source).
-    db.query(
-      `UPDATE runs SET state = 'cancelled', signal = 'cancelled', ended_at = ?, updated_at = ?
-        WHERE task_id = ? AND state IN ('starting','running')`
-    ).run(t, t, taskId);
+    // ISH-808: request cancellation of any IN-FLIGHT Run for this task. Only
+    // `signal` is set — the Run stays `starting`/`running` so it REMAINS VISIBLE
+    // to the single-writer fence and workspace cleanup until its process actually
+    // exits. The settle path turns the signal into `cancelled`; rewriting the
+    // state here would orphan a still-writing process. The process group is
+    // signalled below, after this transaction commits.
+    const activeRuns = db
+      .query(`SELECT id, pid FROM runs WHERE task_id = ? AND state IN ('starting','running')`)
+      .all(taskId) as { id: string; pid: number | null }[];
+    for (const r of activeRuns) {
+      db.query(`UPDATE runs SET signal = 'cancelled', updated_at = ? WHERE id = ?`).run(t, r.id);
+      runsToStop.push(r);
+    }
     logEvent(db, { source: "worker", workerId, taskId, type: "task.cancelled", payload: { reason, fromState } });
     bubbleChildCancelled(db, getTask(db, taskId)!, workerId, reason, t);
   })();
+  // Stop the process group(s) AFTER the durable `signal` is committed, exactly
+  // like `relay run cancel`: the Run keeps holding the writer until it exits.
+  for (const r of runsToStop) signalRunProcess(r.pid);
   // The cancelled task left the runnable/roll-up surface: re-derive counts.
   requestReconcile(db, `cancel:${taskId}`);
   return getTask(db, taskId)!;

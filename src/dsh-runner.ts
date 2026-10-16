@@ -522,8 +522,9 @@ export async function startDshRun(db: Database, opts: StartRunOptions): Promise<
 
     const durationMs = now() - run.started_at;
     const fast = durationMs < fastExitMs;
-    // An external `relay run cancel` marks the row before signalling, so honour
-    // it here instead of recording a bare signal failure.
+    // An external `relay run cancel` (or `relay task cancel`) writes the row's
+    // `signal` before stopping the process, so honour it here instead of
+    // recording a bare signal failure.
     const external = getRun(db, runId)?.signal ?? null;
     const reason = cancelReason ?? external;
     let state: RunState;
