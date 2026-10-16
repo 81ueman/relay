@@ -311,6 +311,13 @@ export function buildRunBrief(db: Database, task: Task, opts: BuildBriefOptions)
       lines.push(`- [${f.kind}] ${f.reason ?? "(no reason recorded)"}${ev}`);
     }
   }
+  lines.push(
+    "",
+    "## Do NOT run `relay` mutations",
+    "Do not invoke `relay claim`/`relay submit`/`relay approve`/`relay note` (or any `relay` task/run mutation) for this",
+    "task. Relay ALONE submits the result of this Run AFTER the process exits; a worker claim/submit during the Run is",
+    "refused (RUN_OWNED) and can never advance the Task. Just make the change, run the checks, and commit."
+  );
   lines.push("", "_Pinned by Relay (ISH-760) before launch: the Task/Worktree persists; this Run is disposable._");
   return { text: lines.join("\n"), findings, checks };
 }

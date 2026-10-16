@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Database } from "bun:sqlite";
 import { openDb } from "../src/db";
-import { blockTask, getTask } from "../src/tasks";
+import { blockTask, claimNext, claimTask, getTask } from "../src/tasks";
 import { registerWorker } from "../src/workers";
 import { inboxFor } from "../src/messages";
 import { intakeTask, recordReview, runMechanicalVerification, submitPhase, taskChecks } from "../src/workflow";
@@ -13,7 +13,7 @@ import { insertTaskResult } from "../src/results";
 import { acceptRunSubmission, DUPLICATE_WRITER, listRuns } from "../src/dsh-runner";
 import { launchTaskRun } from "../src/run-lifecycle";
 import { defaultRunner, gitHead } from "../src/verify";
-import { processPgid, processStartToken } from "../src/proc-identity";
+import { processPgid, spawnIdentityToken } from "../src/proc-identity";
 import { DEFAULT_INTEGRATOR_WORKER, pidAlive, runFactoryTask } from "../src/factory";
 import {
   DEFAULT_REVIEWER_WORKER as REVIEWER_WORKER,
@@ -548,7 +548,7 @@ describe("PR #10 finding 4: an orphaned running Run never hangs the factory", ()
     const childPid = child.pid;
     db.query(
       `UPDATE runs SET state='running', pid=?, spawn_lstart=?, exit_code=NULL, ended_at=NULL WHERE id=?`
-    ).run(childPid, processStartToken(childPid), launched.handle.id);
+    ).run(childPid, spawnIdentityToken(childPid), launched.handle.id);
 
     const res = await runFactoryTask(db, id, { ...factoryDeps(dsh, reviewerHarness(["pass"]).spawner), timeoutMs: 300 });
     expect(res.outcome).toBe("coding_failed");
@@ -573,7 +573,7 @@ describe("PR #10 finding 4: an orphaned running Run never hangs the factory", ()
     const childPid = child.pid;
     db.query(
       `UPDATE runs SET state='running', pid=?, spawn_lstart=?, exit_code=NULL, ended_at=NULL WHERE id=?`
-    ).run(childPid, processStartToken(childPid), launched.handle.id);
+    ).run(childPid, spawnIdentityToken(childPid), launched.handle.id);
     const res = await runFactoryTask(db, id, {
       ...factoryDeps(dsh, reviewerHarness(["pass"]).spawner),
       timeoutMs: 300,
@@ -608,7 +608,7 @@ describe("PR #10 finding 4: an orphaned running Run never hangs the factory", ()
     const victimPid = victim.pid;
     expect(processPgid(victimPid)).not.toBe(victimPid); // not a leader
     db.query(
-      `UPDATE runs SET state='running', pid=?, spawn_lstart='not-the-real-token', exit_code=NULL, ended_at=NULL WHERE id=?`
+      `UPDATE runs SET state='running', pid=?, spawn_lstart='lstart-v1:not-the-real-token', exit_code=NULL, ended_at=NULL WHERE id=?`
     ).run(victimPid, launched.handle.id);
 
     const res = await runFactoryTask(db, id, { ...factoryDeps(dsh, reviewerHarness(["pass"]).spawner), timeoutMs: 300 });
@@ -632,7 +632,7 @@ describe("PR #10 finding 4: an orphaned running Run never hangs the factory", ()
     const victimPid = victim.pid;
     expect(processPgid(victimPid)).toBe(victimPid); // is a leader
     db.query(
-      `UPDATE runs SET state='running', pid=?, spawn_lstart='Tue Jan  1 00:00:00 1980', exit_code=NULL, ended_at=NULL WHERE id=?`
+      `UPDATE runs SET state='running', pid=?, spawn_lstart='lstart-v1:Tue Jan  1 00:00:00 1980', exit_code=NULL, ended_at=NULL WHERE id=?`
     ).run(victimPid, launched.handle.id);
 
     const res = await runFactoryTask(db, id, { ...factoryDeps(dsh, reviewerHarness(["pass"]).spawner), timeoutMs: 300 });
@@ -663,6 +663,129 @@ describe("PR #10 finding 5: an all-optional check list is not a gate", () => {
     });
     const res = await runFactoryTask(db, id, factoryDeps(dsh, reviewerHarness(["pass"]).spawner));
     expect(res.outcome).toBe("merge_ready");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PR #10 round-4 findings.
+// ---------------------------------------------------------------------------
+
+describe("PR #10 finding 1: the spawn token is canonical (env-independent)", () => {
+  test("spawnIdentityToken is identical across caller LC_ALL/TZ", () => {
+    const before = spawnIdentityToken(process.pid);
+    const saved = { LC_ALL: process.env.LC_ALL, LANG: process.env.LANG, TZ: process.env.TZ };
+    try {
+      process.env.LC_ALL = "ja_JP.UTF-8";
+      process.env.LANG = "ja_JP.UTF-8";
+      process.env.TZ = "Asia/Tokyo";
+      const after = spawnIdentityToken(process.pid);
+      expect(after).toBe(before);
+      expect(before?.startsWith("lstart-v1:")).toBe(true);
+    } finally {
+      for (const [k, v] of Object.entries(saved)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+  });
+
+  test("a genuine orphan stored under one LC_ALL/TZ is still MATCHED after a restart under another", async () => {
+    const dsh = fakeDsh("dsh-commit", COMMITTING_DSH);
+    const id = newTask();
+    const launched = await launchTaskRun(db, id, { repo, worktreesRoot: join(dir, "worktrees"), outputRoot: join(dir, "runs"), dshBin: dsh, fastExitMs: 0 });
+    await launched.handle.wait();
+    const child = Bun.spawn(["sleep", "30"], { detached: true, stdin: "ignore", stdout: "ignore", stderr: "ignore" });
+    const childPid = child.pid;
+    db.query(
+      `UPDATE runs SET state='running', pid=?, spawn_lstart=?, exit_code=NULL, ended_at=NULL WHERE id=?`
+    ).run(childPid, spawnIdentityToken(childPid), launched.handle.id);
+
+    // Adopt from a process with a DIFFERENT locale/timezone than the spawn.
+    const saved = { LC_ALL: process.env.LC_ALL, LANG: process.env.LANG, TZ: process.env.TZ };
+    let res: Awaited<ReturnType<typeof runFactoryTask>>;
+    try {
+      process.env.LC_ALL = "ja_JP.UTF-8";
+      process.env.LANG = "ja_JP.UTF-8";
+      process.env.TZ = "Asia/Tokyo";
+      res = await runFactoryTask(db, id, { ...factoryDeps(dsh, reviewerHarness(["pass"]).spawner), timeoutMs: 300 });
+    } finally {
+      for (const [k, v] of Object.entries(saved)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+    expect(res.outcome).toBe("coding_failed");
+    // Canonical token => identity MATCHED => the genuine orphan was killed, not
+    // misread as "reused" (which would release the fence while it lived).
+    expect(pidAlive(childPid)).toBe(false);
+    expect(listRuns(db, { taskId: id })[0].state).toBe("failed");
+  });
+
+  test("a LEGACY non-canonical token is undeterminable: fence held, no signal", async () => {
+    const dsh = fakeDsh("dsh-commit", COMMITTING_DSH);
+    const id = newTask();
+    const launched = await launchTaskRun(db, id, { repo, worktreesRoot: join(dir, "worktrees"), outputRoot: join(dir, "runs"), dshBin: dsh, fastExitMs: 0 });
+    await launched.handle.wait();
+    const child = Bun.spawn(["sleep", "30"], { detached: true, stdin: "ignore", stdout: "ignore", stderr: "ignore" });
+    const childPid = child.pid;
+    // An OLD-format token (no version tag) cannot be compared across environments.
+    db.query(
+      `UPDATE runs SET state='running', pid=?, spawn_lstart='Sat Oct 17 01:24:35 2026', exit_code=NULL, ended_at=NULL WHERE id=?`
+    ).run(childPid, launched.handle.id);
+
+    const res = await runFactoryTask(db, id, { ...factoryDeps(dsh, reviewerHarness(["pass"]).spawner), timeoutMs: 300 });
+    expect(res.outcome).toBe("coding_failed");
+    expect(res.reason).toContain("could not be proven");
+    // Never signalled; the Run is left running so the fence keeps holding.
+    expect(pidAlive(childPid)).toBe(true);
+    expect(listRuns(db, { taskId: id })[0].state).toBe("running");
+    let refused = false;
+    try {
+      await launchTaskRun(db, id, { repo, worktreesRoot: join(dir, "worktrees"), outputRoot: join(dir, "runs"), dshBin: dsh });
+    } catch (e) {
+      refused = new RegExp(DUPLICATE_WRITER).test(String(e));
+    }
+    expect(refused).toBe(true);
+    try { child.kill("SIGKILL"); } catch { /* done */ }
+  });
+});
+
+describe("PR #10 finding 2: the live Run is the only control-plane writer", () => {
+  test("claimTask, claimNext and submitPhase refuse while a Run owns the phase/attempt", async () => {
+    const slow = fakeDsh("dsh-slow", "sleep 2\nexit 0\n");
+    const id = newTask();
+    const live = await launchTaskRun(db, id, { repo, worktreesRoot: join(dir, "worktrees"), outputRoot: join(dir, "runs"), dshBin: slow });
+    registerWorker(db, "thief", { role: "worker" });
+    expect(() => claimTask(db, id, "thief")).toThrow(/RUN_OWNED/);
+    expect(() => submitPhase(db, id, "thief", { evidence: "x" })).toThrow(/RUN_OWNED/);
+    // The generic claim machine must not offer the Run-owned task either.
+    expect(claimNext(db, "thief")).toBeNull();
+    await live.handle.wait();
+  });
+
+  test("a coding Run that runs `relay claim` + `relay submit` cannot advance the Task", async () => {
+    const cli = join(import.meta.dir, "..", "src", "cli.ts");
+    const thiefDsh = `#!/bin/sh
+set -e
+echo "$RELAY_RUN_ID" > "change-$RELAY_RUN_ID.txt"
+git add -A
+git -c user.email=relay@test -c user.name=relay commit -qm "change $RELAY_RUN_ID"
+bun "$RELAY_CLI" worker register w-dsh --role worker >> .relay/attempt.log 2>&1 || true
+bun "$RELAY_CLI" claim "$RELAY_TASK_ID" --worker w-dsh >> .relay/attempt.log 2>&1 || true
+bun "$RELAY_CLI" submit "$RELAY_TASK_ID" --worker w-dsh --evidence done >> .relay/attempt.log 2>&1 || true
+echo DONE
+`;
+    const dsh = fakeDsh("dsh-thief", thiefDsh);
+    const id = newTask();
+    const res = await runFactoryTask(db, id, {
+      ...factoryDeps(dsh, reviewerHarness(["pass"]).spawner),
+      dshEnv: { RELAY_CLI: cli },
+    });
+    // The Run's own generic mutations were refused, so the factory's structured
+    // acceptRunSubmission is the ONLY advance and the whole loop still completes.
+    expect(res.outcome).toBe("merge_ready");
+    const log = readFileSync(join(dir, "worktrees", id, ".relay", "attempt.log"), "utf-8");
+    expect(log).toContain("RUN_OWNED");
   });
 });
 

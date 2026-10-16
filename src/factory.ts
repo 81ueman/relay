@@ -5,7 +5,7 @@ import { getTask, claimTask } from "./tasks";
 import { getWorker, registerWorker } from "./workers";
 import { INTEGRATOR_ROLE, REVIEWER_ROLE } from "./schema";
 import type { Run, RunState, Task, TaskState } from "./schema";
-import { processPgid, processStartToken } from "./proc-identity";
+import { isCanonicalToken, processPgid, spawnIdentityToken } from "./proc-identity";
 import { defaultRunner, type CommandRunner } from "./verify";
 import { runMechanicalVerification, submitPhase, taskChecks } from "./workflow";
 import { acceptRunSubmission, getRun } from "./dsh-runner";
@@ -251,12 +251,15 @@ export function identifyRunProcess(run: Pick<Run, "pid" | "spawn_lstart">): Orph
   const pid = run.pid;
   if (!pid || !pidAlive(pid)) return "dead";
   const pgid = processPgid(pid);
-  const token = processStartToken(pid);
+  const token = spawnIdentityToken(pid);
   if (pgid === null || token === null || !run.spawn_lstart) return "undeterminable";
+  // A token written before canonicalization (no version tag) cannot be compared
+  // reliably across environments: never misread it as "reused" — hold the fence.
+  if (!isCanonicalToken(run.spawn_lstart)) return "undeterminable";
   // Not a group leader => not the setsid'd dsh: a reused PID (or a child of a
   // shell). Never signal it.
   if (pgid !== pid) return "reused";
-  // A different start time proves the PID was reused since launch.
+  // A different canonical start time proves the PID was reused since launch.
   if (token !== run.spawn_lstart) return "reused";
   return "match";
 }

@@ -106,7 +106,20 @@ ordered `steps`. A non-`merge_ready` outcome exits non-zero.
   signal is sent** to the stranger; an **unidentifiable** live PID is left
   `running` so `findActiveWriter` keeps returning `DUPLICATE_WRITER`. There is
   **no `kill(pid)` fallback**: a bare `kill(pid)` fires exactly when `pid` is not a
-  group leader, which proves it is not the dsh.
+  group leader, which proves it is not the dsh. The identity token is
+  **canonical**: `ps` runs with a pinned environment (`LC_ALL=C`, `TZ=UTC`) and the
+  token carries a version tag (`lstart-v1:`), so a factory restarted under a
+  different `LANG`/`LC_*`/`TZ` still matches the genuine writer. A row written in
+  the OLD non-canonical format is treated as **undeterminable** (fence held, no
+  signal), never as `reused`.
+- **The live Run is the only control-plane writer for its `(task, phase,
+  attempt)`.** The headless dsh inherits `RELAY_DB`/`PATH`, so it *could* reach the
+  generic worker CLI. `relay claim`/`relay submit` (`claimTask`/`claimNext`/
+  `submitPhase`) **refuse with `RUN_OWNED`** while a `starting`/`running` Run owns
+  the Task's current phase/attempt — the Run-bound `acceptRunSubmission` is the
+  only advance. The Run brief also tells the coding process not to invoke `relay`
+  mutations. (`RELAY_DB` is deliberately NOT dropped: the CLI would then fall back
+  to the user's real control plane.)
 - **Old HEAD cannot advance.** Every result is bound to the revision it judged;
   the merge gate re-reads GitHub and refuses a PR head != `task.head_sha`.
 - **MergeReady is read-only.** The Factory never pushes, merges, accepts,
@@ -224,7 +237,7 @@ unchanged by this issue.
 
 ## Verified / not verified
 
-- **Verified** — `bun run typecheck`; `bun test` (824 pass, 1 skipped, 0 fail);
+- **Verified** — `bun run typecheck`; `bun test` (829 pass, 1 skipped, 0 fail);
   `bun run smoke:factory` (PASS, 13 checks); `RELAY_REAL_SMOKE=1 bun run
   smoke:factory:real` (PASS with real `dsh 0.2.0-rc.2` + real Claude; see the raw
   output above); `tests/factory.test.ts` covers the FIX→fresh-Run→PASS loop, the
@@ -240,7 +253,13 @@ unchanged by this issue.
   real detached-child orphan that is still alive past its budget is **killed**
   (asserted dead) before the fence is released, and an orphan that cannot be
   killed leaves the Run `running` so `DUPLICATE_WRITER` still fences (finding 4);
-  an all-optional check list is `no_checks` (finding 5).
+  an all-optional check list is `no_checks` (finding 5). The round-3/round-4
+  revisions add: a reused PID (non-leader, or a leader with a different canonical
+  start token) is never signalled; the spawn token is canonical and a legacy
+  non-canonical token is `undeterminable` (fence held); and `claimTask`/`claimNext`/
+  `submitPhase` refuse with `RUN_OWNED` while a Run owns the phase/attempt — proven
+  by a fake dsh that runs `relay claim`+`relay submit` during the Run and still
+  reaches `merge_ready` only via the Run-bound submission.
 - **NOT verified here** — an end-to-end **real-FIX** loop (real dsh attempt 0
   genuinely insufficient → real Claude FIX → real dsh attempt 1 → real Claude
   PASS): the real smoke reached MergeReady on attempt 0 because the real model

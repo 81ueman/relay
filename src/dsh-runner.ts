@@ -6,7 +6,7 @@ import { logEvent } from "./events";
 import { getTask } from "./tasks";
 import type { Run, RunState, Task } from "./schema";
 import { isTerminalTaskState } from "./schema";
-import { processStartToken } from "./proc-identity";
+import { spawnIdentityToken } from "./proc-identity";
 import { gitHead } from "./verify";
 import { submitImplementationFromRun, type RunImplementation } from "./workflow";
 import {
@@ -505,7 +505,7 @@ export async function startDshRun(db: Database, opts: StartRunOptions): Promise<
   updateRun(db, runId, {
     state: "running",
     pid: proc.pid,
-    spawn_lstart: processStartToken(proc.pid),
+    spawn_lstart: spawnIdentityToken(proc.pid),
   });
   let sessionId: string | null = null;
   let cancelReason: string | null = null;
