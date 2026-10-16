@@ -277,6 +277,10 @@ export function buildForest(tasks: Task[]): { forest: DashboardTaskNode[]; byId:
   const order: Record<string, number> = {};
   TASK_STATE_ORDER.forEach((s, i) => (order[s] = i));
   order["done"] = TASK_STATE_ORDER.length;
+  // ISH-808: the other terminal state. Ordered with `done` (bottom), still
+  // rendered, never surfaced as ATTENTION (deriveAttention only flags non-terminal
+  // blockers).
+  order["cancelled"] = TASK_STATE_ORDER.length + 1;
   const cmp = (a: DashboardTaskNode, b: DashboardTaskNode) =>
     (order[a.state] ?? 99) - (order[b.state] ?? 99)
     || (b.priority ?? 0) - (a.priority ?? 0)

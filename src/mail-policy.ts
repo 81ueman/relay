@@ -12,6 +12,8 @@ export const IMMEDIATE_MAIL_KINDS = [
   "children_done",
   "child_blocked",
   "children_blocked",
+  /** ISH-808: a child was closed as `cancelled` — a parent waiting on it must know. */
+  "child_cancelled",
   /** T337: a task entered blocked_human — surface it to the human interface. */
   "blocked_human",
   /**

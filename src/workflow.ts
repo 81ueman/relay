@@ -13,7 +13,7 @@ import {
   notifyGatewayTo,
 } from "./results";
 import type { CodePhase, ResultKind, Task, TaskState, VerifyOutcome } from "./schema";
-import { INTEGRATOR_ROLE, REVIEWER_ROLE } from "./schema";
+import { INTEGRATOR_ROLE, REVIEWER_ROLE, isTerminalTaskState } from "./schema";
 import {
   clearCurrentTaskOrRestoreParent,
   getTask,
@@ -448,7 +448,7 @@ export function linkTask(
 ): Task {
   const task = getTask(db, taskId);
   if (!task) throw new Error(`unknown task: ${taskId}`);
-  const terminal = task.state === "done" || task.state === "failed" || task.accepted_at !== null;
+  const terminal = isTerminalTaskState(task.state) || task.accepted_at !== null;
   if (terminal) {
     // Do not touch a settled task, and never invalidateReview it back to review.
     if (link.headSha !== undefined && link.headSha !== task.head_sha) {
@@ -536,6 +536,10 @@ export function submitPhase(db: Database, taskId: string, workerId: string, opts
   if (!task) throw new Error(`unknown task: ${taskId}`);
   if (!isCodeTask(task)) {
     throw new Error(`${WORKFLOW_ERROR}: ${taskId} is not a code-change task; use \`relay submit\``);
+  }
+  // ISH-808: terminal (e.g. cancelled) tasks are CLOSED and must not be advanced.
+  if (isTerminalTaskState(task.state)) {
+    throw new Error(`${WORKFLOW_ERROR}: cannot submit terminal task ${taskId} (state=${task.state})`);
   }
   const phase = phaseOf(task);
   if (phase !== "implement" && phase !== "integration") {
@@ -632,6 +636,12 @@ export function submitImplementationFromRun(db: Database, taskId: string, impl: 
   const task = getTask(db, taskId);
   if (!task) throw new Error(`unknown task: ${taskId}`);
   if (!isCodeTask(task)) throw new Error(`${WORKFLOW_ERROR}: ${taskId} is not a code-change task`);
+  // ISH-808: a terminal task is CLOSED; a Run must never move it out of
+  // `cancelled` (its phase is unchanged by the cancel, so the phase checks below
+  // would otherwise pass).
+  if (isTerminalTaskState(task.state)) {
+    throw new Error(`${WORKFLOW_ERROR}: cannot submit a Run for terminal task ${taskId} (state=${task.state})`);
+  }
   const phase = phaseOf(task);
   if (phase !== "implement" && phase !== "integration") {
     throw new Error(
@@ -733,6 +743,9 @@ export function recordVerification(
   const task = getTask(db, taskId);
   if (!task) throw new Error(`unknown task: ${taskId}`);
   if (!isCodeTask(task)) throw new Error(`${WORKFLOW_ERROR}: ${taskId} is not a code-change task`);
+  if (isTerminalTaskState(task.state)) {
+    throw new Error(`${WORKFLOW_ERROR}: cannot record a verification for terminal task ${taskId} (state=${task.state})`);
+  }
   const phase = phaseOf(task);
   if (phase !== "verify") {
     throw new Error(`${WORKFLOW_ERROR}: cannot record a verification for ${taskId} in phase '${phase}'`);
@@ -820,6 +833,11 @@ export interface MechanicalVerifyOptions {
  * The block occurrence identity is the bumped lease token (see recordChildBlocked).
  */
 export function quietBlock(db: Database, task: Task, reason: string, actor: string): Task {
+  // ISH-808: a terminal (e.g. cancelled) task is CLOSED and must not be parked
+  // into blocked_human by a late verify/provider pass.
+  if (isTerminalTaskState(task.state)) {
+    throw new Error(`${WORKFLOW_ERROR}: cannot block terminal task ${task.id} (state=${task.state})`);
+  }
   const t = now();
   const prev = task.assignee;
   db.transaction(() => {
@@ -863,6 +881,11 @@ export async function runMechanicalVerification(
   const task = getTask(db, taskId);
   if (!task) throw new Error(`unknown task: ${taskId}`);
   if (!isCodeTask(task)) throw new Error(`${WORKFLOW_ERROR}: ${taskId} is not a code-change task`);
+  // ISH-808: never mechanically verify a terminal (e.g. cancelled) task — the
+  // NOT_RUN path would otherwise quietBlock it into blocked_human.
+  if (isTerminalTaskState(task.state)) {
+    throw new Error(`${WORKFLOW_ERROR}: cannot mechanically verify terminal task ${taskId} (state=${task.state})`);
+  }
   if (phaseOf(task) !== "verify") {
     throw new Error(`${WORKFLOW_ERROR}: cannot mechanically verify ${taskId} in phase '${phaseOf(task)}'`);
   }
@@ -1207,6 +1230,10 @@ export function acceptTask(db: Database, taskId: string, actor: string): Task {
   const task = getTask(db, taskId);
   if (!task) throw new Error(`unknown task: ${taskId}`);
   if (!isCodeTask(task)) throw new Error(`${WORKFLOW_ERROR}: ${taskId} is not a code-change task`);
+  // ISH-808: a cancelled task at merge_ready must not be accepted into `done`.
+  if (isTerminalTaskState(task.state)) {
+    throw new Error(`${GATE_ERROR}: cannot accept terminal task ${taskId} (state=${task.state})`);
+  }
   const phase = phaseOf(task);
   if (phase !== "merge_ready") {
     throw new Error(
@@ -1283,6 +1310,11 @@ export function confirmMerged(db: Database, taskId: string, opts: MergedOptions 
   const task = getTask(db, taskId);
   if (!task) throw new Error(`unknown task: ${taskId}`);
   if (!isCodeTask(task)) throw new Error(`${WORKFLOW_ERROR}: ${taskId} is not a code-change task`);
+  // ISH-808: never touch a cancelled/failed task. `done` is deliberately allowed
+  // — accept-then-merge credits the merge on an already-accepted task.
+  if (task.state === "cancelled" || task.state === "failed") {
+    throw new Error(`${GATE_ERROR}: cannot confirm a merge for ${taskId} (state ${task.state})`);
+  }
   const phase = phaseOf(task);
   // A merge may be observed any time AFTER the review passed (integration,
   // merge_ready) or once the task is internally accepted. A merge seen while the

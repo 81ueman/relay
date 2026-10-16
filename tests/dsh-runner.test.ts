@@ -12,10 +12,12 @@ import {
   recordReview,
   recordVerification,
 } from "../src/workflow";
-import { claimNext, claimTask, getTask } from "../src/tasks";
+import { claimNext, claimTask, cancelTask, getTask } from "../src/tasks";
 import { registerWorker } from "../src/workers";
 import {
   acceptRunSubmission,
+  assertNoActiveWriter,
+  findActiveWriter,
   getRun,
   listRuns,
   startDshRun,
@@ -551,5 +553,85 @@ describe("structured submission is the only thing that advances a Task", () => {
     h.cancel();
     const run = await h.wait();
     expect(() => acceptRunSubmission(db, { runId: run.id })).toThrow(/clean exit 0/);
+  });
+});
+
+// ISH-808 round 2: the Run path must treat `cancelled` (any terminal state) as
+// CLOSED. `cancelTask` leaves `phase`/`attempt` untouched, so without these
+// guards a Run could move a cancelled code-change task back to queued/verify.
+describe("ISH-808: a cancelled task is terminal on the Run path", () => {
+  test("startDshRun on a cancelled task is refused before any writer starts", async () => {
+    const { id, outputRoot } = newTask();
+    const spawner = new FakeSpawner();
+    cancelTask(db, id, "w", "superseded");
+    expect(getTask(db, id)!.state).toBe("cancelled");
+
+    await expect(startDshRun(db, { taskId: id, outputRoot, spawner })).rejects.toThrow(/terminal/);
+
+    expect(getTask(db, id)!.state).toBe("cancelled");
+    expect(spawner.procs.length).toBe(0); // no dsh process, no runs row
+    expect(listRuns(db, { taskId: id }).length).toBe(0);
+  });
+
+  test("a Run that settles exit 0 cannot be submitted after the task is cancelled", async () => {
+    const { id, outputRoot } = newTask();
+    const spawner = new FakeSpawner();
+    let proc!: FakeProcess;
+    spawner.onSpawn = (p) => (proc = p);
+    const h = await startDshRun(db, { taskId: id, spawner, outputRoot });
+    proc.writeOut("done\n");
+    proc.finish(0);
+    await h.wait();
+    expect(getRun(db, h.id)!.state).toBe("exited");
+
+    cancelTask(db, id, "w", "superseded");
+
+    expect(() => acceptRunSubmission(db, { runId: h.id })).toThrow(/terminal/);
+    // The task stays cancelled — never queued/verify again.
+    expect(getTask(db, id)!.state).toBe("cancelled");
+    expect(findTaskResult(db, id, "implement", 0, "TaskSubmitted")).toBeNull();
+  });
+
+  test("cancelTask keeps a live Run visible to the single-writer fence and stops its process", async () => {
+    const { id, cwd, outputRoot } = newTask();
+    const spawner = new FakeSpawner();
+    let proc!: FakeProcess;
+    spawner.onSpawn = (p) => (proc = p);
+    const h = await startDshRun(db, { taskId: id, spawner, outputRoot, cwd });
+    expect(getRun(db, h.id)!.state).toBe("running");
+    expect(findActiveWriter(db, { cwd })?.id).toBe(h.id);
+
+    // Stub process.kill so the test never touches a real OS pid, and record the
+    // signal cancelTask sends (the Run's process is what must be stopped).
+    const calls: { pid: number; signal: string | number | undefined }[] = [];
+    const realKill = process.kill;
+    (process as unknown as { kill: unknown }).kill = (pid: number, signal?: string | number) => {
+      calls.push({ pid, signal });
+      return true;
+    };
+    try {
+      cancelTask(db, id, "w", "obsolete");
+    } finally {
+      (process as unknown as { kill: unknown }).kill = realKill;
+    }
+
+    // The process GROUP was signalled (negative pid = -pid, SIGTERM).
+    expect(calls.some((c) => c.signal === "SIGTERM" && c.pid === -proc.pid)).toBe(true);
+    // The ROW is not rewritten: the Run is still `running` with a cancel signal,
+    // so the single-writer fence still refuses a second writer.
+    const live = getRun(db, h.id)!;
+    expect(live.state).toBe("running");
+    expect(live.signal).toBe("cancelled");
+    expect(findActiveWriter(db, { cwd })?.id).toBe(h.id);
+    // The single-writer fence still REFUSES a second writer on this worktree.
+    expect(() => assertNoActiveWriter(db, { cwd })).toThrow(/DUPLICATE_WRITER/);
+    await expect(startDshRun(db, { taskId: id, spawner, outputRoot, cwd })).rejects.toThrow(/terminal/);
+
+    // The process finally exits 0: the settle path records `cancelled`.
+    proc.finish(0);
+    await h.wait();
+    expect(getRun(db, h.id)!.state).toBe("cancelled");
+    expect(() => acceptRunSubmission(db, { runId: h.id })).toThrow(/RUN_SUBMISSION_REJECTED/);
+    expect(getTask(db, id)!.state).toBe("cancelled");
   });
 });

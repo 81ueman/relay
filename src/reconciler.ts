@@ -1897,8 +1897,8 @@ export async function handleIdleSignal(db: Database, rt: Runtime, workerId: stri
     await tryWake(rt, db, fresh0, NEXT_NUDGE, "idle-in-review", at);
     return "woke-next";
   }
-  if (task.state === "blocked_human" || task.state === "blocked_internal") {
-    // A human-blocked task never parks the worker: release + move on.
+  if (task.state === "cancelled" || task.state === "blocked_human" || task.state === "blocked_internal") {
+    // A cancelled/blocked task never parks the worker: release + move on.
     db.query(`UPDATE workers SET current_task_id = NULL, state = 'idle', updated_at = ? WHERE id = ?`).run(at, workerId);
     const fresh = getWorker(db, workerId)!;
     if (claimableRunnableTasks(db, workerId).length > 0 || (hasClaimableReview(db) && w.role === "reviewer")) {

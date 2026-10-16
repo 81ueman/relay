@@ -5,6 +5,7 @@ import { dirname, join, resolve, sep } from "node:path";
 import { defaultDbPath, now, projectRoot } from "./db";
 import { logEvent } from "./events";
 import type { Run, Task, TaskResult } from "./schema";
+import { isTerminalTaskState } from "./schema";
 import { getTask } from "./tasks";
 import {
   assertNoActiveWriter,
@@ -499,7 +500,7 @@ export function planWorkspaceCleanup(db: Database, taskId: string, opts: Cleanup
   const merged = task.merged_at !== null;
   const aborted = !!opts.abort;
   if (!merged && !aborted) {
-    if (task.state !== "done" && task.state !== "failed") {
+    if (!isTerminalTaskState(task.state)) {
       reasons.push(`task is not terminal (state=${task.state})`);
     } else {
       reasons.push("task is terminal but not merged; pass --abort <reason> to reclaim it");

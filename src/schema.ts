@@ -9,8 +9,24 @@ export const TASK_STATES = [
   "blocked_internal",
   "blocked_human",
   "failed",
+  "cancelled",
 ] as const;
 export type TaskState = (typeof TASK_STATES)[number];
+
+/**
+ * ISH-808: the states from which a task's lifecycle is OVER.
+ *
+ * `done` (accepted) and `failed` are the existing terminals; `cancelled` is the
+ * explicit CLOSE for work that is superseded / duplicate / obsolete /
+ * policy-changed. `blocked_*` is a PARK, not a terminal — it can be unblocked
+ * back into the queue. Every "is this finished?" test should read this list so a
+ * new terminal cannot be forgotten in one place and honored in another.
+ */
+export const TERMINAL_TASK_STATES = ["done", "failed", "cancelled"] as const;
+export type TerminalTaskState = (typeof TERMINAL_TASK_STATES)[number];
+export function isTerminalTaskState(state: string): boolean {
+  return (TERMINAL_TASK_STATES as readonly string[]).includes(state);
+}
 
 export const WORKER_STATES = [
   "starting",

@@ -6,7 +6,7 @@ import type { Database } from "bun:sqlite";
 import { openDb } from "../src/db";
 import { MockRuntime } from "../src/runtime/runtime";
 import { reconcile } from "../src/reconciler";
-import { addTask, claimNext, claimTask, getTask, runnableTasks, unblockTask } from "../src/tasks";
+import { addTask, cancelTask, claimNext, claimTask, getTask, runnableTasks, unblockTask } from "../src/tasks";
 import { getWorker, registerWorker } from "../src/workers";
 import {
   acceptTask,
@@ -17,7 +17,9 @@ import {
   findUnresolvedNgAtHead,
   intakeTask,
   linkTask,
+  quietBlock,
   recordReview,
+  recordVerification,
   runMechanicalVerification,
   submitPhase,
   taskChecks,
@@ -933,5 +935,74 @@ describe("round 4: a transient comment-read failure must not consume the waterma
     // Once the read recovers, the marker is applied.
     for (let i = 0; i < 3; i++) reconcileTaskFromProvider(db, t.id, { github: gh });
     expect(getTask(db, t.id)!.phase).toBe("integration");
+  });
+});
+
+// ISH-808 round 2: a cancelled code-change task is CLOSED. Every workflow entry
+// point checks isTerminalTaskState, so none of them can move it back to
+// queued/verify/review or park it blocked_human.
+describe("ISH-808: a cancelled code-change task cannot be advanced", () => {
+  /** intake -> claim -> submit, leaving the task at phase=verify. */
+  function toVerify(issue: string): string {
+    const t = intakeTask(db, { provider: "github", issueId: issue, codeChange: true, headSha: FULL, checks: [CHECK] });
+    claimTask(db, t.id, "impl");
+    submitPhase(db, t.id, "impl");
+    expect(getTask(db, t.id)!.phase).toBe("verify");
+    return t.id;
+  }
+
+  test("runMechanicalVerification refuses a cancelled task (never quietBlocks it)", async () => {
+    const id = toVerify("o/r#808a");
+    cancelTask(db, id, "w", "superseded");
+    await expect(mechanical(id, "pass")).rejects.toThrow(/terminal/);
+    // Stays cancelled: the NOT_RUN path never parks it blocked_human.
+    expect(getTask(db, id)!.state).toBe("cancelled");
+  });
+
+  test("submitPhase refuses a cancelled task", () => {
+    const t = intakeTask(db, { provider: "github", issueId: "o/r#808b", codeChange: true, headSha: FULL, checks: [CHECK] });
+    claimTask(db, t.id, "impl");
+    cancelTask(db, t.id, "w", "duplicate");
+    expect(() => submitPhase(db, t.id, "impl")).toThrow(/terminal/);
+    expect(getTask(db, t.id)!.state).toBe("cancelled");
+  });
+
+  test("recordVerification refuses a cancelled task", () => {
+    const id = toVerify("o/r#808c");
+    cancelTask(db, id, "w", "obsolete");
+    expect(() => recordVerification(db, id, "impl", { passed: true, headSha: FULL })).toThrow(/terminal/);
+    expect(getTask(db, id)!.state).toBe("cancelled");
+  });
+
+  test("acceptTask refuses a cancelled merge_ready task (never -> done)", async () => {
+    const t = intakeTask(db, {
+      provider: "github", issueId: "o/r#808d", codeChange: true, headSha: FULL, checks: [CHECK],
+      prUrl: "https://github.com/o/r/pull/808", prRepo: "o/r",
+    });
+    await toReview(t.id);
+    claimNext(db, "rev");
+    recordReview(db, t.id, "rev", { verdict: "pass", headSha: FULL });
+    claimTask(db, t.id, "integ");
+    submitPhase(db, t.id, "integ");
+    expect(getTask(db, t.id)!.phase).toBe("merge_ready");
+
+    cancelTask(db, t.id, "w", "program closed");
+    expect(() => acceptTask(db, t.id, "integ")).toThrow(/terminal/);
+    expect(getTask(db, t.id)!.state).toBe("cancelled");
+  });
+
+  test("confirmMerged refuses a cancelled task", () => {
+    const id = toVerify("o/r#808e");
+    cancelTask(db, id, "w", "superseded");
+    expect(() => confirmMerged(db, id, { headSha: FULL })).toThrow(/cannot confirm a merge/);
+    expect(getTask(db, id)!.state).toBe("cancelled");
+  });
+
+  test("quietBlock refuses a cancelled task", () => {
+    const id = toVerify("o/r#808f");
+    cancelTask(db, id, "w", "superseded");
+    const live = getTask(db, id)!;
+    expect(() => quietBlock(db, live, "late hold", "provider:linear")).toThrow(/terminal/);
+    expect(getTask(db, id)!.state).toBe("cancelled");
   });
 });

@@ -19,7 +19,7 @@ import { attachSession, detachSession, getSession, listSessions, releaseUnhosted
 import { listRuntimes, adoptRuntimeTarget } from "./runtimes";
 import type { Task } from "./schema";
 import {
-  addTask, approveTask, blockTask, claimNext, claimTask, claimableRunnableTasks, getNotes, getTask,
+  addTask, approveTask, blockTask, cancelTask, claimNext, claimTask, claimableRunnableTasks, getNotes, getTask,
   listTasks, notesClaimingApproval, notYetRunnableTasks, rejectTask, releaseTask, reviewHeldByLiveReviewer, runnableTasks, setTaskDependencies,
   submitTask, taskCounts, taskDependencies, taskChildren, setTaskParent, unblockTask,
   unclaimableRunnableTasks, addNote, setTaskPlan, waitTask,
@@ -27,6 +27,7 @@ import {
 import { acceptTask, confirmMerged, intakeTask, recordReview, recordVerification, runMechanicalVerification, submitPhase, taskChecks } from "./workflow";
 import { defaultRunner, type CheckSpec } from "./verify";
 import { acceptRunSubmission, getRun, listRuns, startDshRun } from "./dsh-runner";
+import { signalRunProcess } from "./run-signal";
 import {
   applyWorkspaceCleanup,
   ensureTaskWorktree,
@@ -252,11 +253,17 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
       "relay task link <id> <plan-id>",
       "relay task unlink <id>",
       "relay task depend <id> <dep-id...> | --clear",
+      'relay task cancel <task-id> --reason <text>',
     ],
   },
   "task add": {
     about: "Queue a new task. --parent nests it under T1; approving a child then tells the immediate parent (one-hop completion bubbling: a child_done note on the parent, children_done when all direct children are done, and a durable message to the parent's current assignee). A --role makes the task claimable only by a worker of that role by default; an unknown role warns (non-fatal), and a role no registered worker has is surfaced as Unclaimable in `relay status`. --plan <plan-id> records which agent-status plan.json item this task belongs to. --depends-on T1,T2 declares prerequisites: the task is NOT runnable (never offered by `relay next`, never claimable, never woken) until every one is done.",
     usage: ['relay task add "description" [--title T] [--acceptance A] [--priority N] [--role R] [--parent T1] [--plan <plan-id>] [--depends-on T1,T2]'],
+  },
+  "task cancel": {
+    about:
+      "Close a task in the explicit terminal state `cancelled` (distinct from `done` and from the reversible `blocked_*` parks). Use it for work that is superseded / duplicate / obsolete / policy-changed. The task leaves `relay next` / claim / wake / Unclaimable / Attention, ownership is released, and the reason is recorded as a `cancel` note + event. `done`/`failed` are refused; re-cancelling is an idempotent no-op.",
+    usage: ['relay task cancel <task-id> --reason <text> [--worker <id>]'],
   },
   "task intake": {
     about:
@@ -513,9 +520,11 @@ function truncText(s: string, max = 48): string {
 const TASK_CONTEXT_KINDS = new Set([
   "child_done",
   "children_done",
+  "child_cancelled",
   "blocked_human",
   "blocked_internal",
   "reject",
+  "cancel",
   "evidence",
 ]);
 
@@ -1082,6 +1091,17 @@ async function main(): Promise<void> {
               console.error(`  [${n.kind}] ${n.worker_id ?? "?"}: ${n.body}`);
             }
           }
+        } else if (sub === "cancel") {
+          // ISH-808: the explicit terminal CLOSE. Reason is required (audit),
+          // and may be positional or `--reason <text>` like block/reject.
+          const rest = argv.slice(2);
+          const id = positionals(rest)[0];
+          const usage = 'usage: relay task cancel <task-id> --reason <text> [--worker <id>]';
+          if (!id) throw new Error(usage);
+          const reason = resolveText(rest, usage, "--reason");
+          const workerId = resolveWorkerId(db, flag(rest, "--worker"));
+          const t = cancelTask(db, id, workerId, reason);
+          console.log(`${t.id} -> cancelled`);
         } else {
           throw new Error(`unknown task subcommand: ${sub}`);
         }
@@ -1570,17 +1590,7 @@ async function main(): Promise<void> {
           // Mark the request in the row BEFORE signalling so the process that
           // owns the Run records it as `cancelled`, not a bare signal failure.
           db.query(`UPDATE runs SET signal = 'cancelled', updated_at = ? WHERE id = ?`).run(now(), id);
-          if (r.pid) {
-            try {
-              process.kill(-r.pid, "SIGTERM");
-            } catch {
-              try {
-                process.kill(r.pid, "SIGTERM");
-              } catch {
-                /* already gone */
-              }
-            }
-          }
+          signalRunProcess(r.pid);
           console.log(`${id} cancel signalled (pid ${r.pid ?? "-"})`);
           break;
         }
@@ -1734,7 +1744,7 @@ async function main(): Promise<void> {
         console.log("");
         console.log("Tasks");
         console.log("-----");
-        for (const s of ["queued", "running", "review", "blocked_internal", "blocked_human", "done", "failed"]) {
+        for (const s of ["queued", "running", "review", "blocked_internal", "blocked_human", "done", "failed", "cancelled"]) {
           console.log(`${s.padEnd(16)} ${counts[s] ?? 0}`);
         }
         const stranded = unclaimableRunnableTasks(db);

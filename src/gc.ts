@@ -2,6 +2,10 @@ import type { Database } from "bun:sqlite";
 import { now } from "./db";
 import { logEvent } from "./events";
 import type { Task, Worker } from "./schema";
+import { TERMINAL_TASK_STATES } from "./schema";
+
+/** Terminal task states as an SQL `IN (...)` list (done/failed/cancelled). */
+const TERMINAL_STATE_SQL = TERMINAL_TASK_STATES.map((s) => `'${s}'`).join(",");
 
 // ---------------------------------------------------------------------------
 // `relay gc` — explicit, safe purge of HISTORICAL rows.
@@ -13,8 +17,9 @@ import type { Task, Worker } from "./schema";
 //   - never touches events / messages / task_notes unless `--with-history`.
 //
 // Tasks/sessions/runtimes are DISPOSABLE history; tasks are durable, so only
-// `done`/`failed` tasks are ever eligible. A terminal task that a surviving task
-// still depends on (or that has a non-terminal child) is SKIPPED, not deleted.
+// terminal (`done`/`failed`/`cancelled`) tasks are ever eligible. A terminal
+// task that a surviving task still depends on (or that has a non-terminal child)
+// is SKIPPED, not deleted.
 // ---------------------------------------------------------------------------
 
 export interface GcSkip {
@@ -74,10 +79,10 @@ export function planGc(db: Database, opts: GcOptions = {}): GcPlan {
     workers.push(w.id);
   }
 
-  // 2. Tasks: only terminal (done/failed). A candidate is dropped when a task
-  //    OUTSIDE the candidate set still depends on it, or it has a non-terminal
-  //    child (deleting it would strand signalling/deps).
-  const terminal = db.query(`SELECT * FROM tasks WHERE state IN ('done','failed')`).all() as Task[];
+  // 2. Tasks: only terminal (done/failed/cancelled). A candidate is dropped
+  //    when a task OUTSIDE the candidate set still depends on it, or it has a
+  //    non-terminal child (deleting it would strand signalling/deps).
+  const terminal = db.query(`SELECT * FROM tasks WHERE state IN (${TERMINAL_STATE_SQL})`).all() as Task[];
   const candidates: string[] = [];
   for (const t of terminal) {
     if (t.updated_at > cutoff) {
@@ -85,7 +90,7 @@ export function planGc(db: Database, opts: GcOptions = {}): GcPlan {
       continue;
     }
     const liveChildren = db
-      .query(`SELECT id FROM tasks WHERE parent_task_id = ? AND state NOT IN ('done','failed')`)
+      .query(`SELECT id FROM tasks WHERE parent_task_id = ? AND state NOT IN (${TERMINAL_STATE_SQL})`)
       .all(t.id) as { id: string }[];
     if (liveChildren.length > 0) {
       skipped.push({ kind: "task", id: t.id, reason: `non-terminal child ${liveChildren.map((c) => c.id).join(",")}` });
@@ -208,7 +213,7 @@ export function applyGc(db: Database, plan: GcPlan): GcPlan {
       // Dependency rows are gating metadata, not history: remove them with the
       // task so no dangling edge survives.
       db.query(`DELETE FROM task_deps WHERE task_id = ? OR depends_on = ?`).run(id, id);
-      db.query(`DELETE FROM tasks WHERE id = ? AND state IN ('done','failed')`).run(id);
+      db.query(`DELETE FROM tasks WHERE id = ? AND state IN (${TERMINAL_STATE_SQL})`).run(id);
     }
     for (const sid of plan.sessions) {
       db.query(

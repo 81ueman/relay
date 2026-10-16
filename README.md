@@ -1141,6 +1141,17 @@ Reviewer: `relay next` (review first, then queued — peer, no hierarchy),
 wakes it). Human blocker: `relay block T2 --human "..."` then `relay
 next` — the system keeps moving.
 
+Close work that will never be `done` — superseded, duplicate, obsolete, or
+policy-changed — with the explicit terminal state `cancelled` (distinct from
+`done` and from the reversible `blocked_*` parks). The reason is recorded as a
+`cancel` note plus a `task.cancelled` event, ownership is released, and a
+cancelled task leaves `relay next`/claim/wake and the Unclaimable/Attention
+surfaces. `done`/`failed` are refused; re-cancelling is an idempotent no-op.
+
+```bash
+relay task cancel T246 --reason "superseded by T293"
+```
+
 Messages (durable-first: INSERT → commit → wake; wake failure keeps the row):
 
 ```bash
@@ -1263,6 +1274,13 @@ one hop only, same as completion. A `blocked_human` task additionally reaches a
 Because even immediate kinds defer while a worker is mid-turn, this surfaces at
 the recipient's next idle/turn boundary (or immediately for an idle human).
 
+**Cancelled roll-up (ISH-808).** Cancelling a child records a durable
+`child_cancelled` note on its IMMEDIATE parent and messages the parent's assignee
+when it has one — one hop only, so a parent waiting on that subtree learns it was
+CLOSED rather than completed. It is deliberately NOT folded into the `done`
+aggregation: a cancelled child never makes `children_done` fire, and the parent
+is never auto-completed.
+
 **Runtime idle is not task idle (bounded quiet lease).** A worker may hold a
 RUNNING task and still end its turn (session idle). Normally that is an anomaly;
 to make a *deliberate* short wait explicit and bounded, declare a quiet lease:
@@ -1381,7 +1399,7 @@ worker, and borrowing a file default that lives in another live pane is
 ## States (MVP core)
 
 ```text
-Task:    queued running review done blocked_human blocked_internal (+ failed)
+Task:    queued running review done blocked_human blocked_internal cancelled (+ failed)
 Worker:  idle working waiting_input stalled dead (+ starting transient)
 Session: managed | unmanaged
 Runtime: starting active stale dead cleaned, each relay_owned = true | false
