@@ -357,6 +357,23 @@ whole table is unit-tested; the daemon pass (`runMergeGates`) is idempotent and
 logs each new decision identity once. One-command real-PR dry run:
 `bun run smoke:merge-gate 81ueman/relay#7` (or `relay merge-check <task> --json`).
 
+### Factory E2E: dsh → VERIFY → Claude review → MergeReady (ISH-762)
+
+`relay run factory <task-id>` (or `runFactoryTask`) drives ONE Task through the
+whole factory with **no hand-driven TUI/pane for the coding**: a real headless
+dsh Run implements, Relay **mechanically VERIFYs** the recorded worktree/HEAD, an
+**independent headless Claude** reviewer (`claude -p --output-format json`,
+read-only) returns a **structured** FIX/PASS, a FIX is the **SAME worktree + a
+fresh dsh Run** with the findings, and a PASS reaches **read-only MergeReady**.
+It is sequencing only — every transition reuses the ordinary durable results
+(`acceptRunSubmission`, `runMechanicalVerification`, `recordReview`,
+`submitPhase`), so a `dsh` exit 0 / `final`, a missing/malformed reviewer result,
+a foreign/stale HEAD, or a non-independent reviewer **cannot advance** the Task.
+The Factory never pushes, merges, accepts, or writes a provider/Linear. One-shot:
+`bun run smoke:factory` (fixture) and `RELAY_REAL_SMOKE=1 bun run
+smoke:factory:real` (real dsh 0.2.0-rc.2 + real Claude) — see
+[`docs/factory-e2e.md`](docs/factory-e2e.md).
+
 ### Headless dsh Runs (no Herdr)
 
 A coding attempt can run as **one `dsh --profile headless --json` process** — no
