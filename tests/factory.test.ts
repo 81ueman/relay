@@ -13,7 +13,7 @@ import { insertTaskResult } from "../src/results";
 import { acceptRunSubmission, DUPLICATE_WRITER, listRuns } from "../src/dsh-runner";
 import { launchTaskRun } from "../src/run-lifecycle";
 import { defaultRunner, gitHead } from "../src/verify";
-import { DEFAULT_INTEGRATOR_WORKER, runFactoryTask } from "../src/factory";
+import { DEFAULT_INTEGRATOR_WORKER, pidAlive, runFactoryTask } from "../src/factory";
 import {
   DEFAULT_REVIEWER_WORKER as REVIEWER_WORKER,
   REVIEW_NOT_INDEPENDENT,
@@ -535,19 +535,54 @@ describe("PR #10 finding 4: an orphaned running Run never hangs the factory", ()
     expect(getTask(db, id)!.phase).toBe("implement");
   });
 
-  test("a live-pid but expired orphan is bounded by the deadline and marked failed", async () => {
+  test("an EXPIRED but still-live orphan is KILLED before the fence is released", async () => {
     const dsh = fakeDsh("dsh-commit", COMMITTING_DSH);
     const id = newTask();
     const launched = await launchTaskRun(db, id, { repo, worktreesRoot: join(dir, "worktrees"), outputRoot: join(dir, "runs"), dshBin: dsh, fastExitMs: 0 });
     await launched.handle.wait();
-    // A LIVE pid (this test process) but no coroutine will ever finish the Run.
-    db.query(`UPDATE runs SET state='running', pid=?, exit_code=NULL, ended_at=NULL WHERE id=?`).run(process.pid, launched.handle.id);
-    const started = Date.now();
+    // A REAL detached child in its own process group — the orphan that a crashed
+    // factory leaves behind. Nothing in this test process will ever finish it.
+    const child = Bun.spawn(["sleep", "30"], { detached: true, stdin: "ignore", stdout: "ignore", stderr: "ignore" });
+    const childPid = child.pid;
+    db.query(`UPDATE runs SET state='running', pid=?, exit_code=NULL, ended_at=NULL WHERE id=?`).run(childPid, launched.handle.id);
+
     const res = await runFactoryTask(db, id, { ...factoryDeps(dsh, reviewerHarness(["pass"]).spawner), timeoutMs: 300 });
     expect(res.outcome).toBe("coding_failed");
     expect(res.reason).toContain("expired");
-    expect(Date.now() - started).toBeLessThan(5000);
+    // KILL BEFORE RELEASE: the orphan is dead, so the Run is terminal `failed`.
+    expect(pidAlive(childPid)).toBe(false);
     expect(listRuns(db, { taskId: id })[0].state).toBe("failed");
+    // With the writer truly gone, the worktree is free again — a following launch
+    // is admitted (no stale DUPLICATE_WRITER, no second live writer).
+    const next = await launchTaskRun(db, id, { repo, worktreesRoot: join(dir, "worktrees"), outputRoot: join(dir, "runs"), dshBin: dsh, fastExitMs: 0 });
+    expect(next.handle.id).not.toBe(launched.handle.id);
+    await next.handle.wait();
+  });
+
+  test("an orphan that CANNOT be killed leaves the Run running (DUPLICATE_WRITER keeps fencing)", async () => {
+    const dsh = fakeDsh("dsh-commit", COMMITTING_DSH);
+    const id = newTask();
+    const launched = await launchTaskRun(db, id, { repo, worktreesRoot: join(dir, "worktrees"), outputRoot: join(dir, "runs"), dshBin: dsh, fastExitMs: 0 });
+    await launched.handle.wait();
+    // A live PID we will (by seam) fail to terminate: use this test process's own
+    // pid so no real signal is ever sent, and inject a terminate that returns false.
+    db.query(`UPDATE runs SET state='running', pid=?, exit_code=NULL, ended_at=NULL WHERE id=?`).run(process.pid, launched.handle.id);
+    const res = await runFactoryTask(db, id, {
+      ...factoryDeps(dsh, reviewerHarness(["pass"]).spawner),
+      timeoutMs: 300,
+      terminateOrphan: async () => false,
+    });
+    expect(res.outcome).toBe("coding_failed");
+    expect(res.reason).toContain("could not be terminated");
+    // The Run stays `running`, so the single-writer fence is intact.
+    expect(listRuns(db, { taskId: id })[0].state).toBe("running");
+    let refused = false;
+    try {
+      await launchTaskRun(db, id, { repo, worktreesRoot: join(dir, "worktrees"), outputRoot: join(dir, "runs"), dshBin: dsh });
+    } catch (e) {
+      refused = new RegExp(DUPLICATE_WRITER).test(String(e));
+    }
+    expect(refused).toBe(true);
   });
 });
 

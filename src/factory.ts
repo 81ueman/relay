@@ -75,6 +75,12 @@ export interface FactoryDeps {
   maxAttempts?: number;
   /** A coding Run that produced no new commit is a NO_IMPLEMENTATION (default true). */
   noChangeIsFailure?: boolean;
+  /**
+   * Terminate an adopted Run's detached process group, returning true once the
+   * leader is gone (default `terminateProcessGroup`). Test seam for the
+   * "cannot-be-killed -> keep fencing" path.
+   */
+  terminateOrphan?: (pid: number) => Promise<boolean>;
 }
 
 export interface FactoryAttempt {
@@ -153,28 +159,86 @@ export function pidAlive(pid: number | null): boolean {
   }
 }
 
-/** Bound an adopted Run's wait: return the row, or `timedOut` past the deadline. */
+/** Default run budget when the caller gives none (mirrors `relay run` 30m). */
+export const DEFAULT_RUN_TIMEOUT_MS = 30 * 60_000;
+/** SIGTERM -> SIGKILL grace for a terminated orphan process group. */
+export const ORPHAN_SIGKILL_GRACE_MS = 5000;
+
+/**
+ * Bound an adopted Run's wait: return the row, or `timedOut` once the ABSOLUTE
+ * `deadlineMs` passes. The deadline is derived from the Run's own `started_at` +
+ * its run budget, not from the moment of adoption, so a Run that already spent
+ * its budget before the restart expires immediately instead of getting a second
+ * full window.
+ */
 async function waitRunBounded(
   db: Database,
   runId: string,
-  timeoutMs: number,
+  deadlineMs: number,
   pollMs = 250
 ): Promise<{ run: Run; timedOut: boolean }> {
-  const deadline = Date.now() + timeoutMs;
   for (;;) {
     const r = getRun(db, runId);
     if (!r) throw new Error(`unknown run: ${runId}`);
     if (RUN_TERMINAL_STATES.has(r.state)) return { run: r, timedOut: false };
-    if (Date.now() > deadline) return { run: r, timedOut: true };
+    if (Date.now() > deadlineMs) return { run: r, timedOut: true };
     await new Promise((res) => setTimeout(res, pollMs));
   }
 }
 
+async function sleep(ms: number): Promise<void> {
+  await new Promise((res) => setTimeout(res, ms));
+}
+
+/** Wait until `pid` is gone, up to `budgetMs`; returns true when it is gone. */
+async function waitPidGone(pid: number, budgetMs: number): Promise<boolean> {
+  const deadline = Date.now() + budgetMs;
+  while (Date.now() < deadline) {
+    if (!pidAlive(pid)) return true;
+    await sleep(50);
+  }
+  return !pidAlive(pid);
+}
+
 /**
- * Mark a still-live Run terminal `failed`. Used when an adopted Run is ORPHANED
- * (its owning process is gone) or EXPIRED (it outlived the adoption deadline):
- * the coroutine that would have written the terminal state is lost, so nothing
- * else can release the single-writer fence. Never advances the Task.
+ * Terminate an adopted Run's DETACHED process group. dsh is spawned detached
+ * (`setsid`), so `pid` is the group leader: `kill(-pid, ...)` reaches the whole
+ * tree, exactly like `RunHandle.cancel`. SIGTERM first, then SIGKILL after a
+ * grace period. Returns true only once the leader is actually gone.
+ *
+ * A caller MUST NOT release the single-writer fence (mark the Run terminal) while
+ * this returns false: the old writer would still be writing the worktree.
+ */
+export async function terminateProcessGroup(pid: number, graceMs = ORPHAN_SIGKILL_GRACE_MS): Promise<boolean> {
+  if (!pidAlive(pid)) return true;
+  try {
+    process.kill(-pid, "SIGTERM");
+  } catch {
+    try {
+      process.kill(pid, "SIGTERM");
+    } catch {
+      /* already gone */
+    }
+  }
+  if (await waitPidGone(pid, graceMs)) return true;
+  try {
+    process.kill(-pid, "SIGKILL");
+  } catch {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      /* already gone */
+    }
+  }
+  return waitPidGone(pid, 2000);
+}
+
+/**
+ * Mark a still-live Run terminal `failed`. Used ONLY once the orphan's process
+ * group is confirmed dead (or was never alive): the coroutine that would have
+ * written the terminal state is lost, so nothing else releases the single-writer
+ * fence. Never advances the Task. Callers must NOT call this while the process
+ * may still be writing — that would free the fence for a second writer.
  */
 function markRunOrphan(db: Database, runId: string, reason: string): void {
   const t = now();
@@ -202,19 +266,43 @@ async function implementOnce(
     logEvent(db, { source: "factory", taskId: task.id, type: "factory.run_adopted", payload: { runId: live.id, pid: live.pid } });
     // Restart/reconcile MUST NOT hang on an orphaned Run. A detached dsh Run's
     // terminal state is written by the coroutine that launched it; if that
-    // process died, the row stays `running` forever. Check the PID is alive and
-    // bound the wait with the run timeout; a dead/expired orphan is marked
-    // terminal `failed` and the Factory fails closed (never advances).
+    // process died, the row stays `running` forever. Check the PID is alive; if
+    // not, the owner is gone and the row can safely be marked terminal `failed`.
     if (!pidAlive(live.pid)) {
       const reason = `orphaned run ${live.id}: owner pid ${live.pid ?? "none"} is not alive`;
       markRunOrphan(db, live.id, reason);
       const r = getRun(db, live.id)!;
       return { run: r, producedHead: r.head_sha, error: `${CODING_FAILED}: ${reason}` };
     }
-    const adoptTimeoutMs = deps.timeoutMs ?? 30 * 60_000;
-    const { run: waited, timedOut } = await waitRunBounded(db, live.id, adoptTimeoutMs);
+    // The Run is still ALIVE (a factory crash left the detached dsh running with
+    // no in-process killer). Bound the wait from the Run's OWN start + budget.
+    const runTimeoutMs = deps.timeoutMs ?? DEFAULT_RUN_TIMEOUT_MS;
+    const deadlineMs = (live.started_at || Date.now()) + runTimeoutMs;
+    const { run: waited, timedOut } = await waitRunBounded(db, live.id, deadlineMs);
     if (timedOut) {
-      const reason = `adopted run ${live.id} did not finish within ${adoptTimeoutMs}ms (expired)`;
+      const reason = `adopted run ${live.id} exceeded its ${runTimeoutMs}ms budget (expired)`;
+      // KILL BEFORE RELEASE: never free the single-writer fence while the old
+      // writer may still be writing the worktree. Terminate the detached process
+      // group first; only a confirmed-dead leader lets us mark the Run terminal.
+      const terminate = deps.terminateOrphan ?? ((pid: number) => terminateProcessGroup(pid));
+      const dead = await terminate(live.pid!);
+      if (!dead) {
+        // Could not prove the writer is gone: leave the Run `running` so
+        // `findActiveWriter` (and thus `launchTaskRun`) keeps returning
+        // DUPLICATE_WRITER for this worktree/branch. Fail closed, never advance.
+        logEvent(db, {
+          source: "factory",
+          taskId: task.id,
+          type: "factory.orphan_unterminated",
+          payload: { runId: live.id, pid: live.pid, reason },
+        });
+        const r = getRun(db, live.id)!;
+        return {
+          run: r,
+          producedHead: r.head_sha,
+          error: `${CODING_FAILED}: ${reason}; orphan process group could not be terminated (Run left running to keep the single-writer fence)`,
+        };
+      }
       markRunOrphan(db, live.id, reason);
       const r = getRun(db, live.id)!;
       return { run: r, producedHead: r.head_sha, error: `${CODING_FAILED}: ${reason}` };

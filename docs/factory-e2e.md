@@ -91,10 +91,17 @@ ordered `steps`. A non-`merge_ready` outcome exits non-zero.
   credited. A principal that is not an independent reviewer (wrong role, or the
   submitter) → `REVIEW_NOT_INDEPENDENT`. An unresolved NG at the same head is
   never cleared by a later OK alone.
-- **An orphaned Run never hangs the Factory.** On adoption the Run's PID is
-  checked (`process.kill(pid, 0)`); a Run whose owning process is gone, or that
-  outlives the run timeout, is marked terminal `failed` and the Factory returns
-  `CODING_FAILED` — restart/reconcile always finishes and never advances.
+- **An orphaned Run never hangs the Factory, and never lets a second writer in.**
+  On adoption the Run's PID is checked (`process.kill(pid, 0)`); a Run whose
+  owning process is gone is marked terminal `failed`. A Run that is still ALIVE
+  when it exceeds its budget (the deadline is `started_at + run timeout`, not the
+  moment of adoption) is **killed before the single-writer fence is released**:
+  the detached process group is `SIGTERM`-ed, then `SIGKILL`-ed after a grace
+  period, and the Run is marked `failed` **only once the leader is confirmed
+  gone**. If the group cannot be killed, the Run is **left `running`** so
+  `findActiveWriter` keeps returning `DUPLICATE_WRITER` for the worktree/branch —
+  the Factory still returns `CODING_FAILED`, but never frees the workspace for a
+  second writer.
 - **Old HEAD cannot advance.** Every result is bound to the revision it judged;
   the merge gate re-reads GitHub and refuses a PR head != `task.head_sha`.
 - **MergeReady is read-only.** The Factory never pushes, merges, accepts,
@@ -212,7 +219,7 @@ unchanged by this issue.
 
 ## Verified / not verified
 
-- **Verified** — `bun run typecheck`; `bun test` (821 pass, 1 skipped, 0 fail);
+- **Verified** — `bun run typecheck`; `bun test` (822 pass, 1 skipped, 0 fail);
   `bun run smoke:factory` (PASS, 13 checks); `RELAY_REAL_SMOKE=1 bun run
   smoke:factory:real` (PASS with real `dsh 0.2.0-rc.2` + real Claude; see the raw
   output above); `tests/factory.test.ts` covers the FIX→fresh-Run→PASS loop, the
@@ -224,9 +231,11 @@ unchanged by this issue.
   round-1 findings each have a dedicated regression test: `blocked_internal` is
   terminal (finding 1); a non-zero/signalled reviewer process is
   `REVIEW_PROCESS_FAILED` (finding 2); a worktree HEAD moved during review is
-  `REVIEW_HEAD_MISMATCH` (finding 3); a dead-pid orphan and a live-pid-then-expired
-  orphan are both marked `failed` → `CODING_FAILED` (finding 4); an all-optional
-  check list is `no_checks` (finding 5).
+  `REVIEW_HEAD_MISMATCH` (finding 3); a dead-pid orphan is marked `failed`, a
+  real detached-child orphan that is still alive past its budget is **killed**
+  (asserted dead) before the fence is released, and an orphan that cannot be
+  killed leaves the Run `running` so `DUPLICATE_WRITER` still fences (finding 4);
+  an all-optional check list is `no_checks` (finding 5).
 - **NOT verified here** — an end-to-end **real-FIX** loop (real dsh attempt 0
   genuinely insufficient → real Claude FIX → real dsh attempt 1 → real Claude
   PASS): the real smoke reached MergeReady on attempt 0 because the real model
