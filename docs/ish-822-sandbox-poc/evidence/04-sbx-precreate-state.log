@@ -1,0 +1,142 @@
+$ sbx ls
+No sandboxes found
+
+$ sbx policy ls
+error: global network policy has not been initialized
+  try: sbx policy init <allow-all|balanced|deny-all>
+
+$ sbx settings ls (or similar)
+Description:
+  View and manage settings for Docker Sandboxes.
+
+  Settings can come from defaults, environment variables, or user overrides.
+  These commands use the local daemon to read evaluated values and manage
+  overrides, starting it if necessary.
+
+  Most changes take effect within about five seconds. Some require a daemon
+  restart.
+
+Usage:
+  sbx settings COMMAND
+
+Available Commands:
+  get         Get the value of a setting
+  ls          List settings
+  set         Set a setting override
+  unset       Remove a setting override
+
+Flags:
+  -h, --help   help for settings
+
+Global Flags:
+      --cloud   Dispatch to Docker Cloud Sandboxes API instead of local sandboxd (supported by a growing set of verbs — run 'sbx --cloud --help' for the current list)
+  -D, --debug   Enable debug logging
+
+Use "sbx settings COMMAND --help" for more information about a command.
+
+$ sbx create --help
+Description:
+  Create a sandbox with access to a host workspace for an agent.
+
+  The first positional argument may be a built-in agent name or a sandbox kit
+  reference. Sandbox kit references may be local directories, ZIP files, git
+  repositories, or OCI references. Relative local references must be explicit
+  paths such as ./my-kit or ../my-kit.zip.
+
+  Omit the path to create a sandbox without a workspace bind mount: the agent
+  then works in the container's own filesystem instead of on your files.
+
+  Use "sbx run --name SANDBOX" to attach to the agent after creation.
+
+  Available agents: claude, codex, copilot, cursor, devin, docker-agent, droid, gemini, kiro, opencode, shell
+
+  With --cloud:
+  Create a cloud sandbox for an agent.
+
+  Cloud sandboxes have no host workspace, so no path follows the agent. Sizing
+  comes from --cpus and --memory and must land on a billable shape; without them
+  a cloud sandbox gets 2 CPUs and 4 GiB. A template named with -t / --template
+  must already exist in the cloud registry.
+
+  Cloud sandboxes use cloud network policies. Host network and HTTP policies
+  do not apply. Set cloud account defaults with
+  "sbx --cloud policy init <allow-all|balanced|deny-all>".
+
+  Use "sbx --cloud run --name SANDBOX" to attach to the agent after creation.
+
+Usage:
+  sbx create AGENT|SANDBOX_KIT [PATH...] [flags]
+  sbx create COMMAND
+
+Examples:
+  # Create a sandbox for Claude in the current directory
+  sbx create claude .
+
+  # Create a sandbox with a custom name
+  sbx create --name my-project claude /path/to/project
+
+  # Create with additional read-only workspaces
+  sbx create claude . /path/to/docs:ro
+
+  # Create without a workspace bind mount
+  sbx create claude
+
+  # Create from a local sandbox kit
+  sbx create ../path/to/my-agent/
+
+  # Add a mixin to a built-in agent
+  sbx create claude --kit ./my-mixin/
+
+  # Run the agent on an in-container clone of the host repo, wired back via a git-daemon
+  sbx create --clone claude .
+
+  # Create a cloud sandbox for claude
+  sbx --cloud create claude
+
+  # Create a named cloud sandbox with a mixin baked in
+  sbx --cloud create --name my-project claude --kit ./my-mixin/
+
+  # Create from a template that already exists in the cloud registry
+  sbx --cloud create -t TEMPLATE
+
+Available Commands:
+  claude         Create a sandbox for claude
+  codex          Create a sandbox for codex
+  cursor         Create a sandbox for cursor
+  devin          Create a sandbox for devin
+  docker-agent   Create a sandbox for docker-agent
+  gemini         Create a sandbox for gemini
+  opencode       Create a sandbox for opencode
+  shell          Create a sandbox for shell
+
+Flags:
+      --allow-network strings       Network pattern to allow for cloud sandbox egress (cloud only; can be specified multiple times)
+      --clone                       Run the agent on a private in-container clone of the host Git repository (mounted read-only) instead of bind-mounting the workspace; the agent's commits are accessible via the sandbox-<name> git remote on the host
+      --cpus int                    Number of CPUs to allocate to the sandbox (0 = auto: all host CPUs, at most 16 on Linux arm64)
+      --deny-network strings        Add a per-sandbox network deny rule at creation time. Can be specified multiple times. The rule applies only to the new sandbox and can be listed or removed later with 'sbx policy ls <NAME>' or 'sbx policy rm network --sandbox <NAME> --resource <HOST>'. Safe under centralized governance because a local deny can only narrow, never widen, egress.
+  -e, --env stringArray             Set an environment variable in the sandbox (can be repeated): KEY=VALUE, or a bare KEY to take the value from the current environment
+      --env-file stringArray        Read environment variables from a file (can be repeated). --env wins over any file; a later file wins over an earlier one
+  -h, --help                        help for create
+      --image-ref string            OCI image reference for inline-mode cloud create (mutually exclusive with --template; requires --cpus and --memory)
+      --kit strings                 (Experimental) Additional kit reference (must be a mixin; directory, ZIP, git, or OCI). Can be specified multiple times
+      --kit-arg stringArray         (Experimental) Value for an argument the kit declares, as name=value for every kit or kit.name=value for one (can be repeated)
+      --kit-args-file stringArray   (Experimental) File of name=value kit arguments, one per line (can be repeated); --kit-arg overrides
+  -m, --memory string               Memory limit in binary units (e.g., 512m, 8g). Minimum: 512 MiB. Default: 50% of host memory, clamped to 512 MiB–32 GiB. Maximum: max(75% of host memory, 512 MiB)
+      --name string                 Name for the sandbox (defaults to <agent>-<workdir>; at least two characters, starting with a letter or number, containing only letters, numbers, hyphens and periods (periods are rejected with --cloud); 'default' is reserved)
+      --no-progress                 Suppress progress output
+      --on-timeout string           What happens when --ttl lapses: 'stop' stops the sandbox in place so it can be started again later, 'restart' keeps it running by stopping and immediately starting it, or 'delete' removes it. Omit the flag and the server stops the sandbox when it can be started again later, and deletes it otherwise. With 'restart' a supplied --ttl must be at least 1h (cloud only).
+      --platform string             Target platform: linux/amd64 or linux/arm64 (cloud only). With --image-ref, omitting it lets the server resolve the platform from the image and the CLI sends the local CPU as a hint for multi-platform images. With --template, omitting it inherits the template platform. With a sandbox kit, the kit's template is built for this platform and cached apart from other platforms; omitting it keeps the server's choice.
+      --profile string              Governance profile to assign to the sandbox
+  -p, --publish stringArray         Publish a sandbox port to the host (can be repeated): [[HOST_IP:]HOST_PORT:]SANDBOX_PORT[/PROTOCOL]
+      --pull string                 Image pull policy (always|missing|never; default: never for saved local snapshots, missing for v3 kit compositions, otherwise always)
+      --skills string               Shared skills store mode for the agent's skills directory (e.g. ~/.claude/skills): off, readonly (store linked in read-only, directory stays writable), or readwrite (store mounted over it, writes are shared). Default: readonly, or the configured skills.defaultMode setting.
+      --static-mcp strings          MCP server names that form the sandbox's fixed (static) MCP set. Accepts a comma-separated list (--static-mcp notion,atlassian), repeated flags (--static-mcp notion --static-mcp atlassian), or a mix; all forms accumulate into the same set. The set is chosen once at creation time. Local sandboxes take names registered with 'sbx mcp add'. Cloud sandboxes resolve names on the cloud MCP gateway.
+  -t, --template string             Container image to use for the sandbox (default: agent-specific image)
+      --ttl duration                Cloud sandbox time-to-live before it times out (e.g. 30m, 2h, 1h30m; units are case-insensitive; cloud only; default: server-side)
+  -v, --volume stringArray          (Experimental) Attach an existing persistent volume, NAME:MOUNTPATH (cloud only, experimental; repeatable)
+
+Global Flags:
+      --cloud   Dispatch to Docker Cloud Sandboxes API instead of local sandboxd (supported by a growing set of verbs — run 'sbx --cloud --help' for the current list)
+  -D, --debug   Enable debug logging
+
+Use "sbx create COMMAND --help" for more information about a command.

@@ -1,0 +1,77 @@
+$ sbx login --help
+Description:
+  Sign in to Docker
+
+Usage:
+  sbx login [flags]
+
+Examples:
+  sbx login
+
+  # Non-interactive sign-in, for CI
+  echo "$DOCKER_PAT" | sbx login --username me --password-stdin
+
+Flags:
+  -h, --help              help for login
+      --password-stdin    Read password or access token from stdin
+      --username string   Docker username for non-interactive login
+
+Global Flags:
+      --cloud   Dispatch to Docker Cloud Sandboxes API instead of local sandboxd (supported by a growing set of verbs — run 'sbx --cloud --help' for the current list)
+  -D, --debug   Enable debug logging
+
+$ sbx daemon --help
+Description:
+  Manage sandboxd daemon
+
+Usage:
+  sbx daemon COMMAND
+
+Available Commands:
+  log-level   Show or change sandboxd's per-category log levels
+  restart     Restart the sandboxd daemon
+  start       Start the sandboxd daemon
+  status      Show sandboxd daemon status
+  stop        Stop the sandboxd daemon
+
+Flags:
+  -h, --help   help for daemon
+
+Global Flags:
+      --cloud   Dispatch to Docker Cloud Sandboxes API instead of local sandboxd (supported by a growing set of verbs — run 'sbx --cloud --help' for the current list)
+  -D, --debug   Enable debug logging
+
+Use "sbx daemon COMMAND --help" for more information about a command.
+
+$ sbx diagnose
+
+INSTALLATION
+  ✓ CLI binary — found
+      /opt/homebrew/Caskroom/sbx/0.48.0/Sbx.app/Contents/MacOS/sbx
+  ✓ Binary version — v0.48.0
+  ✗ Daemon — not reachable
+      Get "http://localhost/daemon/health": dial unix /Users/81ueman/Library/Application Support/com.docker.sandboxes/sandboxes/sandboxd/sandboxd.sock: connect: no such file or directory
+      try: sbx daemon start
+  ⊘ Daemon diagnostics — Daemon unavailable
+
+PLATFORM
+  ✓ Virtualization — supported
+      kern.hv_support is 1
+  ✓ mkfs.erofs — found
+      /opt/homebrew/Caskroom/sbx/0.48.0/Sbx.app/Contents/libexec/mkfs.erofs, default block size 4096 bytes, guest kernel page size 16384 bytes
+  ✓ mkfs.ext4 — found
+      /opt/homebrew/Caskroom/sbx/0.48.0/Sbx.app/Contents/libexec/mkfs.ext4, mke2fs 1.47.4 (6-Mar-2025)
+
+STORAGE
+  ✓ Storage directories — all 1 paths present
+  ✓ Directory permissions — all writable
+  ✓ Disk space — 221.5GiB free
+      221.5GiB free of 926.3GiB on the state directory's volume
+
+CONNECTION
+  ⊘ Version match — Daemon unavailable
+  ✓ Socket — not present (daemon not running)
+  ✓ SSH client config — not configured
+  ⊘ Authentication — Daemon unavailable
+
+  10 passed · 1 failed · 3 skipped

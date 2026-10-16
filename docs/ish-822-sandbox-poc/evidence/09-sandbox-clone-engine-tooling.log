@@ -1,0 +1,38 @@
+$ sbx exec ish822-poc bash -lc '<clone+engine+tooling>'
+=== all mounts ===
+bind-95f03ffa45a7d998 on /etc/resolv.conf type virtiofs (ro,relatime)
+host on /run/sandbox/source type virtiofs (ro,nosuid,nodev,relatime)
+--- df ---
+host                   927G  709G  218G  77% /run/sandbox/source
+=== find the private clone ===
+total 40
+drwxr-xr-x 1 agent agent 4096 Oct 16 15:35 .
+drwxr-xr-x 1 root  root  4096 Sep 23 17:54 ..
+-rw-r--r-- 1 agent agent   77 Sep 23 18:14 .bash_profile
+-rw-r--r-- 1 agent agent  309 Sep 23 18:14 .bashrc
+drwxr-xr-x 3 agent agent   46 Sep 23 17:57 .docker
+-rw-r--r-- 1 agent agent  222 Oct 16 15:35 .gitconfig
+-rw-r--r-- 1 agent agent    5 Oct 16 15:35 .gitignore_global
+drwxr-xr-x 4 agent agent   61 Sep 23 17:57 .local
+drwxr-xr-x 1 agent agent   27 Sep 23 17:54 workspace
+=== primary workspace writable? ===
+WROTE-to-primary
+=== sudo ===
+sudo-ok
+=== tooling present? ===
+node: /usr/bin/node
+npm: /usr/bin/npm
+git: /usr/bin/git
+ssh: /usr/bin/ssh
+docker: /usr/bin/docker
+=== node/npm versions (if any) ===
+v22.22.1
+9.2.0
+=== apt available? ===
+/usr/bin/apt-get
+PRETTY_NAME="Ubuntu 26.04.1 LTS"
+=== engine name + host-container isolation ===
+SandboxDocker=ish822-poc OS=Ubuntu 26.04.1 LTS (containerized)
+--- docker ps -a (inside) ---
+CONTAINER ID   IMAGE     COMMAND   CREATED   STATUS    PORTS     NAMES
+EXIT=0

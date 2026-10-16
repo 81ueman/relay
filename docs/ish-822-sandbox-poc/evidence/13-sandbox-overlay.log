@@ -1,0 +1,28 @@
+$ sbx stop ish822-poc
+Git remote sandbox-ish822-poc is restored when the sandbox next starts.
+Stopped sandbox ish822-poc
+
+$ sbx exec ish822-poc bash -lc '<check env after restart>'
+  ✓ sandbox ish822-poc — started
+OLLAMA_CLOUD_V41_API_KEY=<unset>
+OPENCODE_GO_API_KEY=<unset>
+--- write provider overlay to /home/agent/dsh-overlay.yml ---
+wrote:
+- id: llm-pi-ai
+  name: "@deepseek-ai/dsh-llm-pi-ai"
+  config:
+    providers:
+      ollama-cloud-v41:
+        displayName: Ollama Cloud
+        apiKeyEnv: OLLAMA_CLOUD_V41_API_KEY
+        api: openai-completions
+        baseURL: https://ollama.com/v1
+        models:
+          - id: deepseek-v4.1-flash:cloud
+            name: DeepSeek V4.1 Flash
+- id: agent-default-model
+  name: "@deepseek-ai/dsh-agent-default-model"
+  config:
+    provider: ollama-cloud-v41
+    model: deepseek-v4.1-flash:cloud
+EXIT=0

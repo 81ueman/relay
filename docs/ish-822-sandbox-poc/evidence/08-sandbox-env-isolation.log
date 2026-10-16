@@ -1,0 +1,47 @@
+$ sbx exec ish822-poc bash -lc '<checks>'
+  ✓ sandbox ish822-poc — started
+=== uname / os ===
+Linux ish822-poc 7.0.14 #1 SMP PREEMPT Mon Sep 28 07:01:01 UTC 2026 aarch64 GNU/Linux
+PRETTY_NAME="Ubuntu 26.04.1 LTS"
+VERSION="26.04.1 LTS (Resolute Raccoon)"
+=== id / whoami ===
+uid=1000(agent) gid=1000(agent) groups=1000(agent),27(sudo),1001(docker)
+agent
+=== default cwd ===
+/private/var/folders/2l/lk91l4dd1ysb1jfw7bkw0nrh0000gn/T/ish822-fixture
+=== git clone remote / branch (in-sandbox clone) ===
+=== read-only source mount ===
+host on /run/sandbox/source type virtiofs (ro,nosuid,nodev,relatime)
+total 16
+drwxr-xr-x+1 agent agent 256 Oct 16 15:27 .
+drwxr-xr-x 3 root  root   60 Oct 16 15:36 ..
+-rw-r--r--+1 agent agent  34 Oct 16 15:27 .env
+drwxr-xr-x+1 agent agent   0 Oct 16 15:36 .git
+-rw-r--r--+1 agent agent  28 Oct 16 15:27 .gitignore
+-rw-r--r--+1 agent agent  35 Oct 16 15:27 README.md
+drwxr-xr-x+1 agent agent   0 Oct 16 15:27 src
+-rw-r--r--+1 agent agent  35 Oct 16 15:27 untracked-sentinel.txt
+=== can we WRITE to the RO source? (expect fail) ===
+touch: cannot touch '/run/sandbox/source/ISH822-WRITE-TEST': Read-only file system
+=== untracked + gitignored VISIBLE via source mount (expected: visible) ===
+ISH822-UNTRACKED-SENTINEL-<abc123>
+ISH822-GITIGNORED-SECRET-<zzz999>
+=== host HOME sentinel (expect: NOT visible) ===
+ls: cannot access '/home/agent/ISH822_HOST_HOME_SENTINEL.txt': No such file or directory
+cat: /home/agent/ISH822_HOST_HOME_SENTINEL.txt: No such file or directory
+=== host ~/.ssh (expect: NOT the host key) ===
+ls: cannot access '/home/agent/.ssh': No such file or directory
+=== other host repo (expect: NOT visible) ===
+ls: cannot access '/private/var/folders/2l/lk91l4dd1ysb1jfw7bkw0nrh0000gn/T/ish822-other-repo': No such file or directory
+=== host docker socket (expect: separate/absent) ===
+srw-rw---- 1 root docker 0 Oct 16 15:36 /var/run/docker.sock
+ls: cannot access '/Users/81ueman/.orbstack': No such file or directory
+=== sandbox docker engine ===
+OS=Ubuntu 26.04.1 LTS (containerized) ARCH=aarch64 NAME=ish822-poc
+CONTAINER ID   IMAGE     COMMAND   CREATED   STATUS    PORTS     NAMES
+=== ssh agent ===
+SSH_AUTH_SOCK=/run/ssh-agent.sock
+256 SHA256:NS4st6T1s3gkrUQddXYITu8oQiQEivnQ4ZmzconHi3I mathmathds@gmail.com (ED25519)
+=== ~/.ssh contents ===
+ls: cannot access '/home/agent/.ssh': No such file or directory
+EXIT=2

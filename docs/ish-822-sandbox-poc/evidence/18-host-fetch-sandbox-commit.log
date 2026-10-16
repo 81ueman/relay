@@ -1,0 +1,18 @@
+=== host remotes on fixture ===
+sandbox-ish822-poc	git://127.0.0.1:49155/ish822-fixture (fetch)
+sandbox-ish822-poc	git://127.0.0.1:49155/ish822-fixture (push)
+
+$ git fetch sandbox-ish822-poc
+remote: warning: unable to access '/root/.config/git/attributes': Permission denied        
+From git://127.0.0.1:49155/ish822-fixture
+ * [new branch]      main       -> sandbox-ish822-poc/main
+   ab967ff..526f8a1  main       -> refs/sandboxes/ish822-poc/main
+fetch exit=0
+=== fetched commit present on host? ===
+526f8a1 ISH-822: sandbox dsh commit
+ab967ff fixture: initial tracked content
+526f8a1 ISH-822: sandbox dsh commit
+ poc-note.txt | 1 +
+ 1 file changed, 1 insertion(+)
+=== host HEAD unchanged (sandbox commit NOT merged) ===
+ab967ffefafa656399eee2969272a343daad268a

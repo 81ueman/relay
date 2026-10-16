@@ -1,0 +1,27 @@
+# dsh runtime overlay for the ISH-822 sandbox PoC.
+#
+# The shipped `headless` profile defaults to the DeepSeek-official provider
+# (`provider: deepseek-official`, `model: deepseek-flash`), which needs
+# DEEPSEEK_API_KEY. This host has no DeepSeek API key, so the PoC borrows the
+# host's already-configured Ollama Cloud provider (a DeepSeek model served over
+# an OpenAI-compatible API). The key is supplied to the sandbox only as an
+# `sbx secret set-custom` placeholder; the sandbox never sees the real value.
+#
+# Pass with:  dsh --profile headless --patch /home/agent/dsh-overlay.yml --json "<task>"
+- id: llm-pi-ai
+  name: "@deepseek-ai/dsh-llm-pi-ai"
+  config:
+    providers:
+      ollama-cloud-v41:
+        displayName: Ollama Cloud
+        apiKeyEnv: OLLAMA_CLOUD_V41_API_KEY
+        api: openai-completions
+        baseURL: https://ollama.com/v1
+        models:
+          - id: deepseek-v4.1-flash:cloud
+            name: DeepSeek V4.1 Flash
+- id: agent-default-model
+  name: "@deepseek-ai/dsh-agent-default-model"
+  config:
+    provider: ollama-cloud-v41
+    model: deepseek-v4.1-flash:cloud

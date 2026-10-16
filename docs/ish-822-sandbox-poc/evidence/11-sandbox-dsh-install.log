@@ -1,0 +1,12 @@
+$ sbx exec ish822-poc bash -lc 'npm i -g @deepseek-ai/dsh@0.2.0-rc.2; dsh --version'
+WARN: docker hub refresh lock held by another process: context deadline exceeded
+npm WARN deprecated node-domexception@1.0.0: Use your platform's native DOMException instead
+
+added 543 packages in 1m
+
+65 packages are looking for funding
+  run `npm fund` for details
+---
+/usr/local/share/npm-global/bin/dsh
+0.2.0-rc.2
+EXIT=0
