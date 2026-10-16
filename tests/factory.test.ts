@@ -13,6 +13,7 @@ import { insertTaskResult } from "../src/results";
 import { acceptRunSubmission, DUPLICATE_WRITER, listRuns } from "../src/dsh-runner";
 import { launchTaskRun } from "../src/run-lifecycle";
 import { defaultRunner, gitHead } from "../src/verify";
+import { processPgid, processStartToken } from "../src/proc-identity";
 import { DEFAULT_INTEGRATOR_WORKER, pidAlive, runFactoryTask } from "../src/factory";
 import {
   DEFAULT_REVIEWER_WORKER as REVIEWER_WORKER,
@@ -540,16 +541,19 @@ describe("PR #10 finding 4: an orphaned running Run never hangs the factory", ()
     const id = newTask();
     const launched = await launchTaskRun(db, id, { repo, worktreesRoot: join(dir, "worktrees"), outputRoot: join(dir, "runs"), dshBin: dsh, fastExitMs: 0 });
     await launched.handle.wait();
-    // A REAL detached child in its own process group — the orphan that a crashed
-    // factory leaves behind. Nothing in this test process will ever finish it.
+    // A REAL detached child in its own process group — the orphan a crashed factory
+    // leaves behind. Store its OWN start token so the identity check proves it is
+    // this Run's process (a genuine orphan), not a reused PID.
     const child = Bun.spawn(["sleep", "30"], { detached: true, stdin: "ignore", stdout: "ignore", stderr: "ignore" });
     const childPid = child.pid;
-    db.query(`UPDATE runs SET state='running', pid=?, exit_code=NULL, ended_at=NULL WHERE id=?`).run(childPid, launched.handle.id);
+    db.query(
+      `UPDATE runs SET state='running', pid=?, spawn_lstart=?, exit_code=NULL, ended_at=NULL WHERE id=?`
+    ).run(childPid, processStartToken(childPid), launched.handle.id);
 
     const res = await runFactoryTask(db, id, { ...factoryDeps(dsh, reviewerHarness(["pass"]).spawner), timeoutMs: 300 });
     expect(res.outcome).toBe("coding_failed");
     expect(res.reason).toContain("expired");
-    // KILL BEFORE RELEASE: the orphan is dead, so the Run is terminal `failed`.
+    // KILL BEFORE RELEASE: proven ours and now dead, so the Run is terminal `failed`.
     expect(pidAlive(childPid)).toBe(false);
     expect(listRuns(db, { taskId: id })[0].state).toBe("failed");
     // With the writer truly gone, the worktree is free again — a following launch
@@ -564,9 +568,12 @@ describe("PR #10 finding 4: an orphaned running Run never hangs the factory", ()
     const id = newTask();
     const launched = await launchTaskRun(db, id, { repo, worktreesRoot: join(dir, "worktrees"), outputRoot: join(dir, "runs"), dshBin: dsh, fastExitMs: 0 });
     await launched.handle.wait();
-    // A live PID we will (by seam) fail to terminate: use this test process's own
-    // pid so no real signal is ever sent, and inject a terminate that returns false.
-    db.query(`UPDATE runs SET state='running', pid=?, exit_code=NULL, ended_at=NULL WHERE id=?`).run(process.pid, launched.handle.id);
+    // A genuine detached orphan (identity MATCHES), but the terminate seam fails.
+    const child = Bun.spawn(["sleep", "30"], { detached: true, stdin: "ignore", stdout: "ignore", stderr: "ignore" });
+    const childPid = child.pid;
+    db.query(
+      `UPDATE runs SET state='running', pid=?, spawn_lstart=?, exit_code=NULL, ended_at=NULL WHERE id=?`
+    ).run(childPid, processStartToken(childPid), launched.handle.id);
     const res = await runFactoryTask(db, id, {
       ...factoryDeps(dsh, reviewerHarness(["pass"]).spawner),
       timeoutMs: 300,
@@ -574,6 +581,8 @@ describe("PR #10 finding 4: an orphaned running Run never hangs the factory", ()
     });
     expect(res.outcome).toBe("coding_failed");
     expect(res.reason).toContain("could not be terminated");
+    // The seam never signalled: the orphan is still alive.
+    expect(pidAlive(childPid)).toBe(true);
     // The Run stays `running`, so the single-writer fence is intact.
     expect(listRuns(db, { taskId: id })[0].state).toBe("running");
     let refused = false;
@@ -583,6 +592,55 @@ describe("PR #10 finding 4: an orphaned running Run never hangs the factory", ()
       refused = new RegExp(DUPLICATE_WRITER).test(String(e));
     }
     expect(refused).toBe(true);
+    try { child.kill("SIGKILL"); } catch { /* done */ }
+  });
+
+  // Round-3 finding: the orphan-kill path must NEVER signal a PID that is not
+  // provably the Run's dsh. A reused PID (an unrelated host process) must survive.
+  test("a reused PID (unrelated NON-leader process) is NEVER signalled", async () => {
+    const dsh = fakeDsh("dsh-commit", COMMITTING_DSH);
+    const id = newTask();
+    const launched = await launchTaskRun(db, id, { repo, worktreesRoot: join(dir, "worktrees"), outputRoot: join(dir, "runs"), dshBin: dsh, fastExitMs: 0 });
+    await launched.handle.wait();
+    // A NON-detached child: it shares this process's group, so it is NOT a group
+    // leader — exactly the shape the old kill(pid) fallback would have hit.
+    const victim = Bun.spawn(["sleep", "30"], { stdin: "ignore", stdout: "ignore", stderr: "ignore" });
+    const victimPid = victim.pid;
+    expect(processPgid(victimPid)).not.toBe(victimPid); // not a leader
+    db.query(
+      `UPDATE runs SET state='running', pid=?, spawn_lstart='not-the-real-token', exit_code=NULL, ended_at=NULL WHERE id=?`
+    ).run(victimPid, launched.handle.id);
+
+    const res = await runFactoryTask(db, id, { ...factoryDeps(dsh, reviewerHarness(["pass"]).spawner), timeoutMs: 300 });
+    expect(res.outcome).toBe("coding_failed");
+    expect(res.reason).toContain("reused");
+    // The unrelated process is UNTOUCHED and still alive.
+    expect(pidAlive(victimPid)).toBe(true);
+    // The original dsh is gone, so the Row is terminal `failed` (no signal was sent).
+    expect(listRuns(db, { taskId: id })[0].state).toBe("failed");
+    try { victim.kill("SIGKILL"); } catch { /* done */ }
+  });
+
+  test("a group leader with a DIFFERENT spawn start time (reused PID) is NEVER signalled", async () => {
+    const dsh = fakeDsh("dsh-commit", COMMITTING_DSH);
+    const id = newTask();
+    const launched = await launchTaskRun(db, id, { repo, worktreesRoot: join(dir, "worktrees"), outputRoot: join(dir, "runs"), dshBin: dsh, fastExitMs: 0 });
+    await launched.handle.wait();
+    // A detached (group-leader) process, but the stored token is a DIFFERENT start
+    // time: the PID was reused. Identity mismatches on the token -> no signal.
+    const victim = Bun.spawn(["sleep", "30"], { detached: true, stdin: "ignore", stdout: "ignore", stderr: "ignore" });
+    const victimPid = victim.pid;
+    expect(processPgid(victimPid)).toBe(victimPid); // is a leader
+    db.query(
+      `UPDATE runs SET state='running', pid=?, spawn_lstart='Tue Jan  1 00:00:00 1980', exit_code=NULL, ended_at=NULL WHERE id=?`
+    ).run(victimPid, launched.handle.id);
+
+    const res = await runFactoryTask(db, id, { ...factoryDeps(dsh, reviewerHarness(["pass"]).spawner), timeoutMs: 300 });
+    expect(res.outcome).toBe("coding_failed");
+    expect(res.reason).toContain("reused");
+    expect(pidAlive(victimPid)).toBe(true);
+    expect(listRuns(db, { taskId: id })[0].state).toBe("failed");
+    try { victim.kill("SIGKILL"); } catch { /* done */ }
   });
 });
 

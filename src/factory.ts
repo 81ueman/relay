@@ -5,6 +5,7 @@ import { getTask, claimTask } from "./tasks";
 import { getWorker, registerWorker } from "./workers";
 import { INTEGRATOR_ROLE, REVIEWER_ROLE } from "./schema";
 import type { Run, RunState, Task, TaskState } from "./schema";
+import { processPgid, processStartToken } from "./proc-identity";
 import { defaultRunner, type CommandRunner } from "./verify";
 import { runMechanicalVerification, submitPhase, taskChecks } from "./workflow";
 import { acceptRunSubmission, getRun } from "./dsh-runner";
@@ -206,31 +207,58 @@ async function waitPidGone(pid: number, budgetMs: number): Promise<boolean> {
  * tree, exactly like `RunHandle.cancel`. SIGTERM first, then SIGKILL after a
  * grace period. Returns true only once the leader is actually gone.
  *
- * A caller MUST NOT release the single-writer fence (mark the Run terminal) while
- * this returns false: the old writer would still be writing the worktree.
+ * GROUP ONLY: there is deliberately NO `kill(pid)` fallback. A plain `kill(pid)`
+ * would fire exactly when `pid` is NOT a group leader — which proves it is NOT
+ * the setsid'd dsh — so it can only ever hit an innocent, reused PID. Callers
+ * MUST prove the identity first (see `identifyRunProcess`) and MUST NOT release
+ * the single-writer fence while this returns false.
  */
 export async function terminateProcessGroup(pid: number, graceMs = ORPHAN_SIGKILL_GRACE_MS): Promise<boolean> {
   if (!pidAlive(pid)) return true;
   try {
     process.kill(-pid, "SIGTERM");
   } catch {
-    try {
-      process.kill(pid, "SIGTERM");
-    } catch {
-      /* already gone */
-    }
+    /* not a group leader / already gone — never fall back to kill(pid) */
   }
   if (await waitPidGone(pid, graceMs)) return true;
   try {
     process.kill(-pid, "SIGKILL");
   } catch {
-    try {
-      process.kill(pid, "SIGKILL");
-    } catch {
-      /* already gone */
-    }
+    /* not a group leader / already gone */
   }
   return waitPidGone(pid, 2000);
+}
+
+/** How the factory classified an adopted Run's recorded PID. */
+export type OrphanIdentity = "dead" | "match" | "reused" | "undeterminable";
+
+/**
+ * Prove whether the recorded PID still belongs to the Run's dsh, BEFORE any
+ * signal. Two independent identity properties are required:
+ *
+ *   1. it is a process-GROUP leader (`pgid === pid`) — dsh is spawned `detached`;
+ *   2. the process START TIME equals the token stored on the Run row at spawn.
+ *
+ * Returns:
+ *   "dead"           — the PID is gone (safe: nothing to signal);
+ *   "reused"         — a live PID that is NOT this Run's dsh (pgid/≠token): never
+ *                      signal it; treat like dead (the original dsh is gone);
+ *   "match"          — provably this Run's process group: safe to terminate;
+ *   "undeterminable" — a live PID we cannot identify (missing token / ps): never
+ *                      signal it; leave the Run `running` so the fence holds.
+ */
+export function identifyRunProcess(run: Pick<Run, "pid" | "spawn_lstart">): OrphanIdentity {
+  const pid = run.pid;
+  if (!pid || !pidAlive(pid)) return "dead";
+  const pgid = processPgid(pid);
+  const token = processStartToken(pid);
+  if (pgid === null || token === null || !run.spawn_lstart) return "undeterminable";
+  // Not a group leader => not the setsid'd dsh: a reused PID (or a child of a
+  // shell). Never signal it.
+  if (pgid !== pid) return "reused";
+  // A different start time proves the PID was reused since launch.
+  if (token !== run.spawn_lstart) return "reused";
+  return "match";
 }
 
 /**
@@ -281,9 +309,52 @@ async function implementOnce(
     const { run: waited, timedOut } = await waitRunBounded(db, live.id, deadlineMs);
     if (timedOut) {
       const reason = `adopted run ${live.id} exceeded its ${runTimeoutMs}ms budget (expired)`;
-      // KILL BEFORE RELEASE: never free the single-writer fence while the old
-      // writer may still be writing the worktree. Terminate the detached process
-      // group first; only a confirmed-dead leader lets us mark the Run terminal.
+      // IDENTITY BEFORE ANY SIGNAL. A stale `pid` may have been REUSED by an
+      // unrelated host process (reboot / long crash). Prove the PID is still this
+      // Run's dsh (group leader + matching spawn start time) before terminating;
+      // never signal a process we cannot prove is ours.
+      const identity = identifyRunProcess({ pid: live.pid, spawn_lstart: live.spawn_lstart });
+      if (identity === "reused") {
+        // A live PID that is NOT this Run's dsh: the original dsh is gone. Take the
+        // dead-PID path — mark the Run terminal — and send NO signal to the stranger.
+        logEvent(db, {
+          source: "factory",
+          taskId: task.id,
+          type: "factory.orphan_pid_reused",
+          payload: { runId: live.id, pid: live.pid, reason },
+        });
+        markRunOrphan(db, live.id, `${reason}; recorded pid ${live.pid ?? "none"} is an unrelated process (reused)`);
+        const r = getRun(db, live.id)!;
+        return {
+          run: r,
+          producedHead: r.head_sha,
+          error: `${CODING_FAILED}: ${reason} (recorded pid was reused; no signal sent)`,
+        };
+      }
+      if (identity === "undeterminable") {
+        // A live PID we cannot prove belongs to this Run: do NOT signal. Leave the
+        // Run `running` so the single-writer fence keeps holding.
+        logEvent(db, {
+          source: "factory",
+          taskId: task.id,
+          type: "factory.orphan_identity_undeterminable",
+          payload: { runId: live.id, pid: live.pid, reason, spawnLstart: live.spawn_lstart },
+        });
+        const r = getRun(db, live.id)!;
+        return {
+          run: r,
+          producedHead: r.head_sha,
+          error: `${CODING_FAILED}: ${reason}; orphan identity could not be proven (Run left running to keep the single-writer fence)`,
+        };
+      }
+      if (identity === "dead") {
+        markRunOrphan(db, live.id, `${reason}; owner pid is no longer alive`);
+        const r = getRun(db, live.id)!;
+        return { run: r, producedHead: r.head_sha, error: `${CODING_FAILED}: ${reason}` };
+      }
+      // identity === "match": provably this Run's dsh process group. KILL BEFORE
+      // RELEASE — never free the single-writer fence while the old writer may still
+      // be writing the worktree. Only a confirmed-dead leader lets us go terminal.
       const terminate = deps.terminateOrphan ?? ((pid: number) => terminateProcessGroup(pid));
       const dead = await terminate(live.pid!);
       if (!dead) {

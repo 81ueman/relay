@@ -91,17 +91,22 @@ ordered `steps`. A non-`merge_ready` outcome exits non-zero.
   credited. A principal that is not an independent reviewer (wrong role, or the
   submitter) → `REVIEW_NOT_INDEPENDENT`. An unresolved NG at the same head is
   never cleared by a later OK alone.
-- **An orphaned Run never hangs the Factory, and never lets a second writer in.**
-  On adoption the Run's PID is checked (`process.kill(pid, 0)`); a Run whose
-  owning process is gone is marked terminal `failed`. A Run that is still ALIVE
-  when it exceeds its budget (the deadline is `started_at + run timeout`, not the
-  moment of adoption) is **killed before the single-writer fence is released**:
-  the detached process group is `SIGTERM`-ed, then `SIGKILL`-ed after a grace
-  period, and the Run is marked `failed` **only once the leader is confirmed
-  gone**. If the group cannot be killed, the Run is **left `running`** so
-  `findActiveWriter` keeps returning `DUPLICATE_WRITER` for the worktree/branch —
-  the Factory still returns `CODING_FAILED`, but never frees the workspace for a
-  second writer.
+- **An orphaned Run never hangs the Factory, never lets a second writer in, and
+  never signals a stranger.** On adoption the Run's PID is checked
+  (`process.kill(pid, 0)`); a Run whose owning process is gone is marked terminal
+  `failed`. A Run that is still ALIVE when it exceeds its budget (the deadline is
+  `started_at + run timeout`, not the moment of adoption) is **identified before
+  any signal**: the factory requires it to be a **process-group leader**
+  (`pgid === pid`, as the `setsid`-spawned dsh is) **and** its process **start time**
+  (`ps -o lstart=`, stored on `runs.spawn_lstart` at spawn) to match the token
+  captured at launch. Only then is the detached process group `SIGTERM`-ed, then
+  `SIGKILL`-ed after a grace period, and the Run marked `failed` **only once the
+  leader is confirmed gone**. A **reused PID** (a live process that is not this
+  Run's dsh) is treated like a dead one — the Run is marked `failed` and **no
+  signal is sent** to the stranger; an **unidentifiable** live PID is left
+  `running` so `findActiveWriter` keeps returning `DUPLICATE_WRITER`. There is
+  **no `kill(pid)` fallback**: a bare `kill(pid)` fires exactly when `pid` is not a
+  group leader, which proves it is not the dsh.
 - **Old HEAD cannot advance.** Every result is bound to the revision it judged;
   the merge gate re-reads GitHub and refuses a PR head != `task.head_sha`.
 - **MergeReady is read-only.** The Factory never pushes, merges, accepts,
@@ -219,7 +224,7 @@ unchanged by this issue.
 
 ## Verified / not verified
 
-- **Verified** — `bun run typecheck`; `bun test` (822 pass, 1 skipped, 0 fail);
+- **Verified** — `bun run typecheck`; `bun test` (824 pass, 1 skipped, 0 fail);
   `bun run smoke:factory` (PASS, 13 checks); `RELAY_REAL_SMOKE=1 bun run
   smoke:factory:real` (PASS with real `dsh 0.2.0-rc.2` + real Claude; see the raw
   output above); `tests/factory.test.ts` covers the FIX→fresh-Run→PASS loop, the
