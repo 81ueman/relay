@@ -169,14 +169,38 @@ function readEvents(runId: string): any[] {
     .map((l) => JSON.parse(l));
 }
 
+/** The ORIGINAL dsh `--json` JSONL evidence for a Run. */
+function readDshJsonl(runId: string): any[] {
+  const p = join(dir, "runs", runId, "dsh.jsonl");
+  if (!existsSync(p)) return [];
+  return readFileSync(p, "utf-8")
+    .split("\n")
+    .filter(Boolean)
+    .map((l) => JSON.parse(l));
+}
+
+/** One dsh JSONL stdout line (as the real `--json` profile emits it). */
+function dshLine(obj: Record<string, unknown>): string {
+  return `${JSON.stringify(obj)}\n`;
+}
+
+/** A minimal, ordered dsh 0.2.0-rc.2 JSONL run: session -> text -> final. */
+function emitHappyJsonl(p: FakeProcess, sessionId: string, text = "SMOKE_OK"): void {
+  p.writeOut(dshLine({ type: "session", sessionId, cwd: "/tmp/wt" }));
+  p.writeOut(dshLine({ type: "status", phase: "turn_start", turn: 1 }));
+  p.writeOut(dshLine({ type: "text", text }));
+  p.writeOut(dshLine({ type: "status", phase: "turn_end", turn: 1, reason: { kind: "completed" } }));
+  p.writeOut(dshLine({ type: "final", text }));
+}
+
 describe("one-shot headless dsh Run lifecycle", () => {
-  test("normal run: streams stdout/stderr, records exit 0, and does NOT submit", async () => {
+  test("normal run: reads dsh --json JSONL, records exit 0, and does NOT submit", async () => {
     const { id, outputRoot } = newTask();
     const spawner = new FakeSpawner();
+    const sessionId = "session-11111111-2222-3333-4444-555555555555";
     spawner.onSpawn = (p) => {
-      p.writeOut("dsh: reasoning: thinking...\n"); // never (headless puts reasoning on stderr, but be tolerant)
       p.writeErr("dsh: reasoning:\nworking through it\n");
-      p.writeOut("DONE: all edits committed\n");
+      emitHappyJsonl(p, sessionId, "DONE: all edits committed");
       p.finish(0);
     };
     const h = await startDshRun(db, { taskId: id, spawner, outputRoot, fastExitMs: 0 });
@@ -186,26 +210,139 @@ describe("one-shot headless dsh Run lifecycle", () => {
     expect(run.exit_code).toBe(0);
     expect(run.pid).toBeGreaterThan(0);
     expect(run.ended_at).not.toBeNull();
-    expect(readFileSync(run.stdout_path!, "utf-8")).toContain("DONE: all edits committed");
+    // The dsh sessionId from the `session` event is the Run's session_id.
+    expect(run.session_id).toBe(sessionId);
+    // The RAW stdout is still kept, and the ORIGINAL dsh JSONL is separate evidence.
+    expect(readFileSync(run.stdout_path!, "utf-8")).toContain('"type":"final"');
     expect(readFileSync(run.stderr_path!, "utf-8")).toContain("working through it");
-
+    const dsh = readDshJsonl(run.id);
+    expect(dsh.map((e) => e.type)).toEqual(["session", "status", "text", "status", "final"]);
+    expect(run.dsh_events_path).toBe(join(outputRoot, run.id, "dsh.jsonl"));
+    // Relay's own log carries an ANNOTATION of each dsh event TYPE (never the
+    // dsh payload), so the two logs stay distinct.
+    const relay = readEvents(run.id);
+    expect(relay.filter((e) => e.t === "dsh.event").map((e) => e.type)).toEqual([
+      "session",
+      "status",
+      "text",
+      "status",
+      "final",
+    ]);
+    expect(relay.some((e) => e.t === "stdout")).toBe(false);
     // A clean exit is NOT a submission: the task must not have advanced.
     const task = getTask(db, id)!;
     expect(task.phase).toBe("implement");
     expect(task.state).toBe("queued");
     expect(findTaskResult(db, id, "implement", 0, "TaskSubmitted")).toBeNull();
-    expect(readEvents(run.id).some((e) => e.t === "run.exited" && e.state === "exited")).toBe(true);
+    const exited = relay.find((e) => e.t === "run.exited");
+    expect(exited?.state).toBe("exited");
+    expect(exited?.terminal).toBe("final");
+    expect(exited?.turnReason).toBe("completed");
   });
 
-  test("the pinned CLI is used exactly: dsh --profile headless <task>", async () => {
+  test("a real tool_call + tool_result are preserved in per-Run dsh evidence", async () => {
+    const { id, outputRoot } = newTask();
+    const spawner = new FakeSpawner();
+    const sessionId = "session-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    spawner.onSpawn = (p) => {
+      p.writeOut(dshLine({ type: "session", sessionId, cwd: "/tmp/wt" }));
+      p.writeOut(dshLine({ type: "tool_call", callId: "call_1", tool: "read", input: { file_path: "note.txt" } }));
+      p.writeOut(
+        dshLine({
+          type: "tool_result",
+          callId: "call_1",
+          status: "completed",
+          result: "<content>\n1: hello-from-file\n</content>",
+        })
+      );
+      p.writeOut(dshLine({ type: "final", text: "read it" }));
+      p.finish(0);
+    };
+    const h = await startDshRun(db, { taskId: id, spawner, outputRoot, fastExitMs: 0 });
+    const run = await h.wait();
+    expect(run.state).toBe("exited");
+    const dsh = readDshJsonl(run.id);
+    const call = dsh.find((e) => e.type === "tool_call");
+    const result = dsh.find((e) => e.type === "tool_result");
+    expect(call.tool).toBe("read");
+    expect(call.callId).toBe("call_1");
+    expect(call.input.file_path).toBe("note.txt");
+    expect(result.callId).toBe("call_1");
+    expect(result.status).toBe("completed");
+    expect(result.result).toContain("hello-from-file");
+    expect(readEvents(run.id).find((e) => e.t === "run.exited")?.dsh.toolCall).toBe(1);
+  });
+
+  test("a truncated event is preserved and flagged (never a false success)", async () => {
+    const { id, outputRoot } = newTask();
+    const spawner = new FakeSpawner();
+    spawner.onSpawn = (p) => {
+      p.writeOut(dshLine({ type: "session", sessionId: "session-99999999-8888-7777-6666-555555555555", cwd: "/tmp" }));
+      p.writeOut(dshLine({ type: "text", text: "x".repeat(20), truncated: true }));
+      p.writeOut(dshLine({ type: "final", text: "done" }));
+      p.finish(0);
+    };
+    const h = await startDshRun(db, { taskId: id, spawner, outputRoot, fastExitMs: 0 });
+    const run = await h.wait();
+    expect(run.state).toBe("exited");
+    expect(readDshJsonl(run.id).find((e) => e.type === "text").truncated).toBe(true);
+    expect(readEvents(run.id).find((e) => e.t === "run.exited")?.dsh.truncated).toBe(1);
+  });
+
+  test("a missing `session` event leaves session_id null but the Run still exits", async () => {
+    const { id, outputRoot } = newTask();
+    const spawner = new FakeSpawner();
+    spawner.onSpawn = (p) => {
+      p.writeOut(dshLine({ type: "text", text: "no session here" }));
+      p.writeOut(dshLine({ type: "final", text: "no session here" }));
+      p.finish(0);
+    };
+    const h = await startDshRun(db, { taskId: id, spawner, outputRoot, fastExitMs: 0 });
+    const run = await h.wait();
+    expect(run.state).toBe("exited");
+    expect(run.session_id).toBeNull();
+  });
+
+  test("an in-turn failure with a `final` is still failed by the exit code", async () => {
+    const { id, outputRoot } = newTask();
+    const spawner = new FakeSpawner();
+    spawner.onSpawn = (p) => {
+      p.writeOut(dshLine({ type: "session", sessionId: "session-12121212-3434-5656-7878-909090909090", cwd: "/tmp" }));
+      p.writeOut(dshLine({ type: "final", text: "gave up" }));
+      p.finish(1);
+    };
+    const h = await startDshRun(db, { taskId: id, spawner, outputRoot, fastExitMs: 0 });
+    const run = await h.wait();
+    expect(run.state).toBe("failed");
+    expect(run.exit_code).toBe(1);
+    expect(() => acceptRunSubmission(db, { runId: run.id })).toThrow(/RUN_SUBMISSION_REJECTED/);
+    expect(findTaskResult(db, id, "implement", 0, "TaskSubmitted")).toBeNull();
+  });
+
+  test("a terminal `error` event with exit 0 fails closed", async () => {
+    const { id, outputRoot } = newTask();
+    const spawner = new FakeSpawner();
+    spawner.onSpawn = (p) => {
+      p.writeOut(dshLine({ type: "session", sessionId: "session-00000000-1111-2222-3333-444444444444", cwd: "/tmp" }));
+      p.writeOut(dshLine({ type: "error", message: "provider exploded outside a turn" }));
+      p.finish(0);
+    };
+    const h = await startDshRun(db, { taskId: id, spawner, outputRoot, fastExitMs: 0 });
+    const run = await h.wait();
+    expect(run.state).toBe("failed");
+    expect(run.error).toContain("provider exploded");
+    expect(() => acceptRunSubmission(db, { runId: run.id })).toThrow(/RUN_SUBMISSION_REJECTED/);
+  });
+
+  test("the pinned CLI is used exactly: dsh --profile headless --json <task>", async () => {
     const { id, outputRoot } = newTask();
     const spawner = new FakeSpawner();
     spawner.onSpawn = (p) => p.finish(0);
     const h = await startDshRun(db, { taskId: id, spawner, outputRoot });
     await h.wait();
     expect(spawner.argv[0][0]).toBe("dsh");
-    expect(spawner.argv[0].slice(0, 3)).toEqual(["dsh", "--profile", "headless"]);
-    expect(spawner.argv[0][3]).toContain(`# Task ${id}`);
+    expect(spawner.argv[0].slice(0, 4)).toEqual(["dsh", "--profile", "headless", "--json"]);
+    expect(spawner.argv[0][4]).toContain(`# Task ${id}`);
     // Permission boundary: workspace-write by default, and the Run is identified.
     expect(spawner.envs[0].DSH_PERMISSION_MODE).toBe("workspace-write");
     expect(spawner.envs[0].RELAY_RUN_ID).toBe(h.id);
@@ -279,24 +416,44 @@ describe("one-shot headless dsh Run lifecycle", () => {
     expect(readEvents(run.id).some((e) => e.t === "run.timeout")).toBe(true);
   });
 
-  test("malformed stdout never throws and is recorded line by line", async () => {
+  test("malformed stdout stays visible, is never dsh evidence, and never throws", async () => {
     const { id, outputRoot } = newTask();
     const spawner = new FakeSpawner();
     spawner.onSpawn = (p) => {
+      // The real profile prints this plugin banner to stdout BEFORE the JSONL.
+      p.writeOut("[opencode-session-id] mounted: providers=[opencode]\n");
       p.writeOut("not json at all\n");
       p.writeOut('{"broken": \n');
-      p.writeOut("plain final text"); // no trailing newline: still delivered
+      p.writeOut(dshLine({ type: "final", text: "done" })); // no trailing newline case below
       p.finish(0);
     };
     const h = await startDshRun(db, { taskId: id, spawner, outputRoot, fastExitMs: 0 });
     const run = await h.wait();
+    // exit 0 is still the (authoritative) process success, but the malformed
+    // lines are surfaced and are NOT counted as dsh events.
     expect(run.state).toBe("exited");
-    const stdoutEvents = readEvents(run.id).filter((e) => e.t === "stdout");
-    expect(stdoutEvents.map((e) => e.v)).toEqual([
+    const malformed = readEvents(run.id).filter((e) => e.t === "stdout.malformed");
+    expect(malformed.map((e) => e.v)).toEqual([
+      "[opencode-session-id] mounted: providers=[opencode]",
       "not json at all",
       '{"broken": ',
-      "plain final text",
     ]);
+    // Malformed lines are never written into the dsh JSONL evidence.
+    expect(readDshJsonl(run.id).map((e) => e.type)).toEqual(["final"]);
+    expect(readEvents(run.id).find((e) => e.t === "run.exited")?.dsh.malformed).toBe(3);
+  });
+
+  test("a last stdout line without a trailing newline is still parsed", async () => {
+    const { id, outputRoot } = newTask();
+    const spawner = new FakeSpawner();
+    spawner.onSpawn = (p) => {
+      p.writeOut(JSON.stringify({ type: "final", text: "no newline" })); // no "\n"
+      p.finish(0);
+    };
+    const h = await startDshRun(db, { taskId: id, spawner, outputRoot, fastExitMs: 0 });
+    const run = await h.wait();
+    expect(readDshJsonl(run.id).map((e) => e.type)).toEqual(["final"]);
+    expect(readEvents(run.id).some((e) => e.t === "stdout.malformed")).toBe(false);
   });
 
   test("an abnormally fast exit is flagged but still not a submission", async () => {
@@ -498,6 +655,41 @@ describe("relay run start always reaches a terminal state (finding 3)", () => {
     const row = getRun(db, listRuns(db, { taskId: id })[0].id)!;
     expect(row.state).toBe("exited");
     expect(row.exit_code).toBe(0);
+  });
+});
+
+describe("relay run logs: read-only dsh event history (ISH-810)", () => {
+  test("shows the session id and the ordered tool_call/tool_result chronology", async () => {
+    const { id, cwd } = newGitTask();
+    const binDir = mkdtempSync(join(tmpdir(), "relay-dsh-bin-"));
+    const bin = join(binDir, "dsh-json.sh");
+    writeFileSync(
+      bin,
+      [
+        "#!/bin/sh",
+        `printf '%s\\n' '{"type":"session","sessionId":"session-cli-1111-2222-3333-4444-555555555555","cwd":"/tmp"}'`,
+        `printf '%s\\n' '{"type":"tool_call","callId":"c1","tool":"read","input":{"file_path":"note.txt"}}'`,
+        `printf '%s\\n' '{"type":"tool_result","callId":"c1","status":"completed","result":"hello-from-file"}'`,
+        `printf '%s\\n' '{"type":"final","text":"done"}'`,
+        "exit 0",
+        "",
+      ].join("\n")
+    );
+    chmodSync(bin, 0o755);
+    const cli = join(import.meta.dir, "..", "src", "cli.ts");
+    const env = { ...process.env, RELAY_DB: process.env.RELAY_DB!, RELAY_DSH_BIN: bin };
+    const start = Bun.spawnSync(["bun", cli, "run", "start", id, "--cwd", cwd], { env, stdout: "pipe", stderr: "pipe" });
+    expect(start.exitCode).toBe(0);
+    const runId = listRuns(db, { taskId: id })[0].id;
+
+    const logs = Bun.spawnSync(["bun", cli, "run", "logs", runId], { env, stdout: "pipe", stderr: "pipe" });
+    const out = logs.stdout.toString();
+    expect(out).toContain("--- dsh events");
+    expect(out).toContain("session=session-cli-1111-2222-3333-4444-555555555555");
+    expect(out).toContain("tool_call read c1");
+    expect(out).toContain("tool_result c1 status=completed");
+    expect(out).toContain("hello-from-file");
+    expect(out).toContain('final "done"');
   });
 });
 

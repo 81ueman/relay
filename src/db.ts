@@ -311,6 +311,10 @@ function migrate(db: Database): void {
   if (columnExists(db, "runs", "id") && !columnExists(db, "runs", "base_head_sha")) {
     db.exec("ALTER TABLE runs ADD COLUMN base_head_sha TEXT;");
   }
+  // ISH-810 Runs: the per-Run path of the ORIGINAL dsh `--json` JSONL evidence.
+  if (columnExists(db, "runs", "id") && !columnExists(db, "runs", "dsh_events_path")) {
+    db.exec("ALTER TABLE runs ADD COLUMN dsh_events_path TEXT;");
+  }
   // NOTE: (worker_id, generation) is kept unique by application logic (the
   // monotonic `nextGeneration` helper), not by a DB constraint. Legacy rows may
   // legitimately share a generation (e.g. an active row plus a protected stale

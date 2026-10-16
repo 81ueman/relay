@@ -181,7 +181,9 @@ describe("single-writer: one disposable Run per phase/attempt", () => {
     expect(run.exit_code).toBe(0);
     expect(run.cwd).toBe(launched.worktree);
     expect(spawner.cwds[0]).toBe(launched.worktree);
-    expect(spawner.argv[0][3]).toContain(`# Task ${id}`);
+    // ISH-810: the pinned headless CLI now carries `--json` before the task.
+    expect(spawner.argv[0].slice(0, 4)).toEqual(["dsh", "--profile", "headless", "--json"]);
+    expect(spawner.argv[0][4]).toContain(`# Task ${id}`);
     expect(run.generation).toBe(run.attempt);
     // The brief is pinned IN the worktree before launch.
     expect(existsSync(launched.briefPath)).toBe(true);

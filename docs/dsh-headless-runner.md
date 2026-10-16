@@ -1,16 +1,17 @@
-# Headless dsh Run (ISH-803)
+# Headless dsh Run (ISH-803, upgraded in ISH-810)
 
-Relay can run a **coding attempt as one `dsh --profile headless` process** — no
-Herdr pane, no TUI, no `dsh web` server, no Cordis wake plugin, and no manual
-attach. One Run = one process = one coding attempt.
+Relay can run a **coding attempt as one `dsh --profile headless --json` process**
+— no Herdr pane, no TUI, no `dsh web` server, no Cordis wake plugin, and no
+manual attach. One Run = one process = one coding attempt.
 
-This is implemented in `src/dsh-runner.ts` and driven from the CLI:
+This is implemented in `src/dsh-runner.ts` (process lifecycle) and
+`src/dsh-events.ts` (the JSONL decoder) and driven from the CLI:
 
 ```sh
 relay run start <task-id> [--cwd DIR] [--prompt TEXT] [--permission MODE] [--timeout 30m] [--json]
 relay run list [--task <id>] [--json]
 relay run show <run-id> [--json]
-relay run logs <run-id> [--tail N]
+relay run logs <run-id> [--tail N]     # stdout + stderr + the dsh event chronology
 relay run cancel <run-id>
 relay run submit <run-id> [--evidence E] [--summary S]
 ```
@@ -19,33 +20,41 @@ The older `integrations/dsh-relay/` bridge is for the **long-lived** `dsh
 web`/SDK (`worker.wake.await -> followup()`); a one-shot headless attempt is
 launched directly instead — the bridge is not extended and not used here.
 
-## Pinned CLI contract
+## Pinned CLI contract (dsh 0.2.0-rc.2)
 
 Confirmed against the installed tool, not guessed:
 
-- `dsh --version` → **`0.1.5-rc.1`** (bundle `@deepseek-ai/dsh-headless`
-  `0.1.5-rc.2`), checked with the real `dsh --help` and `dsh --profile headless
-  --help`.
-- The app is `dsh --profile headless <task...>`; multiple words are joined by
-  spaces. `-h/--help` prints usage and exits 0; a missing task is a usage error.
-- **stdout**: the final assistant text, then a newline. *Observed deviation on
-  this machine:* the locally installed `@gausszhou/dsh-opencode-session-id`
-  plugin (mounted by this profile) also prints a `[opencode-session-id] mounted:
-  ...` banner to stdout at boot, before the final text. The runner therefore
-  records **every** stdout line as a `stdout` event and never parses stdout as a
-  protocol.
-- **stderr**: streamed provider *reasoning* (prefixed `dsh: reasoning:` on its own
-  line) and errors (`dsh: <code>: <message>`).
-- **exit code**: `0` only when the turn ended with reason `completed`; any other
-  outcome exits `1`.
-- **No `--json`/JSONL flag exists in this version** and there is no
-  machine-readable event field to parse, so the runner treats stdout/stderr as
-  text and writes its **own** lifecycle JSONL (see below). This deliberately
-  avoids implementing unverified options/fields.
-- Relevant environment variables observed in the profile config: `DSH_HOME`
-  (profiles/sessions root), `DSH_PERMISSION_MODE`, `DSH_TOOLS_MODE`,
-  `DEEPSEEK_API_KEY`. The runner only sets `DSH_PERMISSION_MODE` (plus
-  `RELAY_RUN_ID` / `RELAY_TASK_ID` for attribution).
+- `dsh --version` → **`0.2.0-rc.2`**, checked with the real `dsh --help` and
+  `dsh --profile headless --help`.
+- The app is `dsh --profile headless --json <task...>`; multiple words are joined
+  by spaces, and `--json -` reads the task from stdin. `-h/--help` prints usage
+  and exits 0; a missing task is a usage error.
+- **stdout** is **newline-delimited JSON execution events**:
+  `session` (`sessionId`/`cwd`), `status` (turn/step phases; a `turn_end` phase
+  carries the `reason`), `text`, `thinking`, `tool_call`
+  (`callId`/`tool`/`input`), `tool_result` (`callId`/`status`/`result`), and a
+  terminal `final` — or `error` when a failure happens **outside** a turn.
+- **stderr** carries provider *reasoning* (`dsh: reasoning:` lines) and errors
+  (`dsh: <code>: <message>`). It is stored verbatim; the runner never parses it
+  as a protocol.
+- **exit code**: `0` only when the turn completed. The runner treats the exit
+  code as authoritative for **process** success (a `final` event is *not*
+  required, and is *never* a substitute for `relay run submit`).
+- Observed deviation on this machine: the locally installed
+  `@gausszhou/dsh-opencode-session-id` plugin (mounted by the profile) prints a
+  `[opencode-session-id] mounted: …` banner to **stdout** before the JSONL. The
+  decoder therefore tolerates non-JSON lines and records them as
+  `stdout.malformed`; it never treats a stray banner as a dsh event.
+- The JSONL is a **bounded projection**, not a lossless Session log: individual
+  strings are capped (typically ≤8 KiB), a whole event is capped (≤32 KiB, the
+  terminal `final` exempt), truncated fields are flagged, and tool results may
+  contain sensitive data. Relay stores the **raw** JSONL (see below) rather than
+  re-encoding it, so whatever dsh emitted (including its truncation flags) is
+  what the evidence shows.
+- Environment observed in the profile config: `DSH_HOME` (profiles/sessions
+  root), `DSH_PERMISSION_MODE`, `DSH_TOOLS_MODE`, `DEEPSEEK_API_KEY`. The runner
+  only sets `DSH_PERMISSION_MODE` (plus `RELAY_RUN_ID` / `RELAY_TASK_ID` for
+  attribution). It does **not** pass `--session-id`: a FIX is a fresh Run.
 
 ## Process and output
 
@@ -55,16 +64,22 @@ never shared `/tmp`):
 | file | contents |
 | -- | -- |
 | `spec.md` | the task text handed to dsh (title / description / acceptance) |
-| `stdout.log` | the dsh stdout lines (final assistant text) |
+| `stdout.log` | the raw dsh stdout lines (the JSONL events, plus any boot banner) |
 | `stderr.log` | the dsh stderr lines (reasoning/errors) |
-| `events.jsonl` | Relay's own lifecycle JSONL: `run.started`, one `stdout`/`stderr` per line, `run.fast_exit`, `run.cancelled`/`run.timeout`, `run.exited` |
+| `dsh.jsonl` | **the ORIGINAL dsh `--json` JSONL evidence** — one dsh event per line, verbatim |
+| `events.jsonl` | **Relay's own** lifecycle JSONL: `run.started`, one `dsh.event` **annotation** per dsh event (type + callId only — never the dsh payload), `stdout.malformed` for an unparseable line, `stderr` lines, `run.fast_exit`, `run.cancelled`/`run.timeout`, `run.exited` |
+
+The two logs are deliberately **distinct**: Relay never writes its own events
+into `dsh.jsonl`, and never writes a dsh payload into `events.jsonl` as if it
+were a dsh event.
 
 The durable Run row (`runs` table) records id / task / phase / attempt /
 generation / cwd / branch / **base_head_sha (the pre-run HEAD) / head_sha (the
 PRODUCED HEAD, re-read from the worktree at Run end)** / pid / exit code / signal
-/ dsh session id (when a `session-<uuid>` token appears in the output) /
-start+end time / output and evidence refs. It is keyed to the Task; it is **not**
-a second workflow state machine — the Task's `phase`/`attempt` stays the truth.
+/ **dsh `sessionId` (from the `session` event)** / start+end time / output and
+evidence refs (`stdout_path` / `stderr_path` / `events_path` / `dsh_events_path`).
+It is keyed to the Task; it is **not** a second workflow state machine — the
+Task's `phase`/`attempt` stays the truth.
 
 `relay run start` (the only form; there is no detached mode yet) **waits** for
 the Run to reach a terminal state before returning, so the final state/exit is
@@ -73,19 +88,40 @@ always written to SQLite before the CLI's DB handle closes.
 Cancel and timeout kill the whole **process group** (`Bun.spawn({detached:true})`
 + `kill(-pid)`), so a grandchild holding a pipe open cannot outlive the Run.
 
+## Read-only Run history
+
+`relay run logs <run-id>` renders, from the per-Run `dsh.jsonl` (no dsh Web UI or
+TUI required):
+
+- the dsh **Session ID** (also in `relay run show` as `session_id`);
+- an ordered, one-line-per-event chronology —
+  `session … cwd=…`, `status turn_start …`, `tool_call read c1 input=…`,
+  `tool_result c1 status=completed result=…`, `text …`, `final "…"` — with a
+  `[truncated]` marker when dsh flagged a bounded field.
+
+The raw JSONL remains the evidence; the CLI view is only a rendering.
+
+**Web exposure is intentionally deferred.** `relay web` can bind a non-loopback
+address **without a token** (it warns but starts), so publishing unredacted
+`tool_call`/`tool_result` payloads there would leak tool traces to
+unauthenticated off-host clients. Adding a new global auth framework is out of
+scope, so the bounded Run history is exposed **only** through the local CLI
+(`relay run logs`). This can be revisited if/when `relay web` gains real access
+control.
+
 ## Permission boundary
 
 The Run is confined to its worktree: `DSH_PERMISSION_MODE` defaults to
 **`workspace-write`** with `workspaceRoot = process.cwd()` (the Task worktree),
-so file writes stay inside that directory. The runner never grants
-`danger-full-access` and never hands the Run a review-approval socket/API. An
-explicit `--permission`/`RELAY_DSH_*` override is the operator's choice.
+so file writes stay inside that directory. A `danger-full-access` grant is never
+made and the Run is never handed a review-approval socket/API. An explicit
+`--permission`/`RELAY_DSH_*` override is the operator's choice.
 
 ## `exit 0` is not a submission
 
-A clean exit 0 (or the final stdout text) **does not** complete the Task or
-advance the phase. The only path that advances a Task is a structured
-submission bound to the current Run/Task/phase/attempt/branch/HEAD:
+A clean exit 0 (or the terminal `final` event) **does not** complete the Task or
+advance the phase. The only path that advances a Task is a structured submission
+bound to the current Run/Task/phase/attempt/branch/HEAD:
 
 ```sh
 relay run submit <run-id> [--evidence E] [--summary S]
@@ -100,6 +136,9 @@ or its head is bound to a revision other than the Run's **start** head
 implement phase — the branch is not linked until a PR exists) **adopts** the
 Run's produced branch and HEAD, so a clean Run from a real git worktree with no
 linked branch/HEAD is submittable.
+
+A terminal `error` event that contradicts a 0 exit fails **closed** (`failed`): a
+parse/truncation problem is surfaced and can never manufacture a success.
 
 The submission binds to the **produced** HEAD: dsh is asked to commit, so at Run
 end Relay re-reads `git rev-parse HEAD` in the worktree and records it as
@@ -117,14 +156,36 @@ exactly like `submitPhase`, it calls `invalidateReview` and sends the task back
 to `review` at a new attempt, so it can never reach `merge_ready` with an
 unreviewed head (which would dead-end at the accept gate).
 
+## Resuming a Session manually (operator only)
+
+A Factory FIX defaults to a **fresh Run/Session in the same Worktree with the
+previous findings** — Relay does **not** auto-resume a persisted dsh Session.
+If an operator wants to continue one by hand, they can, after locating the
+Session ID:
+
+```sh
+relay run show <run-id>          # -> session_id: session-<uuid>
+dsh --profile headless --session-id session-<uuid> "continue"
+```
+
+This only works when the new invocation has a **compatible cwd / agent preset**
+and the Session was **persisted** (the JSONL is a bounded projection; the full
+Session lives under `$DSH_HOME`). An unknown id is an error. Relay never passes
+`--session-id` itself.
+
 ## Verified / not verified
 
-- Verified: the fake-process suite (`tests/dsh-runner.test.ts`) covers normal,
-  non-zero exit, spawn failure, process crash, cancel, timeout, malformed stdout,
-  two concurrent Runs in different cwds, and every submission-rejection case; and
-  one real local `dsh --profile headless` smoke
+- Verified: the fake-process suite (`tests/dsh-runner.test.ts`) covers normal
+  JSONL, non-zero exit, spawn failure, process crash, cancel, timeout, a
+  truncated event, a missing `session`, an in-turn failure with a `final`, a
+  terminal `error` contradicting exit 0, malformed/banner stdout, and every
+  submission-rejection case; the pure decoder has its own suite
+  (`tests/dsh-events.test.ts`); and one real local
+  `dsh --profile headless --json` smoke
   (`RELAY_DSH_SMOKE=1 bun test tests/dsh-smoke.test.ts`) runs one process and
-  observes exit 0.
+  asserts the Session ID and an ordered `session` → … → `final` stream with a
+  real `tool_call`/`tool_result`.
 - NOT verified here: anything beyond **one** Run's launch/observe/terminate. Task
   worktree creation, multi-writer control and FIX re-entry are ISH-760 — see
-  [`run-lifecycle.md`](run-lifecycle.md).
+  [`run-lifecycle.md`](run-lifecycle.md). The real Factory E2E (ISH-762) is not
+  run here.

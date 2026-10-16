@@ -27,6 +27,7 @@ import {
 import { acceptTask, confirmMerged, intakeTask, recordReview, recordVerification, runMechanicalVerification, submitPhase, taskChecks } from "./workflow";
 import { defaultRunner, type CheckSpec } from "./verify";
 import { acceptRunSubmission, getRun, listRuns, startDshRun } from "./dsh-runner";
+import { formatDshEvent, readDshEvents } from "./dsh-events";
 import { signalRunProcess } from "./run-signal";
 import {
   applyWorkspaceCleanup,
@@ -156,8 +157,8 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
   },
   run: {
     about:
-      "ISH-803 one-shot headless dsh Runs: 1 Run = 1 `dsh --profile headless` process = 1 coding attempt, in the Task's worktree, with NO Herdr pane/TUI/`dsh web`/wake/attach. stdout (final text) and stderr (reasoning) are stored under <control-plane>/runs/<run-id>/. A process `exit 0` does NOT complete anything — only `relay run submit` (a structured submission bound to the Run/Task/phase/attempt/branch/HEAD) advances the Task. `start` waits for the Run to reach a terminal state (there is no detached mode yet). Permissions are the worktree: $DSH_PERMISSION_MODE=workspace-write by default. " +
-      "ISH-760 adds the Task lifecycle: `launch` owns ONE branch+worktree per Task, pins the task spec + verification steps + prior findings into the worktree BEFORE launch, and runs ONE disposable dsh Run per phase/attempt (a FIX is the SAME worktree + findings + a NEW Run). A second writer on the same worktree/branch is refused until the previous Run ends; different worktrees/branches may run in parallel. `worktree` creates/selects the worktree; `cleanup` reclaims it only when safe (real merge or --abort, no open PR, no active writer, no uncommitted changes, relay-owned) and retains the run logs.",
+      "ISH-803/ISH-810 one-shot headless dsh Runs: 1 Run = 1 `dsh --profile headless --json` process = 1 coding attempt, in the Task's worktree, with NO Herdr pane/TUI/`dsh web`/wake/attach. Under <control-plane>/runs/<run-id>/: stdout.log (raw dsh JSONL), stderr.log (reasoning/errors), dsh.jsonl (the ORIGINAL dsh session/status/text/tool_call/tool_result/final events, per-Run evidence) and events.jsonl (Relay's own lifecycle log, kept distinct). A process `exit 0` or a terminal `final` does NOT complete anything — only `relay run submit` (a structured submission bound to the Run/Task/phase/attempt/branch/HEAD) advances the Task. `start` waits for the Run to reach a terminal state (there is no detached mode yet). Permissions are the worktree: $DSH_PERMISSION_MODE=workspace-write by default. " +
+      "ISH-760 adds the Task lifecycle: `launch` owns ONE branch+worktree per Task, pins the task spec + verification steps + prior findings into the worktree BEFORE launch, and runs ONE disposable dsh Run per phase/attempt (a FIX is the SAME worktree + findings + a NEW Run). A second writer on the same worktree/branch is refused until the previous Run ends; different worktrees/branches may run in parallel. `worktree` creates/selects the worktree; `cleanup` reclaims it only when safe (real merge or --abort, no open PR, no active writer, no uncommitted changes, relay-owned) and retains the run logs. `relay run logs <run-id>` renders the read-only dsh session/status/text/tool_call/tool_result/final chronology from the per-Run dsh.jsonl (no TUI/Web UI needed).",
     usage: [
       "relay run start <task-id> [--cwd DIR] [--prompt TEXT] [--permission MODE] [--timeout 30m] [--json]",
       "relay run launch <task-id> [--timeout 30m] [--permission MODE] [--json]",
@@ -1575,6 +1576,18 @@ async function main(): Promise<void> {
             const lines = readFileSync(p, "utf-8").split("\n");
             console.log(`--- ${label} (${p}) ---`);
             console.log(lines.slice(Math.max(0, lines.length - 1 - n)).join("\n"));
+          }
+          // ISH-810: the dsh `--json` execution-event chronology (sessionid /
+          // status / tool_call / tool_result / text / final), the read-only Run
+          // history. Read from the ORIGINAL dsh JSONL evidence, not a re-encode.
+          if (r.dsh_events_path && existsSync(r.dsh_events_path)) {
+            const events = readDshEvents(r.dsh_events_path);
+            console.log(
+              `--- dsh events (${r.dsh_events_path}; session=${r.session_id ?? "-"}) ---`
+            );
+            const shown = events.slice(Math.max(0, events.length - n));
+            shown.forEach((e, i) => console.log(`${events.length - shown.length + i + 1}. ${formatDshEvent(e.event)}`));
+            if (events.length === 0) console.log("(no dsh events)");
           }
           break;
         }
