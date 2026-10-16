@@ -8,6 +8,7 @@ import {
   effectiveVerdictAtHead,
   headsMatch,
   isApprovalSignal,
+  markerAfterInvalidation,
   parsePrUrl,
   parseReviewMarkers,
   performMerge,
@@ -69,6 +70,25 @@ describe("review verdict markers (absorbed from lane.sh)", () => {
   test("an abbreviated SHA still matches the full head", () => {
     expect(headsMatch(FULL.slice(0, 7), FULL)).toBe(true);
     expect(headsMatch(OTHER, FULL)).toBe(false);
+  });
+
+  test("a marker at/before a base-retarget invalidation is stale; a later one is fresh", () => {
+    const m = {
+      headSha: FULL,
+      verdict: "OK" as const,
+      reviewer: "claude",
+      author: "claude",
+      createdAt: "2026-01-02T00:00:00Z",
+      body: "",
+    };
+    // No invalidation -> every marker counts.
+    expect(markerAfterInvalidation(m, 0)).toBe(true);
+    // Posted AFTER the invalidation -> fresh.
+    expect(markerAfterInvalidation(m, Date.parse("2026-01-01T00:00:00Z"))).toBe(true);
+    // Posted BEFORE the invalidation -> stale (not re-applied).
+    expect(markerAfterInvalidation(m, Date.parse("2026-01-03T00:00:00Z"))).toBe(false);
+    // An unparseable timestamp with an invalidation fails closed (stale).
+    expect(markerAfterInvalidation({ ...m, createdAt: "" }, Date.parse("2026-01-01T00:00:00Z"))).toBe(false);
   });
 });
 

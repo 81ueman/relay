@@ -313,6 +313,50 @@ implement --TaskSubmitted--> verify --VerificationResult--> review
   worker; ordinary FIX/PASS never wake it. The Gateway is never a per-phase
   coordinator.
 
+### Merge gate: read-only, HEAD-bound (ISH-761)
+
+An independent Review PASS is **not** merge permission and **not** Task Done.
+`relay merge-check <task>` (and the daemon's workflow pass) evaluates a
+**read-only, HEAD-bound** merge gate over the current GitHub state plus the
+required SQLite evidence, and prints ONE structured decision — `READY`,
+`BLOCKED` (with concrete reason codes) or `MERGED`:
+
+- **GitHub (re-fetched, never assumed).** OPEN / non-draft (an owner-designated
+  draft is retained, still not ready), the PR head must equal the recorded
+  `head_sha` (a missing recorded head is `HEAD_UNKNOWN`; a retargeted base branch
+  is `BASE_CHANGED` and also invalidates the review in the provider pass without
+  moving the head — a FRESH review at that same head is then accepted, keyed on the
+  review epoch (head/attempt/profile) so a revert or a pre-base review cannot
+  deadlock it, and a pre-retarget marker is not re-applied — while a base-*SHA* move
+  alone is not), and mergeability is
+  judged. A `conflicting` PR raises
+  **`IntegrationRequired`** to the Gateway (a routing decision: fix the new HEAD,
+  then re-VERIFY/REVIEW) — it never rebases. An **unrelated** merge of another PR
+  that only moves the base does **not** force a rebase/review loop (no
+  unconditional ancestor requirement); a **changed HEAD** does require a fresh
+  independent review at the new HEAD.
+- **Evidence in SQLite.** A trusted **independent** review PASS at the CURRENT
+  head, no **unresolved NG** at that head (a later OK alone never clears it), no
+  owner **HOLD** (a STRUCTURED Linear state/label or an owner label on the PR —
+  never a keyword scan of free text), the required **check results** (a failed or
+  unreadable read, zero reported checks, or an all-skipped roll-up is `NOT_RUN` →
+  BLOCKED; a CI credit outage can never become PASS), and the **dependent change
+  order** (a PR-bound prerequisite counts as complete only once merged).
+- **Permission.** A real merge needs an explicit point-of-use authority
+  (ISH-288); with none the verdict is `BLOCKED/NO_PERMISSION`. The gate has **no
+  push/rebase/merge executor** and never writes a provider or Linear — it only
+  observes. When GitHub re-fetches `merged` at the recorded head, the task is
+  confirmed done (a `TaskMerged` result) — but only when Relay itself would credit
+  it (the same post-review guard as `confirmMerged`; otherwise
+  `MERGE_NOT_CREDITED`); an unmerged PASS is distinguished from Done. There is no
+  `--no-merge` internal-approve path: acceptance and merge readiness are separate
+  decisions.
+
+The decision is a PURE function of observable facts (`evaluateMergeGate`), so the
+whole table is unit-tested; the daemon pass (`runMergeGates`) is idempotent and
+logs each new decision identity once. One-command real-PR dry run:
+`bun run smoke:merge-gate 81ueman/relay#7` (or `relay merge-check <task> --json`).
+
 ### Headless dsh Runs (no Herdr)
 
 A coding attempt can run as **one `dsh --profile headless --json` process** — no

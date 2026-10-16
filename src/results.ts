@@ -46,7 +46,41 @@ export function findTaskResult(
   );
 }
 
-/** Any ReviewResult already recorded for this exact PR head + review profile. */
+/**
+ * ISH-761: the review EPOCH for a task at a head — the attempt of the latest
+ * BASE-RETARGET (`reason = "base-changed"`) review invalidation recorded at that
+ * head, or 0 when the review has never been re-opened by a retarget.
+ *
+ * A base retarget keeps the SAME HEAD but re-opens the review at a new attempt.
+ * Reviews recorded before that attempt judged the OLD base's diff and must not make
+ * a fresh review look like a duplicate. Keying on the epoch (the attempt) rather
+ * than the base NAME also covers a revert (main -> release-1 -> main) and legacy
+ * rows / rows recorded before the base was known (no base key at all).
+ */
+export function reviewEpochAttempt(db: Database, taskId: string, head: string | null): number {
+  const row = db
+    .query(
+      `SELECT MAX(CAST(json_extract(payload_json, '$.attempt') AS INTEGER)) AS a
+         FROM events
+        WHERE task_id = ? AND type = 'workflow.review_invalidated'
+          AND json_extract(payload_json, '$.reason') = 'base-changed'
+          AND json_extract(payload_json, '$.toHead') IS ?`
+    )
+    .get(taskId, head) as { a: number | null } | null;
+  return row?.a ?? 0;
+}
+
+/**
+ * Any ReviewResult already recorded for this exact PR head + review profile IN
+ * THE CURRENT REVIEW EPOCH.
+ *
+ * The duplicate guard is scoped by the review EPOCH (`reviewEpochAttempt`), NOT by
+ * the base NAME: a base name can coincide again after a revert, and a review
+ * recorded before the base was known (or a legacy row with no base key) would
+ * otherwise act as an over-broad wildcard. Reviews from before the latest
+ * base-retarget invalidation are ignored, so a fresh review of the retargeted diff
+ * is accepted, while a rework that never retargeted is still refused as a duplicate.
+ */
 export function findReviewForHead(
   db: Database,
   taskId: string,
@@ -54,14 +88,15 @@ export function findReviewForHead(
   profile: string
 ): TaskResult | null {
   if (!headSha) return null;
+  const epoch = reviewEpochAttempt(db, taskId, headSha);
   return (
     (db
       .query(
         `SELECT * FROM task_results
-          WHERE task_id = ? AND kind = 'ReviewResult' AND head_sha = ? AND profile = ?
+          WHERE task_id = ? AND kind = 'ReviewResult' AND head_sha = ? AND profile = ? AND attempt >= ?
           ORDER BY id ASC LIMIT 1`
       )
-      .get(taskId, headSha, profile) as TaskResult | null) ?? null
+      .get(taskId, headSha, profile, epoch) as TaskResult | null) ?? null
   );
 }
 

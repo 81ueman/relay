@@ -35,6 +35,7 @@ import {
   launchTaskRun,
 } from "./run-lifecycle";
 import { providerDepsFromEnv } from "./provider-adapters";
+import { checkMergeGate, formatMergeGateDecision } from "./merge-gate";
 import {
   bindSession, findWorkerBySession, getWorker, listWorkers,
   quietActive, registerWorker, retireWorker, setWorkerState, touchSeen, unretireWorker,
@@ -90,6 +91,7 @@ Usage:
   relay result merged <task-id> [--head SHA] [--repo R] [--reason R]
   relay result accept <task-id> [--worker <id>]
   relay verify <task-id> [--cwd <dir>] [--head SHA]   # mechanical verify (Relay runs the commands)
+  relay merge-check <task-id> [--json] [--authority merge]   # read-only HEAD-bound merge readiness (dry-run)
 
   relay next [--worker <id>] [--role <r>] [--any-role]
   relay claim <task-id> [--worker <id>] [--role <r>] [--any-role]
@@ -288,6 +290,11 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
     about:
       "Run a task's mechanical-verify checks (the standard commands recorded at intake) and advance the phase from the PROCESS EXIT RESULT: pass -> review, fail -> implement FIX, a required NOT_RUN/INCONCLUSIVE -> BLOCKED. The daemon does this automatically for a Relay-owned verify phase; this entrypoint is for an explicit run.",
     usage: ["relay verify <task-id> [--cwd <dir>] [--head SHA]"],
+  },
+  "merge-check": {
+    about:
+      "READ-ONLY, HEAD-bound merge readiness (dry-run by default). Judges the GitHub PR (OPEN, non-draft, head/base/diff, mergeability, re-fetched `merged`), a trusted independent review at the CURRENT head, an unresolved NG, an owner HOLD, required check results and dependent change order, and prints READY / BLOCKED with concrete reasons. It NEVER pushes, rebases or merges: a real merge needs a point-of-use authority (ISH-288), so without one the verdict is BLOCKED/NO_PERMISSION. --authority merge only assumes the permission for the DRY-RUN verdict; it performs nothing. A conflict raises IntegrationRequired for a Gateway routing decision. --json emits the structured decision.",
+    usage: ["relay merge-check <task-id> [--json] [--authority merge]"],
   },
   "task list": { about: "List tasks (id, state, priority, role, assignee, plan, depends, title).", usage: ["relay task list [--state <state>]"] },
   "task show": { about: "Print one task as JSON (includes depends_on). Notes go to stderr so stdout stays parseable; --json emits ONE document with the task, its dependencies and its notes.", usage: ["relay task show <id> [--json]"] },
@@ -1277,6 +1284,24 @@ async function main(): Promise<void> {
           console.log(`check ${c.name}: ${c.outcome}${c.exitCode === null ? "" : ` (exit ${c.exitCode})`}`);
         }
         console.log(`${after.id} verify=${outcome}${stale ? " stale-discarded" : ""} -> phase=${after.phase} state=${after.state}`);
+        break;
+      }
+
+      case "merge-check": {
+        // ISH-761: read-only, HEAD-bound merge readiness (dry-run by default).
+        // This endpoint NEVER pushes, rebases or merges; it only reports the
+        // structured decision. Without a point-of-use merge authority the verdict
+        // is BLOCKED/NO_PERMISSION; --authority merge assumes it for the DRY-RUN
+        // verdict only and performs nothing.
+        const rest = argv.slice(1);
+        const id = positionals(rest)[0];
+        if (!id) throw new Error("usage: relay merge-check <task-id> [--json] [--authority merge]");
+        if (!getTask(db, id)) throw new Error(`unknown task: ${id}`);
+        const base = providerDepsFromEnv();
+        const authority = flag(rest, "--authority") === "merge" ? { ...base.authority, merge: true } : base.authority;
+        const decision = checkMergeGate(db, id, { ...base, authority });
+        if (!decision) throw new Error(`unknown task: ${id}`);
+        console.log(hasFlag(rest, "--json") ? JSON.stringify(decision, null, 2) : formatMergeGateDecision(decision));
         break;
       }
 

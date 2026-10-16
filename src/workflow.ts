@@ -469,8 +469,14 @@ export function linkTask(
   const prBaseSha = link.prBaseSha ?? task.pr_base_sha;
   const prDiff = link.prDiff ?? task.pr_diff;
   const headChanged = headSha !== task.head_sha;
+  // A BASE BRANCH change is review-invalidating exactly like a HEAD change: the
+  // review/verify judged a diff against the recorded base, and merging into a
+  // different branch is a different diff. A base-SHA move alone is NOT (an
+  // unrelated merge must not force a rebase/review loop).
+  const baseBranchChanged = task.pr_base !== null && prBase !== null && prBase !== task.pr_base;
   const linkChanged =
     headChanged ||
+    baseBranchChanged ||
     prUrl !== task.pr_url ||
     branch !== task.branch ||
     prRepo !== task.pr_repo ||
@@ -486,12 +492,12 @@ export function linkTask(
     ).run(prUrl, branch, headSha, prRepo, prBase, prBaseSha, prDiff, now(), taskId);
     let next = getTask(db, taskId)!;
     const phase = derivePhase(task);
-    if (headChanged && isCodeTask(task) && phase && REVIEW_PINNED_PHASES.includes(phase)) {
-      next = invalidateReview(db, next, headSha, "head-changed");
+    if ((headChanged || baseBranchChanged) && isCodeTask(task) && phase && REVIEW_PINNED_PHASES.includes(phase)) {
+      next = invalidateReview(db, next, headSha, baseBranchChanged ? "base-changed" : "head-changed");
     }
     return next;
   })();
-  if (headChanged) requestReconcile(db, `link-head:${taskId}`);
+  if (headChanged || baseBranchChanged) requestReconcile(db, `link-changed:${taskId}`);
   return updated;
 }
 
@@ -1110,9 +1116,17 @@ export function recordReview(db: Database, taskId: string, reviewerId: string, o
   if (opts.verdict === "pass" && task.head_sha && !opts.headSha) {
     throw new Error(`${HEAD_MISMATCH}: a PASS must name the reviewed HEAD (task ${taskId} is at ${task.head_sha})`);
   }
-  // Duplicate dispatch: the same PR+HEAD+profile is reviewed once.
+  // Duplicate dispatch: the same PR+HEAD+profile is reviewed once PER REVIEW
+  // EPOCH. A base-branch retarget keeps the HEAD but re-opens the review at a new
+  // attempt (the epoch); reviews from before that attempt are ignored, so a fresh
+  // review of the retargeted diff is accepted while an unretargeted rework is still
+  // refused. The base is recorded for evidence, but is NOT the identity (a base name
+  // can recur on a revert).
+  const base = task.pr_base ?? null;
   if (findReviewForHead(db, taskId, head, profile)) {
-    throw new Error(`${DUPLICATE_DISPATCH}: ${taskId} head ${head} already has a review (profile '${profile}')`);
+    throw new Error(
+      `${DUPLICATE_DISPATCH}: ${taskId} head ${head} already has a review (profile '${profile}') in this review epoch`
+    );
   }
   // Unresolved NG at this head: a later OK must explicitly supersede it. Checked
   // after duplicate-dispatch so a re-review of the same profile is still a
@@ -1131,6 +1145,9 @@ export function recordReview(db: Database, taskId: string, reviewerId: string, o
   const basePayload = {
     source: opts.source ?? (external ? "external" : "worker"),
     reviewer: identity,
+    // The base BRANCH this review judged — recorded for evidence. The duplicate
+    // guard uses the review EPOCH, not this value.
+    base,
     ...(opts.supersedesResultId ? { supersedes: opts.supersedesResultId } : {}),
   };
 
@@ -1423,7 +1440,9 @@ export function canStartPhase(db: Database, taskId: string, phase: CodePhase, at
   if (!task || !isCodeTask(task)) return false;
   if ((task.phase ?? derivePhase(task)) !== phase) return false;
   if (task.attempt !== attempt) return false;
-  if (phase === "review") return !findReviewForHead(db, taskId, task.head_sha, task.review_profile ?? DEFAULT_REVIEW_PROFILE);
+  if (phase === "review") {
+    return !findReviewForHead(db, taskId, task.head_sha, task.review_profile ?? DEFAULT_REVIEW_PROFILE);
+  }
   return !findTaskResult(db, taskId, phase, attempt, "TaskSubmitted");
 }
 

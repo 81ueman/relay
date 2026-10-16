@@ -1,6 +1,8 @@
 import {
   DEFAULT_REVIEW_OWNER,
   NO_AUTHORITY,
+  type CheckRunView,
+  type ChecksReadOnly,
   type CommentView,
   type GitHubReadOnly,
   type IssueView,
@@ -92,7 +94,7 @@ function toPrView(ref: PrRef, j: GhPrJson): PrView {
 }
 
 /** GET-only GitHub reader backed by the `gh` CLI (read verbs only). */
-export class GhCliGitHub implements GitHubReadOnly {
+export class GhCliGitHub implements GitHubReadOnly, ChecksReadOnly {
   readonly name = "gh-cli";
   readonly readOnly = true as const;
 
@@ -150,6 +152,84 @@ export class GhCliGitHub implements GitHubReadOnly {
       }
     }
     return out;
+  }
+
+  /**
+   * ISH-761: the check runs + commit statuses bound to EXACTLY `headSha`. Reads
+   * two GET endpoints (check-runs, combined status) and merges them. This is
+   * FAIL-CLOSED: if EITHER read fails or does not parse — or a read is short of
+   * its declared `total_count` — the whole result is `null` (NOT_RUN). A
+   * one-sided failure can therefore never masquerade as the complete picture, and
+   * a failing check on a later page can never be missed. `--paginate` follows the
+   * `Link` header so EVERY page of check runs is read, not just the first 30. An
+   * empty array means the commit genuinely reported no checks. Never mutates.
+   */
+  listChecks(ref: PrRef, headSha: string): CheckRunView[] | null {
+    if (!headSha) return null;
+    const runs = this.exec([
+      "gh", "api", `repos/${ref.repo}/commits/${headSha}/check-runs`, "--paginate",
+      "-H", "Accept: application/vnd.github+json",
+    ]);
+    if (!runs.ok) return null;
+    const statuses = this.exec(["gh", "api", `repos/${ref.repo}/commits/${headSha}/status`]);
+    if (!statuses.ok) return null;
+
+    const runPages = parseJsonStream(runs.stdout) as {
+      total_count?: number;
+      check_runs?: { name?: string; status?: string; conclusion?: string | null }[];
+    }[];
+    if (runPages.length === 0) return null;
+    const rawRuns = runPages.flatMap((p) => p.check_runs ?? []);
+    const declaredRuns = runPages[0]?.total_count;
+    if (typeof declaredRuns === "number" && rawRuns.length < declaredRuns) return null;
+
+    const statusObjs = parseJsonStream(statuses.stdout) as {
+      total_count?: number;
+      statuses?: { context?: string; state?: string }[];
+    }[];
+    if (statusObjs.length === 0) return null;
+    const rawStatuses = statusObjs.flatMap((o) => o.statuses ?? []);
+    const declaredStatuses = statusObjs[0]?.total_count;
+    if (typeof declaredStatuses === "number" && rawStatuses.length < declaredStatuses) return null;
+
+    const out: CheckRunView[] = [];
+    for (const c of rawRuns) {
+      out.push({ name: c.name ?? "check", bucket: mapCheckRunBucket(c.status ?? "", c.conclusion ?? "") });
+    }
+    for (const s of rawStatuses) {
+      out.push({ name: s.context ?? "status", bucket: mapCommitStatusBucket(s.state ?? "") });
+    }
+    return out;
+  }
+}
+
+/** GitHub check-run (status, conclusion) -> the `gh pr checks` bucket vocabulary. */
+export function mapCheckRunBucket(status: string, conclusion: string): CheckRunView["bucket"] {
+  if ((status ?? "").toLowerCase() !== "completed") return "pending";
+  switch ((conclusion ?? "").toLowerCase()) {
+    case "success":
+    case "neutral":
+      return "pass";
+    case "skipped":
+      return "skipping";
+    case "cancelled":
+      return "cancel";
+    case "":
+      return "pending";
+    default:
+      return "fail";
+  }
+}
+
+/** Legacy commit status state -> the same bucket vocabulary. */
+export function mapCommitStatusBucket(state: string): CheckRunView["bucket"] {
+  switch ((state ?? "").toLowerCase()) {
+    case "success":
+      return "pass";
+    case "pending":
+      return "pending";
+    default:
+      return "fail";
   }
 }
 
@@ -269,6 +349,7 @@ export function providerDepsFromEnv(env: EnvLike = process.env, exec: Exec = def
   return {
     github,
     linear,
+    checks: github,
     authorizedReviewers: authorizedReviewers.length > 0 ? authorizedReviewers : [DEFAULT_REVIEW_OWNER],
     authority: NO_AUTHORITY,
   };

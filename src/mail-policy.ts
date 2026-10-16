@@ -24,6 +24,11 @@ export const IMMEDIATE_MAIL_KINDS = [
   "unclaimable_role",
   /** `relay send --urgent`: a genuine interrupt that MAY wake a busy worker. */
   "urgent",
+  /**
+   * ISH-761: a real merge conflict needs a Gateway ROUTING decision (fix the
+   * new HEAD, then re-VERIFY/REVIEW). Push it promptly; do not wait a turn.
+   */
+  "integration_required",
 ] as const;
 
 /**

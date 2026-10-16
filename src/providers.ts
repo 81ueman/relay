@@ -97,6 +97,81 @@ export interface LinearReadOnly {
 }
 
 // ---------------------------------------------------------------------------
+// ISH-761 required check results (read-only, HEAD-pinned)
+// ---------------------------------------------------------------------------
+
+/**
+ * One GitHub check run or commit status, normalized to the SAME bucket
+ * vocabulary `gh pr checks` uses. `bucket` is the only thing the merge gate
+ * reads: a required check that is `pending`/`fail`/`cancel` (or absent) BLOCKS.
+ */
+export interface CheckRunView {
+  name: string;
+  bucket: "pass" | "fail" | "pending" | "skipping" | "cancel";
+}
+
+/**
+ * The read-only check reader. `listChecks` is pinned to an EXACT head so the
+ * result can never be credited to a moved HEAD. A failed read returns `null`
+ * ("unknown"), which the gate treats as NOT_RUN — never as "no checks, pass".
+ */
+export interface ChecksReadOnly {
+  readonly name: string;
+  readonly readOnly: true;
+  listChecks(ref: PrRef, headSha: string): CheckRunView[] | null;
+}
+
+/** The roll-up the merge gate judges: required checks all concluded green. */
+export interface CheckRollup {
+  total: number;
+  passed: number;
+  pending: string[];
+  failing: string[];
+  skipped: string[];
+  /**
+   * True only when at least one check actually PASSED AND none is failing /
+   * pending / cancelled. A zero-check roll-up, and an all-skipped roll-up, are
+   * deliberately NOT passed: an unrun required gate (e.g. a CI credit outage, or
+   * every job skipped) must BLOCK, never PASS.
+   */
+  requiredPassed: boolean;
+}
+
+export function rollupChecks(checks: CheckRunView[]): CheckRollup {
+  const pending: string[] = [];
+  const failing: string[] = [];
+  const skipped: string[] = [];
+  let passed = 0;
+  for (const c of checks) {
+    switch (c.bucket) {
+      case "pass":
+        passed++;
+        break;
+      case "pending":
+        pending.push(c.name);
+        break;
+      case "fail":
+      case "cancel":
+        failing.push(c.name);
+        break;
+      case "skipping":
+        skipped.push(c.name);
+        break;
+    }
+  }
+  return {
+    total: checks.length,
+    passed,
+    pending,
+    failing,
+    skipped,
+    // At least one check must have actually PASSED: a roll-up of only skipped
+    // checks (passed === 0) is an unrun gate, never a pass.
+    requiredPassed: passed > 0 && pending.length === 0 && failing.length === 0,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Review verdict markers (absorbed from lane.sh `verdict_rows`)
 // ---------------------------------------------------------------------------
 
@@ -170,6 +245,38 @@ export function effectiveVerdictAtHead(markers: ReviewMarker[], liveHead: string
     if (headsMatch(m.headSha, liveHead)) last = m;
   }
   return last;
+}
+
+/**
+ * ISH-761: the newest BASE-RETARGET (`reason = "base-changed"`) invalidation
+ * timestamp for a task at the given head (0 when none). A base-branch retarget
+ * invalidates the review while keeping the same HEAD; a review marker posted
+ * at/before that time judged the OLD base's diff and must NOT be re-applied to the
+ * new attempt. A HEAD-change invalidation (`head-changed`) has a different reason,
+ * so a marker at the (unchanged) head after a pure rework is still attempted (and
+ * refused as a duplicate), preserving the marker-dedupe behaviour.
+ */
+export function latestReviewInvalidationAt(db: Database, taskId: string, head: string | null): number {
+  const row = db
+    .query(
+      `SELECT MAX(timestamp) AS t FROM events
+        WHERE task_id = ? AND type = 'workflow.review_invalidated'
+          AND json_extract(payload_json, '$.reason') = 'base-changed'
+          AND json_extract(payload_json, '$.toHead') IS ?`
+    )
+    .get(taskId, head) as { t: number | null } | null;
+  return row?.t ?? 0;
+}
+
+/**
+ * True when a marker was posted strictly AFTER the invalidation. An unparseable
+ * `createdAt` in the presence of an invalidation is treated as STALE (fail closed)
+ * rather than risking the resurrection of an old verdict.
+ */
+export function markerAfterInvalidation(m: ReviewMarker, invalidatedAt: number): boolean {
+  if (invalidatedAt <= 0) return true;
+  const at = Date.parse(m.createdAt);
+  return Number.isFinite(at) ? at > invalidatedAt : false;
 }
 
 /**
@@ -271,7 +378,24 @@ export function parsePrUrl(url: string | null, fallbackRepo: string | null): PrR
 const LINEAR_HOLD_LABELS = ["hold", "do-not-merge", "do not merge", "human-hold"];
 const LINEAR_HOLD_STATES = ["hold", "on hold", "blocked"];
 
-function linearHolds(issue: IssueView): boolean {
+/**
+ * ISH-761: owner-designated HOLD labels. A PR or Linear issue carrying one of
+ * these is an explicit owner stop — the merge gate must never treat it as
+ * ready. This is a STRUCTURED label lookup, not a keyword scan of free text.
+ */
+export const HOLD_LABELS = ["hold", "do-not-merge", "do not merge", "human-hold"];
+
+/** Owner-designated draft retention: the draft is intentional, do not force-undraft. */
+export const DRAFT_RETAIN_LABELS = ["draft-retained", "hold-draft", ...HOLD_LABELS];
+
+export function hasHoldLabel(labels: readonly string[] | null | undefined): string | null {
+  for (const l of labels ?? []) {
+    if (HOLD_LABELS.includes((l ?? "").toLowerCase())) return l;
+  }
+  return null;
+}
+
+export function linearHolds(issue: IssueView): boolean {
   const state = (issue.state ?? "").toLowerCase();
   if (LINEAR_HOLD_STATES.includes(state)) return true;
   return (issue.labels ?? []).some((l) => LINEAR_HOLD_LABELS.includes(l.toLowerCase()));
@@ -336,7 +460,13 @@ export function reconcileTaskFromProvider(db: Database, taskId: string, deps: Pr
           const comments = deps.github.listComments(ref);
           if (comments !== null) {
             db.query(`UPDATE tasks SET pr_updated_at = ? WHERE id = ?`).run(view.updatedAt ?? "", taskId);
-            const markers = parseReviewMarkers(comments, { authorizedReviewers });
+            // A marker posted BEFORE the review was invalidated judged the OLD diff
+            // (e.g. the pre-retarget base) and must not be re-applied at the same
+            // head after the invalidation re-opened the review.
+            const invalidatedAt = latestReviewInvalidationAt(db, taskId, live.head_sha);
+            const markers = parseReviewMarkers(comments, { authorizedReviewers }).filter((m) =>
+              markerAfterInvalidation(m, invalidatedAt)
+            );
             const eff = effectiveVerdictAtHead(markers, live.head_sha);
             if (eff) actions.push(...applyMarker(db, live, eff, deps.authority ?? NO_AUTHORITY));
           } else {
@@ -455,11 +585,12 @@ function markerNotAppliedLogged(db: Database, taskId: string, markerKey: string)
 // Test fakes (read-only, in-memory; no network)
 // ---------------------------------------------------------------------------
 
-export class FakeGitHub implements GitHubReadOnly {
+export class FakeGitHub implements GitHubReadOnly, ChecksReadOnly {
   readonly name = "fake-github";
   readonly readOnly = true as const;
   private prs = new Map<string, PrView>();
   private comments = new Map<string, CommentView[]>();
+  private checks = new Map<string, CheckRunView[] | null>();
 
   private key(ref: PrRef): string {
     return `${ref.repo}#${ref.number}`;
@@ -472,6 +603,15 @@ export class FakeGitHub implements GitHubReadOnly {
 
   putComments(ref: PrRef, comments: CommentView[]): this {
     this.comments.set(this.key(ref), comments);
+    return this;
+  }
+
+  /**
+   * Pin checks to an exact head. `null` simulates a FAILED read (NOT_RUN); an
+   * empty array means the head genuinely reported no checks (also NOT_RUN).
+   */
+  putChecks(ref: PrRef, headSha: string, checks: CheckRunView[] | null): this {
+    this.checks.set(`${this.key(ref)}@${headSha}`, checks);
     return this;
   }
 
@@ -488,6 +628,11 @@ export class FakeGitHub implements GitHubReadOnly {
 
   listComments(ref: PrRef): CommentView[] {
     return this.comments.get(this.key(ref)) ?? [];
+  }
+
+  listChecks(ref: PrRef, headSha: string): CheckRunView[] | null {
+    const k = `${this.key(ref)}@${headSha}`;
+    return this.checks.has(k) ? this.checks.get(k)! : [];
   }
 }
 
