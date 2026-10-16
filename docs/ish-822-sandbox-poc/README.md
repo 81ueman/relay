@@ -106,9 +106,6 @@ sbx secret set-custom --sandbox ish822-poc --host ollama.com \
   --env OLLAMA_CLOUD_V41_API_KEY --command "$HOSTKEY_CMD"
 sbx secret ls                                    # copy the placeholder
 
-# 7b. prove the real key is not inside the sandbox (key stays on the HOST; stream out + grep host-side)
-KEY_CMD="$HOSTKEY_CMD" bash "$POC/scripts/containment-probe.sh"
-
 # 8. install dsh in the sandbox and run it (overlay file from scripts/)
 sbx exec ish822-poc bash -lc 'npm i -g @deepseek-ai/dsh@0.2.0-rc.2 && dsh --version'
 sbx exec ish822-poc bash -lc 'cat > /home/agent/dsh-overlay.yml' \
@@ -120,6 +117,11 @@ sbx exec -e OLLAMA_CLOUD_V41_API_KEY=<placeholder> -w "$FIX" \
 sbx exec ish822-poc bash -lc \
   'GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=accept-new" \
    git ls-remote ssh://git@ssh.github.com:443/81ueman/relay.git HEAD refs/heads/main'
+
+# 9b. prove the real key is NOT inside the sandbox — run AFTER the dsh run (step 8),
+#     so dsh has written its session/log state (the `ISH-822` positive control needs it).
+#     The key stays on the HOST: the VM filesystem is streamed out and grepped host-side.
+KEY_CMD="$HOSTKEY_CMD" bash "$POC/scripts/containment-probe.sh"
 
 # 10. fetch the sandbox commit back to the host
 git -C "$FIX" fetch sandbox-ish822-poc
@@ -220,16 +222,28 @@ on the host ([`14b`](evidence/14b-real-key-containment.log), script
 [`containment-probe.sh`](scripts/containment-probe.sh)): the sandbox's
 `/{home/agent,tmp,etc,var/tmp,opt}` is streamed *out* (`sudo tar` over `sbx exec`)
 and grepped **on the host** with the real key, so the value is never sent into
-the VM:
+the VM. It is run **after the dsh run** (README step 9b), and the script exits
+non-zero unless both positive controls are `>=1` and the key/placeholder counts
+are `0` — so `RESULT: PASS` / `EXIT=0` below is a real pass, not an absence:
 
 ```
-# sandbox user                 : agent
-# host sha256(real key)        : dc0865b0…                       # host-side, hash only
+# sandbox user          : agent
+# host sha256(real key) : dc0865b0…                              # host-side, hash only
+# NOTE: taken AFTER the dsh run (README step 9b), so dsh session/log state exists
 # stream: 184616960 bytes (tar), 179868429 bytes (extracted)
-# POSITIVE CONTROLS  grep -acF 'Ubuntu' = 21 ; 'ISH-822' = 8      # proves the stream IS inspected
-# SUBJECT            grep -acF -f <(KEY_CMD) = 0                  # real key absent
-#                    grep -acF 'sbx-cs-'      = 0                 # placeholder not persisted either
+# POSITIVE CONTROLS (must be >=1):
+#   grep -acF 'Ubuntu'      = 21                                  # proves the stream IS inspected
+#   grep -acF 'ISH-822'     = 8                                   # from dsh's own run state
+# SUBJECT (must be 0):
+#   grep -acF -f <(KEY_CMD) = 0                                   # real key absent
+#   grep -acF 'sbx-cs-'     = 0                                   # placeholder not persisted either
+RESULT: PASS
 ```
+
+The script's **failure path** is exercised in
+[`14c`](evidence/14c-containment-probe-selftest.log): forcing a key that matches
+present text yields `grep -acF -f <(KEY_CMD) = 21`, then
+`FAIL: real key present in the sandbox (21 matches)`, `RESULT: FAIL`, `EXIT=1`.
 
 (The sandbox was created *before* the secret, so the placeholder was also passed
 explicitly with `sbx exec -e` — placeholders are not secret.)

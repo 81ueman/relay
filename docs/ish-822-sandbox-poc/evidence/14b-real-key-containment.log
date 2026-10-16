@@ -1,19 +1,20 @@
-# ISH-822 real-key containment probe (host-side grep; the key is read on the host only).
+# ISH-822 real-key containment probe — taken AFTER the dsh run (README step 9b).
 # Script (committed): docs/ish-822-sandbox-poc/scripts/containment-probe.sh
-# KEY_CMD prints the real provider key on the host; its value never leaves the host.
+# KEY_CMD prints the real provider key on the HOST; its value never leaves the host.
 
-$ KEY_CMD=<host key cmd> bash docs/ish-822-sandbox-poc/scripts/containment-probe.sh
-# sandbox user                 : agent
-# host sha256(real key)        : dc0865b0ba3b362cda037e033a3f4d8138185a5b003d907985a02e05c7dad255
+$ KEY_CMD=<host key cmd> bash "$POC/scripts/containment-probe.sh"
+# sandbox user          : agent
+# host sha256(real key) : dc0865b0ba3b362cda037e033a3f4d8138185a5b003d907985a02e05c7dad255
+# NOTE: taken AFTER the dsh run (README step 9b), so dsh session/log state exists
 # tar reads as root inside the VM; its 2>/dev/null drops unreadable-file errors
-# streaming sandbox /{home/agent,tmp,etc,var/tmp,opt} OUT to /var/folders/2l/lk91l4dd1ysb1jfw7bkw0nrh0000gn/T/ish822-sandbox-visible.sVfaqGZIo8
+# streaming sandbox /{home/agent,tmp,etc,var/tmp,opt} OUT to /var/folders/2l/lk91l4dd1ysb1jfw7bkw0nrh0000gn/T/ish822-contain.m8cQM0uRb8/stream.tar
 # stream:  184616960 bytes (tar),  179868429 bytes (extracted)
 
-# POSITIVE CONTROLS (prove the pipeline inspects content), host-side:
-#   grep -acF 'Ubuntu'     = 21   (expect >=1)
-#   grep -acF 'ISH-822'    = 8   (expect >=1)
-# SUBJECT, host-side:
-#   grep -acF -f <(KEY_CMD) = 0   (expect 0)
-# also no persisted placeholder, host-side:
-#   grep -acF 'sbx-cs-'      = 0   (expect 0)
+# POSITIVE CONTROLS (must be >=1):
+#   grep -acF 'Ubuntu'      = 21
+#   grep -acF 'ISH-822'     = 8
+# SUBJECT (must be 0):
+#   grep -acF -f <(KEY_CMD) = 0
+#   grep -acF 'sbx-cs-'     = 0
+RESULT: PASS
 EXIT=0
