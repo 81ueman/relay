@@ -1,6 +1,8 @@
 import {
   DEFAULT_REVIEW_OWNER,
   NO_AUTHORITY,
+  type CheckRunView,
+  type ChecksReadOnly,
   type CommentView,
   type GitHubReadOnly,
   type IssueView,
@@ -92,7 +94,7 @@ function toPrView(ref: PrRef, j: GhPrJson): PrView {
 }
 
 /** GET-only GitHub reader backed by the `gh` CLI (read verbs only). */
-export class GhCliGitHub implements GitHubReadOnly {
+export class GhCliGitHub implements GitHubReadOnly, ChecksReadOnly {
   readonly name = "gh-cli";
   readonly readOnly = true as const;
 
@@ -150,6 +152,76 @@ export class GhCliGitHub implements GitHubReadOnly {
       }
     }
     return out;
+  }
+
+  /**
+   * ISH-761: the check runs + commit statuses bound to EXACTLY `headSha`. Reads
+   * two GET endpoints (check-runs, combined status) and merges them. A failed
+   * read returns `null` (unknown != ready); an empty array means the commit
+   * genuinely reported no checks. Never mutates.
+   */
+  listChecks(ref: PrRef, headSha: string): CheckRunView[] | null {
+    if (!headSha) return null;
+    const runs = this.exec([
+      "gh", "api", `repos/${ref.repo}/commits/${headSha}/check-runs`, "-H", "Accept: application/vnd.github+json",
+    ]);
+    const statuses = this.exec(["gh", "api", `repos/${ref.repo}/commits/${headSha}/status`]);
+    // BOTH reads failed -> the check state is unknown; report NOT_RUN (null).
+    if (!runs.ok && !statuses.ok) return null;
+    const out: CheckRunView[] = [];
+    if (runs.ok) {
+      let j: { check_runs?: { name?: string; status?: string; conclusion?: string | null }[] };
+      try {
+        j = JSON.parse(runs.stdout) as typeof j;
+      } catch {
+        return null;
+      }
+      for (const c of j.check_runs ?? []) {
+        out.push({ name: c.name ?? "check", bucket: mapCheckRunBucket(c.status ?? "", c.conclusion ?? "") });
+      }
+    }
+    if (statuses.ok) {
+      let j: { statuses?: { context?: string; state?: string }[] };
+      try {
+        j = JSON.parse(statuses.stdout) as typeof j;
+      } catch {
+        return null;
+      }
+      for (const s of j.statuses ?? []) {
+        out.push({ name: s.context ?? "status", bucket: mapCommitStatusBucket(s.state ?? "") });
+      }
+    }
+    return out;
+  }
+}
+
+/** GitHub check-run (status, conclusion) -> the `gh pr checks` bucket vocabulary. */
+export function mapCheckRunBucket(status: string, conclusion: string): CheckRunView["bucket"] {
+  if ((status ?? "").toLowerCase() !== "completed") return "pending";
+  switch ((conclusion ?? "").toLowerCase()) {
+    case "success":
+    case "neutral":
+      return "pass";
+    case "skipped":
+      return "skipping";
+    case "cancelled":
+      return "cancel";
+    case "":
+      return "pending";
+    default:
+      return "fail";
+  }
+}
+
+/** Legacy commit status state -> the same bucket vocabulary. */
+export function mapCommitStatusBucket(state: string): CheckRunView["bucket"] {
+  switch ((state ?? "").toLowerCase()) {
+    case "success":
+      return "pass";
+    case "pending":
+      return "pending";
+    default:
+      return "fail";
   }
 }
 
@@ -269,6 +341,7 @@ export function providerDepsFromEnv(env: EnvLike = process.env, exec: Exec = def
   return {
     github,
     linear,
+    checks: github,
     authorizedReviewers: authorizedReviewers.length > 0 ? authorizedReviewers : [DEFAULT_REVIEW_OWNER],
     authority: NO_AUTHORITY,
   };

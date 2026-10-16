@@ -5,9 +5,11 @@ import { TERMINAL_TASK_STATES } from "./schema";
 import { getTask } from "./tasks";
 import { defaultRunner, type CommandRunner } from "./verify";
 import { runMechanicalVerification, taskChecks } from "./workflow";
+import { runMergeGates } from "./merge-gate";
 import {
   NO_AUTHORITY,
   reconcileTaskFromProvider,
+  type ChecksReadOnly,
   type GitHubReadOnly,
   type LinearReadOnly,
   type ProviderAuthority,
@@ -40,6 +42,8 @@ export interface WorkflowDeps {
   verifyHeadProbe?: (cwd: string) => string | null;
   github?: GitHubReadOnly;
   linear?: LinearReadOnly;
+  /** ISH-761: HEAD-pinned required-check reader for the merge gate. */
+  checks?: ChecksReadOnly;
   authorizedReviewers?: string[];
   authority?: ProviderAuthority;
 }
@@ -145,13 +149,36 @@ export function reconcileProviderBound(db: Database, deps: WorkflowDeps): string
 }
 
 /**
+ * ISH-761: evaluate the read-only, HEAD-bound merge gate for every candidate and
+ * raise `IntegrationRequired` on a real conflict. Logs each new decision identity
+ * once. Pure observation: it never merges, rebases or writes a provider.
+ */
+export function reconcileMergeGates(db: Database, deps: WorkflowDeps): string[] {
+  const actions: string[] = [];
+  const runs = runMergeGates(db, {
+    github: deps.github,
+    linear: deps.linear,
+    checks: deps.checks,
+    authorizedReviewers: deps.authorizedReviewers,
+    authority: deps.authority ?? NO_AUTHORITY,
+  });
+  for (const r of runs) {
+    if (r.logged) actions.push(`merge-gate-${r.decision.status.toLowerCase()}:${r.decision.taskId}`);
+    if (r.integrationRaised) actions.push(`integration-required:${r.decision.taskId}`);
+  }
+  return actions;
+}
+
+/**
  * One workflow pass: mechanical verify first (so a fresh submit advances the
- * same tick), then provider reconciliation. Never merges and never writes to a
- * provider; authority-gated effects are out of this path.
+ * same tick), then provider reconciliation, then the read-only merge gate.
+ * Never merges and never writes to a provider; authority-gated effects are out
+ * of this path.
  */
 export async function processWorkflow(db: Database, deps: WorkflowDeps = EMPTY_WORKFLOW_DEPS): Promise<string[]> {
   const actions: string[] = [];
   actions.push(...(await runPendingMechanicalVerifications(db, deps)));
   actions.push(...reconcileProviderBound(db, deps));
+  actions.push(...reconcileMergeGates(db, deps));
   return actions;
 }

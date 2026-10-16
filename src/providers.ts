@@ -97,6 +97,78 @@ export interface LinearReadOnly {
 }
 
 // ---------------------------------------------------------------------------
+// ISH-761 required check results (read-only, HEAD-pinned)
+// ---------------------------------------------------------------------------
+
+/**
+ * One GitHub check run or commit status, normalized to the SAME bucket
+ * vocabulary `gh pr checks` uses. `bucket` is the only thing the merge gate
+ * reads: a required check that is `pending`/`fail`/`cancel` (or absent) BLOCKS.
+ */
+export interface CheckRunView {
+  name: string;
+  bucket: "pass" | "fail" | "pending" | "skipping" | "cancel";
+}
+
+/**
+ * The read-only check reader. `listChecks` is pinned to an EXACT head so the
+ * result can never be credited to a moved HEAD. A failed read returns `null`
+ * ("unknown"), which the gate treats as NOT_RUN — never as "no checks, pass".
+ */
+export interface ChecksReadOnly {
+  readonly name: string;
+  readonly readOnly: true;
+  listChecks(ref: PrRef, headSha: string): CheckRunView[] | null;
+}
+
+/** The roll-up the merge gate judges: required checks all concluded green. */
+export interface CheckRollup {
+  total: number;
+  passed: number;
+  pending: string[];
+  failing: string[];
+  skipped: string[];
+  /**
+   * True only when at least one check actually ran AND none is failing /
+   * pending / cancelled. A zero-check roll-up is deliberately NOT passed: an
+   * unrun required gate (e.g. a CI credit outage) must BLOCK, never PASS.
+   */
+  requiredPassed: boolean;
+}
+
+export function rollupChecks(checks: CheckRunView[]): CheckRollup {
+  const pending: string[] = [];
+  const failing: string[] = [];
+  const skipped: string[] = [];
+  let passed = 0;
+  for (const c of checks) {
+    switch (c.bucket) {
+      case "pass":
+        passed++;
+        break;
+      case "pending":
+        pending.push(c.name);
+        break;
+      case "fail":
+      case "cancel":
+        failing.push(c.name);
+        break;
+      case "skipping":
+        skipped.push(c.name);
+        break;
+    }
+  }
+  return {
+    total: checks.length,
+    passed,
+    pending,
+    failing,
+    skipped,
+    requiredPassed: checks.length > 0 && pending.length === 0 && failing.length === 0,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Review verdict markers (absorbed from lane.sh `verdict_rows`)
 // ---------------------------------------------------------------------------
 
@@ -271,7 +343,24 @@ export function parsePrUrl(url: string | null, fallbackRepo: string | null): PrR
 const LINEAR_HOLD_LABELS = ["hold", "do-not-merge", "do not merge", "human-hold"];
 const LINEAR_HOLD_STATES = ["hold", "on hold", "blocked"];
 
-function linearHolds(issue: IssueView): boolean {
+/**
+ * ISH-761: owner-designated HOLD labels. A PR or Linear issue carrying one of
+ * these is an explicit owner stop — the merge gate must never treat it as
+ * ready. This is a STRUCTURED label lookup, not a keyword scan of free text.
+ */
+export const HOLD_LABELS = ["hold", "do-not-merge", "do not merge", "human-hold"];
+
+/** Owner-designated draft retention: the draft is intentional, do not force-undraft. */
+export const DRAFT_RETAIN_LABELS = ["draft-retained", "hold-draft", ...HOLD_LABELS];
+
+export function hasHoldLabel(labels: readonly string[] | null | undefined): string | null {
+  for (const l of labels ?? []) {
+    if (HOLD_LABELS.includes((l ?? "").toLowerCase())) return l;
+  }
+  return null;
+}
+
+export function linearHolds(issue: IssueView): boolean {
   const state = (issue.state ?? "").toLowerCase();
   if (LINEAR_HOLD_STATES.includes(state)) return true;
   return (issue.labels ?? []).some((l) => LINEAR_HOLD_LABELS.includes(l.toLowerCase()));
@@ -455,11 +544,12 @@ function markerNotAppliedLogged(db: Database, taskId: string, markerKey: string)
 // Test fakes (read-only, in-memory; no network)
 // ---------------------------------------------------------------------------
 
-export class FakeGitHub implements GitHubReadOnly {
+export class FakeGitHub implements GitHubReadOnly, ChecksReadOnly {
   readonly name = "fake-github";
   readonly readOnly = true as const;
   private prs = new Map<string, PrView>();
   private comments = new Map<string, CommentView[]>();
+  private checks = new Map<string, CheckRunView[] | null>();
 
   private key(ref: PrRef): string {
     return `${ref.repo}#${ref.number}`;
@@ -472,6 +562,15 @@ export class FakeGitHub implements GitHubReadOnly {
 
   putComments(ref: PrRef, comments: CommentView[]): this {
     this.comments.set(this.key(ref), comments);
+    return this;
+  }
+
+  /**
+   * Pin checks to an exact head. `null` simulates a FAILED read (NOT_RUN); an
+   * empty array means the head genuinely reported no checks (also NOT_RUN).
+   */
+  putChecks(ref: PrRef, headSha: string, checks: CheckRunView[] | null): this {
+    this.checks.set(`${this.key(ref)}@${headSha}`, checks);
     return this;
   }
 
@@ -488,6 +587,11 @@ export class FakeGitHub implements GitHubReadOnly {
 
   listComments(ref: PrRef): CommentView[] {
     return this.comments.get(this.key(ref)) ?? [];
+  }
+
+  listChecks(ref: PrRef, headSha: string): CheckRunView[] | null {
+    const k = `${this.key(ref)}@${headSha}`;
+    return this.checks.has(k) ? this.checks.get(k)! : [];
   }
 }
 
