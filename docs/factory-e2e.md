@@ -67,17 +67,34 @@ ordered `steps`. A non-`merge_ready` outcome exits non-zero.
   **nothing** (`head == base_head`) is `NO_IMPLEMENTATION`; a non-zero/signalled/
   cancelled/timeout Run is `CODING_FAILED`; a stale/superseded Run's submission is
   `RUN_SUBMISSION_REFUSED`.
-- **Hard required checks.** VERIFY runs the Task's commands in the recorded
-  worktree and requires `git rev-parse HEAD == task.head_sha`. `pass → review`,
-  `fail → implement (new attempt)`, a **required** `not_run`/`inconclusive` → the
-  task BLOCKS. CI credit exhaustion / an unrun required check is **NOT_RUN, never
-  PASS**.
+- **Only a runnable Task state is driven.** The Factory whitelists `queued`/
+  `running`/`review`; **every** other state — including `blocked_internal` (which
+  `blockTask` sets while leaving `phase` unchanged) and `blocked_human`/terminal —
+  returns immediately. A durable block is never carried to MergeReady or erased.
+- **A FAILED reviewer process is not a verdict.** A reviewer that exits non-zero
+  or is signalled is `REVIEW_PROCESS_FAILED` **before** its stdout is parsed — a
+  crash can never be mistaken for a pass, even with a well-formed verdict on
+  stdout.
+- **Hard required checks.** The Factory requires **at least one REQUIRED**
+  (`required !== false`) mechanical check — an all-optional list is `no_checks`,
+  so an optional `not_run`/`inconclusive` can never be aggregated into a PASS.
+  VERIFY runs the Task's commands in the recorded worktree and requires
+  `git rev-parse HEAD == task.head_sha`. `pass → review`, `fail → implement (new
+  attempt)`, a **required** `not_run`/`inconclusive` → the task BLOCKS. CI credit
+  exhaustion / an unrun required check is **NOT_RUN, never PASS**.
 - **Independent structured review.** The reviewer must print ONE structured JSON
   verdict. No structured result / malformed output → `REVIEW_NO_STRUCTURED_RESULT`
   (REFUSED). A verdict that does not name the CURRENT head, or a worktree HEAD
-  that moved → `REVIEW_HEAD_MISMATCH` (REFUSED). A principal that is not an
-  independent reviewer (wrong role, or the submitter) → `REVIEW_NOT_INDEPENDENT`.
-  An unresolved NG at the same head is never cleared by a later OK alone.
+  that moved → `REVIEW_HEAD_MISMATCH` (REFUSED). The worktree HEAD **and** the
+  live `review@head` binding are re-checked **after** the reviewer returns, so a
+  reviewer that commits to the worktree while it runs cannot have its verdict
+  credited. A principal that is not an independent reviewer (wrong role, or the
+  submitter) → `REVIEW_NOT_INDEPENDENT`. An unresolved NG at the same head is
+  never cleared by a later OK alone.
+- **An orphaned Run never hangs the Factory.** On adoption the Run's PID is
+  checked (`process.kill(pid, 0)`); a Run whose owning process is gone, or that
+  outlives the run timeout, is marked terminal `failed` and the Factory returns
+  `CODING_FAILED` — restart/reconcile always finishes and never advances.
 - **Old HEAD cannot advance.** Every result is bound to the revision it judged;
   the merge gate re-reads GitHub and refuses a PR head != `task.head_sha`.
 - **MergeReady is read-only.** The Factory never pushes, merges, accepts,
@@ -195,7 +212,7 @@ unchanged by this issue.
 
 ## Verified / not verified
 
-- **Verified** — `bun run typecheck`; `bun test` (813 pass, 1 skipped, 0 fail);
+- **Verified** — `bun run typecheck`; `bun test` (821 pass, 1 skipped, 0 fail);
   `bun run smoke:factory` (PASS, 13 checks); `RELAY_REAL_SMOKE=1 bun run
   smoke:factory:real` (PASS with real `dsh 0.2.0-rc.2` + real Claude; see the raw
   output above); `tests/factory.test.ts` covers the FIX→fresh-Run→PASS loop, the
@@ -203,7 +220,13 @@ unchanged by this issue.
   malformed reviewer output, foreign-HEAD verdicts, fake/non-independent reviewer
   identities, an unresolved NG, the blocked/terminal task, the live-Run adoption
   (no duplicate running work), the same-worktree single-writer exclusion, distinct
-  parallel worktrees, and the judgment-only Gateway notifications.
+  parallel worktrees, and the judgment-only Gateway notifications. The PR #10
+  round-1 findings each have a dedicated regression test: `blocked_internal` is
+  terminal (finding 1); a non-zero/signalled reviewer process is
+  `REVIEW_PROCESS_FAILED` (finding 2); a worktree HEAD moved during review is
+  `REVIEW_HEAD_MISMATCH` (finding 3); a dead-pid orphan and a live-pid-then-expired
+  orphan are both marked `failed` → `CODING_FAILED` (finding 4); an all-optional
+  check list is `no_checks` (finding 5).
 - **NOT verified here** — an end-to-end **real-FIX** loop (real dsh attempt 0
   genuinely insufficient → real Claude FIX → real dsh attempt 1 → real Claude
   PASS): the real smoke reached MergeReady on attempt 0 because the real model

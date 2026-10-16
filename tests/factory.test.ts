@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Database } from "bun:sqlite";
 import { openDb } from "../src/db";
-import { getTask } from "../src/tasks";
+import { blockTask, getTask } from "../src/tasks";
 import { registerWorker } from "../src/workers";
 import { inboxFor } from "../src/messages";
 import { intakeTask, recordReview, runMechanicalVerification, submitPhase, taskChecks } from "../src/workflow";
@@ -18,6 +18,7 @@ import {
   DEFAULT_REVIEWER_WORKER as REVIEWER_WORKER,
   REVIEW_NOT_INDEPENDENT,
   REVIEW_NO_STRUCTURED_RESULT,
+  REVIEW_PROCESS_FAILED,
   runHeadlessReview,
   extractReviewerVerdict,
   type ReviewerProcess,
@@ -60,7 +61,16 @@ echo DONE
 const NOOP_DSH = `echo DONE
 `;
 
-type ReviewPlan = "pass" | "fix" | "blocked" | "garbage" | "wronghead" | "envelope";
+type ReviewPlan =
+  | "pass"
+  | "fix"
+  | "blocked"
+  | "garbage"
+  | "wronghead"
+  | "envelope"
+  | "exitfail"
+  | "signal"
+  | "mutatehead";
 
 interface ReviewerHarness {
   spawner: ReviewerSpawner;
@@ -101,16 +111,35 @@ function reviewerHarness(plan: ReviewPlan[]): ReviewerHarness {
             result: JSON.stringify({ verdict: "pass", head, summary: "ok via envelope" }),
           });
           break;
+        case "exitfail":
+          // A WELL-FORMED pass on stdout, but the reviewer process failed.
+          stdout = JSON.stringify({ verdict: "pass", head, summary: "looks fine" });
+          break;
+        case "signal":
+          stdout = JSON.stringify({ verdict: "pass", head, summary: "looks fine" });
+          break;
+        case "mutatehead": {
+          // Commit to the worktree WHILE the reviewer runs, then name the OLD head.
+          writeFileSync(join(ctx.cwd, "mutated-by-reviewer.txt"), "mutated\n");
+          git(ctx.cwd, "add", "mutated-by-reviewer.txt");
+          git(ctx.cwd, "commit", "-q", "-m", "reviewer moved the head");
+          stdout = JSON.stringify({ verdict: "pass", head, summary: "ok for the head it saw" });
+          break;
+        }
         default:
           stdout = JSON.stringify({ verdict: "pass", head, summary: "looks correct" });
       }
+      if (p === "exitfail") return { exitCode: 1, signal: null, stdout, stderr: "reviewer crashed" };
+      if (p === "signal") return { exitCode: null, signal: "SIGKILL", stdout, stderr: "" };
       return { exitCode: 0, signal: null, stdout, stderr: "" };
     },
   };
   return { spawner, calls };
 }
 
-function newTask(extra: { checks?: { name: string; command: string; timeoutMs?: number }[]; title?: string } = {}) {
+function newTask(
+  extra: { checks?: { name: string; command: string; required?: boolean; timeoutMs?: number }[]; title?: string } = {}
+) {
   return intakeTask(db, {
     provider: "test",
     issueId: `ISH-762-${issueSeq++}`,
@@ -425,6 +454,122 @@ describe("blocked / terminal tasks never advance", () => {
     const res = await runFactoryTask(db, id, factoryDeps(dsh, reviewerHarness(["pass"]).spawner));
     expect(res.outcome).toBe("terminal");
     expect(listRuns(db, { taskId: id })).toHaveLength(0);
+  });
+
+  // Regression (PR #10 finding 1): `blockTask(..., human=false)` sets
+  // `blocked_internal` while LEAVING `phase` unchanged, so a guard that lists
+  // only `blocked_human` carried the task to MergeReady and erased the block.
+  test("a blocked_internal task is terminal (the durable block is never erased)", async () => {
+    const dsh = fakeDsh("dsh-commit", COMMITTING_DSH);
+    registerWorker(db, "impl-worker", { role: "worker" });
+    const id = newTask();
+    blockTask(db, id, "impl-worker", "needs a human decision", false);
+    expect(getTask(db, id)!.state).toBe("blocked_internal");
+    const phaseBefore = getTask(db, id)!.phase;
+    const res = await runFactoryTask(db, id, factoryDeps(dsh, reviewerHarness(["pass"]).spawner));
+    expect(res.outcome).toBe("terminal");
+    expect(res.reason).toBe("state blocked_internal");
+    expect(getTask(db, id)!.state).toBe("blocked_internal");
+    expect(getTask(db, id)!.phase).toBe(phaseBefore);
+    expect(listRuns(db, { taskId: id })).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PR #10 round-1 findings — regression tests (each reproduced the bug on the
+// pre-fix HEAD; none of these was caught by the existing suite).
+// ---------------------------------------------------------------------------
+
+describe("PR #10 finding 2: a failed reviewer process is never a verdict", () => {
+  test("a non-zero reviewer exit with a well-formed pass on stdout is REFUSED", async () => {
+    const dsh = fakeDsh("dsh-commit", COMMITTING_DSH);
+    const id = newTask();
+    const res = await runFactoryTask(db, id, factoryDeps(dsh, reviewerHarness(["exitfail"]).spawner));
+    expect(res.outcome).toBe("review_refused");
+    expect(res.reason).toContain(REVIEW_PROCESS_FAILED);
+    expect(getTask(db, id)!.phase).toBe("review");
+  });
+
+  test("a signalled reviewer with a valid pass on stdout is REFUSED", async () => {
+    const dsh = fakeDsh("dsh-commit", COMMITTING_DSH);
+    const id = newTask();
+    const res = await runFactoryTask(db, id, factoryDeps(dsh, reviewerHarness(["signal"]).spawner));
+    expect(res.outcome).toBe("review_refused");
+    expect(res.reason).toContain(REVIEW_PROCESS_FAILED);
+    expect(getTask(db, id)!.phase).toBe("review");
+  });
+});
+
+describe("PR #10 finding 3: a worktree HEAD that moved during review is REFUSED", () => {
+  test("a reviewer that commits to the worktree while running cannot advance", async () => {
+    const dsh = fakeDsh("dsh-commit", COMMITTING_DSH);
+    const id = newTask();
+    const headBefore = await driveToReview(id, dsh);
+    const rev = reviewerHarness(["mutatehead"]);
+    const res = await runFactoryTask(db, id, { ...factoryDeps(dsh, rev.spawner), maxAttempts: 1 });
+    expect(res.outcome).toBe("review_refused");
+    expect(res.reason).toContain("HEAD_MISMATCH");
+    // The task is NOT advanced, and its recorded head still names the reviewed rev.
+    const task = getTask(db, id)!;
+    expect(task.phase).toBe("review");
+    expect(task.head_sha).toBe(headBefore);
+  });
+});
+
+describe("PR #10 finding 4: an orphaned running Run never hangs the factory", () => {
+  test("a dead-pid orphan is marked failed and the factory fails closed", async () => {
+    const dsh = fakeDsh("dsh-commit", COMMITTING_DSH);
+    const id = newTask();
+    const launched = await launchTaskRun(db, id, { repo, worktreesRoot: join(dir, "worktrees"), outputRoot: join(dir, "runs"), dshBin: dsh, fastExitMs: 0 });
+    await launched.handle.wait();
+    // Simulate the owner process dying: the row stays `running` with a dead pid.
+    const dead = Bun.spawnSync(["true"]);
+    const deadPid = dead.pid ?? 999999;
+    db.query(`UPDATE runs SET state='running', pid=?, exit_code=NULL, ended_at=NULL WHERE id=?`).run(deadPid, launched.handle.id);
+    const res = await runFactoryTask(db, id, { ...factoryDeps(dsh, reviewerHarness(["pass"]).spawner), timeoutMs: 2000 });
+    expect(res.outcome).toBe("coding_failed");
+    expect(res.reason).toContain("orphaned");
+    const runs = listRuns(db, { taskId: id });
+    expect(runs).toHaveLength(1);
+    expect(runs[0].state).toBe("failed");
+    expect(getTask(db, id)!.phase).toBe("implement");
+  });
+
+  test("a live-pid but expired orphan is bounded by the deadline and marked failed", async () => {
+    const dsh = fakeDsh("dsh-commit", COMMITTING_DSH);
+    const id = newTask();
+    const launched = await launchTaskRun(db, id, { repo, worktreesRoot: join(dir, "worktrees"), outputRoot: join(dir, "runs"), dshBin: dsh, fastExitMs: 0 });
+    await launched.handle.wait();
+    // A LIVE pid (this test process) but no coroutine will ever finish the Run.
+    db.query(`UPDATE runs SET state='running', pid=?, exit_code=NULL, ended_at=NULL WHERE id=?`).run(process.pid, launched.handle.id);
+    const started = Date.now();
+    const res = await runFactoryTask(db, id, { ...factoryDeps(dsh, reviewerHarness(["pass"]).spawner), timeoutMs: 300 });
+    expect(res.outcome).toBe("coding_failed");
+    expect(res.reason).toContain("expired");
+    expect(Date.now() - started).toBeLessThan(5000);
+    expect(listRuns(db, { taskId: id })[0].state).toBe("failed");
+  });
+});
+
+describe("PR #10 finding 5: an all-optional check list is not a gate", () => {
+  test("a task with only OPTIONAL checks is no_checks (an unrun check can never PASS)", async () => {
+    const dsh = fakeDsh("dsh-commit", COMMITTING_DSH);
+    const id = newTask({ checks: [{ name: "slow", command: "sleep 5", required: false, timeoutMs: 80 }] });
+    const res = await runFactoryTask(db, id, factoryDeps(dsh, reviewerHarness(["pass"]).spawner));
+    expect(res.outcome).toBe("no_checks");
+    expect(getTask(db, id)!.phase).toBe("verify");
+  });
+
+  test("a task with at least one REQUIRED check still runs", async () => {
+    const dsh = fakeDsh("dsh-commit", COMMITTING_DSH);
+    const id = newTask({
+      checks: [
+        { name: "required-noop", command: "true", required: true },
+        { name: "optional-noop", command: "true", required: false },
+      ],
+    });
+    const res = await runFactoryTask(db, id, factoryDeps(dsh, reviewerHarness(["pass"]).spawner));
+    expect(res.outcome).toBe("merge_ready");
   });
 });
 

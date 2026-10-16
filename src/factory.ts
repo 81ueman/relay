@@ -1,13 +1,13 @@
 import type { Database } from "bun:sqlite";
+import { now } from "./db";
 import { logEvent } from "./events";
 import { getTask, claimTask } from "./tasks";
 import { getWorker, registerWorker } from "./workers";
 import { INTEGRATOR_ROLE, REVIEWER_ROLE } from "./schema";
-import type { Task } from "./schema";
+import type { Run, RunState, Task, TaskState } from "./schema";
 import { defaultRunner, type CommandRunner } from "./verify";
 import { runMechanicalVerification, submitPhase, taskChecks } from "./workflow";
-import { acceptRunSubmission, getRun, waitDshRun } from "./dsh-runner";
-import type { Run } from "./schema";
+import { acceptRunSubmission, getRun } from "./dsh-runner";
 import { launchTaskRun, type LaunchRunOptions } from "./run-lifecycle";
 import {
   DEFAULT_REVIEWER_WORKER,
@@ -124,6 +124,66 @@ function isLive(run: Run | null): boolean {
   return !!run && (run.state === "running" || run.state === "starting");
 }
 
+/** Run states that are terminal (an adopted Run in one of these needs no wait). */
+const RUN_TERMINAL_STATES: ReadonlySet<RunState> = new Set<RunState>([
+  "exited",
+  "failed",
+  "cancelled",
+  "timeout",
+  "submitted",
+]);
+
+/**
+ * Task states the Factory may drive. Anything else — including `blocked_internal`
+ * (which `blockTask` writes while LEAVING `phase` unchanged) — is terminal for the
+ * Factory: a durable block must never be erased by carrying the task to
+ * MergeReady. Whitelisting runnable states (rather than blacklisting) is the
+ * fail-closed form, so a NEW state is non-runnable by default.
+ */
+const FACTORY_RUNNABLE_STATES: ReadonlySet<TaskState> = new Set<TaskState>(["queued", "running", "review"]);
+
+/** True when the process id is a live process (EPERM means alive-but-not-ours). */
+export function pidAlive(pid: number | null): boolean {
+  if (!pid) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/** Bound an adopted Run's wait: return the row, or `timedOut` past the deadline. */
+async function waitRunBounded(
+  db: Database,
+  runId: string,
+  timeoutMs: number,
+  pollMs = 250
+): Promise<{ run: Run; timedOut: boolean }> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const r = getRun(db, runId);
+    if (!r) throw new Error(`unknown run: ${runId}`);
+    if (RUN_TERMINAL_STATES.has(r.state)) return { run: r, timedOut: false };
+    if (Date.now() > deadline) return { run: r, timedOut: true };
+    await new Promise((res) => setTimeout(res, pollMs));
+  }
+}
+
+/**
+ * Mark a still-live Run terminal `failed`. Used when an adopted Run is ORPHANED
+ * (its owning process is gone) or EXPIRED (it outlived the adoption deadline):
+ * the coroutine that would have written the terminal state is lost, so nothing
+ * else can release the single-writer fence. Never advances the Task.
+ */
+function markRunOrphan(db: Database, runId: string, reason: string): void {
+  const t = now();
+  db.query(
+    `UPDATE runs SET state = 'failed', error = ?, ended_at = ?, updated_at = ? WHERE id = ? AND state IN ('running', 'starting')`
+  ).run(reason, t, t, runId);
+  logEvent(db, { source: "factory", type: "factory.run_orphaned", payload: { runId, reason } });
+}
+
 /**
  * One implement step: adopt a live Run for this phase/attempt (never start a
  * second writer on restart), else launch ONE disposable dsh Run; wait for it to
@@ -138,8 +198,28 @@ async function implementOnce(
   const existing = latestRun(db, task.id, "implement", task.attempt);
   let run: Run;
   if (isLive(existing)) {
-    logEvent(db, { source: "factory", taskId: task.id, type: "factory.run_adopted", payload: { runId: existing!.id } });
-    run = await waitDshRun(db, existing!.id);
+    const live = existing!;
+    logEvent(db, { source: "factory", taskId: task.id, type: "factory.run_adopted", payload: { runId: live.id, pid: live.pid } });
+    // Restart/reconcile MUST NOT hang on an orphaned Run. A detached dsh Run's
+    // terminal state is written by the coroutine that launched it; if that
+    // process died, the row stays `running` forever. Check the PID is alive and
+    // bound the wait with the run timeout; a dead/expired orphan is marked
+    // terminal `failed` and the Factory fails closed (never advances).
+    if (!pidAlive(live.pid)) {
+      const reason = `orphaned run ${live.id}: owner pid ${live.pid ?? "none"} is not alive`;
+      markRunOrphan(db, live.id, reason);
+      const r = getRun(db, live.id)!;
+      return { run: r, producedHead: r.head_sha, error: `${CODING_FAILED}: ${reason}` };
+    }
+    const adoptTimeoutMs = deps.timeoutMs ?? 30 * 60_000;
+    const { run: waited, timedOut } = await waitRunBounded(db, live.id, adoptTimeoutMs);
+    if (timedOut) {
+      const reason = `adopted run ${live.id} did not finish within ${adoptTimeoutMs}ms (expired)`;
+      markRunOrphan(db, live.id, reason);
+      const r = getRun(db, live.id)!;
+      return { run: r, producedHead: r.head_sha, error: `${CODING_FAILED}: ${reason}` };
+    }
+    run = waited;
   } else {
     const opts: LaunchRunOptions = {
       repo: deps.repo,
@@ -209,7 +289,10 @@ export async function runFactoryTask(
   for (let guard = 0; guard < guardMax; guard++) {
     const task = getTask(db, taskId);
     if (!task) throw new Error(`unknown task: ${taskId}`);
-    if (task.state === "blocked_human" || task.state === "failed" || task.state === "cancelled" || task.state === "done") {
+    // Fail closed on ANY non-runnable state — `blocked_internal` included, since
+    // `blockTask` leaves `phase` unchanged and `isTerminalTaskState` does not
+    // cover the blocked states. A durable block is never overwritten.
+    if (!FACTORY_RUNNABLE_STATES.has(task.state)) {
       return { taskId, outcome: "terminal", head: task.head_sha, attempts, gate: null, reason: `state ${task.state}`, steps };
     }
     if (task.attempt !== lastAttempt) {
@@ -238,7 +321,11 @@ export async function runFactoryTask(
       }
       case "verify": {
         const checks = taskChecks(task);
-        if (checks.length === 0) {
+        // Require at least one REQUIRED check, not merely a non-empty list: an
+        // all-optional list lets `aggregateOutcome` turn an optional NOT_RUN/
+        // INCONCLUSIVE into a PASS, which the spec forbids (an unrun check must
+        // never become PASS).
+        if (!checks.some((c) => c.required !== false)) {
           return {
             taskId,
             outcome: "no_checks",

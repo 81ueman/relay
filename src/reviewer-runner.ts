@@ -37,6 +37,8 @@ export const REVIEW_BAD_VERDICT = "REVIEW_BAD_VERDICT";
 export const REVIEW_HEAD_MISMATCH = "REVIEW_HEAD_MISMATCH";
 export const REVIEW_NOT_INDEPENDENT = "REVIEW_NOT_INDEPENDENT";
 export const REVIEW_NOT_IN_REVIEW = "REVIEW_NOT_IN_REVIEW";
+/** The reviewer process itself failed (non-zero exit / a signal): never a verdict. */
+export const REVIEW_PROCESS_FAILED = "REVIEW_PROCESS_FAILED";
 
 /** The worker row a headless Claude review is recorded under (role: reviewer). */
 export const DEFAULT_REVIEWER_WORKER = "claude-review";
@@ -454,6 +456,28 @@ export async function runHeadlessReview(
     /* evidence write is best effort, never a verdict */
   }
 
+  // A FAILED reviewer process is not a verdict, even when its stdout happens to
+  // contain a well-formed pass: the exit code / signal is authoritative for
+  // PROCESS success, so a crash can never be mistaken for a review decision.
+  if (proc.exitCode !== 0 || proc.signal !== null) {
+    logEvent(db, {
+      source: "factory",
+      taskId,
+      type: "factory.review_refused",
+      payload: {
+        reason: REVIEW_PROCESS_FAILED,
+        head,
+        exitCode: proc.exitCode,
+        signal: proc.signal,
+        evidence: evidencePath,
+      },
+    });
+    return refusal(
+      `${REVIEW_PROCESS_FAILED}: reviewer process exit ${proc.exitCode ?? "none"} signal ${proc.signal ?? "none"}`,
+      task,
+      { verdict, evidenceRef: evidencePath, raw }
+    );
+  }
   if (!verdict) {
     logEvent(db, {
       source: "factory",
@@ -477,6 +501,39 @@ export async function runHeadlessReview(
         { verdict, evidenceRef: evidencePath, raw }
       );
     }
+  }
+
+  // The worktree HEAD was checked BEFORE the reviewer ran. Re-check AFTER it
+  // returns (and that the live task is still review@head): a reviewer — or a
+  // concurrent writer — that moved the worktree HEAD must never have its verdict
+  // credited, even though `recordReview` only compares the DB `head_sha`.
+  const postHead = gitHead(worktree);
+  const liveReview = getTask(db, taskId);
+  if (
+    postHead !== head ||
+    !liveReview ||
+    liveReview.phase !== "review" ||
+    liveReview.state !== "review" ||
+    (liveReview.head_sha ?? null) !== head
+  ) {
+    logEvent(db, {
+      source: "factory",
+      taskId,
+      type: "factory.review_refused",
+      payload: {
+        reason: REVIEW_HEAD_MISMATCH,
+        head,
+        worktreeHead: postHead,
+        livePhase: liveReview?.phase ?? null,
+        liveState: liveReview?.state ?? null,
+        evidence: evidencePath,
+      },
+    });
+    return refusal(
+      `${REVIEW_HEAD_MISMATCH}: after the reviewer ran, worktree HEAD ${postHead ?? "none"} / task ${liveReview?.phase ?? "none"}@${liveReview?.head_sha ?? "none"} != review head ${head}`,
+      task,
+      { verdict, evidenceRef: evidencePath, raw }
+    );
   }
 
   // Independence: the review is recorded as the reviewer worker, which holds
