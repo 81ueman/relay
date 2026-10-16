@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # ISH-822 in-sandbox real `dsh` headless run.
 #
-# Run inside the clone-mode sandbox with the provider placeholder injected:
+# Run inside the clone-mode sandbox with the provider placeholder injected
+# (POC = absolute path to the repo's PoC dir, resolved before any `cd`):
 #
+#   POC="$(git rev-parse --show-toplevel)/docs/ish-822-sandbox-poc"
 #   sbx exec \
 #     -e OLLAMA_CLOUD_V41_API_KEY=<placeholder from `sbx secret ls`> \
 #     -w "$CLONE" \
-#     ish822-poc bash -lc "$(cat docs/ish-822-sandbox-poc/scripts/run-dsh-in-sandbox.sh)"
+#     ish822-poc bash -lc "$(cat "$POC/scripts/run-dsh-in-sandbox.sh")"
 #
 # Preconditions: `dsh` 0.2.0-rc.2 is installed (`npm i -g @deepseek-ai/dsh@0.2.0-rc.2`)
 # and /home/agent/dsh-overlay.yml exists (scripts/dsh-overlay.yml).

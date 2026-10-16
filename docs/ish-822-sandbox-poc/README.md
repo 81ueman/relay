@@ -50,6 +50,10 @@ required for `sbx` (confirmed: Docker Desktop is absent here and `sbx` works).
 ## Reproduce
 
 ```bash
+# 0. Resolve the PoC dir to an ABSOLUTE path FIRST — later steps `cd` into
+#    $OTHER/$FIX, so relative script paths would silently expand to "".
+POC="$(git rev-parse --show-toplevel)/docs/ish-822-sandbox-poc"
+
 # 0a. HOST side: harmless sentinels + a separate "other" repo (host-absolute paths).
 #     Nothing in the relay repo is touched. Proof they exist on the host (raw `ls`
 #     is in evidence/00-host-sentinels-setup.log):
@@ -94,7 +98,7 @@ sbx policy allow network --sandbox ish822-poc \
   "api.deepseek.com:443,ollama.com:443,opencode.ai:443"
 
 # 6. isolation negative tests
-sbx exec ish822-poc bash -lc "$(cat docs/ish-822-sandbox-poc/scripts/negative-tests.sh)"
+sbx exec ish822-poc bash -lc "$(cat "$POC/scripts/negative-tests.sh")"
 
 # 7. store the provider key via the credential proxy (placeholder; real value stays on host)
 HOSTKEY_CMD=/abs/path/to/get-ollama-key.sh      # prints the key to stdout on the host
@@ -102,12 +106,15 @@ sbx secret set-custom --sandbox ish822-poc --host ollama.com \
   --env OLLAMA_CLOUD_V41_API_KEY --command "$HOSTKEY_CMD"
 sbx secret ls                                    # copy the placeholder
 
+# 7b. prove the real key is not inside the sandbox (key stays on the HOST; stream out + grep host-side)
+KEY_CMD="$HOSTKEY_CMD" bash "$POC/scripts/containment-probe.sh"
+
 # 8. install dsh in the sandbox and run it (overlay file from scripts/)
 sbx exec ish822-poc bash -lc 'npm i -g @deepseek-ai/dsh@0.2.0-rc.2 && dsh --version'
 sbx exec ish822-poc bash -lc 'cat > /home/agent/dsh-overlay.yml' \
-  < docs/ish-822-sandbox-poc/scripts/dsh-overlay.yml
+  < "$POC/scripts/dsh-overlay.yml"
 sbx exec -e OLLAMA_CLOUD_V41_API_KEY=<placeholder> -w "$FIX" \
-  ish822-poc bash -lc "$(cat docs/ish-822-sandbox-poc/scripts/run-dsh-in-sandbox.sh)"
+  ish822-poc bash -lc "$(cat "$POC/scripts/run-dsh-in-sandbox.sh")"
 
 # 9. Git over SSH (forwarded agent; GitHub SSH on 443)
 sbx exec ish822-poc bash -lc \
@@ -208,19 +215,24 @@ GET  /v1/models with BOGUS auth -> 200          # public; why the earlier 200 wa
 curl https://example.com        -> 403          # Balanced deny
 ```
 
-The real key never enters the sandbox — measured, not assumed
-([`14b`](evidence/14b-real-key-containment.log)):
+The real key never enters the sandbox — measured **host-side**, keeping the key
+on the host ([`14b`](evidence/14b-real-key-containment.log), script
+[`containment-probe.sh`](scripts/containment-probe.sh)): the sandbox's
+`/{home/agent,tmp,etc,var/tmp,opt}` is streamed *out* (`sudo tar` over `sbx exec`)
+and grepped **on the host** with the real key, so the value is never sent into
+the VM:
 
 ```
-host   sha256(real OLLAMA key)   = 57d012fd…   # host-side, hash only
-sandbox sha256(placeholder env)  = 5b467951…   # different value
-sandbox env auth var             = OLLAMA_CLOUD_V41_API_KEY=sbx-cs-…
-grep real key in /home/agent /tmp /etc /var/tmp /opt  -> (no matches)
+# sandbox user                 : agent
+# host sha256(real key)        : dc0865b0…                       # host-side, hash only
+# stream: 184616960 bytes (tar), 179868429 bytes (extracted)
+# POSITIVE CONTROLS  grep -acF 'Ubuntu' = 21 ; 'ISH-822' = 8      # proves the stream IS inspected
+# SUBJECT            grep -acF -f <(KEY_CMD) = 0                  # real key absent
+#                    grep -acF 'sbx-cs-'      = 0                 # placeholder not persisted either
 ```
 
-(The key is passed to the sandbox-side grep over stdin for the test only, never
-written there. The sandbox was created *before* the secret, so the placeholder was
-also passed explicitly with `sbx exec -e` — placeholders are not secret.)
+(The sandbox was created *before* the secret, so the placeholder was also passed
+explicitly with `sbx exec -e` — placeholders are not secret.)
 
 ### 7. Real `dsh` headless run ([`13`](evidence/13-sandbox-overlay.log), [`15`](evidence/15-sandbox-dsh-run.log))
 
@@ -273,11 +285,14 @@ mechanism is observed but not further explained. GitHub's SSH-on-443 endpoint
 
 ```
 $ git -C "$FIX" fetch sandbox-ish822-poc
- * [new branch] main -> sandbox-ish822-poc/main
-   ab967ff..526f8a1  main -> refs/sandboxes/ish822-poc/main
+From git://127.0.0.1:49156/ish822-fixture
+ * [new branch]      main       -> sandbox-ish822-poc/main
 $ git -C "$FIX" rev-parse HEAD   -> ab967ff…      # host HEAD unchanged
 $ git -C "$FIX" status --porcelain -> (clean)
 ```
+
+(An earlier round-0 fetch also printed a `refs/sandboxes/ish822-poc/main` ref
+line; the committed `evidence/18` from the re-run above is the authoritative one.)
 
 ### 10. Cleanup ([`20`](evidence/20-final-state-cleanup.log), [`21`](evidence/21-secret-cleanup.log))
 

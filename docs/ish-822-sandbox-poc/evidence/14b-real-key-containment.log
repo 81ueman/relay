@@ -1,10 +1,19 @@
-=== real-key containment measurement (no key values printed) ===
-host sha256(real OLLAMA key)   = 57d012fd3a1657ebb46e8e87dff8cd71d80a00a95d06874744c39be928f3d2a1
-sandbox sha256(placeholder env) = 5b467951b97604792cd33787080ffeeed928205f8969f5355cc68c315e3750ff
-received real-key length inside sandbox = 57
---- env auth vars visible in the sandbox ---
-OLLAMA_CLOUD_V41_API_KEY=sbx-cs-aDsM6…
---- grep the REAL key across sandbox-visible paths (/home/agent /tmp /etc /var/tmp /opt) ---
-(no paths printed above = the real key is not present)
---- where does the PLACEHOLDER appear in the sandbox filesystem? ---
-(end)
+# ISH-822 real-key containment probe (host-side grep; the key is read on the host only).
+# Script (committed): docs/ish-822-sandbox-poc/scripts/containment-probe.sh
+# KEY_CMD prints the real provider key on the host; its value never leaves the host.
+
+$ KEY_CMD=<host key cmd> bash docs/ish-822-sandbox-poc/scripts/containment-probe.sh
+# sandbox user                 : agent
+# host sha256(real key)        : dc0865b0ba3b362cda037e033a3f4d8138185a5b003d907985a02e05c7dad255
+# tar reads as root inside the VM; its 2>/dev/null drops unreadable-file errors
+# streaming sandbox /{home/agent,tmp,etc,var/tmp,opt} OUT to /var/folders/2l/lk91l4dd1ysb1jfw7bkw0nrh0000gn/T/ish822-sandbox-visible.sVfaqGZIo8
+# stream:  184616960 bytes (tar),  179868429 bytes (extracted)
+
+# POSITIVE CONTROLS (prove the pipeline inspects content), host-side:
+#   grep -acF 'Ubuntu'     = 21   (expect >=1)
+#   grep -acF 'ISH-822'    = 8   (expect >=1)
+# SUBJECT, host-side:
+#   grep -acF -f <(KEY_CMD) = 0   (expect 0)
+# also no persisted placeholder, host-side:
+#   grep -acF 'sbx-cs-'      = 0   (expect 0)
+EXIT=0

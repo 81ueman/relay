@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # ISH-822 in-sandbox isolation negative tests.
 #
-# Run inside the clone-mode sandbox:
-#   sbx exec ish822-poc bash -lc "$(cat docs/ish-822-sandbox-poc/scripts/negative-tests.sh)"
+# Run inside the clone-mode sandbox (POC = absolute path to the repo's PoC dir,
+# resolved before any `cd`):
+#   POC="$(git rev-parse --show-toplevel)/docs/ish-822-sandbox-poc"
+#   sbx exec ish822-poc bash -lc "$(cat "$POC/scripts/negative-tests.sh")"
 #
 # The negative tests probe HOST-ABSOLUTE paths (`/Users/81ueman/...`), not the
 # sandbox user's own home (`/home/agent`). Probing `~` inside the VM is vacuous:
