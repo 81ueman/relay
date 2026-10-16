@@ -1,0 +1,16 @@
+=== Finding 3a: Docker Desktop presence / version ===
+$ ls -d /Applications/Docker.app
+ls: /Applications/Docker.app: No such file or directory
+$ ls -la /Applications | grep -i docker
+(no Docker.app)
+$ docker context ls
+NAME            DESCRIPTION                               DOCKER ENDPOINT                                   ERROR
+default         Current DOCKER_HOST based configuration   unix:///var/run/docker.sock                       
+desktop-linux   Docker Desktop                            unix:///Users/81ueman/.docker/run/docker.sock     
+orbstack *      OrbStack                                  unix:///Users/81ueman/.orbstack/run/docker.sock   
+$ readlink /usr/local/bin/docker
+/Applications/OrbStack.app/Contents/MacOS/xbin/docker
+$ ls -la ~/.docker/cli-plugins/docker-sandbox
+lrwxr-xr-x@ 1 81ueman  staff  70 Dec 19  2025 /Users/81ueman/.docker/cli-plugins/docker-sandbox -> /Applications/Docker.app/Contents/Resources/cli-plugins/docker-sandbox
+$ docker-desktop --version
+zsh:10: command not found: docker-desktop

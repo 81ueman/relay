@@ -1,0 +1,10 @@
+=== real-key containment measurement (no key values printed) ===
+host sha256(real OLLAMA key)   = 57d012fd3a1657ebb46e8e87dff8cd71d80a00a95d06874744c39be928f3d2a1
+sandbox sha256(placeholder env) = 5b467951b97604792cd33787080ffeeed928205f8969f5355cc68c315e3750ff
+received real-key length inside sandbox = 57
+--- env auth vars visible in the sandbox ---
+OLLAMA_CLOUD_V41_API_KEY=sbx-cs-aDsM6…
+--- grep the REAL key across sandbox-visible paths (/home/agent /tmp /etc /var/tmp /opt) ---
+(no paths printed above = the real key is not present)
+--- where does the PLACEHOLDER appear in the sandbox filesystem? ---
+(end)

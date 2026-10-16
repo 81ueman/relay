@@ -1,18 +1,30 @@
-=== host remotes on fixture ===
-sandbox-ish822-poc	git://127.0.0.1:49155/ish822-fixture (fetch)
-sandbox-ish822-poc	git://127.0.0.1:49155/ish822-fixture (push)
+=== host fixture BEFORE fetch: sandbox artifacts absent, tree clean ===
+total 32
+drwxr-xr-x@     8 81ueman  staff      256 Oct 17 00:27 .
+drwx------@ 31610 81ueman  staff  1011520 Oct 17 00:47 ..
+-rw-r--r--@     1 81ueman  staff       34 Oct 17 00:27 .env
+drwxr-xr-x@    13 81ueman  staff      416 Oct 17 00:47 .git
+-rw-r--r--@     1 81ueman  staff       28 Oct 17 00:27 .gitignore
+-rw-r--r--@     1 81ueman  staff       35 Oct 17 00:27 README.md
+drwxr-xr-x@     3 81ueman  staff       96 Oct 17 00:27 src
+-rw-r--r--@     1 81ueman  staff       35 Oct 17 00:27 untracked-sentinel.txt
+--- git -C "$FIX" status --porcelain ---
+porcelain exit=0
+--- host HEAD before ---
+ab967ffefafa656399eee2969272a343daad268a
 
-$ git fetch sandbox-ish822-poc
-remote: warning: unable to access '/root/.config/git/attributes': Permission denied        
-From git://127.0.0.1:49155/ish822-fixture
+=== remotes ===
+sandbox-ish822-poc	git://127.0.0.1:49156/ish822-fixture (fetch)
+sandbox-ish822-poc	git://127.0.0.1:49156/ish822-fixture (push)
+
+$ git -C "$FIX" fetch sandbox-ish822-poc
+From git://127.0.0.1:49156/ish822-fixture
  * [new branch]      main       -> sandbox-ish822-poc/main
-   ab967ff..526f8a1  main       -> refs/sandboxes/ish822-poc/main
 fetch exit=0
-=== fetched commit present on host? ===
+--- fetched commit on host ---
 526f8a1 ISH-822: sandbox dsh commit
 ab967ff fixture: initial tracked content
-526f8a1 ISH-822: sandbox dsh commit
- poc-note.txt | 1 +
- 1 file changed, 1 insertion(+)
-=== host HEAD unchanged (sandbox commit NOT merged) ===
+
+=== AFTER fetch: host HEAD unchanged, tree still clean (nothing merged) ===
 ab967ffefafa656399eee2969272a343daad268a
+porcelain exit=0

@@ -22,9 +22,9 @@ the host with `git fetch sandbox-<name>`.
 | Clone-mode sandbox from a main checkout | ✅ `ish822-poc` |
 | Real `dsh` 0.2.0-rc.2 headless run, JSONL + exit + commit | ✅ exit `0`, commit `526f8a1` |
 | DeepSeek model via API **inside** the sandbox | ⚠️ DeepSeek model yes; **not** `api.deepseek.com` (no key on host) — see [Caveats](#caveats--not-verified) |
-| Credential never enters the sandbox (proxy placeholder) | ✅ |
+| Credential never enters the sandbox (proxy placeholder) | ✅ substitution proven on a 401-vs-200 endpoint; containment measured |
 | Git over SSH using the forwarded agent, no key file | ✅ (over `ssh.github.com:443`) |
-| Host personal areas / other repos / host Docker not visible | ✅ sentinel negative tests |
+| Host personal areas / other repos / host Docker not visible | ✅ host-absolute sentinel negative tests |
 | Balanced network policy effective allow/deny | ✅ allow npm/github/`*.github.com:443`; deny `example.com` → 403 |
 | Sandbox clone commit fetched back on the host | ✅ `sandbox-ish822-poc/main` |
 | No existing Sandbox / global policy destroyed | ✅ (one global policy *initialized*, was uninitialized) |
@@ -37,7 +37,7 @@ the host with `git fetch sandbox-<name>`.
 | Host | `Darwin DaichinoMacBook-Pro.local 25.2.0 … RELEASE_ARM64_T8142 arm64` | session |
 | `sbx` | `sbx version v0.48.0 5caf923e0587d376848f6f388eca3e0f5ca00e2d` | `01`, `20` |
 | Host `dsh` | `0.2.0-rc.2` (`@deepseek-ai/dsh`) | session |
-| Host Docker | Docker Desktop **not installed** (only dangling symlinks); active context `orbstack` | `02` |
+| Host Docker | Docker Desktop **not installed** (`ls -d /Applications/Docker.app` → `No such file`; `docker-desktop` → `command not found`; `~/.docker/cli-plugins/docker-sandbox` is a dangling symlink; active context `orbstack`) | `02a` |
 | Sandbox kernel | `Linux ish822-poc 7.0.14 … aarch64 GNU/Linux` | `08`, `11` |
 | Sandbox OS | `Ubuntu 26.04.1 LTS` | `08`, `11` |
 | Sandbox user | `uid=1000(agent) … 27(sudo),1001(docker)`, `sudo` works | `08`, `09` |
@@ -50,8 +50,20 @@ required for `sbx` (confirmed: Docker Desktop is absent here and `sbx` works).
 ## Reproduce
 
 ```bash
-# 0. fixture: a harmless verification Git repo (main checkout, NOT a worktree)
-FIX=/private/var/folders/2l/lk91l4dd1ysb1jfw7bkw0nrh0000gn/T/ish822-fixture
+# 0a. HOST side: harmless sentinels + a separate "other" repo (host-absolute paths).
+#     Nothing in the relay repo is touched. Proof they exist on the host (raw `ls`
+#     is in evidence/00-host-sentinels-setup.log):
+TMP=/private/var/folders/2l/lk91l4dd1ysb1jfw7bkw0nrh0000gn/T
+printf 'HOST-HOME-SENTINEL-<home77>\n' > "$HOME/ISH822_HOST_HOME_SENTINEL.txt"
+printf 'HOST-DOCUMENTS-SENTINEL-<docs88>\n' > "$HOME/Documents/ISH822_HOST_DOCUMENTS_SENTINEL.txt"
+OTHER="$TMP/ish822-other-repo"; mkdir -p "$OTHER" && cd "$OTHER"
+git init -q -b main && printf 'OTHER-REPO-SENTINEL-<other42>\n' > secret.txt
+git add -A && git -c user.email=a@b.c -c user.name=x commit -q -m init
+ls -la "$HOME/ISH822_HOST_HOME_SENTINEL.txt" "$HOME/.ssh" \
+       "$HOME/Documents/ISH822_HOST_DOCUMENTS_SENTINEL.txt" "$OTHER/secret.txt"
+
+# 0b. fixture: a harmless verification Git repo (main checkout, NOT a worktree)
+FIX="$TMP/ish822-fixture"
 mkdir -p "$FIX/src" && cd "$FIX"
 git init -q -b main
 git config user.email poc@example.invalid && git config user.name "ISH-822 POC"
@@ -115,18 +127,21 @@ sbx secret rm --placeholder <placeholder> --sandbox ish822-poc -f
 
 ## What was measured
 
-### 1. `sbx` install / diagnose ([`01`](evidence/01-sbx-install.log), [`03`](evidence/03-sbx-diagnose.log))
+### 1. `sbx` install / diagnose ([`01`](evidence/01-sbx-install.log), [`02`](evidence/02-sbx-state-before-login.log), [`03`](evidence/03-sbx-diagnose.log))
 
 `brew install docker/tap/sbx` → `sbx was successfully installed!` /
 `sbx version v0.48.0`. `sbx diagnose`: virtualization `kern.hv_support is 1`,
-`mkfs.erofs`/`mkfs.ext4` present, 221.5 GiB free.
+`mkfs.erofs`/`mkfs.ext4` present, 221.5 GiB free. Before sign-in, `sbx ls` and
+`sbx policy ls` returned `not signed in to Docker` ([`02`](evidence/02-sbx-state-before-login.log)).
 
-### 2. Global policy ([`05`](evidence/05-policy-init-balanced.log))
+### 2. Global policy ([`04`](evidence/04-sbx-precreate-state.log), [`05`](evidence/05-policy-init-balanced.log), [`07`](evidence/07-policy-allow-providers.log))
 
-`sbx policy ls` → `error: global network policy has not been initialized`.
-Initialized `balanced`: `network: 194 allow; filesystem read: 1 allow;
-filesystem write: 1 allow`. **Only an uninitialized policy was initialized; no
-existing policy was overwritten.**
+`sbx policy ls` → `error: global network policy has not been initialized`
+([`04`](evidence/04-sbx-precreate-state.log)). Initialized `balanced`: `network: 194 allow;
+filesystem read: 1 allow; filesystem write: 1 allow`. **Only an uninitialized
+policy was initialized; no existing policy was overwritten.** The three
+provider hosts were then allowed for **this sandbox only**
+(`sbx policy allow network --sandbox ish822-poc …`, [`07`](evidence/07-policy-allow-providers.log)).
 
 ### 3. Clone-mode sandbox ([`06`](evidence/06-sbx-create-clone.log))
 
@@ -140,21 +155,31 @@ $ sbx create --clone --name ish822-poc shell "$FIX"
 ### 4. Isolation negative tests ([`08`](evidence/08-sandbox-env-isolation.log), [`09`](evidence/09-sandbox-clone-engine-tooling.log), [`10`](evidence/10-clone-isolation-host-side.log))
 
 ```
+HOME=/home/agent   (the VM user's home — NOT the host home)
 host on /run/sandbox/source type virtiofs (ro,nosuid,nodev,relatime)
 touch /run/sandbox/source/ISH822-WRITE-TEST  -> Read-only file system
-cat /run/sandbox/source/untracked-sentinel.txt -> ISH822-UNTRACKED-SENTINEL-<abc123>
-cat /run/sandbox/source/.env                   -> ISH822-GITIGNORED-SECRET-<zzz999>
-ls ~/ISH822_HOST_HOME_SENTINEL.txt  -> No such file or directory
-ls ~/.ssh                            -> No such file or directory
-ls …/ish822-other-repo               -> No such file or directory
+
+# NEGATIVE TESTS probe HOST-ABSOLUTE paths (probing `~` inside the VM is vacuous):
+ls /Users/81ueman                                          -> No such file or directory
+ls /Users/81ueman/ISH822_HOST_HOME_SENTINEL.txt            -> No such file or directory
+cat /Users/81ueman/.ssh/id_ed25519                         -> No such file or directory
+ls /Users/81ueman/Documents/ISH822_HOST_DOCUMENTS_SENTINEL.txt -> No such file or directory
+ls …/ish822-other-repo/secret.txt                          -> No such file or directory
+ls /Users/81ueman/.orbstack/run/docker.sock                -> No such file or directory
 ```
 
+`negative-tests.sh` probes `/Users/81ueman/...` (the **host** home), not `~`
+(which inside the VM is `/home/agent`). The host home is not mounted at all — the
+whole `/Users/81ueman` path is absent — which is the meaningful, non-vacuous
+form of the ISH-822 §6 negative test. (The only `~/.ssh` inside the VM is the
+sandbox's own, created by the SSH client and holding only `known_hosts`, no key.)
+
 The clone is a **separate writable copy**: a file written by the sandbox to the
-workspace path does **not** appear on the host, and the host fixture `git status`
-stays clean ([`10`](evidence/10-clone-isolation-host-side.log)). Per the Docker
-docs, clone mode protects against *modification*, **not inspection** — untracked
-and `.gitignore`'d files (here `.env`) remain readable, which is exactly what the
-sentinels above show.
+workspace path does **not** appear on the host, and the host fixture `git status
+--porcelain` is empty ([`10`](evidence/10-clone-isolation-host-side.log),
+[`18`](evidence/18-host-fetch-sandbox-commit.log)). Per the Docker docs, clone mode
+protects against *modification*, **not inspection** — untracked and `.gitignore`'d
+files (here `.env`) remain readable, which is exactly what the sentinels show.
 
 ### 5. Docker-engine isolation ([`19`](evidence/19-docker-engine-isolation.log))
 
@@ -166,20 +191,36 @@ SANDBOX:  own /var/run/docker.sock -> /run/docker.sock, 0 containers
 HOST after: 27 containers (sandbox container NOT visible; host socket unreachable)
 ```
 
-### 6. Credential proxy ([`12`](evidence/12-secret-set-custom.log), [`14`](evidence/14-credential-proxy-probe.log))
+### 6. Credential proxy ([`12`](evidence/12-secret-set-custom.log), [`12a`](evidence/12a-secret-readd.log), [`14`](evidence/14-credential-proxy-probe.log))
 
 `sbx secret set-custom --sandbox ish822-poc --host ollama.com --env
 OLLAMA_CLOUD_V41_API_KEY --command /abs/get-ollama-key.sh` stores the real value
-on the host and exposes only a placeholder (`sbx-cs-…`) to the sandbox. Inside:
+on the host and exposes only a placeholder (`sbx-cs-…`) to the sandbox. The
+placeholder is a **real** substitution, proven on an **authenticated** endpoint
+(the completion API — the model list is public and proves nothing):
 
 ```
-curl -H "Authorization: Bearer $OLLAMA_CLOUD_V41_API_KEY" https://ollama.com/v1/models -> 200
-curl https://example.com                                                                  -> 403   (Balanced deny)
+POST https://ollama.com/v1/chat/completions
+  no auth          -> 401 {"error":{"message":"Unauthorized",…}}
+  BOGUS auth       -> 401 {"error":{"message":"Unauthorized",…}}
+  PLACEHOLDER auth -> 200 {"id":"chatcmpl-637",…,"model":"deepseek-v4.1-flash:cloud",…}
+GET  /v1/models with BOGUS auth -> 200          # public; why the earlier 200 was meaningless
+curl https://example.com        -> 403          # Balanced deny
 ```
 
-The real key is never written to the sandbox filesystem, env, or logs. (The
-sandbox was created *before* the secret, so the placeholder was passed
-explicitly with `sbx exec -e` — placeholders are not secret.)
+The real key never enters the sandbox — measured, not assumed
+([`14b`](evidence/14b-real-key-containment.log)):
+
+```
+host   sha256(real OLLAMA key)   = 57d012fd…   # host-side, hash only
+sandbox sha256(placeholder env)  = 5b467951…   # different value
+sandbox env auth var             = OLLAMA_CLOUD_V41_API_KEY=sbx-cs-…
+grep real key in /home/agent /tmp /etc /var/tmp /opt  -> (no matches)
+```
+
+(The key is passed to the sandbox-side grep over stdin for the test only, never
+written there. The sandbox was created *before* the secret, so the placeholder was
+also passed explicitly with `sbx exec -e` — placeholders are not secret.)
 
 ### 7. Real `dsh` headless run ([`13`](evidence/13-sandbox-overlay.log), [`15`](evidence/15-sandbox-dsh-run.log))
 
@@ -211,7 +252,7 @@ DSH_EXIT=0
 ```
 SSH_AUTH_SOCK=/run/ssh-agent.sock
 ssh-add -l -> 256 SHA256:NS4st6… mathmathds@gmail.com (ED25519)   # host key, forwarded
-ls ~/.ssh  -> No such file or directory                            # no key file in VM
+~/.ssh -> no private key (absent on first run; later holds only the sandbox's own known_hosts)
 ssh -T git@ssh.github.com -p 443 -> Hi 81ueman! You've successfully authenticated…
 git ls-remote ssh://git@ssh.github.com:443/81ueman/relay.git HEAD refs/heads/main
   -> ad7ab7d…  HEAD
@@ -219,10 +260,14 @@ git ls-remote ssh://git@ssh.github.com:443/81ueman/relay.git HEAD refs/heads/mai
 git fetch …/relay.git main -> * branch main -> FETCH_HEAD          # read-only
 ```
 
-SSH on **port 22** handshakes and is then closed by the remote
-(`Connection closed by 20.27.177.113 port 22`); the Balanced policy only allows
-`github.com:443` / `**.github.com:443`, so GitHub's SSH-on-443 endpoint
-(`ssh.github.com:443`) is used. No push/PR is performed (out of scope).
+SSH on **port 22** fails: the TCP connect succeeds but the remote closes the
+session (`Connection closed by 20.27.177.113 port 22`, [`16`](evidence/16-sandbox-git-ssh-port22.log)).
+The effective policy has no `:22` rule — `sbx policy ls ish822-poc --json` shows
+`github.com:443`, `**.github.com:443`, `**.githubusercontent.com:443`,
+`**.githubcopilot.com:443` and **zero** `:22` rules
+([`07a`](evidence/07a-policy-rules-github.log)); the exact accept-then-close
+mechanism is observed but not further explained. GitHub's SSH-on-443 endpoint
+(`ssh.github.com:443`) is therefore used. No push/PR is performed (out of scope).
 
 ### 9. Host fetch of the sandbox commit ([`18`](evidence/18-host-fetch-sandbox-commit.log))
 
@@ -244,16 +289,19 @@ clone — fetch first).
 ## Caveats / NOT verified
 
 - **"DeepSeek API" is the DeepSeek *model*, not `api.deepseek.com`.** The host
-  has **no** `DEEPSEEK_API_KEY` (checked `env`, shell rc, and the dsh credential
-  store: only `OPENCODE_GO_API_KEY`, `OLLAMA_CLOUD_V41_API_KEY`,
-  `COMMAND_CODE_GOAT_API_KEY` are stored). The run therefore used the host's
+  has **no** `DEEPSEEK_API_KEY` ([`02b`](evidence/02b-no-deepseek-key.log): `env`
+  shows it unset, no shell-rc assignment, and the dsh credential store lists only
+  `OPENCODE_GO_API_KEY`, `OLLAMA_CLOUD_V41_API_KEY`, `COMMAND_CODE_GOAT_API_KEY`).
+  The run therefore used the host's
   configured Ollama-Cloud DeepSeek model (`deepseek-v4.1-flash:cloud`). A run
   against the DeepSeek-official endpoint is **Not verified**:
   `dsh --profile headless --json …` with the shipped default provider was not
   executed because no `DEEPSEEK_API_KEY` exists on this host.
 - **No real push / PR / merge from the sandbox** (explicitly out of scope);
   only read-only `ls-remote`/`fetch` over SSH were performed.
-- **SSH port 22** is not usable through the Balanced egress policy; `443` is.
+- **SSH port 22** is not usable (TCP connect accepted, session closed by the
+  remote); the effective policy has no `:22` rule ([`07a`](evidence/07a-policy-rules-github.log)),
+  so `443` is used.
 - **`sbx login` is human-gated** (device code). Automation would need a Docker
   PAT via `sbx login --username … --password-stdin`.
 - Relay was **not modified**; this is a `docs/`-only PoC change (no `src/`,
