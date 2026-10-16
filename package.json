@@ -13,6 +13,8 @@
     "typecheck": "tsc --noEmit",
     "smoke:run-lifecycle": "bun scripts/ish760-smoke.ts",
     "smoke:merge-gate": "bun scripts/ish761-smoke.ts",
+    "smoke:factory": "bun scripts/ish762-smoke.ts",
+    "smoke:factory:real": "RELAY_REAL_SMOKE=1 bun scripts/ish762-real-smoke.ts",
     "daemon": "bun src/cli.ts daemon",
     "formal": "formal/run-tlc.sh Relay",
     "formal:safety": "formal/run-tlc.sh RelaySafety",

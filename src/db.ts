@@ -315,6 +315,11 @@ function migrate(db: Database): void {
   if (columnExists(db, "runs", "id") && !columnExists(db, "runs", "dsh_events_path")) {
     db.exec("ALTER TABLE runs ADD COLUMN dsh_events_path TEXT;");
   }
+  // ISH-762 Runs: the spawn-time process identity token (`ps -o lstart=`), so an
+  // adopted Run's orphan can be proven to still be the SAME dsh before any signal.
+  if (columnExists(db, "runs", "id") && !columnExists(db, "runs", "spawn_lstart")) {
+    db.exec("ALTER TABLE runs ADD COLUMN spawn_lstart TEXT;");
+  }
   // NOTE: (worker_id, generation) is kept unique by application logic (the
   // monotonic `nextGeneration` helper), not by a DB constraint. Legacy rows may
   // legitimately share a generation (e.g. an active row plus a protected stale

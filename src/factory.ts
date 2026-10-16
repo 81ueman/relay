@@ -1,0 +1,591 @@
+import type { Database } from "bun:sqlite";
+import { now } from "./db";
+import { logEvent } from "./events";
+import { getTask, claimTask } from "./tasks";
+import { getWorker, registerWorker } from "./workers";
+import { INTEGRATOR_ROLE, REVIEWER_ROLE } from "./schema";
+import type { Run, RunState, Task, TaskState } from "./schema";
+import { isCanonicalToken, processPgid, spawnIdentityToken } from "./proc-identity";
+import { defaultRunner, type CommandRunner } from "./verify";
+import { runMechanicalVerification, submitPhase, taskChecks } from "./workflow";
+import { acceptRunSubmission, getRun } from "./dsh-runner";
+import { launchTaskRun, type LaunchRunOptions } from "./run-lifecycle";
+import {
+  DEFAULT_REVIEWER_WORKER,
+  runHeadlessReview,
+  type ReviewerSpawner,
+} from "./reviewer-runner";
+import { checkMergeGate, type MergeGateDecision, type MergeGateDeps } from "./merge-gate";
+
+/**
+ * ISH-762 Factory driver.
+ *
+ * Drives ONE code-change Task through the whole factory WITHOUT hand-driving a
+ * TUI/pane for the coding:
+ *
+ *   implement   — a real headless dsh Run edits the Task worktree, commits, exits;
+ *                 the ONLY advance is the structured `acceptRunSubmission`;
+ *   verify      — Relay runs the task's REQUIRED checks in the recorded worktree,
+ *                 bound to the recorded HEAD (a required NOT_RUN never PASSes);
+ *   review      — an INDEPENDENT headless Claude reviewer returns a structured
+ *                 verdict; FIX -> a FRESH dsh Run on the SAME worktree with the
+ *                 findings; PASS -> integration;
+ *   integration — a structured integration submission reaches `merge_ready` at the
+ *                 SAME (reviewed) HEAD — never an unreviewed head;
+ *   merge_ready — the read-only HEAD-bound merge gate is evaluated; NOTHING is
+ *                 merged, pushed, accepted or written to a provider.
+ *
+ * Every step is a REUSE of the ordinary phase machine (`acceptRunSubmission`,
+ * `runMechanicalVerification`, `recordReview`, `submitPhase`); this module is
+ * only the sequencing. It is idempotent/resumable: it reads the LIVE phase each
+ * iteration, adopts an already-live implement Run instead of starting a second
+ * writer, and never advances on a process exit alone.
+ */
+
+export const FACTORY_ERROR = "FACTORY_ERROR";
+export const NO_IMPLEMENTATION = "NO_IMPLEMENTATION";
+export const CODING_FAILED = "CODING_FAILED";
+export const SUBMIT_REFUSED = "RUN_SUBMISSION_REFUSED";
+export const FACTORY_NO_CHECKS = "FACTORY_NO_CHECKS";
+
+/** The integrator principal a Factory integration submission is made as. */
+export const DEFAULT_INTEGRATOR_WORKER = "factory-integrator";
+
+export interface FactoryDeps {
+  /** The main checkout the Task worktree is created from. */
+  repo?: string;
+  worktreesRoot?: string;
+  /** Real dsh binary (default `dsh`); a fake path in tests. */
+  dshBin?: string;
+  outputRoot?: string;
+  permissionMode?: string;
+  timeoutMs?: number;
+  fastExitMs?: number;
+  dshEnv?: Record<string, string>;
+  /** Mechanical verify runner (default: the real command runner). */
+  verifyRunner?: CommandRunner;
+  /** The independent reviewer process (default: real `claude`); fake in tests. */
+  reviewerSpawner?: ReviewerSpawner;
+  reviewerCommand?: string;
+  reviewerModel?: string;
+  reviewerWorker?: string;
+  integratorWorker?: string;
+  /** Head-pinned merge-gate providers (read-only; default none). */
+  mergeGateDeps?: MergeGateDeps;
+  /** Hard cap on coding attempts before giving up (default 4). */
+  maxAttempts?: number;
+  /** A coding Run that produced no new commit is a NO_IMPLEMENTATION (default true). */
+  noChangeIsFailure?: boolean;
+  /**
+   * Terminate an adopted Run's detached process group, returning true once the
+   * leader is gone (default `terminateProcessGroup`). Test seam for the
+   * "cannot-be-killed -> keep fencing" path.
+   */
+  terminateOrphan?: (pid: number) => Promise<boolean>;
+}
+
+export interface FactoryAttempt {
+  attempt: number;
+  runId: string | null;
+  baseHead: string | null;
+  producedHead: string | null;
+  verifyOutcome: string | null;
+  reviewVerdict: string | null;
+  phase: string | null;
+}
+
+export type FactoryOutcome =
+  | "merge_ready"
+  | "blocked"
+  | "coding_failed"
+  | "no_implementation"
+  | "review_refused"
+  | "no_checks"
+  | "max_attempts"
+  | "terminal";
+
+export interface FactoryResult {
+  taskId: string;
+  outcome: FactoryOutcome;
+  head: string | null;
+  attempts: FactoryAttempt[];
+  /** Read-only gate decision at `merge_ready` (never a merge). */
+  gate: MergeGateDecision | null;
+  /** The fail-closed reason for a non-ready terminal outcome. */
+  reason: string | null;
+  steps: string[];
+}
+
+function latestRun(db: Database, taskId: string, phase: string, attempt: number): Run | null {
+  return (
+    (db
+      .query(
+        `SELECT * FROM runs WHERE task_id = ? AND phase = ? AND attempt = ?
+           ORDER BY created_at DESC, rowid DESC LIMIT 1`
+      )
+      .get(taskId, phase, attempt) as Run | null) ?? null
+  );
+}
+
+function isLive(run: Run | null): boolean {
+  return !!run && (run.state === "running" || run.state === "starting");
+}
+
+/** Run states that are terminal (an adopted Run in one of these needs no wait). */
+const RUN_TERMINAL_STATES: ReadonlySet<RunState> = new Set<RunState>([
+  "exited",
+  "failed",
+  "cancelled",
+  "timeout",
+  "submitted",
+]);
+
+/**
+ * Task states the Factory may drive. Anything else — including `blocked_internal`
+ * (which `blockTask` writes while LEAVING `phase` unchanged) — is terminal for the
+ * Factory: a durable block must never be erased by carrying the task to
+ * MergeReady. Whitelisting runnable states (rather than blacklisting) is the
+ * fail-closed form, so a NEW state is non-runnable by default.
+ */
+const FACTORY_RUNNABLE_STATES: ReadonlySet<TaskState> = new Set<TaskState>(["queued", "running", "review"]);
+
+/** True when the process id is a live process (EPERM means alive-but-not-ours). */
+export function pidAlive(pid: number | null): boolean {
+  if (!pid) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/** Default run budget when the caller gives none (mirrors `relay run` 30m). */
+export const DEFAULT_RUN_TIMEOUT_MS = 30 * 60_000;
+/** SIGTERM -> SIGKILL grace for a terminated orphan process group. */
+export const ORPHAN_SIGKILL_GRACE_MS = 5000;
+
+/**
+ * Bound an adopted Run's wait: return the row, or `timedOut` once the ABSOLUTE
+ * `deadlineMs` passes. The deadline is derived from the Run's own `started_at` +
+ * its run budget, not from the moment of adoption, so a Run that already spent
+ * its budget before the restart expires immediately instead of getting a second
+ * full window.
+ */
+async function waitRunBounded(
+  db: Database,
+  runId: string,
+  deadlineMs: number,
+  pollMs = 250
+): Promise<{ run: Run; timedOut: boolean }> {
+  for (;;) {
+    const r = getRun(db, runId);
+    if (!r) throw new Error(`unknown run: ${runId}`);
+    if (RUN_TERMINAL_STATES.has(r.state)) return { run: r, timedOut: false };
+    if (Date.now() > deadlineMs) return { run: r, timedOut: true };
+    await new Promise((res) => setTimeout(res, pollMs));
+  }
+}
+
+async function sleep(ms: number): Promise<void> {
+  await new Promise((res) => setTimeout(res, ms));
+}
+
+/** Wait until `pid` is gone, up to `budgetMs`; returns true when it is gone. */
+async function waitPidGone(pid: number, budgetMs: number): Promise<boolean> {
+  const deadline = Date.now() + budgetMs;
+  while (Date.now() < deadline) {
+    if (!pidAlive(pid)) return true;
+    await sleep(50);
+  }
+  return !pidAlive(pid);
+}
+
+/**
+ * Terminate an adopted Run's DETACHED process group. dsh is spawned detached
+ * (`setsid`), so `pid` is the group leader: `kill(-pid, ...)` reaches the whole
+ * tree, exactly like `RunHandle.cancel`. SIGTERM first, then SIGKILL after a
+ * grace period. Returns true only once the leader is actually gone.
+ *
+ * GROUP ONLY: there is deliberately NO `kill(pid)` fallback. A plain `kill(pid)`
+ * would fire exactly when `pid` is NOT a group leader — which proves it is NOT
+ * the setsid'd dsh — so it can only ever hit an innocent, reused PID. Callers
+ * MUST prove the identity first (see `identifyRunProcess`) and MUST NOT release
+ * the single-writer fence while this returns false.
+ */
+export async function terminateProcessGroup(pid: number, graceMs = ORPHAN_SIGKILL_GRACE_MS): Promise<boolean> {
+  if (!pidAlive(pid)) return true;
+  try {
+    process.kill(-pid, "SIGTERM");
+  } catch {
+    /* not a group leader / already gone — never fall back to kill(pid) */
+  }
+  if (await waitPidGone(pid, graceMs)) return true;
+  try {
+    process.kill(-pid, "SIGKILL");
+  } catch {
+    /* not a group leader / already gone */
+  }
+  return waitPidGone(pid, 2000);
+}
+
+/** How the factory classified an adopted Run's recorded PID. */
+export type OrphanIdentity = "dead" | "match" | "reused" | "undeterminable";
+
+/**
+ * Prove whether the recorded PID still belongs to the Run's dsh, BEFORE any
+ * signal. Two independent identity properties are required:
+ *
+ *   1. it is a process-GROUP leader (`pgid === pid`) — dsh is spawned `detached`;
+ *   2. the process START TIME equals the token stored on the Run row at spawn.
+ *
+ * Returns:
+ *   "dead"           — the PID is gone (safe: nothing to signal);
+ *   "reused"         — a live PID that is NOT this Run's dsh (pgid/≠token): never
+ *                      signal it; treat like dead (the original dsh is gone);
+ *   "match"          — provably this Run's process group: safe to terminate;
+ *   "undeterminable" — a live PID we cannot identify (missing token / ps): never
+ *                      signal it; leave the Run `running` so the fence holds.
+ */
+export function identifyRunProcess(run: Pick<Run, "pid" | "spawn_lstart">): OrphanIdentity {
+  const pid = run.pid;
+  if (!pid || !pidAlive(pid)) return "dead";
+  const pgid = processPgid(pid);
+  const token = spawnIdentityToken(pid);
+  if (pgid === null || token === null || !run.spawn_lstart) return "undeterminable";
+  // A token written before canonicalization (no version tag) cannot be compared
+  // reliably across environments: never misread it as "reused" — hold the fence.
+  if (!isCanonicalToken(run.spawn_lstart)) return "undeterminable";
+  // Not a group leader => not the setsid'd dsh: a reused PID (or a child of a
+  // shell). Never signal it.
+  if (pgid !== pid) return "reused";
+  // A different canonical start time proves the PID was reused since launch.
+  if (token !== run.spawn_lstart) return "reused";
+  return "match";
+}
+
+/**
+ * Mark a still-live Run terminal `failed`. Used ONLY once the orphan's process
+ * group is confirmed dead (or was never alive): the coroutine that would have
+ * written the terminal state is lost, so nothing else releases the single-writer
+ * fence. Never advances the Task. Callers must NOT call this while the process
+ * may still be writing — that would free the fence for a second writer.
+ */
+function markRunOrphan(db: Database, runId: string, reason: string): void {
+  const t = now();
+  db.query(
+    `UPDATE runs SET state = 'failed', error = ?, ended_at = ?, updated_at = ? WHERE id = ? AND state IN ('running', 'starting')`
+  ).run(reason, t, t, runId);
+  logEvent(db, { source: "factory", type: "factory.run_orphaned", payload: { runId, reason } });
+}
+
+/**
+ * One implement step: adopt a live Run for this phase/attempt (never start a
+ * second writer on restart), else launch ONE disposable dsh Run; wait for it to
+ * reach a terminal state; refuse unless it is a clean exit 0 that produced a NEW
+ * commit; then advance ONLY via the structured submission.
+ */
+async function implementOnce(
+  db: Database,
+  task: Task,
+  deps: FactoryDeps
+): Promise<{ run: Run; producedHead: string | null; error: string | null }> {
+  const existing = latestRun(db, task.id, "implement", task.attempt);
+  let run: Run;
+  if (isLive(existing)) {
+    const live = existing!;
+    logEvent(db, { source: "factory", taskId: task.id, type: "factory.run_adopted", payload: { runId: live.id, pid: live.pid } });
+    // Restart/reconcile MUST NOT hang on an orphaned Run. A detached dsh Run's
+    // terminal state is written by the coroutine that launched it; if that
+    // process died, the row stays `running` forever. Check the PID is alive; if
+    // not, the owner is gone and the row can safely be marked terminal `failed`.
+    if (!pidAlive(live.pid)) {
+      const reason = `orphaned run ${live.id}: owner pid ${live.pid ?? "none"} is not alive`;
+      markRunOrphan(db, live.id, reason);
+      const r = getRun(db, live.id)!;
+      return { run: r, producedHead: r.head_sha, error: `${CODING_FAILED}: ${reason}` };
+    }
+    // The Run is still ALIVE (a factory crash left the detached dsh running with
+    // no in-process killer). Bound the wait from the Run's OWN start + budget.
+    const runTimeoutMs = deps.timeoutMs ?? DEFAULT_RUN_TIMEOUT_MS;
+    const deadlineMs = (live.started_at || Date.now()) + runTimeoutMs;
+    const { run: waited, timedOut } = await waitRunBounded(db, live.id, deadlineMs);
+    if (timedOut) {
+      const reason = `adopted run ${live.id} exceeded its ${runTimeoutMs}ms budget (expired)`;
+      // IDENTITY BEFORE ANY SIGNAL. A stale `pid` may have been REUSED by an
+      // unrelated host process (reboot / long crash). Prove the PID is still this
+      // Run's dsh (group leader + matching spawn start time) before terminating;
+      // never signal a process we cannot prove is ours.
+      const identity = identifyRunProcess({ pid: live.pid, spawn_lstart: live.spawn_lstart });
+      if (identity === "reused") {
+        // A live PID that is NOT this Run's dsh: the original dsh is gone. Take the
+        // dead-PID path — mark the Run terminal — and send NO signal to the stranger.
+        logEvent(db, {
+          source: "factory",
+          taskId: task.id,
+          type: "factory.orphan_pid_reused",
+          payload: { runId: live.id, pid: live.pid, reason },
+        });
+        markRunOrphan(db, live.id, `${reason}; recorded pid ${live.pid ?? "none"} is an unrelated process (reused)`);
+        const r = getRun(db, live.id)!;
+        return {
+          run: r,
+          producedHead: r.head_sha,
+          error: `${CODING_FAILED}: ${reason} (recorded pid was reused; no signal sent)`,
+        };
+      }
+      if (identity === "undeterminable") {
+        // A live PID we cannot prove belongs to this Run: do NOT signal. Leave the
+        // Run `running` so the single-writer fence keeps holding.
+        logEvent(db, {
+          source: "factory",
+          taskId: task.id,
+          type: "factory.orphan_identity_undeterminable",
+          payload: { runId: live.id, pid: live.pid, reason, spawnLstart: live.spawn_lstart },
+        });
+        const r = getRun(db, live.id)!;
+        return {
+          run: r,
+          producedHead: r.head_sha,
+          error: `${CODING_FAILED}: ${reason}; orphan identity could not be proven (Run left running to keep the single-writer fence)`,
+        };
+      }
+      if (identity === "dead") {
+        markRunOrphan(db, live.id, `${reason}; owner pid is no longer alive`);
+        const r = getRun(db, live.id)!;
+        return { run: r, producedHead: r.head_sha, error: `${CODING_FAILED}: ${reason}` };
+      }
+      // identity === "match": provably this Run's dsh process group. KILL BEFORE
+      // RELEASE — never free the single-writer fence while the old writer may still
+      // be writing the worktree. Only a confirmed-dead leader lets us go terminal.
+      const terminate = deps.terminateOrphan ?? ((pid: number) => terminateProcessGroup(pid));
+      const dead = await terminate(live.pid!);
+      if (!dead) {
+        // Could not prove the writer is gone: leave the Run `running` so
+        // `findActiveWriter` (and thus `launchTaskRun`) keeps returning
+        // DUPLICATE_WRITER for this worktree/branch. Fail closed, never advance.
+        logEvent(db, {
+          source: "factory",
+          taskId: task.id,
+          type: "factory.orphan_unterminated",
+          payload: { runId: live.id, pid: live.pid, reason },
+        });
+        const r = getRun(db, live.id)!;
+        return {
+          run: r,
+          producedHead: r.head_sha,
+          error: `${CODING_FAILED}: ${reason}; orphan process group could not be terminated (Run left running to keep the single-writer fence)`,
+        };
+      }
+      markRunOrphan(db, live.id, reason);
+      const r = getRun(db, live.id)!;
+      return { run: r, producedHead: r.head_sha, error: `${CODING_FAILED}: ${reason}` };
+    }
+    run = waited;
+  } else {
+    const opts: LaunchRunOptions = {
+      repo: deps.repo,
+      worktreesRoot: deps.worktreesRoot,
+      outputRoot: deps.outputRoot,
+      dshBin: deps.dshBin,
+      permissionMode: deps.permissionMode,
+      timeoutMs: deps.timeoutMs,
+      fastExitMs: deps.fastExitMs,
+      env: deps.dshEnv,
+    };
+    const launched = await launchTaskRun(db, task.id, opts);
+    run = await launched.handle.wait();
+  }
+
+  if (run.state !== "exited" || run.exit_code !== 0) {
+    // A process exit is NOT a submission: nothing advances.
+    return { run, producedHead: run.head_sha, error: `${CODING_FAILED}: run ${run.id} is '${run.state}' (exit ${run.exit_code ?? "none"})` };
+  }
+  if ((deps.noChangeIsFailure ?? true) && run.head_sha !== null && run.head_sha === run.base_head_sha) {
+    return {
+      run,
+      producedHead: run.head_sha,
+      error: `${NO_IMPLEMENTATION}: run ${run.id} exited 0 but produced no commit (head ${run.head_sha ?? "none"} unchanged)`,
+    };
+  }
+  try {
+    acceptRunSubmission(db, { runId: run.id });
+  } catch (e) {
+    // A refused submission (stale/superseded run, moved head/phase) NEVER
+    // advances the Task; surface it as a fail-closed Factory outcome.
+    return {
+      run,
+      producedHead: run.head_sha,
+      error: `${SUBMIT_REFUSED}: ${e instanceof Error ? e.message : String(e)}`,
+    };
+  }
+  return { run, producedHead: run.head_sha, error: null };
+}
+
+/**
+ * Run the whole factory for one Task. Returns a structured result; it NEVER
+ * merges, accepts, pushes, or writes to a provider/Linear.
+ */
+export async function runFactoryTask(
+  db: Database,
+  taskId: string,
+  deps: FactoryDeps = {}
+): Promise<FactoryResult> {
+  const maxAttempts = Math.max(1, deps.maxAttempts ?? 4);
+  const reviewerWorker = deps.reviewerWorker ?? DEFAULT_REVIEWER_WORKER;
+  const integratorWorker = deps.integratorWorker ?? DEFAULT_INTEGRATOR_WORKER;
+  if (!getWorker(db, reviewerWorker)) registerWorker(db, reviewerWorker, { role: REVIEWER_ROLE, agentKind: "claude" });
+  if (!getWorker(db, integratorWorker)) registerWorker(db, integratorWorker, { role: INTEGRATOR_ROLE, agentKind: "relay" });
+
+  const attempts: FactoryAttempt[] = [];
+  const steps: string[] = [];
+  const guardMax = maxAttempts * 6 + 12;
+  let lastAttempt = -1;
+  let current: FactoryAttempt | null = null;
+
+  const push = (s: string) => {
+    steps.push(s);
+    logEvent(db, { source: "factory", taskId, type: "factory.step", payload: { step: s } });
+  };
+
+  for (let guard = 0; guard < guardMax; guard++) {
+    const task = getTask(db, taskId);
+    if (!task) throw new Error(`unknown task: ${taskId}`);
+    // Fail closed on ANY non-runnable state — `blocked_internal` included, since
+    // `blockTask` leaves `phase` unchanged and `isTerminalTaskState` does not
+    // cover the blocked states. A durable block is never overwritten.
+    if (!FACTORY_RUNNABLE_STATES.has(task.state)) {
+      return { taskId, outcome: "terminal", head: task.head_sha, attempts, gate: null, reason: `state ${task.state}`, steps };
+    }
+    if (task.attempt !== lastAttempt) {
+      lastAttempt = task.attempt;
+      current = { attempt: task.attempt, runId: null, baseHead: null, producedHead: null, verifyOutcome: null, reviewVerdict: null, phase: task.phase };
+      attempts.push(current);
+    }
+    if (atAttemptCap(attempts, maxAttempts)) {
+      return { taskId, outcome: "max_attempts", head: task.head_sha, attempts, gate: null, reason: `exceeded ${maxAttempts} attempts`, steps };
+    }
+    const phase = task.phase;
+    switch (phase) {
+      case "implement": {
+        const impl = await implementOnce(db, task, deps);
+        if (current) {
+          current.runId = impl.run.id;
+          current.baseHead = impl.run.base_head_sha;
+          current.producedHead = impl.producedHead;
+        }
+        if (impl.error) {
+          const outcome: FactoryOutcome = impl.error.startsWith(NO_IMPLEMENTATION) ? "no_implementation" : "coding_failed";
+          return { taskId, outcome, head: getTask(db, taskId)!.head_sha, attempts, gate: null, reason: impl.error, steps };
+        }
+        push(`implement:run ${impl.run.id} -> submitted (head ${impl.run.head_sha ?? "none"})`);
+        continue;
+      }
+      case "verify": {
+        const checks = taskChecks(task);
+        // Require at least one REQUIRED check, not merely a non-empty list: an
+        // all-optional list lets `aggregateOutcome` turn an optional NOT_RUN/
+        // INCONCLUSIVE into a PASS, which the spec forbids (an unrun check must
+        // never become PASS).
+        if (!checks.some((c) => c.required !== false)) {
+          return {
+            taskId,
+            outcome: "no_checks",
+            head: task.head_sha,
+            attempts,
+            gate: null,
+            reason: `${FACTORY_NO_CHECKS}: the Factory requires at least one REQUIRED mechanical check`,
+            steps,
+          };
+        }
+        const cwd = task.worktree;
+        if (!cwd) return { taskId, outcome: "blocked", head: task.head_sha, attempts, gate: null, reason: "no worktree", steps };
+        const v = await runMechanicalVerification(db, taskId, {
+          checks,
+          runner: deps.verifyRunner ?? defaultRunner,
+          cwd,
+        });
+        if (current) current.verifyOutcome = v.outcome;
+        if (v.stale) {
+          push(`verify:stale@${task.attempt} discarded`);
+          continue;
+        }
+        if (v.outcome !== "pass") {
+          // fail -> implement (new attempt) for a real breakage; NOT_RUN -> blocked.
+          const live = getTask(db, taskId)!;
+          if (live.state === "blocked_human") {
+            return { taskId, outcome: "blocked", head: live.head_sha, attempts, gate: null, reason: `verify ${v.outcome}`, steps };
+          }
+          push(`verify:${v.outcome}@${task.attempt} -> new attempt`);
+          continue;
+        }
+        push(`verify:pass@${task.attempt}`);
+        continue;
+      }
+      case "review": {
+        const r = await runHeadlessReview(db, taskId, {
+          spawner: deps.reviewerSpawner,
+          command: deps.reviewerCommand,
+          model: deps.reviewerModel,
+          reviewerWorker,
+        });
+        if (current) current.reviewVerdict = r.outcome === "refused" ? "refused" : r.outcome;
+        if (r.outcome === "refused") {
+          return { taskId, outcome: "review_refused", head: getTask(db, taskId)!.head_sha, attempts, gate: null, reason: r.error, steps };
+        }
+        if (r.outcome === "blocked") {
+          const live = getTask(db, taskId)!;
+          return { taskId, outcome: "blocked", head: live.head_sha, attempts, gate: null, reason: r.verdict?.summary ?? "review blocked", steps };
+        }
+        push(`review:${r.outcome}@${task.attempt}`);
+        continue;
+      }
+      case "integration": {
+        // A structured integration submission at the REVIEWED head -> merge_ready.
+        const cur = getTask(db, taskId)!;
+        if (cur.assignee !== integratorWorker) {
+          try {
+            // Claim THIS task (not "next"): a strict role match on the phase's
+            // `integrator` claim role, atomic in claimTask.
+            claimTask(db, taskId, integratorWorker);
+          } catch (e) {
+            return {
+              taskId,
+              outcome: "blocked",
+              head: cur.head_sha,
+              attempts,
+              gate: null,
+              reason: `could not claim integration of ${taskId}: ${e instanceof Error ? e.message : String(e)}`,
+              steps,
+            };
+          }
+        }
+        const owned = getTask(db, taskId)!;
+        submitPhase(db, taskId, integratorWorker, { headSha: owned.head_sha ?? undefined });
+        push(`integration:submitted (head ${owned.head_sha ?? "none"})`);
+        continue;
+      }
+      case "merge_ready": {
+        const gate = checkMergeGate(db, taskId, deps.mergeGateDeps ?? {});
+        push(`merge_ready:gate=${gate?.status ?? "unknown"}`);
+        return { taskId, outcome: "merge_ready", head: getTask(db, taskId)!.head_sha, attempts, gate, reason: null, steps };
+      }
+      default: {
+        return { taskId, outcome: "blocked", head: task.head_sha, attempts, gate: null, reason: `unhandled phase ${String(phase)}`, steps };
+      }
+    }
+  }
+  return { taskId, outcome: "max_attempts", head: getTask(db, taskId)!.head_sha, attempts, gate: null, reason: "guard exhausted", steps };
+}
+
+function atAttemptCap(attempts: FactoryAttempt[], maxAttempts: number): boolean {
+  const current = attempts[attempts.length - 1];
+  return !!current && current.attempt >= maxAttempts;
+}
+
+/** Convenience: a Factory result is "reached MergeReady" (read-only, not merged). */
+export function reachedMergeReady(r: FactoryResult): boolean {
+  return r.outcome === "merge_ready";
+}
+
+export { getRun };

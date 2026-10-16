@@ -22,6 +22,7 @@ import {
   resolveHumanInterface,
   taskChildren,
 } from "./tasks";
+import { findLiveRunFor, runOwnedError } from "./run-owner";
 import { clearCurrentTask, getWorker, normalizeWorkerAfterTaskRelease, touchProgress } from "./workers";
 import {
   gitHead,
@@ -553,6 +554,11 @@ export function submitPhase(db: Database, taskId: string, workerId: string, opts
       `${WORKFLOW_ERROR}: cannot submit ${taskId} in phase '${phase}' (submit applies to implement/integration)`
     );
   }
+  // ISH-762: a live Run owns its (task, phase, attempt). A worker submit while the
+  // Run is starting/running is refused (RUN_OWNED): a Run-driven phase advances
+  // ONLY via the Run-bound `acceptRunSubmission`, never a generic worker submit.
+  const liveRun = findLiveRunFor(db, task.id, phase, task.attempt);
+  if (liveRun) throw runOwnedError(liveRun, task.id);
   assertOwned(task, workerId, opts.leaseToken);
 
   // Integration names a moved HEAD: the reviewed head no longer applies.

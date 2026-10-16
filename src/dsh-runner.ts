@@ -6,6 +6,7 @@ import { logEvent } from "./events";
 import { getTask } from "./tasks";
 import type { Run, RunState, Task } from "./schema";
 import { isTerminalTaskState } from "./schema";
+import { spawnIdentityToken } from "./proc-identity";
 import { gitHead } from "./verify";
 import { submitImplementationFromRun, type RunImplementation } from "./workflow";
 import {
@@ -286,6 +287,8 @@ function insertRunIfNoActiveWriter(db: Database, r: InsertRunInput): Run {
 interface RunPatch {
   state?: RunState;
   pid?: number;
+  /** ISH-762: the spawn-time process identity token (`ps -o lstart=`). */
+  spawn_lstart?: string | null;
   branch?: string | null;
   head_sha?: string | null;
   exit_code?: number | null;
@@ -305,6 +308,7 @@ function updateRun(db: Database, id: string, patch: RunPatch): Run {
   };
   if (patch.state !== undefined) put("state", patch.state);
   if (patch.pid !== undefined) put("pid", patch.pid);
+  if (patch.spawn_lstart !== undefined) put("spawn_lstart", patch.spawn_lstart);
   if (patch.branch !== undefined) put("branch", patch.branch);
   if (patch.head_sha !== undefined) put("head_sha", patch.head_sha);
   if (patch.exit_code !== undefined) put("exit_code", patch.exit_code);
@@ -496,7 +500,13 @@ export async function startDshRun(db: Database, opts: StartRunOptions): Promise<
     return { id: runId, wait: async () => failed, cancel: () => {} };
   }
 
-  updateRun(db, runId, { state: "running", pid: proc.pid });
+  // ISH-762: capture the process identity token NOW, while the dsh is known to be
+  // the process we just spawned. A later adoption compares it before any signal.
+  updateRun(db, runId, {
+    state: "running",
+    pid: proc.pid,
+    spawn_lstart: spawnIdentityToken(proc.pid),
+  });
   let sessionId: string | null = null;
   let cancelReason: string | null = null;
   let settled = false;

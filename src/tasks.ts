@@ -16,6 +16,7 @@ import { TERMINAL_TASK_STATES } from "./schema";
 import { RELAY_TAG, sendMessage } from "./messages";
 import { requestReconcile } from "./control";
 import { signalRunProcess } from "./run-signal";
+import { findLiveRunFor, runOwnedError } from "./run-owner";
 import { findTaskResult, insertTaskResult, notifyGatewayTo } from "./results";
 
 export const STALE_LEASE = "STALE_LEASE";
@@ -85,7 +86,11 @@ const MERGE_READY_SQL = `NOT (IFNULL(t.code_change, 0) = 1 AND t.phase = 'merge_
 // ISH-759: a task whose verify phase is MECHANICAL is owned by Relay, not a
 // worker—it is never offered to the claim machine (no LLM waits on verify).
 const RELAY_OWNED_SQL = `IFNULL(t.claim_role, '') != 'relay'`;
-const RUNNABLE_TASK_SQL = `t.state = 'queued' AND ${DEPS_DONE_SQL} AND ${REVIEW_GATE_SQL} AND ${CONTAINER_TASK_SQL} AND ${MERGE_READY_SQL} AND ${RELAY_OWNED_SQL}`;
+// ISH-762: a live Run owns its (task, phase, attempt). While a `starting`/`running`
+// Run exists for the task's CURRENT phase/attempt the task is NOT offered to the
+// generic claim machine — the Run-bound `acceptRunSubmission` is the only advance.
+const RUN_OWNED_SQL = `NOT EXISTS (SELECT 1 FROM runs r0 WHERE r0.task_id = t.id AND r0.phase = t.phase AND r0.attempt = t.attempt AND r0.state IN ('starting', 'running'))`;
+const RUNNABLE_TASK_SQL = `t.state = 'queued' AND ${DEPS_DONE_SQL} AND ${REVIEW_GATE_SQL} AND ${CONTAINER_TASK_SQL} AND ${MERGE_READY_SQL} AND ${RELAY_OWNED_SQL} AND ${RUN_OWNED_SQL}`;
 
 /** The role gate a task presents: a phase-derived `claim_role` wins over `role`. */
 export function effectiveTaskRole(task: Pick<Task, "role" | "claim_role">): string | null {
@@ -541,6 +546,13 @@ export function claimTask(db: Database, taskId: string, workerId: string, opts: 
   try {
     const task = getTask(db, taskId);
     if (!task) throw new Error(`unknown task: ${taskId}`);
+    // ISH-762: a live Run owns its (task, phase, attempt). A coding process cannot
+    // claim the Task out from under its own Run; the Run-bound submission is the
+    // only advance. Checked BEFORE any ownership mutation.
+    if (task.code_change === 1) {
+      const owner = findLiveRunFor(db, task.id, task.phase, task.attempt);
+      if (owner) throw runOwnedError(owner, task.id);
+    }
     // Reviewers take review work via `relay next` — EXCEPT an explicitly named
     // queued reviewer GATE. Naming the gate is the intended escape from the
     // T295 unclaimable state (a standing gate with nothing in review is parked

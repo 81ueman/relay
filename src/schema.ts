@@ -406,6 +406,12 @@ export interface Run {
   /** ISH-810: the ORIGINAL dsh `--json` JSONL, per-Run evidence (distinct from
    * Relay's own `events.jsonl`). */
   dsh_events_path: string | null;
+  /**
+   * ISH-762: the OS process START TIME of `pid` (`ps -o lstart=`), captured at
+   * spawn. Used on adoption to prove a PID still belongs to THIS Run's dsh before
+   * any orphan signal is sent — a reused PID must never be killed.
+   */
+  spawn_lstart: string | null;
   error: string | null;
   fast_exit: number;
   started_at: number;
@@ -739,6 +745,7 @@ CREATE TABLE IF NOT EXISTS runs (
   stderr_path TEXT,
   events_path TEXT,
   dsh_events_path TEXT,
+  spawn_lstart TEXT,
   error TEXT,
   fast_exit INTEGER NOT NULL DEFAULT 0,
   started_at INTEGER NOT NULL,
