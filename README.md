@@ -323,7 +323,9 @@ required SQLite evidence, and prints ONE structured decision — `READY`,
 
 - **GitHub (re-fetched, never assumed).** OPEN / non-draft (an owner-designated
   draft is retained, still not ready), the PR head must equal the recorded
-  `head_sha`, and mergeability is judged. A `conflicting` PR raises
+  `head_sha` (a missing recorded head is `HEAD_UNKNOWN`; a retargeted base branch
+  is `BASE_CHANGED`, while a base-*SHA* move alone is not), and mergeability is
+  judged. A `conflicting` PR raises
   **`IntegrationRequired`** to the Gateway (a routing decision: fix the new HEAD,
   then re-VERIFY/REVIEW) — it never rebases. An **unrelated** merge of another PR
   that only moves the base does **not** force a rebase/review loop (no
@@ -339,10 +341,12 @@ required SQLite evidence, and prints ONE structured decision — `READY`,
 - **Permission.** A real merge needs an explicit point-of-use authority
   (ISH-288); with none the verdict is `BLOCKED/NO_PERMISSION`. The gate has **no
   push/rebase/merge executor** and never writes a provider or Linear — it only
-  observes. When GitHub re-fetches `merged` at the recorded head the task is
-  confirmed done (a `TaskMerged` result); an unmerged PASS is distinguished from
-  Done. There is no `--no-merge` internal-approve path: acceptance and merge
-  readiness are separate decisions.
+  observes. When GitHub re-fetches `merged` at the recorded head, the task is
+  confirmed done (a `TaskMerged` result) — but only when Relay itself would credit
+  it (the same post-review guard as `confirmMerged`; otherwise
+  `MERGE_NOT_CREDITED`); an unmerged PASS is distinguished from Done. There is no
+  `--no-merge` internal-approve path: acceptance and merge readiness are separate
+  decisions.
 
 The decision is a PURE function of observable facts (`evaluateMergeGate`), so the
 whole table is unit-tested; the daemon pass (`runMergeGates`) is idempotent and

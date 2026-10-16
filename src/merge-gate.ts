@@ -70,6 +70,7 @@ export type MergeBlockCode =
   | "PR_NOT_OPEN"
   | "PR_DRAFT"
   | "HEAD_MOVED"
+  | "HEAD_UNKNOWN"
   | "REVIEW_MISSING"
   | "REVIEW_STALE"
   | "REVIEW_NOT_INDEPENDENT"
@@ -79,7 +80,9 @@ export type MergeBlockCode =
   | "CHECKS_NOT_PASSED"
   | "CONFLICT"
   | "MERGEABILITY_UNKNOWN"
+  | "BASE_CHANGED"
   | "DEPENDENCY_UNMET"
+  | "MERGE_NOT_CREDITED"
   | "NO_PERMISSION";
 
 export interface MergeGateReason {
@@ -121,6 +124,8 @@ export interface MergeGateInput {
   submitter: string | null;
   /** An unresolved NG at the current head, or null. */
   unresolvedNgId: number | null;
+  /** The base branch the review/verify judged (task`pr_base`); null if unrecorded. */
+  prBase: string | null;
   /** A structured owner HOLD (Linear state/label or PR label), or null. */
   hold: string | null;
   /** The required-check roll-up; null = the read FAILED (NOT_RUN). */
@@ -181,6 +186,27 @@ export function evaluateMergeGate(input: MergeGateInput): MergeGateDecision {
       );
       return decide(input, "BLOCKED", reasons);
     }
+    // Mirror `confirmMerged`'s postReview guard EXACTLY: a merge is credited only
+    // for a code task, not cancelled/failed, and only once the review has passed
+    // (phase integration/merge_ready) or the task was already internally accepted.
+    // Otherwise Relay itself would refuse to credit it (logging merge_not_credited)
+    // and the dry run must not report Done.
+    const postReview = input.phase === "integration" || input.phase === "merge_ready" || input.state === "done";
+    if (!input.codeChange) {
+      push("MERGE_NOT_CREDITED", "GitHub reports the PR merged, but the task is not a code-change task; Relay will not credit it");
+      return decide(input, "BLOCKED", reasons);
+    }
+    if (input.state === "cancelled" || input.state === "failed") {
+      push("MERGE_NOT_CREDITED", `GitHub reports the PR merged, but the task is ${input.state}; Relay will not credit it`);
+      return decide(input, "BLOCKED", reasons);
+    }
+    if (!postReview) {
+      push(
+        "MERGE_NOT_CREDITED",
+        `GitHub reports the PR merged, but the review has not passed (phase '${input.phase ?? "none"}', state '${input.state}'); Relay credits a merge only at integration/merge_ready or after accept`
+      );
+      return decide(input, "BLOCKED", reasons);
+    }
     return decide(input, "MERGED", reasons);
   }
 
@@ -198,6 +224,11 @@ export function evaluateMergeGate(input: MergeGateInput): MergeGateDecision {
   }
   if (input.phase !== "merge_ready") {
     push("NOT_MERGE_READY", `phase is '${input.phase ?? "none"}', not merge_ready`);
+  }
+  // A merge gate is HEAD-bound: with no recorded head there is nothing tying the
+  // review/verify to the PR head being judged, so it can never be READY.
+  if (input.head === null) {
+    push("HEAD_UNKNOWN", "the task records no head_sha; a review cannot be bound to the judged HEAD");
   }
 
   // --- Pull request state -------------------------------------------------
@@ -218,6 +249,15 @@ export function evaluateMergeGate(input: MergeGateInput): MergeGateDecision {
         `PR head ${short(pr.headSha)} != recorded head ${short(input.head)}; a changed HEAD needs a fresh independent review`
       );
     }
+    // The base BRANCH is part of the reviewed diff identity: a retarget means the
+    // review/verify judged a diff against another base. A base-SHA move alone is
+    // NOT a block (an unrelated merge must not force a rebase loop).
+    if (input.prBase && pr.baseRef && input.prBase !== pr.baseRef) {
+      push(
+        "BASE_CHANGED",
+        `PR base '${pr.baseRef}' != the recorded base '${input.prBase}'; the review judged a different diff`
+      );
+    }
     if (pr.mergeable === "conflicting") {
       push(
         "CONFLICT",
@@ -233,7 +273,9 @@ export function evaluateMergeGate(input: MergeGateInput): MergeGateDecision {
   if (!input.review) {
     push("REVIEW_MISSING", "no trusted independent review PASS at the current HEAD");
   } else {
-    if (input.head && input.review.head && !headsMatch(input.review.head, input.head)) {
+    // A review that names NO head cannot be the current-HEAD pass; and a review at
+    // another head is stale. Either way it does not satisfy the gate.
+    if (!input.review.head || (input.head && !headsMatch(input.review.head, input.head))) {
       push("REVIEW_STALE", `the review names ${short(input.review.head)}, not the current head ${short(input.head)}`);
     }
     if (input.review.workerId && input.submitter && input.review.workerId === input.submitter) {
@@ -362,8 +404,10 @@ export function gatherMergeGateInput(db: Database, taskId: string, deps: MergeGa
   }
 
   let checks: CheckRollup | null = null;
-  if (deps.checks && pr) {
-    const raw = deps.checks.listChecks(pr.ref, head ?? pr.headSha);
+  // Checks are pinned to the RECORDED head. With no recorded head there is no
+  // head to pin to, so the roll-up stays NOT_RUN (never the live PR head).
+  if (deps.checks && pr && head) {
+    const raw = deps.checks.listChecks(pr.ref, head);
     checks = raw === null ? null : rollupChecks(raw);
   }
 
@@ -386,6 +430,7 @@ export function gatherMergeGateInput(db: Database, taskId: string, deps: MergeGa
     review,
     submitter: submission?.worker_id ?? null,
     unresolvedNgId: ng?.id ?? null,
+    prBase: task.pr_base ?? null,
     hold,
     checks,
     unmetDependencies,
@@ -422,7 +467,9 @@ export interface IntegrationRequiredResult {
 /**
  * Record an `IntegrationRequired` routing decision for a conflict and tell the
  * Gateway ONCE per (task, head). Read-only w.r.t. providers: it never rebases,
- * pushes or writes GitHub. Idempotent via the (task, head) event key.
+ * pushes or writes GitHub. Idempotent via the (task, headKey) event key, where
+ * `headKey` is the head or the literal `"none"` (so a null head is deduped too,
+ * instead of matching a `"head":""` pattern that a JSON `null` never produces).
  */
 export function raiseIntegrationRequired(
   db: Database,
@@ -431,13 +478,15 @@ export function raiseIntegrationRequired(
   reason: string
 ): IntegrationRequiredResult {
   const recipient = resolveHumanInterface(db, task);
+  const headKey = head ?? "none";
   const already = db
     .query(
       `SELECT 1 AS x FROM events
-        WHERE task_id = ? AND type = 'workflow.integration_required' AND payload_json LIKE ?
+        WHERE task_id = ? AND type = 'workflow.integration_required'
+          AND json_extract(payload_json, '$.headKey') = ?
         LIMIT 1`
     )
-    .get(task.id, `%"head":"${head ?? ""}"%`);
+    .get(task.id, headKey);
   if (already) return { raised: false, recipient };
   const t = now();
   db.query(
@@ -448,7 +497,7 @@ export function raiseIntegrationRequired(
     source: "workflow",
     taskId: task.id,
     type: "workflow.integration_required",
-    payload: { head, reason },
+    payload: { head, headKey, reason },
   });
   notifyGatewayTo(db, recipient, task, `${task.id}: IntegrationRequired — ${reason}`, "integration_required");
   return { raised: true, recipient };

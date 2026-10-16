@@ -72,6 +72,7 @@ function base(over: Partial<MergeGateInput> = {}): MergeGateInput {
     review: { workerId: "rev", head: HEAD, reviewer: "claude" },
     submitter: "impl",
     unresolvedNgId: null,
+    prBase: "main",
     hold: null,
     checks: { total: 2, passed: 2, pending: [], failing: [], skipped: [], requiredPassed: true },
     unmetDependencies: [],
@@ -188,6 +189,41 @@ describe("merge gate: the READY / BLOCKED decision table (pure)", () => {
     expect(evaluateMergeGate(base({ merged: true, pr: view({ state: "merged", headSha: MOVED }) })).status).toBe("BLOCKED");
   });
 
+  // --- round-2 findings ---------------------------------------------------
+
+  test("#4 a merge Relay will not credit (pre-review / non-code / cancelled) -> BLOCKED MERGE_NOT_CREDITED", () => {
+    // Mirrors confirmMerged's postReview guard: implement/review is not credited.
+    const early = evaluateMergeGate(base({ merged: true, phase: "implement", state: "queued" }));
+    expect(early.status).toBe("BLOCKED");
+    expect(early.reasons.map((r) => r.code)).toContain("MERGE_NOT_CREDITED");
+    expect(evaluateMergeGate(base({ merged: true, state: "cancelled" })).reasons.map((r) => r.code)).toContain(
+      "MERGE_NOT_CREDITED"
+    );
+    expect(evaluateMergeGate(base({ merged: true, codeChange: false })).status).toBe("BLOCKED");
+    // The creditable cases stay MERGED.
+    expect(evaluateMergeGate(base({ merged: true, phase: "integration", state: "queued" })).status).toBe("MERGED");
+    expect(evaluateMergeGate(base({ merged: true, state: "done" })).status).toBe("MERGED");
+  });
+
+  test("#2 a task with no recorded HEAD -> BLOCKED HEAD_UNKNOWN (never bound to head=none)", () => {
+    const d = evaluateMergeGate(base({ head: null, review: { workerId: "rev", head: null, reviewer: "rev" } }));
+    expect(d.status).toBe("BLOCKED");
+    expect(d.reasons.map((r) => r.code)).toContain("HEAD_UNKNOWN");
+    // A review that names no head is stale, never a pass.
+    expect(evaluateMergeGate(base({ review: { workerId: "rev", head: null, reviewer: "rev" } })).reasons.map((r) => r.code)).toContain(
+      "REVIEW_STALE"
+    );
+  });
+
+  test("#5 a retargeted base branch -> BLOCKED BASE_CHANGED; a base-SHA move alone is not a block", () => {
+    const retargeted = evaluateMergeGate(base({ pr: view({ baseRef: "release-1" }) }));
+    expect(retargeted.reasons.map((r) => r.code)).toContain("BASE_CHANGED");
+    // Same base branch, moved base SHA + still mergeable -> READY (no rebase loop).
+    expect(evaluateMergeGate(base({ pr: view({ baseSha: "c".repeat(40) }) })).status).toBe("READY");
+    // An unrecorded base is not compared (legacy tasks).
+    expect(evaluateMergeGate(base({ prBase: null, pr: view({ baseRef: "release-1" }) })).status).toBe("READY");
+  });
+
   test("a done-but-unmerged task is distinguished from Done -> BLOCKED NOT_MERGED (and TERMINAL for failed/cancelled)", () => {
     expect(codes({ state: "done" })).toContain("NOT_MERGED");
     expect(codes({ state: "cancelled" })).toContain("TERMINAL");
@@ -264,6 +300,57 @@ describe("check roll-up + the gh adapter mapping", () => {
     expect(new GhCliGitHub(failing).listChecks({ repo: "o/r", number: 1 }, HEAD)).toBeNull();
     // An empty head can never be bound.
     expect(gh.listChecks({ repo: "o/r", number: 1 }, "")).toBeNull();
+  });
+
+  test("#1 a one-sided read failure is NOT_RUN, never the other read as the whole picture", () => {
+    const runsOnly: Exec = (argv) =>
+      argv.some((a) => a.endsWith("/check-runs"))
+        ? { ok: false, stdout: "", stderr: "rate limited" }
+        : { ok: true, stdout: JSON.stringify({ statuses: [{ context: "ci/legacy", state: "success" }] }), stderr: "" };
+    expect(new GhCliGitHub(runsOnly).listChecks({ repo: "o/r", number: 1 }, HEAD)).toBeNull();
+
+    const statusesFail: Exec = (argv) =>
+      argv.some((a) => a.endsWith("/check-runs"))
+        ? { ok: true, stdout: JSON.stringify({ check_runs: [{ name: "test", status: "completed", conclusion: "success" }] }), stderr: "" }
+        : { ok: false, stdout: "", stderr: "rate limited" };
+    expect(new GhCliGitHub(statusesFail).listChecks({ repo: "o/r", number: 1 }, HEAD)).toBeNull();
+
+    // An UNPARSEABLE read is also NOT_RUN.
+    const badJson: Exec = (argv) =>
+      argv.some((a) => a.endsWith("/check-runs"))
+        ? { ok: true, stdout: "not json at all", stderr: "" }
+        : { ok: true, stdout: JSON.stringify({ statuses: [] }), stderr: "" };
+    expect(new GhCliGitHub(badJson).listChecks({ repo: "o/r", number: 1 }, HEAD)).toBeNull();
+  });
+
+  test("#1 check runs are paginated: every page is read and a short read is NOT_RUN", () => {
+    const pages: string[][] = [];
+    const exec: Exec = (argv) => {
+      if (argv.some((a) => a.endsWith("/check-runs"))) {
+        pages.push(argv);
+        // Two concatenated pages (what `gh api --paginate` emits).
+        return {
+          ok: true,
+          stdout:
+            JSON.stringify({ total_count: 2, check_runs: [{ name: "a", status: "completed", conclusion: "success" }] }) +
+            JSON.stringify({ total_count: 2, check_runs: [{ name: "b", status: "completed", conclusion: "failure" }] }),
+          stderr: "",
+        };
+      }
+      return { ok: true, stdout: JSON.stringify({ statuses: [] }), stderr: "" };
+    };
+    const checks = new GhCliGitHub(exec).listChecks({ repo: "o/r", number: 1 }, HEAD);
+    // The failing run on the second page is seen, and --paginate was requested.
+    expect(checks!.map((c) => c.name)).toEqual(["a", "b"]);
+    expect(checks!.find((c) => c.name === "b")!.bucket).toBe("fail");
+    expect(pages[0]).toContain("--paginate");
+
+    // Declared total_count exceeds what was read -> incomplete -> NOT_RUN.
+    const short: Exec = (argv) =>
+      argv.some((a) => a.endsWith("/check-runs"))
+        ? { ok: true, stdout: JSON.stringify({ total_count: 31, check_runs: [{ name: "a", status: "completed", conclusion: "success" }] }), stderr: "" }
+        : { ok: true, stdout: JSON.stringify({ statuses: [] }), stderr: "" };
+    expect(new GhCliGitHub(short).listChecks({ repo: "o/r", number: 1 }, HEAD)).toBeNull();
   });
 });
 
@@ -406,5 +493,50 @@ describe("merge gate: gathering the facts + the daemon pass (read-only)", () => 
     expect(b.raised).toBe(false);
     expect(getTask(db, t.id)!.state).toBe(live.state);
     expect(getTask(db, t.id)!.phase).toBe(live.phase);
+  });
+
+  test("#3 IntegrationRequired is deduped for a NULL head too (no per-tick spam)", () => {
+    const t = intake("o/r#8");
+    toMergeReady(t.id);
+    // Simulate a task with no recorded head (the #2 trigger).
+    db.query(`UPDATE tasks SET head_sha = NULL WHERE id = ?`).run(t.id);
+    const a = raiseIntegrationRequired(db, getTask(db, t.id)!, null, "conflict with base");
+    const b = raiseIntegrationRequired(db, getTask(db, t.id)!, null, "conflict with base");
+    const c = raiseIntegrationRequired(db, getTask(db, t.id)!, null, "conflict with base");
+    expect([a.raised, b.raised, c.raised]).toEqual([true, false, false]);
+    const events = db
+      .query(`SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'workflow.integration_required'`)
+      .get(t.id) as { n: number };
+    expect(events.n).toBe(1);
+  });
+
+  test("#2 a null-head task never reaches READY and its checks stay NOT_RUN", () => {
+    const gh = new FakeGitHub();
+    gh.putPullRequest(view());
+    gh.putChecks({ repo: "o/r", number: 1 }, HEAD, CHECKS);
+    // Intake with NO headSha, then drive to merge_ready.
+    const t = intakeTask(db, {
+      provider: "github",
+      issueId: "o/r#9",
+      codeChange: true,
+      prUrl: "https://github.com/o/r/pull/1",
+      prRepo: "o/r",
+      branch: "feat/x",
+    });
+    claimTask(db, t.id, "impl");
+    submitPhase(db, t.id, "impl");
+    claimTask(db, t.id, "impl");
+    recordVerification(db, t.id, "impl", { passed: true });
+    recordReview(db, t.id, "rev", { verdict: "pass" });
+    claimTask(db, t.id, "integ");
+    submitPhase(db, t.id, "integ");
+
+    const input = gatherMergeGateInput(db, t.id, { github: gh, checks: gh, authority: GRANT })!;
+    expect(input.head).toBeNull();
+    // Checks are NOT pinned to the live PR head when the recorded head is missing.
+    expect(input.checks).toBeNull();
+    const d = evaluateMergeGate(input);
+    expect(d.status).toBe("BLOCKED");
+    expect(d.reasons.map((r) => r.code)).toContain("HEAD_UNKNOWN");
   });
 });
