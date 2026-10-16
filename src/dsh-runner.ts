@@ -8,9 +8,18 @@ import type { Run, RunState, Task } from "./schema";
 import { isTerminalTaskState } from "./schema";
 import { gitHead } from "./verify";
 import { submitImplementationFromRun, type RunImplementation } from "./workflow";
+import {
+  countDshLine,
+  dshSessionId,
+  emptyDshCounts,
+  type DshEvent,
+  type DshEventCounts,
+  parseDshLine,
+  turnEndReason,
+} from "./dsh-events";
 
 /**
- * ISH-803 — one-shot headless dsh coding runner.
+ * ISH-803 / ISH-810 — one-shot headless dsh coding runner.
  *
  * 1 Run = 1 `dsh --profile headless` process = 1 coding attempt. Starting /
  * running / finishing a dsh attempt must NOT require a Herdr pane, a TUI, the
@@ -18,14 +27,21 @@ import { submitImplementationFromRun, type RunImplementation } from "./workflow"
  * ONLY one Run's launch / observe / terminate; Task worktrees, single-writer
  * control and FIX re-entry are ISH-760.
  *
- * PINNED CLI CONTRACT (dsh 0.1.5-rc.1, dsh-headless 0.1.5-rc.2): the app is
- * `dsh --profile headless <task...>` (multiple words joined by spaces). It
- * streams provider reasoning to STDERR, prints the final assistant text to
- * STDOUT, and exits 0 only when the turn completed (`turn/end` reason
- * `completed`); any other outcome exits 1. There is NO `--json`/JSONL output in
- * this version and no machine-readable event field to parse, so the runner
- * treats stdout/stderr as text and records its own lifecycle JSONL. See
- * `docs/dsh-headless-runner.md`. No unverified option/field is used.
+ * PINNED CLI CONTRACT (dsh **0.2.0-rc.2**): the app is
+ * `dsh --profile headless --json <task...>` (multiple words joined by spaces, or
+ * `--json -` to read the task from stdin). STDERR carries provider reasoning and
+ * errors; STDOUT is newline-delimited JSON **execution events** — `session`
+ * (sessionId/cwd), `status` (turn/step + `turn_end` reason), `text`, `thinking`,
+ * `tool_call`, `tool_result`, and a terminal `final` (or `error` on a failure
+ * outside a turn). The runner reads that JSONL incrementally, records the
+ * ORIGINAL dsh JSONL as per-Run evidence (`dsh.jsonl`) and keeps Relay's own
+ * lifecycle log (`events.jsonl`) strictly distinct.
+ *
+ * The JSONL is a BOUNDED projection, not a lossless Session log (fields/events
+ * can be truncated, tool results may be sensitive), and an in-turn failure can
+ * still print a `final`. **The process exit code / `turn_end` reason are
+ * authoritative for process success**, and *neither* means Relay Task approval.
+ * A parse/truncation problem is surfaced and never manufactures a success.
  *
  * `exit 0` is NOT a submission: only a structured `acceptRunSubmission` (bound
  * to the Run/Task/phase/attempt/branch/HEAD) advances the Task.
@@ -34,7 +50,6 @@ import { submitImplementationFromRun, type RunImplementation } from "./workflow"
 export const DEFAULT_FAST_EXIT_MS = 1500;
 /** dsh's default permission mode: writes are confined to the Run cwd. */
 export const DEFAULT_PERMISSION_MODE = "workspace-write";
-const SESSION_ID_RE = /\bsession-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/i;
 
 /** One line of the Run's own lifecycle JSONL (`events.jsonl`). */
 export interface RunEvent {
@@ -213,6 +228,8 @@ interface InsertRunInput {
   stdoutPath: string;
   stderrPath: string;
   eventsPath: string;
+  /** ISH-810: the per-Run path of the ORIGINAL dsh `--json` JSONL evidence. */
+  dshEventsPath: string;
 }
 
 function insertRun(db: Database, r: InsertRunInput): Run {
@@ -222,9 +239,9 @@ function insertRun(db: Database, r: InsertRunInput): Run {
   db.query(
     `INSERT INTO runs
        (id, task_id, phase, attempt, generation, cwd, branch, head_sha, base_head_sha, prompt,
-        spec_path, output_dir, state, stdout_path, stderr_path, events_path,
+        spec_path, output_dir, state, stdout_path, stderr_path, events_path, dsh_events_path,
         fast_exit, started_at, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, 'starting', ?, ?, ?, 0, ?, ?, ?)`
+     VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, 'starting', ?, ?, ?, ?, 0, ?, ?, ?)`
   ).run(
     r.id,
     r.taskId,
@@ -240,6 +257,7 @@ function insertRun(db: Database, r: InsertRunInput): Run {
     r.stdoutPath,
     r.stderrPath,
     r.eventsPath,
+    r.dshEventsPath,
     t,
     t,
     t
@@ -419,10 +437,14 @@ export async function startDshRun(db: Database, opts: StartRunOptions): Promise<
   const stdoutPath = join(runDir, "stdout.log");
   const stderrPath = join(runDir, "stderr.log");
   const eventsPath = join(runDir, "events.jsonl");
+  // ISH-810: the ORIGINAL dsh `--json` JSONL (one event per line) is per-Run
+  // evidence, kept separate from Relay's own `events.jsonl` lifecycle log.
+  const dshEventsPath = join(runDir, "dsh.jsonl");
   const specPath = join(runDir, "spec.md");
   writeFileSync(specPath, prompt + "\n");
   writeFileSync(stdoutPath, "");
   writeFileSync(stderrPath, "");
+  writeFileSync(dshEventsPath, "");
 
   const events = (e: RunEvent): void => {
     appendFileSync(eventsPath, `${JSON.stringify({ ts: now(), ...e })}\n`);
@@ -443,6 +465,7 @@ export async function startDshRun(db: Database, opts: StartRunOptions): Promise<
     stdoutPath,
     stderrPath,
     eventsPath,
+    dshEventsPath,
   });
 
   events({ t: "run.started", runId, taskId: task.id, phase, attempt: task.attempt, cwd, branch, baseHead: head, permissionMode });
@@ -453,7 +476,7 @@ export async function startDshRun(db: Database, opts: StartRunOptions): Promise<
     payload: { runId, phase, attempt: task.attempt, cwd, branch, baseHead: head, permissionMode },
   });
 
-  const argv = [dshBin, "--profile", "headless", prompt];
+  const argv = [dshBin, "--profile", "headless", "--json", prompt];
   const env: Record<string, string> = {
     ...baseEnv(),
     ...(opts.env ?? {}),
@@ -477,17 +500,43 @@ export async function startDshRun(db: Database, opts: StartRunOptions): Promise<
   let sessionId: string | null = null;
   let cancelReason: string | null = null;
   let settled = false;
+  // ISH-810 dsh JSONL observability (see src/dsh-events.ts).
+  const counts: DshEventCounts = emptyDshCounts();
+  let terminal: "final" | "error" | null = null;
+  let terminalError: string | null = null;
+  let turnReason: string | null = null;
 
   const onStdout = (line: string): void => {
     appendFileSync(stdoutPath, `${line}\n`);
-    const m = SESSION_ID_RE.exec(line);
-    if (m) sessionId = m[0];
-    events({ t: "stdout", v: line });
+    const parsed = parseDshLine(line);
+    countDshLine(counts, parsed);
+    if (parsed.kind === "event") {
+      const ev: DshEvent = parsed.event;
+      // The ORIGINAL dsh JSONL is per-Run evidence, kept separate from Relay's
+      // own lifecycle log below. Relay never writes its own events here.
+      appendFileSync(dshEventsPath, `${parsed.raw}\n`);
+      const sid = dshSessionId(ev);
+      if (sid && !sessionId) sessionId = sid;
+      const reason = turnEndReason(ev);
+      if (reason) turnReason = reason;
+      if (ev.type === "final") terminal = "final";
+      if (ev.type === "error") {
+        terminal = "error";
+        terminalError = `dsh error event: ${String(ev.message ?? ev.error ?? ev.text ?? "unknown")}`;
+      }
+      // Relay's OWN audit annotation: the event TYPE only, never its payload, so
+      // the two logs stay distinct.
+      events({ t: "dsh.event", type: ev.type, ...(typeof ev.callId === "string" ? { callId: ev.callId } : {}) });
+      return;
+    }
+    if (parsed.kind === "malformed") {
+      // A non-JSON / unparseable stdout line stays VISIBLE; it never becomes a
+      // success and never aborts the Run (the profile may print boot banners).
+      events({ t: "stdout.malformed", error: parsed.error, v: parsed.raw });
+    }
   };
   const onStderr = (line: string): void => {
     appendFileSync(stderrPath, `${line}\n`);
-    const m = SESSION_ID_RE.exec(line);
-    if (m && !sessionId) sessionId = m[0];
     events({ t: "stderr", v: line });
   };
   const outP = pumpLines(proc.stdout, onStdout).catch(() => {});
@@ -531,10 +580,33 @@ export async function startDshRun(db: Database, opts: StartRunOptions): Promise<
     if (reason === "timeout") state = "timeout";
     else if (reason) state = "cancelled";
     else if (failure) state = "failed";
-    else state = exitCode === 0 ? "exited" : "failed";
+    // The process exit code is authoritative for process success. A terminal
+    // `error` event (a failure OUTSIDE a turn) disagreeing with a 0 exit is a
+    // contradiction: fail CLOSED rather than report a success we cannot trust.
+    // A `final` event is NOT required and is NEVER a substitute for `run submit`.
+    else state = exitCode === 0 && terminal !== "error" ? "exited" : "failed";
 
     if (fast) events({ t: "run.fast_exit", durationMs, exitCode });
-    events({ t: "run.exited", state, exitCode, durationMs, fast, sessionId, baseHead: run.base_head_sha, producedHead });
+    events({
+      t: "run.exited",
+      state,
+      exitCode,
+      durationMs,
+      fast,
+      sessionId,
+      baseHead: run.base_head_sha,
+      producedHead,
+      dsh: counts,
+      terminal,
+      turnReason,
+    });
+    const errorText =
+      failure ??
+      (state === "exited"
+        ? null
+        : reason
+          ? `run ${reason}`
+          : terminalError ?? `exit ${exitCode}`);
     const finalRun = updateRun(db, runId, {
       state,
       branch: producedBranch,
@@ -542,7 +614,7 @@ export async function startDshRun(db: Database, opts: StartRunOptions): Promise<
       exit_code: exitCode,
       signal: reason,
       session_id: sessionId,
-      error: failure ?? (state === "exited" ? null : reason ? `run ${reason}` : `exit ${exitCode}`),
+      error: errorText,
       fast_exit: fast ? 1 : 0,
       ended_at: now(),
     });
@@ -550,7 +622,18 @@ export async function startDshRun(db: Database, opts: StartRunOptions): Promise<
       source: "dsh-runner",
       taskId: task.id,
       type: `dsh.run.${state}`,
-      payload: { runId, exitCode, durationMs, fast, sessionId, baseHead: run.base_head_sha, producedHead },
+      payload: {
+        runId,
+        exitCode,
+        durationMs,
+        fast,
+        sessionId,
+        baseHead: run.base_head_sha,
+        producedHead,
+        dsh: counts,
+        terminal,
+        turnReason,
+      },
     });
     return finalRun;
   })();

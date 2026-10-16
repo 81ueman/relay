@@ -315,21 +315,27 @@ implement --TaskSubmitted--> verify --VerificationResult--> review
 
 ### Headless dsh Runs (no Herdr)
 
-A coding attempt can run as **one `dsh --profile headless` process** — no Herdr
-pane, TUI, `dsh web` server, wake plugin, or manual attach (`relay run start`,
-`list`, `show`, `logs`, `cancel`, `submit`). stdout (final text) and stderr
-(reasoning) are stored under `<control-plane>/runs/<run-id>/`; the durable `runs`
-row is keyed to the Task (it is not a second workflow state) and records both the
-pre-run `base_head_sha` and the PRODUCED HEAD re-read in the worktree at Run end
-(dsh is asked to commit). `relay run start` waits for a terminal state.
+A coding attempt can run as **one `dsh --profile headless --json` process** — no
+Herdr pane, TUI, `dsh web` server, wake plugin, or manual attach (`relay run
+start`, `list`, `show`, `logs`, `cancel`, `submit`). Under `<control-plane>/runs/<run-id>/`:
+`stdout.log` is the **raw dsh JSONL event stream** (`session`, `status`, `text`,
+`thinking`, `tool_call`, `tool_result`, `final`/`error`), `stderr.log` carries
+reasoning/errors, **`dsh.jsonl` is the ORIGINAL dsh events captured verbatim as
+per-Run evidence**, and `events.jsonl` is **Relay's own lifecycle log** (a
+`dsh.event` annotation only — never a dsh payload). The durable `runs` row is
+keyed to the Task (it is not a second workflow state), records the dsh `sessionId`
+and both the pre-run `base_head_sha` and the PRODUCED HEAD re-read in the worktree
+at Run end (dsh is asked to commit). `relay run start` waits for a terminal state.
 Cancel/timeout kill the whole process group. Permissions stay in the worktree
-(`DSH_PERMISSION_MODE=workspace-write`). A process `exit 0` or the final text is
-**not** a submission — only a structured `relay run submit` bound to the current
-Run/Task/phase/attempt/branch/HEAD advances the Task (a task with no linked
-branch/HEAD yet adopts the Run's; the recorded head is the produced one); a
-non-zero/cancelled/stale Run never does. This covers one Run's launch/observe/terminate only; the
-Task worktree (create/select/own), single-writer control and FIX re-entry are
-ISH-760 — see [`docs/run-lifecycle.md`](docs/run-lifecycle.md). See
+(`DSH_PERMISSION_MODE=workspace-write`). A process `exit 0` or a terminal `final`
+event is **not** a submission — only a structured `relay run submit` bound to the
+current Run/Task/phase/attempt/branch/HEAD advances the Task (a task with no
+linked branch/HEAD yet adopts the Run's; the recorded head is the produced one);
+a non-zero/cancelled/stale Run never does. `relay run logs <run-id>` renders the
+read-only session id + ordered `tool_call`/`tool_result` chronology (no TUI/Web UI
+needed). This covers one Run's launch/observe/terminate only; the Task worktree
+(create/select/own), single-writer control and FIX re-entry are ISH-760 — see
+[`docs/run-lifecycle.md`](docs/run-lifecycle.md). See
 [`docs/dsh-headless-runner.md`](docs/dsh-headless-runner.md) for the pinned
 `dsh` CLI contract and the exact file/output format.
 

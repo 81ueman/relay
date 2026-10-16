@@ -403,6 +403,9 @@ export interface Run {
   stdout_path: string | null;
   stderr_path: string | null;
   events_path: string | null;
+  /** ISH-810: the ORIGINAL dsh `--json` JSONL, per-Run evidence (distinct from
+   * Relay's own `events.jsonl`). */
+  dsh_events_path: string | null;
   error: string | null;
   fast_exit: number;
   started_at: number;
@@ -735,6 +738,7 @@ CREATE TABLE IF NOT EXISTS runs (
   stdout_path TEXT,
   stderr_path TEXT,
   events_path TEXT,
+  dsh_events_path TEXT,
   error TEXT,
   fast_exit INTEGER NOT NULL DEFAULT 0,
   started_at INTEGER NOT NULL,
