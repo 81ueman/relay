@@ -325,9 +325,10 @@ required SQLite evidence, and prints ONE structured decision — `READY`,
   draft is retained, still not ready), the PR head must equal the recorded
   `head_sha` (a missing recorded head is `HEAD_UNKNOWN`; a retargeted base branch
   is `BASE_CHANGED` and also invalidates the review in the provider pass without
-  moving the head — a FRESH review at that same head is then accepted, keyed on
-  (head, base, profile), and a pre-retarget marker is not re-applied — while a
-  base-*SHA* move alone is not), and mergeability is
+  moving the head — a FRESH review at that same head is then accepted, keyed on the
+  review epoch (head/attempt/profile) so a revert or a pre-base review cannot
+  deadlock it, and a pre-retarget marker is not re-applied — while a base-*SHA* move
+  alone is not), and mergeability is
   judged. A `conflicting` PR raises
   **`IntegrationRequired`** to the Gateway (a routing decision: fix the new HEAD,
   then re-VERIFY/REVIEW) — it never rebases. An **unrelated** merge of another PR

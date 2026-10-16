@@ -642,4 +642,94 @@ describe("merge gate: gathering the facts + the daemon pass (read-only)", () => 
     // ...and the gate is READY again for the retargeted base.
     expect(checkMergeGate(db, t.id, { github: gh, checks: gh, authority: GRANT })!.status).toBe("READY");
   });
+
+  test("#1 (round-4a) main -> release-1 -> main: every retarget accepts a fresh PASS at the same head", async () => {
+    process.env.RELAY_PROVIDER_POLL_MS = "0";
+    const ref = { repo: "o/r", number: 1 };
+    const gh = new FakeGitHub();
+    gh.putPullRequest(view({ baseRef: "release-1" }));
+    gh.putChecks(ref, HEAD, CHECKS);
+    // A stale OK marker for the same head (posted before the retarget).
+    gh.putComments(ref, [
+      {
+        author: DEFAULT_REVIEW_OWNER,
+        createdAt: "2026-01-01T00:00:00Z",
+        body: `<!-- ishiul-review head=${HEAD} verdict=OK reviewer=claude -->`,
+      },
+    ]);
+
+    const t = intakeTask(db, {
+      provider: "github",
+      issueId: "o/r#12",
+      codeChange: true,
+      headSha: HEAD,
+      prUrl: "https://github.com/o/r/pull/1",
+      prRepo: "o/r",
+      branch: "feat/x",
+      prBase: "main",
+      prBaseSha: BASE,
+    });
+    toMergeReady(t.id); // PASS at attempt 0, base main
+
+    // retarget main -> release-1
+    await processWorkflow(db, { github: gh, checks: gh, authority: GRANT, authorizedReviewers: [DEFAULT_REVIEW_OWNER] });
+    expect(getTask(db, t.id)!.phase).toBe("review");
+    expect(getTask(db, t.id)!.attempt).toBe(1);
+    // the stale main-era marker stayed unapplied (the task is still in review)
+    expect(checkMergeGate(db, t.id, { github: gh, checks: gh, authority: GRANT })!.status).not.toBe("READY");
+    recordReview(db, t.id, "rev", { verdict: "pass", headSha: HEAD });
+    claimTask(db, t.id, "integ");
+    submitPhase(db, t.id, "integ");
+    expect(checkMergeGate(db, t.id, { github: gh, checks: gh, authority: GRANT })!.status).toBe("READY");
+
+    // revert release-1 -> main: the FIRST base-main PASS must NOT match the new epoch.
+    gh.putPullRequest(view({ baseRef: "main" }));
+    await processWorkflow(db, { github: gh, checks: gh, authority: GRANT, authorizedReviewers: [DEFAULT_REVIEW_OWNER] });
+    expect(getTask(db, t.id)!.phase).toBe("review");
+    expect(getTask(db, t.id)!.attempt).toBe(2);
+    recordReview(db, t.id, "rev", { verdict: "pass", headSha: HEAD });
+    claimTask(db, t.id, "integ");
+    submitPhase(db, t.id, "integ");
+    expect(getTask(db, t.id)!.phase).toBe("merge_ready");
+    expect(checkMergeGate(db, t.id, { github: gh, checks: gh, authority: GRANT })!.status).toBe("READY");
+  });
+
+  test("#1 (round-4b) a null-base PASS then link then retarget accepts a fresh PASS at the same head", async () => {
+    process.env.RELAY_PROVIDER_POLL_MS = "0";
+    const ref = { repo: "o/r", number: 1 };
+    const gh = new FakeGitHub();
+    gh.putPullRequest(view({ baseRef: "main" }));
+    gh.putChecks(ref, HEAD, CHECKS);
+
+    // Intake with NO --base: the PASS is recorded with base null (and legacy rows
+    // have no base key at all).
+    const t = intakeTask(db, {
+      provider: "github",
+      issueId: "o/r#13",
+      codeChange: true,
+      headSha: HEAD,
+      prUrl: "https://github.com/o/r/pull/1",
+      prRepo: "o/r",
+      branch: "feat/x",
+    });
+    toMergeReady(t.id); // PASS at attempt 0, base null
+    expect(getTask(db, t.id)!.pr_base).toBeNull();
+
+    // The first provider pass FILLS pr_base=main (null -> main is NOT a retarget).
+    await processWorkflow(db, { github: gh, checks: gh, authority: GRANT });
+    expect(getTask(db, t.id)!.pr_base).toBe("main");
+    expect(getTask(db, t.id)!.phase).toBe("merge_ready");
+    expect(checkMergeGate(db, t.id, { github: gh, checks: gh, authority: GRANT })!.status).toBe("READY");
+
+    // Retarget to release-1: the null-base PASS must not deadlock the fresh review.
+    gh.putPullRequest(view({ baseRef: "release-1" }));
+    await processWorkflow(db, { github: gh, checks: gh, authority: GRANT });
+    expect(getTask(db, t.id)!.phase).toBe("review");
+    expect(getTask(db, t.id)!.attempt).toBe(1);
+    recordReview(db, t.id, "rev", { verdict: "pass", headSha: HEAD });
+    claimTask(db, t.id, "integ");
+    submitPhase(db, t.id, "integ");
+    expect(getTask(db, t.id)!.phase).toBe("merge_ready");
+    expect(checkMergeGate(db, t.id, { github: gh, checks: gh, authority: GRANT })!.status).toBe("READY");
+  });
 });
