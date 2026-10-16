@@ -129,9 +129,10 @@ export interface CheckRollup {
   failing: string[];
   skipped: string[];
   /**
-   * True only when at least one check actually ran AND none is failing /
-   * pending / cancelled. A zero-check roll-up is deliberately NOT passed: an
-   * unrun required gate (e.g. a CI credit outage) must BLOCK, never PASS.
+   * True only when at least one check actually PASSED AND none is failing /
+   * pending / cancelled. A zero-check roll-up, and an all-skipped roll-up, are
+   * deliberately NOT passed: an unrun required gate (e.g. a CI credit outage, or
+   * every job skipped) must BLOCK, never PASS.
    */
   requiredPassed: boolean;
 }
@@ -164,7 +165,9 @@ export function rollupChecks(checks: CheckRunView[]): CheckRollup {
     pending,
     failing,
     skipped,
-    requiredPassed: checks.length > 0 && pending.length === 0 && failing.length === 0,
+    // At least one check must have actually PASSED: a roll-up of only skipped
+    // checks (passed === 0) is an unrun gate, never a pass.
+    requiredPassed: passed > 0 && pending.length === 0 && failing.length === 0,
   };
 }
 

@@ -15,6 +15,7 @@ import {
   type ProviderAuthority,
 } from "../src/providers";
 import { GhCliGitHub, mapCheckRunBucket, mapCommitStatusBucket, type Exec } from "../src/provider-adapters";
+import { processWorkflow } from "../src/workflow-driver";
 import {
   boundPrRef,
   checkMergeGate,
@@ -155,6 +156,15 @@ describe("merge gate: the READY / BLOCKED decision table (pure)", () => {
     expect(codes({ checks: pending })).toContain("CHECKS_NOT_PASSED");
   });
 
+  test("#2 an all-skipped roll-up -> BLOCKED CHECKS_NOT_RUN (no gate actually ran); a pass+skip mix stays READY", () => {
+    const allSkipped = { total: 1, passed: 0, pending: [], failing: [], skipped: ["ci"], requiredPassed: false };
+    const d = evaluateMergeGate(base({ checks: allSkipped }));
+    expect(d.status).toBe("BLOCKED");
+    expect(d.reasons.map((r) => r.code)).toContain("CHECKS_NOT_RUN");
+    const mixed = { total: 2, passed: 1, pending: [], failing: [], skipped: ["b"], requiredPassed: true };
+    expect(evaluateMergeGate(base({ checks: mixed })).status).toBe("READY");
+  });
+
   test("a conflict -> BLOCKED CONFLICT and action IntegrationRequired (a Gateway routing decision)", () => {
     const d = evaluateMergeGate(base({ pr: view({ mergeable: "conflicting" }) }));
     expect(d.status).toBe("BLOCKED");
@@ -251,8 +261,11 @@ describe("check roll-up + the gh adapter mapping", () => {
     expect(rollupChecks([{ name: "a", bucket: "pending" }]).requiredPassed).toBe(false);
     expect(rollupChecks([{ name: "a", bucket: "fail" }]).requiredPassed).toBe(false);
     expect(rollupChecks([{ name: "a", bucket: "cancel" }]).requiredPassed).toBe(false);
-    // A skipped optional job does not, by itself, fail the roll-up.
+    // A skipped optional job does not, by itself, fail the roll-up...
     expect(rollupChecks([{ name: "a", bucket: "pass" }, { name: "b", bucket: "skipping" }]).requiredPassed).toBe(true);
+    // ...but an ALL-skipped roll-up had no gate actually run: it is NOT passed.
+    expect(rollupChecks([{ name: "a", bucket: "skipping" }]).requiredPassed).toBe(false);
+    expect(rollupChecks([{ name: "a", bucket: "skipping" }, { name: "b", bucket: "skipping" }]).requiredPassed).toBe(false);
   });
 
   test("check-run + commit-status buckets map to the gh vocabulary", () => {
@@ -371,6 +384,7 @@ beforeEach(() => {
 
 afterEach(() => {
   delete process.env.RELAY_HUMAN;
+  delete process.env.RELAY_PROVIDER_POLL_MS;
   db.close();
   rmSync(dir, { recursive: true, force: true });
 });
@@ -538,5 +552,43 @@ describe("merge gate: gathering the facts + the daemon pass (read-only)", () => 
     const d = evaluateMergeGate(input);
     expect(d.status).toBe("BLOCKED");
     expect(d.reasons.map((r) => r.code)).toContain("HEAD_UNKNOWN");
+  });
+
+  test("#1 (round-2) a retargeted base branch is caught by the daemon pass, not silently overwritten", async () => {
+    process.env.RELAY_PROVIDER_POLL_MS = "0"; // no throttle: the provider pass runs
+    const gh = new FakeGitHub();
+    // The PR was retargeted to release-1 AFTER the review judged main.
+    gh.putPullRequest(view({ baseRef: "release-1" }));
+    gh.putChecks({ repo: "o/r", number: 1 }, HEAD, CHECKS);
+
+    const t = intakeTask(db, {
+      provider: "github",
+      issueId: "o/r#10",
+      codeChange: true,
+      headSha: HEAD,
+      prUrl: "https://github.com/o/r/pull/1",
+      prRepo: "o/r",
+      branch: "feat/x",
+      prBase: "main",
+      prBaseSha: BASE,
+    });
+    toMergeReady(t.id);
+    expect(getTask(db, t.id)!.pr_base).toBe("main");
+
+    // Before any daemon pass the gate already blocks on the retargeted base.
+    const before = checkMergeGate(db, t.id, { github: gh, checks: gh, authority: GRANT })!;
+    expect(before.status).toBe("BLOCKED");
+    expect(before.reasons.map((r) => r.code)).toContain("BASE_CHANGED");
+
+    // The provider pass + gate pass run together (as the daemon does).
+    const actions = await processWorkflow(db, { github: gh, checks: gh, authority: GRANT });
+    // The provider path must NOT silently overwrite the reviewed base and leave
+    // the task READY: the base-branch change invalidates the review.
+    expect(getTask(db, t.id)!.pr_base).toBe("release-1");
+    expect(getTask(db, t.id)!.phase).toBe("review");
+    expect(getTask(db, t.id)!.state).toBe("review");
+    expect(actions.some((a) => a.startsWith("merge-gate-ready:"))).toBe(false);
+    // And afterwards the gate is definitively not READY.
+    expect(checkMergeGate(db, t.id, { github: gh, checks: gh, authority: GRANT })!.status).toBe("BLOCKED");
   });
 });

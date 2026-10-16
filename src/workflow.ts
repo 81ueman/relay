@@ -469,8 +469,14 @@ export function linkTask(
   const prBaseSha = link.prBaseSha ?? task.pr_base_sha;
   const prDiff = link.prDiff ?? task.pr_diff;
   const headChanged = headSha !== task.head_sha;
+  // A BASE BRANCH change is review-invalidating exactly like a HEAD change: the
+  // review/verify judged a diff against the recorded base, and merging into a
+  // different branch is a different diff. A base-SHA move alone is NOT (an
+  // unrelated merge must not force a rebase/review loop).
+  const baseBranchChanged = task.pr_base !== null && prBase !== null && prBase !== task.pr_base;
   const linkChanged =
     headChanged ||
+    baseBranchChanged ||
     prUrl !== task.pr_url ||
     branch !== task.branch ||
     prRepo !== task.pr_repo ||
@@ -486,12 +492,12 @@ export function linkTask(
     ).run(prUrl, branch, headSha, prRepo, prBase, prBaseSha, prDiff, now(), taskId);
     let next = getTask(db, taskId)!;
     const phase = derivePhase(task);
-    if (headChanged && isCodeTask(task) && phase && REVIEW_PINNED_PHASES.includes(phase)) {
-      next = invalidateReview(db, next, headSha, "head-changed");
+    if ((headChanged || baseBranchChanged) && isCodeTask(task) && phase && REVIEW_PINNED_PHASES.includes(phase)) {
+      next = invalidateReview(db, next, headSha, baseBranchChanged ? "base-changed" : "head-changed");
     }
     return next;
   })();
-  if (headChanged) requestReconcile(db, `link-head:${taskId}`);
+  if (headChanged || baseBranchChanged) requestReconcile(db, `link-changed:${taskId}`);
   return updated;
 }
 

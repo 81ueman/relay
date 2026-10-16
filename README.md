@@ -324,7 +324,8 @@ required SQLite evidence, and prints ONE structured decision — `READY`,
 - **GitHub (re-fetched, never assumed).** OPEN / non-draft (an owner-designated
   draft is retained, still not ready), the PR head must equal the recorded
   `head_sha` (a missing recorded head is `HEAD_UNKNOWN`; a retargeted base branch
-  is `BASE_CHANGED`, while a base-*SHA* move alone is not), and mergeability is
+  is `BASE_CHANGED` and also invalidates the review in the provider pass, while a
+  base-*SHA* move alone is not), and mergeability is
   judged. A `conflicting` PR raises
   **`IntegrationRequired`** to the Gateway (a routing decision: fix the new HEAD,
   then re-VERIFY/REVIEW) — it never rebases. An **unrelated** merge of another PR
@@ -335,9 +336,9 @@ required SQLite evidence, and prints ONE structured decision — `READY`,
   head, no **unresolved NG** at that head (a later OK alone never clears it), no
   owner **HOLD** (a STRUCTURED Linear state/label or an owner label on the PR —
   never a keyword scan of free text), the required **check results** (a failed or
-  unreadable read, or zero reported checks, is `NOT_RUN` → BLOCKED; a CI credit
-  outage can never become PASS), and the **dependent change order** (a PR-bound
-  prerequisite counts as complete only once merged).
+  unreadable read, zero reported checks, or an all-skipped roll-up is `NOT_RUN` →
+  BLOCKED; a CI credit outage can never become PASS), and the **dependent change
+  order** (a PR-bound prerequisite counts as complete only once merged).
 - **Permission.** A real merge needs an explicit point-of-use authority
   (ISH-288); with none the verdict is `BLOCKED/NO_PERMISSION`. The gate has **no
   push/rebase/merge executor** and never writes a provider or Linear — it only

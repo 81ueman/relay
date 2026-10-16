@@ -298,6 +298,9 @@ export function evaluateMergeGate(input: MergeGateInput): MergeGateDecision {
     push("CHECKS_NOT_RUN", "required check results are unavailable (NOT_RUN; a CI outage or an unreadable read)");
   } else if (input.checks.total === 0) {
     push("CHECKS_NOT_RUN", "no check results were reported for this HEAD");
+  } else if (input.checks.passed === 0 && input.checks.failing.length === 0 && input.checks.pending.length === 0) {
+    // Every reported check was skipped: no required gate actually RAN.
+    push("CHECKS_NOT_RUN", "every reported check was skipped; no required gate actually ran");
   } else if (!input.checks.requiredPassed) {
     const detail: string[] = [];
     if (input.checks.failing.length) detail.push(`failing: ${input.checks.failing.join(",")}`);
