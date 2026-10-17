@@ -5,7 +5,8 @@ import { join } from "node:path";
 import type { Database } from "bun:sqlite";
 import { openDb } from "../src/db";
 import { applyGc, planGc, runGc } from "../src/gc";
-import { listEvents } from "../src/events";
+import { listEvents, logEvent } from "../src/events";
+import { LAB_OWNER_ASSIGNED_EVENT } from "../src/lab-cleanup";
 import { sendMessage } from "../src/messages";
 import { recordRuntime } from "../src/runtimes";
 import {
@@ -140,6 +141,39 @@ describe("applyGc purges only safe history", () => {
     const plan = planGc(db, { olderThanMs: 60_000 });
     expect(plan.workers).toHaveLength(0);
     expect(plan.skipped.some((s) => s.id === "gone" && /grace/.test(s.reason))).toBe(true);
+  });
+});
+
+describe("ISH-845: a pending Lab cleanup keeps a Task out of gc", () => {
+  test("a terminal Task with an unfinished Lab cleanup is skipped while a hook is configured", () => {
+    const t = addTask(db, { title: "lab task" });
+    finish(t.id); // done
+    logEvent(db, {
+      source: "lab-cleanup",
+      taskId: t.id,
+      type: LAB_OWNER_ASSIGNED_EVENT,
+      payload: { ownerId: `${t.id}-${t.created_at}` },
+    });
+
+    // Assigned but never cleaned ⇒ gc must NOT delete it (owner id still needed).
+    const pending = planGc(db, { labCleanupHook: true });
+    expect(pending.tasks).not.toContain(t.id);
+    expect(pending.skipped.some((s) => s.id === t.id && /lab cleanup pending/.test(s.reason))).toBe(true);
+
+    // Without a configured hook there is nothing to run, so gc is unchanged.
+    expect(planGc(db, { labCleanupHook: false }).tasks).toContain(t.id);
+
+    // A later SUCCESSFUL cleanup makes the Task eligible again.
+    logEvent(db, { source: "lab-cleanup", taskId: t.id, type: "lab.cleaned", payload: { ownerId: `${t.id}-${t.created_at}` } });
+    expect(planGc(db, { labCleanupHook: true }).tasks).toContain(t.id);
+  });
+
+  test("gc --apply refuses to delete a Task whose Lab cleanup is pending", () => {
+    const t = addTask(db, { title: "lab task" });
+    finish(t.id);
+    logEvent(db, { source: "lab-cleanup", taskId: t.id, type: LAB_OWNER_ASSIGNED_EVENT, payload: { ownerId: "x" } });
+    runGc(db, { apply: true, labCleanupHook: true });
+    expect(db.query(`SELECT 1 AS x FROM tasks WHERE id = ?`).get(t.id)).not.toBeNull();
   });
 });
 

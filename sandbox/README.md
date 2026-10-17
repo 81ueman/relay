@@ -19,6 +19,16 @@ agent (`extends: shell`) and adds only the Ishiul development tools:
 - `/usr/local/bin/labctl`, installed from the checked-out Ishiul workspace
   ([`ishiul labs/labctl/labctl.py`](https://github.com/81ueman/ishiul/blob/main/labs/labctl/README.md)
   — no second copy);
+- the `network-lab` agent skill (ISH-845), installed at the dsh **user skill**
+  path `~/.agents/skills/network-lab/SKILL.md` (`files/home/.agents/skills/`).
+  This is the path the pinned `dsh 0.2.0-rc.2` actually scans
+  (`@deepseek-ai/dsh-skill-filesystem` → `FileSystemSkillProvider.roots`,
+  `$AGENTS_HOME/skills`). It is a *Sandbox* skill — separate from Relay's
+  OpenCode Gateway skills (`~/.config/opencode/skills`) and from the legacy
+  Herdr attached Coding Worker skills. The skill is a byte-for-byte copy of
+  [`skills/network-lab/SKILL.md`](../skills/network-lab/SKILL.md); it tells the
+  agent to deploy an arbitrary containerlab topology with `labctl`, pinned to the
+  task's `RELAY_LAB_OWNER`;
 - a focused network allowlist (npm/rust/crates/PyPI, GitHub, `api.deepseek.com`)
   and the Shared Lab's **fixed host ports** (`host.docker.internal:49170` API,
   `:18002` gNMI — never a bare host), plus an SSH config that routes GitHub to

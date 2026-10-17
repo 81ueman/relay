@@ -1,0 +1,24 @@
+{
+  "taskId": "T1",
+  "worktree": null,
+  "branch": null,
+  "remove": false,
+  "apply": false,
+  "reasons": [
+    "no recorded worktree"
+  ],
+  "removed": false,
+  "retainedRuns": 0,
+  "labCleanup": {
+    "taskId": "T1",
+    "ownerId": "T1",
+    "cmd": "/tmp/ish845/lab-cleanup.sh",
+    "remove": true,
+    "apply": false,
+    "reasons": [],
+    "cleaned": false,
+    "status": "dry-run",
+    "exitCode": null,
+    "error": null
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "taskId": "T2",
+  "worktree": null,
+  "branch": null,
+  "remove": false,
+  "apply": true,
+  "reasons": [
+    "no recorded worktree"
+  ],
+  "removed": false,
+  "retainedRuns": 0,
+  "labCleanup": {
+    "taskId": "T2",
+    "ownerId": "T2",
+    "cmd": "/tmp/ish845/lab-cleanup-authfail.sh",
+    "remove": true,
+    "apply": true,
+    "reasons": [],
+    "cleaned": false,
+    "status": "failed",
+    "exitCode": 4,
+    "error": "labctl: authentication failed (injected)\n"
+  }
+}

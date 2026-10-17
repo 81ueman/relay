@@ -1,0 +1,15 @@
+[
+  {
+    "source": "localhost:18011",
+    "timestamp": 1792217872729467281,
+    "time": "2026-10-17T15:17:52.729467281+09:00",
+    "updates": [
+      {
+        "Path": "srl_nokia-system:system/srl_nokia-system-name:name/host-name",
+        "values": {
+          "srl_nokia-system:system/srl_nokia-system-name:name/host-name": "srl1"
+        }
+      }
+    ]
+  }
+]

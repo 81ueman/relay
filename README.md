@@ -444,6 +444,36 @@ directory are saved; run logs are retained. One-command fixture smoke:
 `bun run smoke:sandbox`; the real-sandbox smoke is `bun run smoke:sandbox:real`
 (opt-in). See [`docs/sandbox-lifecycle.md`](docs/sandbox-lifecycle.md).
 
+### Task-owned Network Lab skill + cleanup hook (ISH-845)
+
+A coding Task may deploy an **arbitrary containerlab topology** on the shared
+Network Lab. Relay stays **containerlab-agnostic**: it models no network, no NOS
+and no topology, and adds **no `relay lab` command**. It knows only the Task's
+**owner id** (`labOwnerId` = `<task id>-<created_at>`, never reused, handed out as
+`RELAY_LAB_OWNER` and recorded as `lab.owner_assigned` when the Coding Sandbox is
+launched) and *when* cleanup is due. The `network-lab` skill
+([`skills/network-lab/SKILL.md`](skills/network-lab/SKILL.md), installed for the
+pinned dsh at the real Sandbox skill path `~/.agents/skills/` by
+`sandbox/coding-kit`) tells the agent to deploy with `labctl` under
+`--namespace "$RELAY_LAB_OWNER"`.
+
+`relay run [sandbox] cleanup <task-id>` reclaims the Task's external Lab through
+**one trusted, pre-configured hook** (the repo ships a reference,
+[`scripts/lab-cleanup.sh`](scripts/lab-cleanup.sh)), `RELAY_LAB_CLEANUP_CMD`,
+invoked as `<cmd> <owner-id>` (the only argument). A Task-prompt-derived
+shell/URL is never executed; with no hook configured — or no owner ever assigned
+— it is a pure no-op. The hook runs only when the Task has **ended** (merged or
+`--abort`) with **no active Run** — reaching `merge_ready` alone cleans nothing —
+and a non-zero exit, a missing hook or a timeout is **recorded** and
+**re-runnable** (`relay gc` refuses a Task whose Lab cleanup is still pending, so
+its owner id stays addressable). The reference hook selects the lab by exact
+owner name (`netlab-<owner>`), never by suffix, and fails closed if its workspace
+purge does not succeed. Relay forwards a narrow, named `LABCTL_*` set
+(`LABCTL_ENV_ALLOWLIST`) to the **hook only** (never to the dsh Run), so the hook
+can authenticate without leaking host secrets into the sandbox. Image and
+Shared-Lab VM management stay out of Relay. See
+[`docs/ish845-network-lab-skill.md`](docs/ish845-network-lab-skill.md).
+
 ### Historical cleanup: `relay gc`
 
 There was no supported purge for old worker/runtime/session/task rows (fleet
