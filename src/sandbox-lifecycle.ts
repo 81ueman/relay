@@ -28,6 +28,7 @@ import {
 import { buildRunBrief, inheritFindings, taskBranchName, type RunFinding } from "./run-lifecycle";
 import { spawnIdentityToken } from "./proc-identity";
 import { childEnv } from "./child-env";
+import { isPinnedDsh, PINNED_DSH_VERSION } from "./dsh-version";
 import { labOwnerId, LAB_OWNER_ASSIGNED_EVENT } from "./lab-cleanup";
 import {
   DUPLICATE_SANDBOX_WRITER,
@@ -75,6 +76,13 @@ import {
  *   - cleanup removes the VM only AFTER the produced commit and every Run's log
  *     directory are confirmed saved; otherwise it refuses.
  */
+
+/**
+ * ISH-869: `PINNED_DSH_VERSION` / `isPinnedDsh` live in the shared
+ * `src/dsh-version.ts` (one constant for BOTH the host runner and the sandbox).
+ * Re-exported here so existing sandbox imports keep working.
+ */
+export { isPinnedDsh, PINNED_DSH_VERSION } from "./dsh-version";
 
 const ORPHANED = "orphaned";
 
@@ -260,25 +268,34 @@ export function sandboxDshVersion(cli: SbxCli, name: string, opts: { workdir?: s
 export interface PrepareSandboxOptions {
   dshVersion?: string;
   installDsh?: boolean;
+  /** The in-VM dsh executable to probe/install (default `dsh`). */
+  dshBin?: string;
   cli?: SbxCli;
 }
 
 /**
  * Ensure a usable dsh inside the sandbox. When it is missing and `installDsh`
- * is set (default true), install the pinned ISH-810 build. Never installs into
+ * is set (default true), install the pinned ISH-869 build. Never installs into
  * the host — the command runs inside the VM.
+ *
+ * The returned `version` is whatever `dsh --version` reports after the attempt;
+ * the caller MUST check it with `isPinnedDsh` — a sandbox left on an older build
+ * must never be treated as a successful start (ISH-869).
  */
 export function prepareSandboxDsh(
   binding: SandboxBinding,
   opts: PrepareSandboxOptions = {}
 ): { version: string | null; installed: boolean } {
   const cli = opts.cli ?? realSbxCli;
-  const want = opts.dshVersion ?? "0.2.0-rc.2";
-  const have = sandboxDshVersion(cli, binding.name, { workdir: binding.workspace });
-  if (have && have.includes(want)) return { version: have, installed: false };
+  const want = opts.dshVersion ?? PINNED_DSH_VERSION;
+  // ISH-869 finding 2: probe and install the SAME binary the Run will spawn, so
+  // the guard can never bless a different executable than the one that runs.
+  const bin = opts.dshBin ?? "dsh";
+  const have = sandboxDshVersion(cli, binding.name, { workdir: binding.workspace, dshBin: bin });
+  if (have && isPinnedDsh(have, want)) return { version: have, installed: false };
   if (opts.installDsh === false) return { version: have, installed: false };
   const r = cli.run(
-    sbxExecArgv(binding.name, bashLc(`npm i -g @deepseek-ai/dsh@${want} >/dev/null 2>&1 && dsh --version`), {
+    sbxExecArgv(binding.name, bashLc(`npm i -g @deepseek-ai/dsh@${want} >/dev/null 2>&1 && ${bin} --version`), {
       workdir: binding.workspace,
     }),
     { timeoutMs: 15 * 60_000 }
@@ -541,8 +558,20 @@ export async function launchTaskSandboxRun(
   // Refuse BEFORE pinning/writing when the sandbox already has a live writer.
   assertNoActiveSandboxWriter(db, { sandboxName: binding.name, branch: binding.branch });
 
-  const dsh = prepareSandboxDsh(binding, { installDsh: opts.installDsh, cli });
+  const dsh = prepareSandboxDsh(binding, { installDsh: opts.installDsh, cli, dshBin: opts.dshBin });
   logSandbox(db, taskId, "sandbox.dsh", { name: binding.name, version: dsh.version, installed: dsh.installed });
+  // ISH-869 fail-closed: a sandbox still on an OLD dsh (e.g. the 0.2.0-rc.2
+  // baseline left by an earlier Task) must NOT be started as a success. There is
+  // one pinned build; a mismatch refuses the Run rather than silently running the
+  // stale one.
+  if (!isPinnedDsh(dsh.version)) {
+    const got = dsh.version ?? "none";
+    logSandbox(db, taskId, "sandbox.dsh.version_mismatch", { name: binding.name, want: PINNED_DSH_VERSION, got });
+    throw new Error(
+      `${SANDBOX_ERROR}: sandbox ${binding.name} has dsh ${got}, but Relay pins @deepseek-ai/dsh@${PINNED_DSH_VERSION}; ` +
+        `refusing to start a Run (an old version is never a silent pass)`
+    );
+  }
 
   const outputRoot = opts.outputRoot ?? join(dirname(defaultDbPath()), "runs");
   const runId = `run-${crypto.randomUUID().slice(0, 8)}`;

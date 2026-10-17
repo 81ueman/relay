@@ -4,7 +4,7 @@ name: ishiul-coding
 displayName: Ishiul coding sandbox
 description: >-
   Reproducible lightweight ARM64 coding sandbox for Ishiul work: dsh
-  0.2.0-rc.2 headless, the Rust/Cargo toolchain, Python with PyYAML, uv, and
+  0.2.1-rc.2 headless, the Rust/Cargo toolchain, Python with PyYAML, uv, and
   the `network-lab` agent skill (files/home/.agents/skills). It carries no NOS
   image and no inner containerlab: lab work happens on the persistent Shared
   Lab (see labs/labctl). Git is used over the forwarded SSH agent.
@@ -19,7 +19,7 @@ licenses:
 extends: shell
 
 # `network-lab` (ISH-845) is installed as a dsh *user* skill, at the path dsh
-# 0.2.0-rc.2 actually scans (`$AGENTS_HOME/skills`, default `~/.agents/skills`;
+# 0.2.1-rc.2 actually scans (`$AGENTS_HOME/skills`, default `~/.agents/skills`;
 # see @deepseek-ai/dsh-skill-filesystem → FileSystemSkillProvider.roots). It is a
 # Sandbox skill, distinct from Relay's OpenCode Gateway skills and from the
 # legacy attached Coding Worker skills. The file here is a byte-for-byte copy of
@@ -78,8 +78,8 @@ permissions:
 
 setup:
   install:
-    - description: "dsh 0.2.0-rc.2 (DeepSeek harness) pinned via npm"
-      command: "npm i -g @deepseek-ai/dsh@0.2.0-rc.2"
+    - description: "dsh 0.2.1-rc.2 (DeepSeek harness) pinned via npm"
+      command: "npm i -g @deepseek-ai/dsh@0.2.1-rc.2"
       user: "0"
     - description: "Build prerequisites: linker, pkg-config, protoc, Python + PyYAML"
       command: >-

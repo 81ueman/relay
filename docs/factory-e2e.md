@@ -13,7 +13,7 @@ merged, NOT Linear Done).
   reminder sweeps, decision-only callbacks. This E2E does **not** require a Claude
   Gateway.
 - **Coding worker = `dsh` headless** — `dsh --profile headless --json`, **pinned
-  `0.2.0-rc.2`**. One Run = one process = one coding attempt.
+  `0.2.1-rc.2`**. One Run = one process = one coding attempt.
 - **Independent reviewer = Claude** — `claude -p --output-format json`, invoked
   **read-only** (`--allowedTools "Read Grep Glob"`), returning ONE structured
   verdict. The Gateway and reviewer deliberately use different models/harnesses.
@@ -47,7 +47,7 @@ result (`acceptRunSubmission`, `runMechanicalVerification`, `recordReview`,
 ```sh
 # the library/smoke entrypoints
 bun run smoke:factory                       # fixture: fake dsh + fake reviewer (deterministic)
-RELAY_REAL_SMOKE=1 bun run smoke:factory:real   # real dsh 0.2.0-rc.2 + real Claude
+RELAY_REAL_SMOKE=1 bun run smoke:factory:real   # real dsh 0.2.1-rc.2 + real Claude
 bun test tests/factory.test.ts              # the fixture suite
 
 # the pilot entrypoint (one Task, real dsh + real Claude by default)
@@ -156,7 +156,7 @@ ISH-762 factory fixture smoke
 PASS — 13 checks
 ```
 
-### Real smoke (real dsh 0.2.0-rc.2 + real Claude)
+### Real smoke (real dsh 0.2.1-rc.2 + real Claude)
 
 ```
 $ RELAY_REAL_SMOKE=1 bun run smoke:factory:real
@@ -239,7 +239,7 @@ unchanged by this issue.
 
 - **Verified** — `bun run typecheck`; `bun test` (829 pass, 1 skipped, 0 fail);
   `bun run smoke:factory` (PASS, 13 checks); `RELAY_REAL_SMOKE=1 bun run
-  smoke:factory:real` (PASS with real `dsh 0.2.0-rc.2` + real Claude; see the raw
+  smoke:factory:real` (PASS with real `dsh 0.2.1-rc.2` + real Claude; see the raw
   output above); `tests/factory.test.ts` covers the FIX→fresh-Run→PASS loop, the
   exit/exit-0-no-commit refusals, the required-check NOT_RUN block, missing/
   malformed reviewer output, foreign-HEAD verdicts, fake/non-independent reviewer

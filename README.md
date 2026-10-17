@@ -371,7 +371,7 @@ It is sequencing only — every transition reuses the ordinary durable results
 a foreign/stale HEAD, or a non-independent reviewer **cannot advance** the Task.
 The Factory never pushes, merges, accepts, or writes a provider/Linear. One-shot:
 `bun run smoke:factory` (fixture) and `RELAY_REAL_SMOKE=1 bun run
-smoke:factory:real` (real dsh 0.2.0-rc.2 + real Claude) — see
+smoke:factory:real` (real dsh 0.2.1-rc.2 + real Claude) — see
 [`docs/factory-e2e.md`](docs/factory-e2e.md).
 
 ### Headless dsh Runs (no Herdr)

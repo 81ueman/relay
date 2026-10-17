@@ -11,6 +11,7 @@ import { inboxFor } from "../src/messages";
 import { intakeTask, recordReview, runMechanicalVerification, submitPhase, taskChecks } from "../src/workflow";
 import { insertTaskResult } from "../src/results";
 import { acceptRunSubmission, DUPLICATE_WRITER, listRuns } from "../src/dsh-runner";
+import { PINNED_DSH_VERSION } from "../src/dsh-version";
 import { launchTaskRun } from "../src/run-lifecycle";
 import { defaultRunner, gitHead, type CommandRunner } from "../src/verify";
 import { upsertSandbox } from "../src/sandbox";
@@ -46,7 +47,9 @@ function git(cwd: string, ...args: string[]): string {
 
 function fakeDsh(name: string, body: string): string {
   const p = join(binDir, name);
-  writeFileSync(p, `#!/bin/sh\n${body}`);
+  // ISH-869: the host runner probes `<dshBin> --version` before spawning; answer
+  // with the pin so the factory tests exercise the Run loop, not the guard.
+  writeFileSync(p, `#!/bin/sh\nif [ "$1" = "--version" ]; then echo ${PINNED_DSH_VERSION}; exit 0; fi\n${body}`);
   chmodSync(p, 0o755);
   return p;
 }

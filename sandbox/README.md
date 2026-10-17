@@ -12,7 +12,7 @@ it is the *coding* sandbox an agent works in, with no NOS image and no inner con
 A `schemaVersion: "2"`, `kind: sandbox` kit that forks the built-in `shell`
 agent (`extends: shell`) and adds only the Ishiul development tools:
 
-- `dsh` `0.2.0-rc.2` (`@deepseek-ai/dsh`) for headless Runs;
+- `dsh` `0.2.1-rc.2` (`@deepseek-ai/dsh`) for headless Runs;
 - the Rust/Cargo toolchain (rustup, minimal stable) with `build-essential`,
   `pkg-config` and `protoc`;
 - Python with `PyYAML` and `uv`;
@@ -21,7 +21,7 @@ agent (`extends: shell`) and adds only the Ishiul development tools:
   — no second copy);
 - the `network-lab` agent skill (ISH-845), installed at the dsh **user skill**
   path `~/.agents/skills/network-lab/SKILL.md` (`files/home/.agents/skills/`).
-  This is the path the pinned `dsh 0.2.0-rc.2` actually scans
+  This is the path the pinned `dsh 0.2.1-rc.2` actually scans
   (`@deepseek-ai/dsh-skill-filesystem` → `FileSystemSkillProvider.roots`,
   `$AGENTS_HOME/skills`). It is a *Sandbox* skill — separate from Relay's
   OpenCode Gateway skills (`~/.config/opencode/skills`) and from the legacy

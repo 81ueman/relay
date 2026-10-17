@@ -1,5 +1,5 @@
 import { describe, expect, test, beforeEach, afterEach } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -17,7 +17,9 @@ import {
   ensureTaskSandbox,
   fetchSandboxHead,
   findActiveSandboxWriter,
+  isPinnedDsh,
   launchTaskSandboxRun,
+  PINNED_DSH_VERSION,
   planSandboxCleanup,
   sandboxDshAlive,
   sandboxDshState,
@@ -103,7 +105,7 @@ class FakeSbx implements SbxCli {
   created: string[] = [];
   calls: string[][] = [];
   headSha = "a".repeat(40);
-  dshVersion = "0.2.0-rc.2";
+  dshVersion = "0.2.1-rc.2";
   dshAlive = false;
   /** The branch the fake clone is on (set by a `git checkout` exec). */
   currentBranch: string | null = "main";
@@ -189,10 +191,19 @@ beforeEach(() => {
   registerWorker(db, "impl", { role: "worker" });
   registerWorker(db, "rev", { role: "reviewer" });
   seq = 0;
+  // ISH-869: the host `startDshRun` probes `<dshBin> --version`; point it at a
+  // pinned fake so the one host-runner test here passes the guard.
+  const binDir = join(dir, "bin");
+  mkdirSync(binDir, { recursive: true });
+  const dshBin = join(binDir, "dsh-pinned");
+  writeFileSync(dshBin, `#!/bin/sh\nif [ "$1" = "--version" ]; then echo ${PINNED_DSH_VERSION}; exit 0; fi\nexit 0\n`);
+  chmodSync(dshBin, 0o755);
+  process.env.RELAY_DSH_BIN = dshBin;
 });
 
 afterEach(() => {
   db.close();
+  delete process.env.RELAY_DSH_BIN;
   rmSync(dir, { recursive: true, force: true });
 });
 
@@ -397,6 +408,102 @@ describe("sandbox Run: one disposable dsh per attempt", () => {
     expect(dshJsonl).toContain('"type":"tool_call"');
     // The mapping reflects the produced head.
     expect(getSandbox(db, id)!.head_sha).toBe(produced);
+  });
+
+  // ISH-869: a single pinned dsh build, fail-closed on any other version.
+  test("isPinnedDsh matches ONLY the exact pinned build (never a 0.2.x fallback)", () => {
+    expect(PINNED_DSH_VERSION).toBe("0.2.1-rc.2");
+    expect(isPinnedDsh("0.2.1-rc.2")).toBe(true);
+    expect(isPinnedDsh("dsh 0.2.1-rc.2")).toBe(true); // tolerant of a `dsh ` prefix
+    expect(isPinnedDsh("0.2.0-rc.2")).toBe(false); // the previous baseline
+    expect(isPinnedDsh("0.2.1-rc.1")).toBe(false);
+    expect(isPinnedDsh("0.2.1-rc.20")).toBe(false); // no loose substring match
+    expect(isPinnedDsh("latest")).toBe(false);
+    expect(isPinnedDsh(null)).toBe(false);
+    expect(isPinnedDsh("")).toBe(false);
+  });
+
+  test("ISH-869: an OLD dsh in the sandbox fails the launch closed (no silent pass)", async () => {
+    const id = newTask();
+    const sbx = new FakeSbx();
+    sbx.dshVersion = "0.2.0-rc.2"; // the pre-ISH-869 baseline is still installed
+    const spawner = new FakeSpawner();
+    // installDsh:false keeps the stale build in place, so the guard (not a reinstall) must refuse.
+    await expect(
+      launchTaskSandboxRun(db, id, { source: repo, cli: sbx, spawner, outputRoot: outputRoot(), installDsh: false })
+    ).rejects.toThrow(new RegExp(`${SANDBOX_ERROR}.*0\\.2\\.0-rc\\.2.*${PINNED_DSH_VERSION}`));
+    expect(spawner.procs.length).toBe(0); // no dsh process was ever started
+    expect(listRuns(db, { taskId: id }).length).toBe(0); // and no Run row was recorded
+  });
+
+  test("ISH-869: a MISSING dsh (install disabled) also fails the launch closed", async () => {
+    const id = newTask();
+    const sbx = new FakeSbx();
+    sbx.failDshVersion = true; // `dsh --version` cannot resolve
+    const spawner = new FakeSpawner();
+    await expect(
+      launchTaskSandboxRun(db, id, { source: repo, cli: sbx, spawner, outputRoot: outputRoot(), installDsh: false })
+    ).rejects.toThrow(new RegExp(`${SANDBOX_ERROR}.*dsh none`));
+    expect(spawner.procs.length).toBe(0);
+  });
+
+  // ISH-869 finding 2: the guard must probe the SAME binary the Run spawns.
+  test("ISH-869: the sandbox guard probes the configured dshBin, not the default `dsh`", async () => {
+    const id = newTask();
+    const sbx = new FakeSbx();
+    // The default `dsh` reports the pin, but the configured alt binary is absent.
+    sbx.handler = (args) => {
+      if (args[0] !== "exec") return null;
+      const joined = args.join(" ");
+      if (!joined.includes("--version")) return null;
+      return joined.includes("dsh-alt")
+        ? { ok: true, code: 0, out: "", err: "" }
+        : { ok: true, code: 0, out: PINNED_DSH_VERSION, err: "" };
+    };
+    const spawner = new FakeSpawner();
+    await expect(
+      launchTaskSandboxRun(db, id, {
+        source: repo,
+        cli: sbx,
+        spawner,
+        outputRoot: outputRoot(),
+        dshBin: "dsh-alt",
+        installDsh: false,
+      })
+    ).rejects.toThrow(new RegExp(`${SANDBOX_ERROR}.*dsh none`));
+    expect(spawner.procs.length).toBe(0);
+  });
+
+  test("ISH-869: the Run spawns the configured dshBin the guard blessed", async () => {
+    const id = newTask();
+    const sbx = new FakeSbx();
+    sbx.handler = (args) => {
+      if (args[0] === "exec" && args.join(" ").includes("--version")) {
+        return args.join(" ").includes("dsh-alt")
+          ? { ok: true, code: 0, out: PINNED_DSH_VERSION, err: "" }
+          : { ok: true, code: 0, out: "0.2.0-rc.2", err: "" }; // default is stale
+      }
+      return null;
+    };
+    const spawner = new FakeSpawner();
+    let runArgv: string[] = [];
+    spawner.onSpawn = (p, argv) => {
+      runArgv = argv;
+      dshStream(p);
+      p.finish(0);
+    };
+    const launched = await launchTaskSandboxRun(db, id, {
+      source: repo,
+      cli: sbx,
+      spawner,
+      outputRoot: outputRoot(),
+      dshBin: "dsh-alt",
+      fastExitMs: 0,
+    });
+    publishFakeSandboxCommit(launched.sandbox.name, launched.sandbox.branch);
+    await launched.handle.wait();
+    expect(runArgv).toContain("dsh-alt");
+    expect(runArgv).not.toContain("dsh"); // never the default binary
   });
 
   test("refuses a second writer while a Run holds the sandbox", async () => {
