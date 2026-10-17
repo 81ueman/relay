@@ -1,5 +1,5 @@
-import { createHash } from "node:crypto";
 import type { Task } from "./schema";
+import { labOwnerId } from "./lab-cleanup";
 
 /**
  * ISH-829 — the thin `labctl` seam.
@@ -14,8 +14,10 @@ import type { Task } from "./schema";
  *   - it parses `labctl --json` and FAILS CLOSED on anything malformed — a lab
  *     that did not come up, a node that is not `running`, an inspect blob with no
  *     management endpoint, or an API/transport error never becomes a PASS;
- *   - it names the lab from the STABLE Task id so a Task can only ever touch its
- *     OWN lab (the "別 Task Lab への誤アクセス" negative).
+ *   - it uses the ONE Task-owned Lab identity ISH-845 shipped
+ *     (`labOwnerId(task)` → lab name `netlab-<owner>`), so a Task can only ever
+ *     touch its OWN lab (the "別 Task Lab への誤アクセス" negative) and that lab
+ *     is the one the ISH-845 cleanup hook destroys.
  *
  * It is deliberately NOT `relay lab`, holds no DB state, and never deletes NOS
  * images (there is no image verb here at all).
@@ -48,25 +50,32 @@ export interface Labctl {
 }
 
 // ---------------------------------------------------------------------------
-// Task-scoped lab identity
+// Task-scoped lab identity (the ISH-845 owner id; NO second identity)
 // ---------------------------------------------------------------------------
 
-const LAB_SLUG_RE = /[^a-zA-Z0-9.-]+/g;
-
-/** The Task identity a lab operation is scoped to. */
-export type LabTask = Pick<Task, "id" | "issue_id">;
+/**
+ * The Task identity a lab operation is scoped to. `created_at` is REQUIRED (not
+ * `issue_id`): the owner id embeds it so a `relay gc`-freed id can never take
+ * over an earlier Task's lab (ISH-845).
+ */
+export type LabTask = Pick<Task, "id" | "created_at">;
 
 /**
- * The lab name a Task owns: `relay-<issue-or-id>-<hash8>`. The trailing hash is
- * derived from the STABLE Task id (not the issue string), so two Tasks that
- * sanitise to the same slug still get distinct labs — the same rule ISH-828 uses
- * for sandbox names, so a Task's sandbox and its lab line up.
+ * The Task's lab **namespace** — the ISH-845 owner id (`<id>-<created_at>`). The
+ * `network-lab` skill passes exactly this as `labctl deploy --namespace`.
+ */
+export function labNamespaceForTask(task: LabTask): string {
+  return labOwnerId(task);
+}
+
+/**
+ * The lab name a Task owns: `netlab-<owner-id>` — the exact name the ISH-845
+ * `network-lab` skill writes into the topology `name:` and the ISH-845 cleanup
+ * hook destroys. Relay does NOT invent a second identity; a Task only ever owns
+ * `netlab-${labOwnerId(task)}`.
  */
 export function labNameForTask(task: LabTask): string {
-  const hash = createHash("sha256").update(task.id).digest("hex").slice(0, 8);
-  const base = (task.issue_id ?? task.id).toLowerCase().replace(LAB_SLUG_RE, "-").replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, "");
-  const body = (base || "task").slice(0, 44).replace(/[-.]+$/, "");
-  return `relay-${body}-${hash}`;
+  return `netlab-${labOwnerId(task)}`;
 }
 
 /**
@@ -288,7 +297,21 @@ export async function deployTaskLab(labctl: Labctl, task: LabTask, opts: DeployL
   const r = await labctl.run(labctlDeployArgv(opts), { timeoutMs: opts.timeoutMs });
   if (!r.ok) {
     const detail = redactSecrets((r.err || r.out || "").trim()).slice(0, 400);
-    return { ok: false, lab: null, nodes: [], error: `${LAB_ERROR}: labctl deploy failed (exit ${r.code ?? "?"}${r.timedOut ? ", timed out" : ""}): ${detail}`, code: r.code };
+    // A Task's lab name is DETERMINISTIC (`netlab-<owner>`), so on the codes that
+    // may have CREATED a lab — partial create (8), a client timeout (7 /
+    // `timedOut`), or "lab already exists" (6) — report that expected name so the
+    // caller can destroy it: a partial/timed-out deploy must never leak a lab.
+    // auth/API/usage/bundle errors create nothing, so `lab:null`.
+    const mayExist = r.code === 8 || r.code === 6 || r.timedOut === true;
+    const expected = mayExist ? labNameForTask(task) : null;
+    const tag = r.code === 8 ? LAB_NOT_RUNNING : r.code === 6 ? LAB_EXISTS : LAB_ERROR;
+    return {
+      ok: false,
+      lab: expected,
+      nodes: [],
+      error: `${tag}: labctl deploy failed (exit ${r.code ?? "?"}${r.timedOut ? ", timed out" : ""}): ${detail}`,
+      code: r.code,
+    };
   }
   // `deploy --json` prints `{lab, nodes:[{nodeName,state,...}], transferred}`.
   let parsed: unknown;

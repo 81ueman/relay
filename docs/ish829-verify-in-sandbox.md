@@ -6,14 +6,15 @@ evidence record. Companion to [`sandbox-lifecycle.md`](sandbox-lifecycle.md) (IS
 [`../sandbox/README.md`](../sandbox/README.md) (the Coding Kit) and
 [`ish828-sandbox-evidence.md`](ish828-sandbox-evidence.md).
 
-> **Scope note (round 3).** The Relay-side execution boundary, the fail-closed
+> **Scope note (round 4).** The Relay-side execution boundary, the fail-closed
 > fencing and the `labctl` seam are implemented, wired and tested, and proven
-> against a **real Coding Sandbox**. The **live** Shared-Lab
-> `deploy → inspect --json → real SR Linux read-back → destroy` run now executes
-> end-to-end from inside the Coding Sandbox (see §B), against the Shared Lab of
-> ISH-824/844. What remains outside this PR is the **Ishiul-side** work (Rust tests
-> in the sandbox; the `labs/srl-maintenance/apply.sh` external endpoint) and the
-> full daemon E2E, so this is still a slice of ISH-829 — not a claim to close it.
+> against a **real Coding Sandbox**. The Task-owned Lab identity is ISH-845's
+> (`labOwnerId` → lab name `netlab-<owner>`); there is no second identity. The
+> **live** Shared-Lab `deploy → inspect --json → real SR Linux read-back → destroy`
+> run executes end-to-end from inside the Coding Sandbox (see §B). What remains
+> outside this PR is the **Ishiul-side** work (Rust tests in the sandbox; the
+> `labs/srl-maintenance/apply.sh` external endpoint) and the full daemon E2E, so
+> this is still a slice of ISH-829 — not a claim to close it.
 
 > 注記: 個人パス・ユーザ名は伏せている。token / password は記録していない。
 
@@ -34,14 +35,14 @@ gate はそのまま再利用し、新しい TEST FSM や Review engine は作�
 | file | why |
 | --- | --- |
 | `src/sandbox-verify.ts` | **new**: the sandbox `sbx exec` async seam, the HEAD + working-tree fence, the sandbox-bound `CommandRunner`, the JSONL evidence sink, `sandboxLabctl`, a fail-closed `notRunRunner`, and the one `verifyTarget` resolver. |
-| `src/lab.ts` | **new**: the thin `labctl deploy / inspect --json / destroy` process+JSON seam with fail-closed parsing, Task-scoped lab naming/ownership (enforced), and secret redaction. |
+| `src/lab.ts` | **new**: the thin `labctl deploy / inspect --json / destroy` process+JSON seam. Lab identity is ISH-845's (`labOwnerId` → lab name `netlab-<owner>`); fail-closed parsing + secret redaction. |
 | `src/review-workspace.ts` | **new**: `git worktree add --detach` — the reviewer's independent fixed-HEAD read-only checkout. |
 | `src/verify.ts` | `ExecutedCheck` gains optional `sandbox`/`head`/`headBefore`/`headAfter`/`timedOut`/`stdout`/`stderr` (evidence), no behavior change. |
 | `src/workflow-driver.ts` | `WorkflowDeps.verifyTarget(db, task, checks)` — the single sandbox-vs-host switch for mechanical VERIFY. |
 | `src/provider-adapters.ts` | the daemon wires `verifyTarget: defaultVerifyTarget`. |
 | `src/cli.ts` | `relay verify <id>` uses the sandbox target unless `--cwd` is given; `relay run factory` passes the independent review-worktree root. |
 | `src/factory.ts` | Factory VERIFY **defaults** to `defaultVerifyTarget`; `reviewWorktreeRoot` makes the reviewer read a detached read-only checkout. |
-| `src/reviewer-runner.ts` | `HeadlessReviewDeps.reviewWorktree` + `evidenceDir` (evidence stays durable; the existing path is unchanged for the old Herdr Reviewer). |
+| `src/reviewer-runner.ts` | `HeadlessReviewDeps.reviewWorktree` (evidence stays durable under the Task's `worktree`; the existing path is unchanged for the old Herdr Reviewer). |
 
 ### The VERIFY boundary
 
@@ -75,6 +76,13 @@ so generated code is never run on the host because a sandbox went away.
 
 ### Borrowing a NOS without a host escape
 
+**One Task-owned Lab identity.** The lab name is ISH-845's identity — there is NO
+second one here. `labOwnerId(task)` = `<id>-<created_at>` (never reused, so a
+`relay gc`-freed id can never take over an earlier Task's lab), the lab name is
+`netlab-${labOwnerId(task)}`, and the deploy namespace is the owner id itself — the
+exact contract the `network-lab` skill and the ISH-845 cleanup hook use, so a Task's
+lab is the one that hook destroys.
+
 `labctl` is installed **inside** the clone by the Coding Kit
 ([`sandbox/coding-kit`](../sandbox/coding-kit), ISH-827/849); the smoke also
 installs it explicitly and asserts `command -v labctl` before deploying, so it is
@@ -84,9 +92,12 @@ inherits the host env); prefer `LABCTL_TOKEN` since a value on argv is visible i
 the host process table.
 
 * `deployTaskLab(labctl, task, opts)` fails closed unless `labctl` exits 0 **and**
-  every declared node is `running` **and** the returned lab is the Task's OWN; a
-  mis-named deploy is **destroyed** (a private, unfenced destroy) before returning
-  `LAB_FOREIGN`.
+  every declared node is `running` **and** the returned lab is the Task's OWN
+  (`netlab-${labOwnerId(task)}`); a mis-named deploy is **destroyed** (a private,
+  unfenced destroy) before returning `LAB_FOREIGN`. On the codes that may have
+  CREATED a lab — partial create (`8`), a client timeout (`7`/`timedOut`), or
+  "lab already exists" (`6`) — it reports the DETERMINISTIC Task lab name so the
+  caller can destroy it; a partial/timed-out deploy can never leak.
 * `inspectTaskLab(labctl, task, opts)` refuses a **foreign** lab name *before*
   invoking `labctl`, then fails closed unless the echoed lab matches, every node is
   `running`, and (by default) a reachable management endpoint is published.
@@ -120,13 +131,14 @@ recorded `evidence_ref` never dangles after teardown.
 | check made the tree dirty | `inconclusive` (a fail still `fail`) | same |
 | missing recorded head | blocks (`runMechanicalVerification`) | `tests/verify.test.ts` |
 | sandbox row `failed`/`removed`/no workspace | fail-closed `not_run` (no host fallback) | `tests/sandbox-verify.test.ts` |
-| `labctl deploy` partial create / API error / timeout / non-JSON | `ok:false` | `tests/lab.test.ts` |
+| `labctl deploy` partial create (`exit 8`) / timeout / non-JSON | `ok:false`, deterministic lab name reported | `tests/lab.test.ts` |
 | deploy lands under a FOREIGN lab | refused + destroyed | same |
 | `inspect` foreign lab (before/after) | refused; `labctl` never invoked | same |
 | `inspect` node not running / no endpoint | `ok:false` | same |
 | `destroy` foreign lab | refused; `labctl` never invoked | same |
 | `labctl destroy` fails | `ok:false` (never swallowed) | same |
-| smoke: partial deploy (`lab` set, not running) | recorded + destroyed | `scripts/ish829-real-smoke.ts` |
+| a reused Task id with a DIFFERENT `created_at` | does NOT own the earlier lab | same |
+| smoke: partial/timed-out/existing deploy | deterministic name recorded + destroyed | `scripts/ish829-real-smoke.ts` |
 | smoke: failed `destroy` / `sbx rm` | non-zero exit, PASS suppressed | same |
 | reviewer checkout not at the fixed HEAD | `ok:false` / review refused | `tests/review-workspace.test.ts` |
 | review evidence after worktree teardown | exists on a durable path | `tests/factory.test.ts` |
@@ -167,7 +179,7 @@ the HOST path stays absent and the file exists only in the sandbox's own `$HOME`
 Checks 8–12 are the failure cases: non-zero → `fail`; timeout, dirty tree, and HEAD
 mismatch → `not_run`; a check that dirties the tree → `inconclusive` — never PASS.
 
-### B. Shared Lab — **measured live (round 3)**
+### B. Shared Lab — **measured live (rounds 3–4)**
 
 The same smoke, with `LABCTL_API` set, installs and asserts `labctl` **inside** the
 sandbox, allows only the Lab's published API/gNMI ports, deploys a real
@@ -177,7 +189,7 @@ back, and destroys it — with the Lab image cache retained:
 ```
   ok 15. allowed the sandbox to reach the Lab (host.docker.internal:49170,host.docker.internal:18002,localhost:49170,localhost:18002)
   ok 16. labctl is installed and runnable inside the sandbox
-  ok 17. labctl deploy (in-sandbox) brought the lab up: relay-ish-829-ac80ed29 (nodes running)
+  ok 17. labctl deploy (in-sandbox) brought the lab up: netlab-ish829-smoke-1700000000000 (nodes running)
   ok 18. labctl inspect --json reported running nodes + 2 reachable management endpoint(s)
   ok 19. real SR Linux read-back from the sandbox: Software Version     : v26.7.2
   ok 20. labctl destroy removed the lab (NOS image retained)
@@ -186,11 +198,22 @@ PASS — 20 checks
 ```
 
 The topology is generated **inside the throwaway repo** as
-`labs/ish829-smoke/smoke.clab.yml` with `name: relay-ish-829-ac80ed29` ==
-`labNameForTask({id:"ish829-smoke"})`, committed before `sbx create`, so (a) the
-clone is clean and (b) the Task-scoped ownership fence (`foreignLabError`) is
+`labs/ish829-smoke/smoke.clab.yml` with `name: netlab-ish829-smoke-1700000000000` ==
+`labNameForTask({id:"ish829-smoke", created_at:1700000000000})`, deployed with
+`--namespace = labNamespaceForTask(...)`, and committed before `sbx create`, so (a)
+the clone is clean and (b) the ISH-845 ownership fence (`foreignLabError`) is
 satisfied. The read-back runs `sr_cli -c "show version"` through `labctl exec` (a
 sandbox → Lab API management call), and the reply is a real SR Linux version.
+
+**Partial/existing-lab leak is closed (round 4).** Because the lab name is
+deterministic, the smoke records `deployedLab` **before** deploying, and a deploy
+that fails with `exit 8` / a timeout / `exit 6` reports that name so `finally`
+destroys it. Verified against the real binary: with a pre-existing
+`netlab-ish829-smoke-1700000000000` lab, the smoke reports
+`LAB_EXISTS (exit 6)`, then `ok 17. labctl destroy removed the lab`, and no
+`clab-netlab-ish829-*` container remains. A `destroy` that finds the lab already
+absent (`exit 6`, confirmed by a raw `inspect` exit 6) is a clean cleanup; any other
+failure sets a non-zero exit and **suppresses PASS**.
 
 Run it (a Coding Sandbox can only reach the Lab's **published** ports; the smoke
 adds those policy rules itself):
@@ -211,10 +234,10 @@ recorded here. `LABCTL_SRC` points at a host `labctl.py` to copy into the clone;
 `RELAY_SANDBOX_AGENT=$PWD/sandbox/coding-kit` uses the full Coding Kit (which
 provisions the same toolchain).
 
-The lab half is wrapped in a `try/finally` that is **fail-closed**: a *partial*
-deploy (`LAB_NOT_RUNNING`, `lab` set) is recorded as soon as `dep.lab` is known and
-**always** destroyed; and a failed `destroy` or `sbx rm` sets a non-zero exit and
-**suppresses PASS**. Teardown is `labctl destroy` only (image cache kept).
+The lab half is wrapped in a `try/finally` that is **fail-closed**: the
+deterministic lab is destroyed whenever `dep.lab` is known (recorded BEFORE the
+deploy), and a failed `destroy` or `sbx rm` sets a non-zero exit and **suppresses
+PASS**. Teardown is `labctl destroy` only (image cache kept).
 
 ## Not measured / limits
 
@@ -223,8 +246,9 @@ deploy (`LAB_NOT_RUNNING`, `lab` set) is recorded as soon as `dep.lab` is known 
   tests in the sandbox; the `labs/srl-maintenance/apply.sh` external endpoint). The
   boundary, the Factory wiring, the review worktree and the live Shared-Lab round
   are proven separately.
-* A sandbox topology must name its lab `labNameForTask` for the ownership fence;
-  per-task topology `name:` rewriting stays out of Relay (ISH-844 non-goal).
+* A sandbox topology must name its lab `labNameForTask` (`netlab-<owner>`) for the
+  ownership fence AND for the ISH-845 cleanup hook; per-task topology `name:`
+  rewriting stays out of Relay (ISH-844 non-goal).
 * Publishing the Lab port (`sbx ports`) and the per-deployment sandbox network
   allowlist remain a deployment concern (ISH-824/844); the smoke adds the two ports
   it needs but Relay does not manage policy.

@@ -18,7 +18,8 @@
  * The throwaway repo ALWAYS carries the pieces the Shared-Lab half needs:
  *   - `labs/labctl/labctl.py`  (copied from `LABCTL_SRC`, or auto-discovered);
  *   - `labs/ish829-smoke/smoke.clab.yml` with `name:` == `labNameForTask(smokeTask)`
- *     for a FIXED smoke Task id, so the Task-scoped ownership fence is satisfied.
+ *     == `netlab-<owner>` (the ISH-845 identity) for a FIXED smoke Task
+ *     `{id, created_at}`, deployed with `--namespace = labNamespaceForTask(...)`.
  * Both are committed BEFORE `sbx create`, so the clone starts CLEAN.
  *
  * The Shared-Lab half (`labctl deploy/inspect --json/destroy`) runs only when
@@ -47,16 +48,17 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { bashLc, realSbxCli, sbxCreateArgv, sbxExecArgv } from "../src/sandbox";
 import { realSandboxExec, evidenceSandboxRunner, sandboxCommandRunner, sandboxLabctl, jsonlEvidenceSink, type SandboxCheckEvidence } from "../src/sandbox-verify";
-import { deployTaskLab, destroyTaskLab, inspectTaskLab, labNameForTask, type LabTask } from "../src/lab";
+import { deployTaskLab, destroyTaskLab, inspectTaskLab, labNameForTask, labNamespaceForTask, labctlInspectArgv, type LabTask } from "../src/lab";
 
 if (process.env.RELAY_SANDBOX_SMOKE !== "1") {
   console.error("refusing to run: set RELAY_SANDBOX_SMOKE=1 (this creates real Docker Sandboxes)");
   process.exit(2);
 }
 
-/** A FIXED smoke Task id, so `labNameForTask` — and the checked-in topology — is stable. */
-const SMOKE_TASK: LabTask = { id: "ish829-smoke", issue_id: "ISH-829" };
+/** A FIXED smoke Task identity (id + created_at), so the ISH-845 owner id — and the checked-in topology `name:` — is stable. */
+const SMOKE_TASK: LabTask = { id: "ish829-smoke", created_at: 1_700_000_000_000 };
 const SMOKE_LAB = labNameForTask(SMOKE_TASK);
+const SMOKE_NAMESPACE = labNamespaceForTask(SMOKE_TASK);
 
 let steps = 0;
 let cleanupFailed = false;
@@ -245,14 +247,17 @@ async function main(): Promise<void> {
       const insecure = process.env.LABCTL_INSECURE === "1";
       const labctl = sandboxLabctl({ sandbox: name, workspace, exec: realSandboxExec }, labEnv());
       const topology = "labs/ish829-smoke/smoke.clab.yml"; // clone-relative
+      // (d) The lab name is DETERMINISTIC (`netlab-<owner>`), so record it BEFORE
+      // deploying: whatever happens (partial create, timeout, a live lab from an
+      // earlier run at exit 6, a Bun-side spawn error) `finally` always destroys
+      // it. Never leak a labctl-reported-or-created lab.
+      deployedLab = { lab: SMOKE_LAB };
       const dep = await deployTaskLab(labctl, SMOKE_TASK, {
         topology,
-        namespace: process.env.LABCTL_NAMESPACE,
+        namespace: SMOKE_NAMESPACE,
         api,
         insecure,
       });
-      // (d) A PARTIAL deploy (a node not running) returns ok:false with `lab` set:
-      // remember it so `finally` ALWAYS destroys it — never leak a running lab.
       if (dep.lab) deployedLab = { lab: dep.lab };
       if (!dep.ok) throw new Error(`labctl deploy failed: ${dep.error}`);
       ok(`labctl deploy (in-sandbox) brought the lab up: ${dep.lab} (nodes running)`);
@@ -275,17 +280,26 @@ async function main(): Promise<void> {
       console.log("  ... Shared-Lab half SKIPPED (set LABCTL_API; see the header for credentials)");
     }
   } finally {
-    // FAIL-CLOSED cleanup: any failure here is a non-PASS, and a partial deploy is
-    // always destroyed first (never leaked), then the sandbox.
+    // FAIL-CLOSED cleanup: any failure here is a non-PASS, and a deterministic
+    // lab is always destroyed first (never leaked), then the sandbox.
     if (deployedLab) {
       try {
-        const del = await destroyTaskLab(
-          sandboxLabctl({ sandbox: name, workspace: repo, exec: realSandboxExec }, labEnv()),
-          SMOKE_TASK,
-          { lab: deployedLab.lab, api: api!, insecure: process.env.LABCTL_INSECURE === "1" }
-        );
-        if (del.ok) ok(`labctl destroy removed the lab (NOS image retained)`);
-        else {
+        const cleanupLabctl = sandboxLabctl({ sandbox: name, workspace: repo, exec: realSandboxExec }, labEnv());
+        const insecure = process.env.LABCTL_INSECURE === "1";
+        const del = await destroyTaskLab(cleanupLabctl, SMOKE_TASK, { lab: deployedLab.lab, api: api!, insecure });
+        if (del.ok) {
+          ok(`labctl destroy removed the lab (NOS image retained)`);
+        } else if (del.code === 6) {
+          // EXIT_NOTFOUND: the lab (or its workspace dir) is already gone. Confirm
+          // with a raw inspect — only a conclusive "no such lab" is a clean cleanup.
+          const ins = await cleanupLabctl.run(labctlInspectArgv({ lab: deployedLab.lab, api: api!, insecure }));
+          if (ins.code === 6) {
+            ok(`lab ${deployedLab.lab} was already absent (nothing to destroy)`);
+          } else {
+            cleanupFailed = true;
+            console.error(`  CLEANUP FAILURE: destroy said not-found but inspect did not confirm absence (exit ${ins.code})`);
+          }
+        } else {
           cleanupFailed = true;
           console.error(`  CLEANUP FAILURE: labctl destroy failed: ${del.error}`);
         }

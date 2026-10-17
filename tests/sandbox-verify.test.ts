@@ -274,7 +274,7 @@ describe("sandboxLabctl: labctl runs inside the sandbox, not the host", () => {
 
 describe("other-task lab: a Task never inspects/destroys another Task's lab", () => {
   test("labctl is called with the Task's OWN lab name only", async () => {
-    // ownership is enforced by `ownsLab`/`assertOwnLab` (see tests/lab.test.ts);
+    // ownership is enforced by `ownsLab`/`foreignLabError` (see tests/lab.test.ts);
     // here we assert the sandbox labctl wrapper never rewrites the target.
     const exec = new FakeSbxExec();
     const labctl = sandboxLabctl(binding(exec));
