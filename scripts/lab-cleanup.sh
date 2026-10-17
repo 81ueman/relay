@@ -34,15 +34,18 @@ esac
 
 # Optional operator-owned credentials file: a fallback for a deployment that
 # keeps the Lab secret OUT of Relay's environment. It is sourced only when no
-# credential is already present, so an explicit environment always wins. $HOME is
-# on Relay's child-env allowlist, so this path is reachable when Relay runs the
-# hook.
+# credential is already present, so an explicit environment always wins, and it
+# is sourced with auto-export, so a plain `KEY=value` file (the usual `.env`
+# form) works as well as `export KEY=value`. $HOME is on Relay's child-env
+# allowlist, so this path is reachable when Relay runs the hook.
 LABCTL_ENV_FILE="${LABCTL_ENV_FILE:-$HOME/.config/relay/labctl.env}"
 if [ -f "$LABCTL_ENV_FILE" ] &&
    [ -z "${LABCTL_TOKEN:-}" ] && [ -z "${LABCTL_USER:-}" ] &&
    [ -z "${LABCTL_PASSWORD:-}" ] && [ -z "${LABCTL_PASSWORD_FILE:-}" ]; then
+  set -a
   # shellcheck disable=SC1090
   . "$LABCTL_ENV_FILE"
+  set +a
 fi
 
 LABCTL="${LABCTL_BIN:-labctl}"

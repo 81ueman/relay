@@ -130,4 +130,15 @@ describe("trusted lab cleanup hook: credentials and purge failures (round 3)", (
     expect(r.status).toBe(0);
     expect(calls()).toContain("creds API=https://from-file USER=fileuser PW=set");
   });
+
+  test("a plain KEY=value (non-export) credentials file is auto-exported (round 4)", () => {
+    mkdirSync(join(dir, ".config", "relay"), { recursive: true });
+    writeFileSync(
+      join(dir, ".config", "relay", "labctl.env"),
+      "LABCTL_API=https://plain-file\nLABCTL_USER=plainuser\nLABCTL_PASSWORD=plainpass\n"
+    );
+    const r = runHook("T1");
+    expect(r.status).toBe(0);
+    expect(calls()).toContain("creds API=https://plain-file USER=plainuser PW=set");
+  });
 });

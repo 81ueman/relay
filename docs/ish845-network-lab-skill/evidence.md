@@ -198,7 +198,8 @@ for the dsh run was Ollama-Cloud (no `DEEPSEEK_API_KEY` on this host).
    the hook a narrow, explicitly named `LABCTL_*` set copied from Relay's own
    environment (`labCleanupHookEnv` / `LABCTL_ENV_ALLOWLIST`: `API`, `USER`,
    `PASSWORD`, `PASSWORD_FILE`, `TOKEN`, `CA_CERT`, `BIN`); the hook may instead
-   load `$HOME/.config/relay/labctl.env`. `tests/lab-cleanup.test.ts` runs the
+   load `$HOME/.config/relay/labctl.env` (sourced with auto-export, so a plain
+   `KEY=value` file works — round 4). `tests/lab-cleanup.test.ts` runs the
    committed `scripts/lab-cleanup.sh` **through `applyLabCleanup` +
    `realLabCleanupRunner`** against a fake `labctl` and asserts the credentials
    arrive and the result is `ok`. (The round-1 §3c live run invoked the hook by
@@ -212,3 +213,13 @@ for the dsh run was Ollama-Cloud (no `DEEPSEEK_API_KEY` on this host).
    so a hidden purge failure can never be recorded as `lab.cleaned` and leak the
    directory. `tests/lab-cleanup-hook.test.ts` covers purge `5`/`7` (hook exits
    non-zero) and `6` (no-op).
+
+## 8. Round-4 review fix
+
+1. **The credentials file is auto-exported** — `scripts/lab-cleanup.sh` now
+   sources `$HOME/.config/relay/labctl.env` under `set -a`/`set +a`, so a plain
+   `KEY=value` file (the usual `.env` form) works, not only `export KEY=value`;
+   `labctl` reads `LABCTL_PASSWORD`/`LABCTL_TOKEN` from its own environment, so an
+   unexported file previously left the hook without a password and every cleanup
+   failed. `tests/lab-cleanup-hook.test.ts` has a dedicated **non-export**
+   fixture and asserts `PW=set` reaches the fake `labctl`.

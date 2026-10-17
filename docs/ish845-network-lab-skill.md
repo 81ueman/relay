@@ -84,7 +84,9 @@ locale — and the SSH agent socket, as every Relay child does), plus
 `CA_CERT`, `BIN`) copied **from Relay's own environment** in `labCleanupHookEnv`.
 A hook that prefers to keep the secret out of Relay's environment may instead
 load it from the operator-owned file `$HOME/.config/relay/labctl.env` (sourced
-only when the environment defines no credential, so the environment wins).
+with auto-export, so plain `KEY=value` and `export KEY=value` lines both work;
+sourced only when the environment defines no credential, so the environment
+wins).
 
 The **dsh Run inside the sandbox** is a different boundary: it still gets only
 the explicit `-e` values Relay sets, so an unrelated host secret in Relay's
