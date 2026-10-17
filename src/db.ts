@@ -320,6 +320,11 @@ function migrate(db: Database): void {
   if (columnExists(db, "runs", "id") && !columnExists(db, "runs", "spawn_lstart")) {
     db.exec("ALTER TABLE runs ADD COLUMN spawn_lstart TEXT;");
   }
+  // ISH-828 Runs: the Coding Sandbox a Run executed in (NULL for a worktree Run).
+  if (columnExists(db, "runs", "id") && !columnExists(db, "runs", "sandbox_name")) {
+    db.exec("ALTER TABLE runs ADD COLUMN sandbox_name TEXT;");
+  }
+  db.exec("CREATE INDEX IF NOT EXISTS idx_runs_sandbox ON runs(sandbox_name);");
   // NOTE: (worker_id, generation) is kept unique by application logic (the
   // monotonic `nextGeneration` helper), not by a DB constraint. Legacy rows may
   // legitimately share a generation (e.g. an active row plus a protected stale

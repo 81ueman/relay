@@ -12,6 +12,8 @@
     "test": "bun test",
     "typecheck": "tsc --noEmit",
     "smoke:run-lifecycle": "bun scripts/ish760-smoke.ts",
+    "smoke:sandbox": "bun scripts/ish828-smoke.ts",
+    "smoke:sandbox:real": "bun scripts/ish828-real-smoke.ts",
     "smoke:merge-gate": "bun scripts/ish761-smoke.ts",
     "smoke:factory": "bun scripts/ish762-smoke.ts",
     "smoke:factory:real": "RELAY_REAL_SMOKE=1 bun scripts/ish762-real-smoke.ts",

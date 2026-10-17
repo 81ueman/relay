@@ -7,6 +7,7 @@ import { getTask } from "./tasks";
 import type { Run, RunState, Task } from "./schema";
 import { isTerminalTaskState } from "./schema";
 import { spawnIdentityToken } from "./proc-identity";
+import { childEnv } from "./child-env";
 import { gitHead } from "./verify";
 import { submitImplementationFromRun, type RunImplementation } from "./workflow";
 import {
@@ -118,7 +119,7 @@ export interface StartRunOptions {
   timeoutMs?: number;
   /** A Run shorter than this is flagged `fast_exit` (still not a submission). */
   fastExitMs?: number;
-  /** Extra env for the child (merged over process.env). */
+  /** Extra env for the child (merged over a small allowlist, never all of process.env). */
   env?: Record<string, string>;
   /** Test seam. */
   spawner?: DshSpawner;
@@ -327,12 +328,6 @@ function updateRun(db: Database, id: string, patch: RunPatch): Run {
 // Helpers
 // ---------------------------------------------------------------------------
 
-function baseEnv(): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const [k, v] of Object.entries(process.env)) if (typeof v === "string") out[k] = v;
-  return out;
-}
-
 /** The current branch of `cwd`, or null (detached / not a git checkout). */
 export function gitBranch(cwd: string): string | null {
   try {
@@ -482,8 +477,7 @@ export async function startDshRun(db: Database, opts: StartRunOptions): Promise<
 
   const argv = [dshBin, "--profile", "headless", "--json", prompt];
   const env: Record<string, string> = {
-    ...baseEnv(),
-    ...(opts.env ?? {}),
+    ...childEnv(process.env, opts.env),
     DSH_PERMISSION_MODE: permissionMode,
     RELAY_RUN_ID: runId,
     RELAY_TASK_ID: task.id,

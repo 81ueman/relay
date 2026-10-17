@@ -9,6 +9,12 @@ This is implemented in `src/run-lifecycle.ts` on top of the ISH-758 phase machin
 (`src/workflow.ts`) and the ISH-803 one-shot runner (`src/dsh-runner.ts`). It does
 **not** reimplement either one.
 
+> **ISH-828:** the worktree is being superseded by a **Task-scoped Coding Sandbox**
+> (Docker Sandboxes clone mode): one Task = one private in-VM clone, one Run = one
+> fresh `dsh` inside it. That path is `src/sandbox.ts` +
+> `src/sandbox-lifecycle.ts`; see [`sandbox-lifecycle.md`](sandbox-lifecycle.md).
+> The worktree lifecycle below remains for tasks that have not moved to a sandbox.
+
 ```sh
 relay run worktree <task-id> [--branch B] [--base REF] [--path DIR] [--json]
 relay run launch   <task-id> [--timeout 30m] [--permission MODE] [--json]

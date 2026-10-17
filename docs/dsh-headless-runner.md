@@ -7,6 +7,10 @@ manual attach. One Run = one process = one coding attempt.
 This is implemented in `src/dsh-runner.ts` (process lifecycle) and
 `src/dsh-events.ts` (the JSONL decoder) and driven from the CLI:
 
+> **ISH-828:** the same one-shot dsh contract is launched **inside a Task Coding
+> Sandbox** via `sbx exec`; the JSONL/evidence collection is reused unchanged. See
+> [`sandbox-lifecycle.md`](sandbox-lifecycle.md).
+
 ```sh
 relay run start <task-id> [--cwd DIR] [--prompt TEXT] [--permission MODE] [--timeout 30m] [--json]
 relay run list [--task <id>] [--json]
