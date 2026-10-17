@@ -6,13 +6,14 @@ evidence record. Companion to [`sandbox-lifecycle.md`](sandbox-lifecycle.md) (IS
 [`../sandbox/README.md`](../sandbox/README.md) (the Coding Kit) and
 [`ish828-sandbox-evidence.md`](ish828-sandbox-evidence.md).
 
-> **Scope note (round 2).** This PR is a **partial slice** of ISH-829. The Relay-side
-> execution boundary, the fail-closed fencing and the `labctl` seam are implemented,
-> wired and tested, and proven against a **real Coding Sandbox**. The **live** Shared-Lab
-> `deploy → inspect --json → destroy` run is **not** reproduced here (it is gated on Lab
-> credentials that are not available to the author), so this does **not** close ISH-829.
-> The Ishiul-side items (Rust tests in the sandbox, the `labs/srl-maintenance/apply.sh`
-> external-endpoint change) also live outside this repo.
+> **Scope note (round 3).** The Relay-side execution boundary, the fail-closed
+> fencing and the `labctl` seam are implemented, wired and tested, and proven
+> against a **real Coding Sandbox**. The **live** Shared-Lab
+> `deploy → inspect --json → real SR Linux read-back → destroy` run now executes
+> end-to-end from inside the Coding Sandbox (see §B), against the Shared Lab of
+> ISH-824/844. What remains outside this PR is the **Ishiul-side** work (Rust tests
+> in the sandbox; the `labs/srl-maintenance/apply.sh` external endpoint) and the
+> full daemon E2E, so this is still a slice of ISH-829 — not a claim to close it.
 
 > 注記: 個人パス・ユーザ名は伏せている。token / password は記録していない。
 
@@ -75,14 +76,17 @@ so generated code is never run on the host because a sandbox went away.
 ### Borrowing a NOS without a host escape
 
 `labctl` is installed **inside** the clone by the Coding Kit
-([`sandbox/coding-kit`](../sandbox/coding-kit), ISH-827/849). `sandboxLabctl` runs
-`labctl` through the same `sbx exec` boundary. Lab credentials are forwarded
-**explicitly** as `sbx exec -e` (the sandbox never inherits the host env); prefer
-`LABCTL_TOKEN` since a value on argv is visible in the host process table.
+([`sandbox/coding-kit`](../sandbox/coding-kit), ISH-827/849); the smoke also
+installs it explicitly and asserts `command -v labctl` before deploying, so it is
+self-contained. `sandboxLabctl` runs `labctl` through the same `sbx exec` boundary.
+Lab credentials are forwarded **explicitly** as `sbx exec -e` (the sandbox never
+inherits the host env); prefer `LABCTL_TOKEN` since a value on argv is visible in
+the host process table.
 
 * `deployTaskLab(labctl, task, opts)` fails closed unless `labctl` exits 0 **and**
   every declared node is `running` **and** the returned lab is the Task's OWN; a
-  mis-named deploy is **destroyed** before returning `LAB_FOREIGN`.
+  mis-named deploy is **destroyed** (a private, unfenced destroy) before returning
+  `LAB_FOREIGN`.
 * `inspectTaskLab(labctl, task, opts)` refuses a **foreign** lab name *before*
   invoking `labctl`, then fails closed unless the echoed lab matches, every node is
   `running`, and (by default) a reachable management endpoint is published.
@@ -96,9 +100,9 @@ The reviewer keeps its existing brief/verdict/`recordReview` path. When
 `reviewWorktreeRoot` is configured (the `relay run factory` CLI always sets it),
 the Factory materialises a **detached** git worktree at the recorded head and runs
 the reviewer there — a snapshot the coding writer cannot move. Pre- and post-run
-HEAD binding still apply. The RAW reviewer output is written to a **durable** base
-(the Task's own worktree, or `evidenceDir`), **not** into the temporary review
-worktree, so a recorded `evidence_ref` never dangles after teardown.
+HEAD binding still apply. The RAW reviewer output is written to a **durable** base —
+the Task's own `worktree` — **not** into the temporary review worktree, so a
+recorded `evidence_ref` never dangles after teardown.
 
 ## Fail-closed matrix (each row has a unit test)
 
@@ -122,6 +126,8 @@ worktree, so a recorded `evidence_ref` never dangles after teardown.
 | `inspect` node not running / no endpoint | `ok:false` | same |
 | `destroy` foreign lab | refused; `labctl` never invoked | same |
 | `labctl destroy` fails | `ok:false` (never swallowed) | same |
+| smoke: partial deploy (`lab` set, not running) | recorded + destroyed | `scripts/ish829-real-smoke.ts` |
+| smoke: failed `destroy` / `sbx rm` | non-zero exit, PASS suppressed | same |
 | reviewer checkout not at the fixed HEAD | `ok:false` / review refused | `tests/review-workspace.test.ts` |
 | review evidence after worktree teardown | exists on a durable path | `tests/factory.test.ts` |
 | Factory with a sandbox row | host `defaultRunner` never called | `tests/factory.test.ts` |
@@ -132,74 +138,103 @@ worktree, so a recorded `evidence_ref` never dangles after teardown.
 
 `RELAY_SANDBOX_SMOKE=1 bun scripts/ish829-real-smoke.ts` on the ISH-822/827/828 host
 (`sbx v0.48.0`, Docker Sandboxes, Apple Silicon). It creates a throwaway main
-checkout, a **real** clone-mode sandbox, and drives the ISH-829 boundary against it:
+checkout (committing `labs/labctl/labctl.py` + a Task-named topology so the clone
+starts clean), a **real** clone-mode sandbox, and drives the ISH-829 boundary:
 
 ```
 ISH-829 real sandbox smoke — repo …/relay-ish829-real-…/repo
-  head 48f7d95c9b7cd4b8019bb7a9e011798dd4401471
-  ok 1. created clone-mode sandbox relay-ish829-real-…
-  ok 2. clone HEAD matches the host HEAD (48f7d95c9b7c)
-  ok 3. a check runs inside the clone (exit 0)
-  ok 4. the check is labelled with its sandbox + bound HEAD
-  ok 5. the command did NOT escape to the host (host-home sentinel absent)
-  ok 6. the sentinel file IS inside the sandbox's home
-  ok 7. a non-zero exit is a FAIL (exit 3)
-  ok 8. a timeout is NOT_RUN (never a PASS)
-  ok 9. a check that DIRTIES the tree is INCONCLUSIVE (never a PASS)
-  ok 10. a DIRTY clone is NOT_RUN (never a PASS)
-  ok 11. a HEAD mismatch is NOT_RUN (never a PASS)
-  ok 12. evidence JSONL has one line per check (5)
-  ok 13. evidence carries HEAD + required check count
-
-PASS — 13 checks
+  head 1f15949e406be4ebee755ee8d2d890bb360e1de5
+  smoke lab: relay-ish-829-ac80ed29
+  ok 1. created clone-mode sandbox relay-ish829-real-… (agent shell)
+  ok 2. clone HEAD matches the host HEAD (1f15949e406b)
+  ok 3. clone starts CLEAN (the topology + labctl are committed)
+  ok 4. a check runs inside the clone (exit 0)
+  ok 5. the check is labelled with its sandbox + bound HEAD
+  ok 6. the command did NOT escape to the host (host-home sentinel absent)
+  ok 7. the sentinel file IS inside the sandbox's home
+  ok 8. a non-zero exit is a FAIL (exit 3)
+  ok 9. a timeout is NOT_RUN (never a PASS)
+  ok 10. a check that DIRTIES the tree is INCONCLUSIVE (never a PASS)
+  ok 11. a DIRTY clone is NOT_RUN (never a PASS)
+  ok 12. a HEAD mismatch is NOT_RUN (never a PASS)
+  ok 13. evidence JSONL has one line per check (5)
+  ok 14. evidence carries HEAD + required check count
+  …
 ```
 
-Checks 5–6 are the **host-escape sentinel**: the command writes `$HOME/<sentinel>`;
+Checks 6–7 are the **host-escape sentinel**: the command writes `$HOME/<sentinel>`;
 the HOST path stays absent and the file exists only in the sandbox's own `$HOME`.
-Checks 7–11 are the failure cases: non-zero → `fail`; timeout, dirty tree, and HEAD
+Checks 8–12 are the failure cases: non-zero → `fail`; timeout, dirty tree, and HEAD
 mismatch → `not_run`; a check that dirties the tree → `inconclusive` — never PASS.
 
-### B. Shared Lab — seam implemented, live run credential-gated
+### B. Shared Lab — **measured live (round 3)**
 
-The Shared Lab VM (`sbx` sandbox from ISH-824) is warm (`clab-api-server` v0.8.0
-healthy, `ghcr.io/nokia/srlinux:latest` cached, API published to a
-sandbox-reachable host port). `labctl` is installed **inside** the Coding Kit, not
-on the host, and the Lab API authenticates against the Lab's system accounts, so
-the live `deploy → inspect --json → destroy` half is gated on credentials the author
-does not have. The seam it exercises (`sandboxLabctl` + the three operations above)
-is covered fail-closed by `tests/lab.test.ts`. To run it:
+The same smoke, with `LABCTL_API` set, installs and asserts `labctl` **inside** the
+sandbox, allows only the Lab's published API/gNMI ports, deploys a real
+`ghcr.io/nokia/srlinux:latest` node from inside the Coding Sandbox, reads the NOS
+back, and destroys it — with the Lab image cache retained:
+
+```
+  ok 15. allowed the sandbox to reach the Lab (host.docker.internal:49170,host.docker.internal:18002,localhost:49170,localhost:18002)
+  ok 16. labctl is installed and runnable inside the sandbox
+  ok 17. labctl deploy (in-sandbox) brought the lab up: relay-ish-829-ac80ed29 (nodes running)
+  ok 18. labctl inspect --json reported running nodes + 2 reachable management endpoint(s)
+  ok 19. real SR Linux read-back from the sandbox: Software Version     : v26.7.2
+  ok 20. labctl destroy removed the lab (NOS image retained)
+
+PASS — 20 checks
+```
+
+The topology is generated **inside the throwaway repo** as
+`labs/ish829-smoke/smoke.clab.yml` with `name: relay-ish-829-ac80ed29` ==
+`labNameForTask({id:"ish829-smoke"})`, committed before `sbx create`, so (a) the
+clone is clean and (b) the Task-scoped ownership fence (`foreignLabError`) is
+satisfied. The read-back runs `sr_cli -c "show version"` through `labctl exec` (a
+sandbox → Lab API management call), and the reply is a real SR Linux version.
+
+Run it (a Coding Sandbox can only reach the Lab's **published** ports; the smoke
+adds those policy rules itself):
 
 ```sh
 RELAY_SANDBOX_SMOKE=1 \
 LABCTL_API=https://host.docker.internal:49170 \
-LABCTL_TOPOLOGY=labs/labctl/examples/srl2.clab.yml \
-LABCTL_USER=<user> LABCTL_PASSWORD=<pw> \
+LABCTL_INSECURE=1 \
+LABCTL_TOKEN=<jwt> \                 # or LABCTL_USER=<u> LABCTL_PASSWORD=<pw>
   bun scripts/ish829-real-smoke.ts
 ```
 
-The lab half is wrapped in a `try/finally` that **always** destroys a deployed lab,
-so a later failure cannot leak it; teardown is `labctl destroy` only (image cache
-kept).
+`LABCTL_TOKEN` (preferred) or `LABCTL_USER`/`LABCTL_PASSWORD` are forwarded into the
+sandbox via `sbx exec -e` and never logged. For this PoC Lab the token is an HS256
+JWT signed with the Lab's `JWT_SECRET` carrying a `username` claim (the same
+credential class `labctl` obtains from `POST /login`); the secret itself is never
+recorded here. `LABCTL_SRC` points at a host `labctl.py` to copy into the clone;
+`RELAY_SANDBOX_AGENT=$PWD/sandbox/coding-kit` uses the full Coding Kit (which
+provisions the same toolchain).
+
+The lab half is wrapped in a `try/finally` that is **fail-closed**: a *partial*
+deploy (`LAB_NOT_RUNNING`, `lab` set) is recorded as soon as `dep.lab` is known and
+**always** destroyed; and a failed `destroy` or `sbx rm` sets a non-zero exit and
+**suppresses PASS**. Teardown is `labctl destroy` only (image cache kept).
 
 ## Not measured / limits
 
-* The **live** Shared-Lab `deploy/inspect/destroy` from inside a Coding Sandbox
-  (§B). This is the decisive acceptance evidence; until it is supplied this PR is a
-  partial slice and must not be treated as closing ISH-829.
 * The full daemon E2E (a real `dsh` implement Run in the sandbox → produced HEAD
-  fetched to the host → this VERIFY boundary). The boundary, the Factory wiring and
-  the review worktree are proven separately.
+  fetched to the host → this VERIFY boundary), and the **Ishiul-side** work (Rust
+  tests in the sandbox; the `labs/srl-maintenance/apply.sh` external endpoint). The
+  boundary, the Factory wiring, the review worktree and the live Shared-Lab round
+  are proven separately.
 * A sandbox topology must name its lab `labNameForTask` for the ownership fence;
   per-task topology `name:` rewriting stays out of Relay (ISH-844 non-goal).
-* Publishing the Lab port (`sbx ports`) and the sandbox network allowlist remain a
-  deployment concern (ISH-824/844); Relay does not manage them.
+* Publishing the Lab port (`sbx ports`) and the per-deployment sandbox network
+  allowlist remain a deployment concern (ISH-824/844); the smoke adds the two ports
+  it needs but Relay does not manage policy.
 
 ## Verify
 
 ```sh
 bun run typecheck
 bun test
-RELAY_SANDBOX_SMOKE=1 bun scripts/ish829-real-smoke.ts   # real sbx, no Lab credential
+RELAY_SANDBOX_SMOKE=1 bun scripts/ish829-real-smoke.ts   # real sbx; add LABCTL_API for the Lab half
 ```
 
 `formal/` is untouched (`git diff --name-only | grep -q '^formal/'` is empty), so no

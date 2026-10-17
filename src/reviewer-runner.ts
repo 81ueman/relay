@@ -106,12 +106,6 @@ export interface HeadlessReviewDeps {
    * edits. Omitted -> the existing `task.worktree` path (old Herdr Reviewer).
    */
   reviewWorktree?: string;
-  /**
-   * ISH-829: where the RAW reviewer output is retained. It MUST outlive a
-   * temporary `reviewWorktree` (which the caller removes), so it defaults to the
-   * Task's durable `worktree`, then `reviewWorktree`, then the caller's dir.
-   */
-  evidenceDir?: string;
 }
 
 export interface HeadlessReviewResult {
@@ -443,10 +437,10 @@ export async function runHeadlessReview(
   const verdict = extractReviewerVerdict(proc.stdout) ?? extractReviewerVerdict(proc.stderr);
 
   // Retain the RAW reviewer output as evidence. ISH-829: this is written to a
-  // DURABLE base (the Task's own worktree / evidence dir), never inside a
-  // temporary `reviewWorktree` that the caller removes — a recorded
-  // `evidence_ref` must never dangle.
-  const evidenceBase = deps.evidenceDir ?? task.worktree ?? worktree;
+  // DURABLE base — the Task's own worktree — never inside a temporary
+  // `reviewWorktree` that the caller removes, so a recorded `evidence_ref` never
+  // dangles.
+  const evidenceBase = task.worktree ?? worktree;
   const evidencePath = reviewEvidencePath(evidenceBase, task.attempt, head);
   try {
     mkdirSync(dirname(evidencePath), { recursive: true });

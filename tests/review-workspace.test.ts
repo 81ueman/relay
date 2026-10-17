@@ -144,8 +144,9 @@ describe("runHeadlessReview on an independent read-only worktree", () => {
     expect(prepareReadOnlyReviewWorktree(repo, head, ro).ok).toBe(true);
     const { spawner } = harness();
     // The reviewer runs in the ephemeral `ro`, but evidence is pinned under the
-    // durable writer repo — so removing `ro` cannot delete it.
-    const r = await runHeadlessReview(db, t.id, { spawner, reviewWorktree: ro, evidenceDir: repo });
+    // durable Task worktree — so removing `ro` cannot delete it.
+    db.query(`UPDATE tasks SET worktree = ? WHERE id = ?`).run(repo, t.id);
+    const r = await runHeadlessReview(db, t.id, { spawner, reviewWorktree: ro });
     expect(r.outcome).toBe("pass");
     expect(r.evidenceRef).toBeTruthy();
     expect(r.evidenceRef!.startsWith(repo)).toBe(true);

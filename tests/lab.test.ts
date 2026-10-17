@@ -4,9 +4,9 @@ import {
   LAB_FOREIGN,
   LAB_NOT_RUNNING,
   LAB_NO_ENDPOINTS,
-  assertOwnLab,
   deployTaskLab,
   destroyTaskLab,
+  foreignLabError,
   inspectTaskLab,
   labNameForTask,
   labctlDeployArgv,
@@ -63,8 +63,9 @@ describe("lab identity + ownership", () => {
   test("a Task only owns its own lab; a foreign lab is refused", () => {
     expect(ownsLab(task, OWN)).toBe(true);
     expect(ownsLab(task, "relay-someone-else-deadbeef")).toBe(false);
-    expect(() => assertOwnLab(task, "relay-someone-else-deadbeef")).toThrow(LAB_FOREIGN);
-    expect(() => assertOwnLab(task, null)).toThrow(LAB_FOREIGN);
+    expect(foreignLabError(task, OWN)).toBeNull();
+    expect(foreignLabError(task, "relay-someone-else-deadbeef")).toContain(LAB_FOREIGN);
+    expect(foreignLabError(task, null)).toContain(LAB_FOREIGN);
   });
 });
 
