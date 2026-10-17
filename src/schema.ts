@@ -371,6 +371,19 @@ export const RUN_STATES = [
 export type RunState = (typeof RUN_STATES)[number];
 
 /**
+ * ISH-828: the durable state of a Task's Coding Sandbox (one row per Task).
+ *
+ *   creating  — `sbx create --clone` has been requested, not yet confirmed
+ *   running   — the sandbox exists (running or stopped) and is bound to the Task
+ *   stopped   — stopped (kept for evidence; never auto-removed)
+ *   removed   — `sbx rm` completed after the produced commit was fetched
+ *   failed    — creation/probe failed; the mapping is retained for replay
+ */
+export const SANDBOX_STATES = ["creating", "running", "stopped", "removed", "failed"] as const;
+export type SandboxState = (typeof SANDBOX_STATES)[number];
+
+
+/**
  * One headless dsh Run. Bound at start to (task, phase, attempt, branch, HEAD)
  * and to the files under `output_dir` (stdout/stderr/events/spec) plus the OS
  * process (pid). No Herdr pane, TUI, `dsh web` server or wake subscription is
@@ -407,6 +420,13 @@ export interface Run {
    * Relay's own `events.jsonl`). */
   dsh_events_path: string | null;
   /**
+   * ISH-828: the Task Coding Sandbox this Run executed in, or NULL for a
+   * worktree Run (ISH-760). A sandbox Run's `cwd` is the in-VM clone path, so
+   * the sandbox name is the durable identity the single-writer/staleness fences
+   * key on.
+   */
+  sandbox_name: string | null;
+  /**
    * ISH-762: the OS process START TIME of `pid` (`ps -o lstart=`), captured at
    * spawn. Used on adoption to prove a PID still belongs to THIS Run's dsh before
    * any orphan signal is sent — a reused PID must never be killed.
@@ -418,6 +438,35 @@ export interface Run {
   ended_at: number | null;
   created_at: number;
   updated_at: number;
+}
+
+/**
+ * ISH-828: the durable Task -> Coding Sandbox mapping (one row per Task). The
+ * Task is durable; the sandbox is a disposable private clone inside a Docker
+ * Sandboxes microVM. `branch`/`head_sha` mirror the Task binding as the sandbox
+ * produced them; `evidence_dir` is the host run directory whose logs must
+ * survive even if the sandbox is later removed.
+ */
+export interface Sandbox {
+  task_id: string;
+  /** The sbx sandbox name; the host remote `sandbox-<name>` is fetched back. */
+  name: string;
+  /** The agent or sandbox-kit reference the sandbox was created from. */
+  agent: string;
+  /** The host MAIN checkout `sbx create --clone` cloned (never a linked worktree). */
+  source: string;
+  /** The in-VM clone path (where dsh runs). */
+  workspace: string | null;
+  /** The branch the sandbox commits on (the Task's branch). */
+  branch: string | null;
+  /** The last produced HEAD fetched back to the host (`sandbox-<name>/<branch>`). */
+  head_sha: string | null;
+  state: SandboxState;
+  /** Host directory holding this Task's Run evidence (never deleted by cleanup). */
+  evidence_dir: string | null;
+  created_at: number;
+  updated_at: number;
+  removed_at: number | null;
 }
 
 /**
@@ -745,6 +794,10 @@ CREATE TABLE IF NOT EXISTS runs (
   stderr_path TEXT,
   events_path TEXT,
   dsh_events_path TEXT,
+  -- ISH-828: the Task Coding Sandbox this Run executed in (NULL for a worktree
+  -- Run). The in-VM clone path lives in cwd; this column is the identity the
+  -- sandbox single-writer/staleness fences key on.
+  sandbox_name TEXT,
   spawn_lstart TEXT,
   error TEXT,
   fast_exit INTEGER NOT NULL DEFAULT 0,
@@ -755,4 +808,27 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 CREATE INDEX IF NOT EXISTS idx_runs_task ON runs(task_id, phase, attempt);
 CREATE INDEX IF NOT EXISTS idx_runs_state ON runs(state);
+CREATE INDEX IF NOT EXISTS idx_runs_sandbox ON runs(sandbox_name);
+
+-- ISH-828: one durable Task -> Coding Sandbox mapping. The Task owns a private
+-- in-container Git clone (Docker Sandboxes clone mode, created from the MAIN
+-- checkout, never a linked worktree); a Run/attempt is a disposable fresh dsh
+-- process inside it. name is the sbx sandbox name and the host remote is
+-- sandbox-<name> (configured by sbx) that the produced commit is fetched from.
+CREATE TABLE IF NOT EXISTS sandboxes (
+  task_id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  agent TEXT NOT NULL DEFAULT 'shell',
+  source TEXT NOT NULL,
+  workspace TEXT,
+  branch TEXT,
+  head_sha TEXT,
+  state TEXT NOT NULL DEFAULT 'creating',
+  evidence_dir TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  removed_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_sandboxes_state ON sandboxes(state);
+CREATE INDEX IF NOT EXISTS idx_sandboxes_name ON sandboxes(name);
 `;

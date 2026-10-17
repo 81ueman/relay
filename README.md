@@ -425,6 +425,25 @@ no open PR, no active writer, no uncommitted changes, relay-owned) and always
 `bun run smoke:run-lifecycle`. See
 [`docs/run-lifecycle.md`](docs/run-lifecycle.md).
 
+### Task Coding Sandbox lifecycle (ISH-828)
+
+`relay run sandbox` runs a coding Task inside its own **Docker Sandboxes
+clone-mode microVM** instead of a host worktree. `relay run sandbox create`
+(or `launch`) creates, or **selects and reuses**, one sandbox per Task
+(`sbx create --clone --name <name> <agent|kit> <main-checkout>`), refusing a
+linked worktree as the clone source. The Task→sandbox `name`/`branch`/`HEAD`
+mapping is durable in SQLite (`sandboxes`), and each Run/attempt is a fresh
+`dsh` started with `sbx exec` inside the same sandbox — a **FIX reuses the
+sandbox** with the previous findings pinned into the brief. The original dsh
+JSONL, Relay's events and the produced commit (`git fetch sandbox-<name>`) are
+recorded per Run; `exit 0` is not a submission. A fetch failure, a non-zero exit,
+a cancel/timeout whose in-VM dsh survived (`orphaned`) and a stale/duplicate
+submit all fail **closed**. `relay run sandbox cleanup` is dry-run by default and
+refuses to remove the VM until the produced commit and every Run's evidence
+directory are saved; run logs are retained. One-command fixture smoke:
+`bun run smoke:sandbox`; the real-sandbox smoke is `bun run smoke:sandbox:real`
+(opt-in). See [`docs/sandbox-lifecycle.md`](docs/sandbox-lifecycle.md).
+
 ### Historical cleanup: `relay gc`
 
 There was no supported purge for old worker/runtime/session/task rows (fleet
@@ -1528,8 +1547,8 @@ The alt-screen + pause/scroll behaviour is verified in a real tmux emulator
 src/cli.ts  daemon.ts  db.ts  schema.ts  scheduler.ts  reconciler.ts
     sessions.ts  socket.ts  messages.ts  tasks.ts  workers.ts  events.ts
     runtimes.ts  mail-policy.ts  harness.ts  wake-outbox.ts  dsh-runner.ts
-    run-lifecycle.ts
-docs/dsh-headless-runner.md  docs/run-lifecycle.md
+    run-lifecycle.ts  sandbox.ts  sandbox-lifecycle.ts
+docs/dsh-headless-runner.md  docs/run-lifecycle.md  docs/sandbox-lifecycle.md
     runtime/{runtime,herdr}.ts
     dashboard/{command,model,render,affinity,herdr,doctor}.ts
 .opencode/plugins/relay.ts  integrations/herdr/{herdr-plugin.toml,focus-pane.ts}

@@ -1,0 +1,9 @@
+{"ts":1792200400468,"t":"run.started","runId":"run-2b926777","taskId":"T1","sandbox":"relay-ish-828-real-1792200236622","phase":"implement","attempt":0,"baseHead":"2e4f7f3e3b0f9edd25ccfd31cb75dbd065273af3"}
+{"ts":1792200404794,"t":"dsh.event","type":"session"}
+{"ts":1792200404801,"t":"dsh.event","type":"status"}
+{"ts":1792200404981,"t":"dsh.event","type":"status"}
+{"ts":1792200405064,"t":"dsh.event","type":"status"}
+{"ts":1792200405071,"t":"dsh.event","type":"status"}
+{"ts":1792200405085,"t":"dsh.event","type":"final"}
+{"ts":1792200405086,"t":"stderr","v":"dsh: MISSING_CREDENTIAL: llm-deepseek: no API key for provider route \"deepseek-official\"; store DEEPSEEK_API_KEY through the credentials service (the web Models page writes it), or export DEEPSEEK_API_KEY in the launching environment"}
+{"ts":1792200405257,"t":"run.exited","state":"failed","exitCode":1,"durationMs":4790,"fast":false,"sessionId":"session-0b65a11d-901e-453d-9578-afdeeec648b5","baseHead":"2e4f7f3e3b0f9edd25ccfd31cb75dbd065273af3","producedHead":null,"dsh":{"total":6,"session":1,"status":4,"text":0,"thinking":0,"toolCall":0,"toolResult":0,"final":1,"error":0,"malformed":0,"truncated":0},"terminal":"final","turnReason":"error"}

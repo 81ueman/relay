@@ -34,6 +34,16 @@ import {
   ensureTaskWorktree,
   launchTaskRun,
 } from "./run-lifecycle";
+import {
+  acceptSandboxSubmission,
+  applySandboxCleanup,
+  ensureTaskSandbox,
+  fetchSandboxHead,
+  launchTaskSandboxRun,
+  planSandboxCleanup,
+  sweepOrphanedSandboxRuns,
+} from "./sandbox-lifecycle";
+import { getSandbox as getTaskSandbox, listSandboxes } from "./sandbox";
 import { providerDepsFromEnv } from "./provider-adapters";
 import { checkMergeGate, formatMergeGateDecision } from "./merge-gate";
 import { runFactoryTask } from "./factory";
@@ -109,6 +119,12 @@ Usage:
   relay run launch <task-id> [--timeout 30m] [--permission MODE] [--json]   # ensure worktree + pin brief + ONE dsh Run
   relay run factory <task-id> [--max-attempts N] [--dsh BIN] [--reviewer CMD] [--model M] [--json]  # dsh -> VERIFY -> Claude review -> MergeReady
   relay run worktree <task-id> [--branch B] [--base REF] [--path DIR] [--json]
+  relay run sandbox create <task-id> [--agent K] [--source DIR] [--json]   # Task Coding Sandbox (sbx clone mode)
+  relay run sandbox launch <task-id> [--timeout 30m] [--permission MODE] [--json]  # fresh dsh Run inside the sandbox
+  relay run sandbox show|head|list [--json]
+  relay run sandbox sweep [--apply] [--json]
+  relay run sandbox submit <run-id> [--evidence E] [--summary S]
+  relay run sandbox cleanup <task-id> [--abort REASON] [--apply] [--force] [--json]
   relay run cleanup <task-id> [--abort REASON] [--apply] [--force] [--json]
   relay run list [--task <id>] [--json]
   relay run show <run-id> [--json]          # a headless dsh Run (no Herdr)
@@ -169,6 +185,14 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
       "relay run launch <task-id> [--timeout 30m] [--permission MODE] [--json]",
       "relay run factory <task-id> [--max-attempts N] [--dsh BIN] [--reviewer CMD] [--model M] [--json]",
       "relay run worktree <task-id> [--branch B] [--base REF] [--path DIR] [--json]",
+      "relay run sandbox create <task-id> [--agent K] [--source DIR] [--json]",
+      "relay run sandbox launch <task-id> [--timeout 30m] [--permission MODE] [--agent K] [--json]",
+      "relay run sandbox show <task-id> [--json]",
+      "relay run sandbox head <task-id> [--json]",
+      "relay run sandbox list [--json]",
+      "relay run sandbox sweep [--apply] [--json]",
+      "relay run sandbox submit <run-id> [--evidence E] [--summary S]",
+      "relay run sandbox cleanup <task-id> [--abort REASON] [--apply] [--force] [--json]",
       "relay run cleanup <task-id> [--abort REASON] [--apply] [--force] [--json]",
       "relay run list [--task <id>] [--limit N] [--json]",
       "relay run show <run-id> [--json]",
@@ -1760,7 +1784,155 @@ async function main(): Promise<void> {
           for (const reason of plan.reasons) console.log(`  skip: ${reason}`);
           break;
         }
-        throw new Error(`unknown run subcommand: ${sub} (try: start|launch|worktree|cleanup|list|show|logs|cancel|submit)`);
+        if (sub === "sandbox") {
+          // ISH-828: Task-scoped Coding Sandbox (Docker Sandboxes clone mode).
+          // The Task/sandbox mapping is durable; each Run is a fresh in-VM dsh.
+          const sandboxSub = rest[0];
+          const srest = rest.slice(1);
+          const agent = () => flag(srest, "--agent") ?? flag(rest, "--agent") ?? undefined;
+          const source = () => flag(srest, "--source") ?? flag(rest, "--source") ?? undefined;
+          if (sandboxSub === "list") {
+            const rows = listSandboxes(db);
+            if (hasFlag(srest, "--json") || hasFlag(rest, "--json")) {
+              console.log(JSON.stringify(rows, null, 2));
+              break;
+            }
+            if (rows.length === 0) console.log("(no sandboxes)");
+            for (const s of rows) {
+              console.log(`${s.name}  ${s.state.padEnd(9)}  task=${s.task_id}  branch=${s.branch ?? "-"}  head=${s.head_sha?.slice(0, 12) ?? "-"}`);
+            }
+            break;
+          }
+          if (sandboxSub === "show") {
+            const id = positionals(srest)[0];
+            if (!id) throw new Error("usage: relay run sandbox show <task-id> [--json]");
+            const s = getTaskSandbox(db, id);
+            if (!s) throw new Error(`no sandbox recorded for task ${id}`);
+            if (hasFlag(srest, "--json") || hasFlag(rest, "--json")) {
+              console.log(JSON.stringify(s, null, 2));
+              break;
+            }
+            for (const [k, v] of Object.entries(s)) console.log(`${k}: ${v ?? "-"}`);
+            break;
+          }
+          if (sandboxSub === "create") {
+            const id = positionals(srest)[0];
+            if (!id) throw new Error("usage: relay run sandbox create <task-id> [--agent K] [--source DIR] [--json]");
+            const b = ensureTaskSandbox(db, id, { agent: agent(), source: source() });
+            if (hasFlag(srest, "--json") || hasFlag(rest, "--json")) {
+              console.log(JSON.stringify(b, null, 2));
+              break;
+            }
+            console.log(`${id} sandbox=${b.name} agent=${b.agent} branch=${b.branch} ${b.created ? "(created)" : "(reused)"}`);
+            console.log(`source: ${b.source}  workspace: ${b.workspace}`);
+            break;
+          }
+          if (sandboxSub === "head") {
+            const id = positionals(srest)[0];
+            if (!id) throw new Error("usage: relay run sandbox head <task-id> [--json]");
+            const s = getTaskSandbox(db, id);
+            if (!s) throw new Error(`no sandbox recorded for task ${id}`);
+            const f = fetchSandboxHead(s.source, s.name, s.branch);
+            if (hasFlag(srest, "--json") || hasFlag(rest, "--json")) {
+              console.log(JSON.stringify(f, null, 2));
+            } else if (f.ok) {
+              console.log(`${id} ${f.remote}/${s.branch ?? "HEAD"} -> ${f.sha}`);
+            } else {
+              console.log(`${id} fetch failed: ${f.error}`);
+              process.exitCode = 1;
+            }
+            break;
+          }
+          if (sandboxSub === "launch") {
+            const id = positionals(srest)[0];
+            if (!id) {
+              throw new Error(
+                "usage: relay run sandbox launch <task-id> [--timeout 30m] [--permission MODE] [--agent K] [--source DIR] [--json]"
+              );
+            }
+            const timeoutRaw = flag(srest, "--timeout") ?? flag(rest, "--timeout");
+            const launched = await launchTaskSandboxRun(db, id, {
+              agent: agent(),
+              source: source(),
+              timeoutMs: timeoutRaw ? parseDuration(timeoutRaw) : undefined,
+              permissionMode: flag(srest, "--permission") ?? flag(rest, "--permission") ?? undefined,
+            });
+            const r = await launched.handle.wait();
+            if (hasFlag(srest, "--json") || hasFlag(rest, "--json")) {
+              console.log(
+                JSON.stringify(
+                  { run: r, sandbox: launched.sandbox, brief: launched.briefPath, findings: launched.findings },
+                  null,
+                  2
+                )
+              );
+            } else {
+              console.log(`${r.id} -> state=${r.state} exit=${r.exit_code ?? "-"}`);
+              console.log(`sandbox: ${launched.sandbox.name} (branch ${launched.sandbox.branch})`);
+              console.log(`head: ${r.head_sha ?? "-"}  session: ${r.session_id ?? "-"}`);
+              console.log(`output: ${r.output_dir}`);
+              console.log("note: exit 0 is NOT a submission; advance the task with `relay run sandbox submit <run-id>`");
+            }
+            if (r.state !== "exited") process.exitCode = 1;
+            break;
+          }
+          if (sandboxSub === "submit") {
+            const id = positionals(srest)[0];
+            if (!id) throw new Error("usage: relay run sandbox submit <run-id> [--evidence E] [--summary S]");
+            const r = acceptSandboxSubmission(db, {
+              runId: id,
+              summary: flag(srest, "--summary") ?? undefined,
+              evidence: flag(srest, "--evidence") ?? undefined,
+            });
+            const t = getTask(db, r.task_id);
+            console.log(`${r.id} accepted -> task ${r.task_id} phase=${t?.phase} state=${t?.state}`);
+            break;
+          }
+          if (sandboxSub === "sweep") {
+            // ISH-828: fail-closed sweep of `running` sandbox Runs whose host
+            // `sbx exec` client is gone (a Relay/host restart). Dry-run unless --apply.
+            const res = sweepOrphanedSandboxRuns(db, { apply: hasFlag(srest, "--apply") || hasFlag(rest, "--apply") });
+            if (hasFlag(srest, "--json") || hasFlag(rest, "--json")) {
+              console.log(JSON.stringify(res, null, 2));
+              break;
+            }
+            console.log(`inspected ${res.inspected} non-terminal sandbox run(s); ${res.orphaned.length} orphaned`);
+            for (const o of res.orphaned) {
+              console.log(
+                `  ${o.runId} task=${o.taskId} sandbox=${o.sandbox} in-vm-dsh=${o.inVmAlive ? "alive" : "gone"} ${o.applied ? (o.stopped ? "(stopped + failed)" : "(failed)") : "(dry-run; pass --apply)"}`
+              );
+            }
+            break;
+          }
+          if (sandboxSub === "cleanup") {
+            const id = positionals(srest)[0];
+            if (!id) throw new Error("usage: relay run sandbox cleanup <task-id> [--abort REASON] [--apply] [--force] [--json]");
+            const plan = hasFlag(srest, "--apply")
+              ? applySandboxCleanup(db, id, {
+                  apply: true,
+                  force: hasFlag(srest, "--force"),
+                  abort: flag(srest, "--abort") ?? undefined,
+                })
+              : planSandboxCleanup(db, id, {
+                  force: hasFlag(srest, "--force"),
+                  abort: flag(srest, "--abort") ?? undefined,
+                });
+            if (hasFlag(srest, "--json") || hasFlag(rest, "--json")) {
+              console.log(JSON.stringify(plan, null, 2));
+              break;
+            }
+            const verdict = plan.apply ? (plan.removed ? "REMOVED" : plan.remove ? "would remove" : "skipped") : "dry-run (pass --apply)";
+            console.log(`relay run sandbox cleanup ${id} — ${verdict}`);
+            console.log(`  sandbox: ${plan.name ?? "-"}  branch: ${plan.branch ?? "-"}  saved head: ${plan.savedHead ?? "-"}`);
+            console.log(`  retained runs (evidence): ${plan.retainedRuns}`);
+            for (const reason of plan.reasons) console.log(`  skip: ${reason}`);
+            break;
+          }
+          throw new Error(
+            `unknown run sandbox subcommand: ${sandboxSub ?? "(none)"} (try: create|launch|show|head|list|sweep|submit|cleanup)`
+          );
+        }
+        throw new Error(`unknown run subcommand: ${sub} (try: start|launch|worktree|sandbox|cleanup|list|show|logs|cancel|submit)`);
       }
 
       case "status": {
