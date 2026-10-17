@@ -109,7 +109,13 @@ Environment: Apple Silicon (`darwin/arm64`), `sbx v0.48.0`.
    pass no provider key `env`/`dshEnv`, and `DEEPSEEK_API_KEY` is not allowlisted.
    The operator authenticates dsh through their **own provider configuration**
    (their dsh profile / provider route, an injected `.env`, or a sandbox
-   credential proxy); Relay never shares the host `~/.dsh/.credentials.yaml`.
+   credential proxy). **Host `.dsh` isolation:** a **sandbox** VM has no host
+   `HOME`, so Relay does not share the host `~/.dsh` with a sandbox Run; a
+   **host** Run, however, inherits `HOME`/`DSH_HOME` (`src/child-env.ts`), so the
+   operator's `~/.dsh` — including `.credentials.yaml` — is **readable** from the
+   host Run. dsh 0.2.1 headless does not read the saved credential by default,
+   but Relay does not isolate it on the host (per-Run `HOME`/`DSH_HOME` isolation
+   is tracked under ISH-869).
    Model route: `deepseek-official` → `deepseek-flash` (V4.1-Flash).
 
 6. **The host Coding Worker guard (ISH-869 finding 1)** — the shared pin is now

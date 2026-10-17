@@ -74,11 +74,18 @@ carries **one** 0.2.x code path (ISH-869).
   `tests/dsh-smoke.test.ts` pass no provider key `env`/`dshEnv` to `startDshRun`,
   and `DEEPSEEK_API_KEY` is deliberately **not** on the allowlist. The operator
   authenticates dsh through their **own provider configuration** (a dsh profile /
-  provider route, an injected `.env`, or a sandbox credential proxy); Relay never
-  shares the host `~/.dsh/.credentials.yaml`. A `deepseek-official` **host CLI**
-  Run on the pin therefore cannot authenticate until provider-key forwarding
-  lands under ISH-869 (deferred). With no key the real
-  `dsh --profile headless --json` emits `status turn_end reason=error`
+  provider route, an injected `.env`, or a sandbox credential proxy).
+  **Host vs. sandbox isolation differs.** Inside a **Coding Sandbox** the VM has
+  no host `HOME`, so Relay does not share the host `~/.dsh` (including
+  `.credentials.yaml`) with a sandbox Run. On the **host** path, though,
+  `childEnv` forwards `HOME` and `DSH_HOME` unchanged (`src/child-env.ts`), so a
+  host Run runs against the operator's own `~/.dsh` and **can read
+  `~/.dsh/.credentials.yaml`**: dsh 0.2.1 headless does not *read* a saved
+  credential by default, but Relay does **not** isolate it on the host. A
+  `deepseek-official` **host CLI** Run on the pin therefore cannot authenticate
+  until provider-key forwarding lands under ISH-869 (deferred); per-Run
+  `HOME`/`DSH_HOME` isolation is likewise tracked under ISH-869. With no key the
+  real `dsh --profile headless --json` emits `status turn_end reason=error`
   (`MISSING_CREDENTIAL`) **and exits non-zero**, so the Run is recorded `failed`
   (never a silent `exited`).
 
