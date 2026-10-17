@@ -52,8 +52,11 @@ out inside the clone so every Run commits onto the branch Relay later fetches.
 ## 1 Run = 1 fresh `sbx exec … dsh`
 
 `relay run sandbox launch` ensures the sandbox, ensures a usable `dsh` inside it
-(reads `dsh --version`; installs `@deepseek-ai/dsh@0.2.0-rc.2` only when missing
-and not disabled), **pins the brief** into the clone
+(reads `dsh --version`; installs the pinned `@deepseek-ai/dsh@0.2.1-rc.2` only
+when missing and not disabled, **and refuses the Run fail-closed when the
+sandbox's `dsh --version` is not exactly `0.2.1-rc.2`** — a sandbox left on the
+`0.2.0-rc.2` baseline is never a silent pass, ISH-869), **pins the brief** into
+the clone
 (`<workspace>/.relay/run-brief.md` via `sbx cp`; the same text is the dsh prompt),
 then starts **exactly one** headless dsh Run:
 

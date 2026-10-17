@@ -5,7 +5,7 @@
  *   RELAY_REAL_SMOKE=1 bun run smoke:factory:real
  *
  * Drives ONE task through the factory with the REAL, pinned dsh
- * (`dsh --profile headless --json`, 0.2.0-rc.2) as the coding worker and the REAL
+ * (`dsh --profile headless --json`, 0.2.1-rc.2) as the coding worker and the REAL
  * Claude Code (`claude -p --output-format json`) as the independent reviewer:
  *
  *   real dsh implement -> structured submit -> real mechanical VERIFY

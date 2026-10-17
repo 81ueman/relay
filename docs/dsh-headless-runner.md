@@ -24,12 +24,17 @@ The older `integrations/dsh-relay/` bridge is for the **long-lived** `dsh
 web`/SDK (`worker.wake.await -> followup()`); a one-shot headless attempt is
 launched directly instead — the bridge is not extended and not used here.
 
-## Pinned CLI contract (dsh 0.2.0-rc.2)
+## Pinned CLI contract (dsh 0.2.1-rc.2)
 
-Confirmed against the installed tool, not guessed:
+Confirmed against the installed tool, not guessed. The pin is a single
+constant, `PINNED_DSH_VERSION` in `src/sandbox-lifecycle.ts` (and
+`sandbox/coding-kit/spec.yaml`); Relay never floats on `latest`/`alpha` and
+carries **one** 0.2.x code path (ISH-869).
 
-- `dsh --version` → **`0.2.0-rc.2`**, checked with the real `dsh --help` and
-  `dsh --profile headless --help`.
+- `dsh --version` → **`0.2.1-rc.2`**, checked with the real `dsh --help` and
+  `dsh --profile headless --help`. **The CLI/JSONL contract below is identical
+  to 0.2.0-rc.2** (diffed against a real returned JSONL stream), so no decoder
+  change was required for the version bump.
 - The app is `dsh --profile headless --json <task...>`; multiple words are joined
   by spaces, and `--json -` reads the task from stdin. `-h/--help` prints usage
   and exits 0; a missing task is a usage error.
@@ -59,6 +64,15 @@ Confirmed against the installed tool, not guessed:
   root), `DSH_PERMISSION_MODE`, `DSH_TOOLS_MODE`, `DEEPSEEK_API_KEY`. The runner
   only sets `DSH_PERMISSION_MODE` (plus `RELAY_RUN_ID` / `RELAY_TASK_ID` for
   attribution). It does **not** pass `--session-id`: a FIX is a fresh Run.
+- **Credential precedence (dsh 0.2.1-rc.1 →):** headless reads the API key from
+  the **environment / `.env`** and does **not** read a saved credential by
+  default (Web/Desktop keep the saved-credential path). Relay already injects a
+  provider key explicitly — the host runner via the `env` option, the sandbox via
+  `sbx exec -e` / the operator's `sbx secret set-custom` proxy — and never shares
+  the host `~/.dsh/.credentials.yaml` (see `src/child-env.ts`). With no key the
+  real `dsh --profile headless --json` emits `status turn_end reason=error`
+  (`MISSING_CREDENTIAL`) **and exits non-zero**, so the Run is recorded `failed`
+  (never a silent `exited`).
 
 ## Process and output
 
@@ -189,6 +203,13 @@ Session lives under `$DSH_HOME`). An unknown id is an error. Relay never passes
   (`RELAY_DSH_SMOKE=1 bun test tests/dsh-smoke.test.ts`) runs one process and
   asserts the Session ID and an ordered `session` → … → `final` stream with a
   real `tool_call`/`tool_result`.
+- **ISH-869:** the pin is `0.2.1-rc.2` and the JSONL contract above is unchanged
+  from `0.2.0-rc.2` (diffed on real streams). The authenticated `deepseek-flash`
+  smoke (`RELAY_DSH_SMOKE=1 …`) is **opt-in** and needs a real `DEEPSEEK_API_KEY`
+  in the launching environment; with no key the real process exits **non-zero**
+  (`MISSING_CREDENTIAL`) and the Run is recorded `failed` — never a silent
+  `exited`. See [`ish869-dsh-0.2.1-rc.2.md`](ish869-dsh-0.2.1-rc.2.md) for what
+  was and was not run.
 - NOT verified here: anything beyond **one** Run's launch/observe/terminate. Task
   worktree creation, multi-writer control and FIX re-entry are ISH-760 — see
   [`run-lifecycle.md`](run-lifecycle.md). The real Factory E2E (ISH-762) is not

@@ -116,7 +116,7 @@ class FakeSbx implements SbxCli {
       }
       if (joined.includes("rev-parse HEAD")) return ok(this.headSha);
       if (joined.includes("rev-parse --abbrev-ref HEAD")) return ok(this.currentBranch);
-      if (joined.includes("--version")) return ok("0.2.0-rc.2");
+      if (joined.includes("--version")) return ok("0.2.1-rc.2");
       return ok("");
     }
     if (args[0] === "rm") {
