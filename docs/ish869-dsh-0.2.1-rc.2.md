@@ -13,26 +13,37 @@ in `relay/` (not moved back to `ishiul`).
 
 | Where | What |
 | -- | -- |
-| `src/sandbox-lifecycle.ts` | `export const PINNED_DSH_VERSION = "0.2.1-rc.2"` — used by `prepareSandboxDsh` (install) and the launch guard |
+| `src/dsh-version.ts` | `PINNED_DSH_VERSION = "0.2.1-rc.2"`, `isPinnedDsh`, `readDshVersion` — the ONE constant + guard used by **both** the host runner and the sandbox |
+| `src/sandbox-lifecycle.ts` | re-exports the shared pin; `prepareSandboxDsh` installs/probes it and the launch guard enforces it |
+| `src/dsh-runner.ts` | the host `startDshRun` guard (`DSH_VERSION_MISMATCH`) |
 | `sandbox/coding-kit/spec.yaml` | `npm i -g @deepseek-ai/dsh@0.2.1-rc.2` (the fresh-sandbox provision) |
 | `sandbox/README.md`, `docs/dsh-headless-runner.md`, `docs/sandbox-lifecycle.md`, `docs/factory-e2e.md`, `README.md` | version references |
 | `tests/*`, `scripts/ish828-smoke.ts`, `scripts/ish762-real-smoke.ts` | pinned fixtures/comments |
 
-## Fail-closed version guard (new)
+## Fail-closed version guard
 
-`launchTaskSandboxRun` now refuses a Run when the sandbox's `dsh --version` is not
-**exactly** `PINNED_DSH_VERSION`:
+Both headless Coding Worker paths require **exactly** `PINNED_DSH_VERSION`; the
+guard runs **before any Run row is written and before any process is spawned**, so
+an old build can never be run as a normal success. `isPinnedDsh` matches an exact
+whitespace-delimited token, so `0.2.1-rc.20` does **not** match.
 
-```
-SANDBOX_ERROR: sandbox <name> has dsh 0.2.0-rc.2, but Relay pins
-@deepseek-ai/dsh@0.2.1-rc.2; refusing to start a Run (an old version is never a
-silent pass)
-```
+- **Sandbox** (`launchTaskSandboxRun`): probes the binary it will run
+  (`sbx exec … <dshBin> --version`) and refuses on a mismatch:
 
-A sandbox left on the `0.2.0-rc.2` baseline (or with dsh missing and
-`installDsh:false`) is **never** treated as a successful start. The check runs
-before any process spawn and before a Run row is written. `isPinnedDsh` matches an
-exact whitespace-delimited token, so `0.2.1-rc.20` does **not** match.
+  ```
+  SANDBOX_ERROR: sandbox <name> has dsh 0.2.0-rc.2, but Relay pins
+  @deepseek-ai/dsh@0.2.1-rc.2; refusing to start a Run (an old version is never a
+  silent pass)
+  ```
+- **Host** (`startDshRun`, reached by `relay run start` and `relay run factory`):
+  probes `<dshBin> --version` (default `$RELAY_DSH_BIN` or `dsh` on `PATH`) and
+  refuses on a mismatch:
+
+  ```
+  DSH_VERSION_MISMATCH: /path/to/dsh reports 0.2.0-rc.2, but Relay pins
+  @deepseek-ai/dsh@0.2.1-rc.2; refusing to start a Run (an old version is never a
+  silent pass)
+  ```
 
 ## Verified (raw output)
 
@@ -61,22 +72,26 @@ Environment: Apple Silicon (`darwin/arm64`), `sbx v0.48.0`.
    /usr/local/share/npm-global/bin/dsh
    ```
 
-4. **An existing old sandbox is detected, not silently passed** — the leftover
-   `ishiul-coding` sandbox still reports the old build, and the new guard refuses it:
+4. **An existing old sandbox is detected** — the leftover `ishiul-coding`
+   sandbox still reports the old build, and by default the next launch would
+   **install the pin in place** and only proceed if `dsh --version` then reports
+   exactly `0.2.1-rc.2` (with `installDsh:false` it refuses outright):
    ```
    $ sbx exec ish827-kit -- dsh --version
    0.2.0-rc.2
    ```
-   Covered by unit tests `ISH-869: an OLD dsh in the sandbox fails the launch
-   closed` and `ISH-869: a MISSING dsh (install disabled) also fails the launch
-   closed` (`tests/sandbox.test.ts`).
+   Covered by the unit test `ISH-869: an OLD dsh in the sandbox fails the launch
+   closed (no silent pass)` (`installDsh:false` → refused) and `ISH-869: a MISSING
+   dsh (install disabled) also fails the launch closed` (`tests/sandbox.test.ts`).
 
-5. **Real headless JSONL contract inside the fresh sandbox** (identical to
-   `0.2.0-rc.2`; no decoder change needed) and **fail-closed with no key** — the
-   real process exits **non-zero** (never a silent `0`):
+5. **Real headless JSONL contract** (identical to `0.2.0-rc.2`; no decoder change
+   needed) and **fail-closed with no key** — the real process exits **non-zero**
+   (never a silent `0`). Same stream from the fresh sandbox and from the isolated
+   pinned host binary:
    ```
-   $ sbx exec ish869-vercheck -- bash -lc 'dsh --profile headless --json "reply with the single token PING"; echo EXIT=$?'
-   {"type":"session","sessionId":"session-b8136206-...","cwd":"..."}
+   $ RELAY_DSH_BIN="$TMP/dsh-021/bin/dsh"   # 0.2.1-rc.2
+   $ DSH_HOME="$TMP/home" "$RELAY_DSH_BIN" --profile headless --json "reply with the single token PING"; echo EXIT=$?
+   {"type":"session","sessionId":"session-d20b4e0b-...","cwd":"..."}
    {"type":"status","phase":"turn_start","turn":1}
    {"type":"status","phase":"step_start","turn":1,"step":1}
    {"type":"status","phase":"step_end","turn":1,"step":1}
@@ -93,28 +108,52 @@ Environment: Apple Silicon (`darwin/arm64`), `sbx v0.48.0`.
    proxy) and never shares the host `~/.dsh/.credentials.yaml`. Model route:
    `deepseek-official` → `deepseek-flash` (V4.1-Flash).
 
-6. Local gates:
+6. **The host Coding Worker guard (ISH-869 finding 1)** — the shared pin is now
+   enforced in front of the host spawn too. Unit tests (no real dsh needed):
+   `tests/dsh-runner.test.ts` → `ISH-869: a host dsh that is not the pin is
+   refused before any Run row or process` (a fake `dshBin` reporting
+   `0.2.0-rc.2` → `DSH_VERSION_MISMATCH`, 0 processes, 0 Run rows), `… whose
+   --version fails is refused`, `an unpinned default from PATH/RELAY_DSH_BIN is
+   refused`, and `the pinned host dsh is admitted and runs`. `tests/dsh-version.test.ts`
+   covers the shared `isPinnedDsh`/`readDshVersion`. This host's global `dsh`
+   (`0.2.0-rc.2`) is now refused on `relay run start`/`factory` unless
+   `$RELAY_DSH_BIN` points at the pin — the global dsh was **not** modified.
+
+7. Local gates:
    ```
    $ bun run typecheck
    $ tsc --noEmit          # exit 0
 
    $ bun test
-   905 pass, 1 skip, 0 fail  (3344 expect() calls; 66 files)
+   918 pass, 1 skip, 0 fail  (3376 expect() calls; 67 files)
 
    $ bun run smoke:sandbox
    PASS — 15 checks
    ```
+   (The 1 skip is the opt-in authenticated smoke below.)
 
 ## NOT verified here (do not treat as PASS)
 
-- **Authenticated `deepseek-flash` API smoke** (a real `tool_call`/`tool_result`
-  with a live key): no `DEEPSEEK_API_KEY` is provisioned in this environment, so
-  it was not run. It is opt-in and needs an operator key. Run it with:
+- **BLOCKED — authenticated `deepseek-flash` API smoke** (acceptance item 2: a
+  real `session` + `tool_call`/`tool_result` + terminal status + exit with the
+  live DeepSeek API). No `DEEPSEEK_API_KEY` is provisioned in this environment
+  (`env | grep -i deepseek` is empty), so the decisive call cannot succeed. The
+  exact command **was run** against the pinned build and fails closed for lack of
+  a key:
+
+  ```
+  $ RELAY_DSH_BIN="$TMP/dsh-021/bin/dsh" RELAY_DSH_SMOKE=1 bun test tests/dsh-smoke.test.ts
+  #  DEEPSEEK_API_KEY is unset; real dsh 0.2.1-rc.2 spawned
+  (fail) real dsh headless smoke (opt-in) > runs one dsh --json process, ...
+    Expected: "exited"
+    Received: "failed"        # MISSING_CREDENTIAL (see item 5)
+  ```
+
+  Unblock by exporting a real key and re-running:
+
   ```sh
   DEEPSEEK_API_KEY=... RELAY_DSH_SMOKE=1 bun test tests/dsh-smoke.test.ts
-  ```
-  or, in a sandbox:
-  ```sh
+  # or, inside a sandbox, with an operator credential proxy:
   RELAY_SANDBOX_SMOKE=1 RELAY_SANDBOX_AGENT=ishiul-coding \
     RELAY_SANDBOX_KEY_CMD=/abs/get-key.sh bun run smoke:sandbox:real
   ```
@@ -122,11 +161,14 @@ Environment: Apple Silicon (`darwin/arm64`), `sbx v0.48.0`.
 - No provider push / PR / merge was performed by this change (Relay adds no
   such authority); the PR for this issue is opened by the owner flow, unmerged.
 
-## Regenerating a pinned sandbox
+## Regenerating / repairing a pinned sandbox
 
 The Kit pins the build in `sandbox/coding-kit/spec.yaml`; a **new** sandbox picks
-it up on create. An **existing** sandbox keeps its old dsh until re-created — and
-Relay now refuses to run in it:
+it up on create. An **existing** sandbox left on `0.2.0-rc.2` is upgraded **in
+place** on the next `relay run sandbox launch` (Relay runs
+`npm i -g @deepseek-ai/dsh@0.2.1-rc.2` inside the VM), and the Run starts only when
+`dsh --version` then reports exactly `0.2.1-rc.2`; with `installDsh:false` the
+launch is refused outright. To rebuild cleanly instead:
 
 ```sh
 sbx rm --force <old-name>

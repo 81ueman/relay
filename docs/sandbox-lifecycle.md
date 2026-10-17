@@ -51,12 +51,8 @@ out inside the clone so every Run commits onto the branch Relay later fetches.
 
 ## 1 Run = 1 fresh `sbx exec … dsh`
 
-`relay run sandbox launch` ensures the sandbox, ensures a usable `dsh` inside it
-(reads `dsh --version`; installs the pinned `@deepseek-ai/dsh@0.2.1-rc.2` only
-when missing and not disabled, **and refuses the Run fail-closed when the
-sandbox's `dsh --version` is not exactly `0.2.1-rc.2`** — a sandbox left on the
-`0.2.0-rc.2` baseline is never a silent pass, ISH-869), **pins the brief** into
-the clone
+`relay run sandbox launch` ensures the sandbox, ensures a usable `dsh` inside it,
+then **pins the brief** into the clone
 (`<workspace>/.relay/run-brief.md` via `sbx cp`; the same text is the dsh prompt),
 then starts **exactly one** headless dsh Run:
 
@@ -72,6 +68,26 @@ the VM. stdout / stderr / the **original dsh `--json` JSONL** / Relay's own
 lifecycle log are written under `<control-plane>/runs/<run-id>/` exactly as the
 worktree runner does, and the run row records phase / attempt / generation /
 branch / `base_head_sha` / `head_sha` / `session_id` / exit code.
+
+### The pinned dsh (ISH-869)
+
+Relay pins exactly one build, `PINNED_DSH_VERSION = 0.2.1-rc.2`
+(`src/dsh-version.ts`; the Kit installs `@deepseek-ai/dsh@0.2.1-rc.2`). On launch
+Relay probes the same binary it will run (`sbx exec … <dshBin> --version`,
+`dshBin` defaulting to `dsh`) and requires exactly that version:
+
+- **Mismatch (e.g. a sandbox left on the `0.2.0-rc.2` baseline):** by default
+  (`installDsh` unset) Relay tries an **in-place** `npm i -g
+  @deepseek-ai/dsh@0.2.1-rc.2` inside the VM, then re-reads `--version`. The Run
+  starts only when it now reports exactly `0.2.1-rc.2`; if the install fails or
+  the version is still wrong, the launch is **refused** before any Run row or
+  process.
+- **`installDsh:false`:** no install is attempted — a non-pinned (or missing)
+  dsh refuses the launch outright.
+
+The host worktree runner (`relay run start` / `relay run factory` → `startDshRun`)
+applies the **same** guard to its host `dshBin` (or `$RELAY_DSH_BIN`, or `dsh` on
+`PATH`) before writing any Run row, so an old host dsh is never a silent pass.
 
 ## Single-writer, staleness and duplicate submission
 

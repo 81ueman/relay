@@ -204,12 +204,16 @@ Session lives under `$DSH_HOME`). An unknown id is an error. Relay never passes
   asserts the Session ID and an ordered `session` → … → `final` stream with a
   real `tool_call`/`tool_result`.
 - **ISH-869:** the pin is `0.2.1-rc.2` and the JSONL contract above is unchanged
-  from `0.2.0-rc.2` (diffed on real streams). The authenticated `deepseek-flash`
-  smoke (`RELAY_DSH_SMOKE=1 …`) is **opt-in** and needs a real `DEEPSEEK_API_KEY`
-  in the launching environment; with no key the real process exits **non-zero**
-  (`MISSING_CREDENTIAL`) and the Run is recorded `failed` — never a silent
-  `exited`. See [`ish869-dsh-0.2.1-rc.2.md`](ish869-dsh-0.2.1-rc.2.md) for what
-  was and was not run.
+  from `0.2.0-rc.2` (diffed on real streams). Both this **host** runner
+  (`startDshRun`) and the in-sandbox runner enforce the pin fail-closed: `dshBin
+  --version` must be exactly `0.2.1-rc.2` or the Run is refused with
+  `DSH_VERSION_MISMATCH` before any Run row or process. The authenticated
+  `deepseek-flash` smoke (`RELAY_DSH_SMOKE=1 …`) is **opt-in** and needs a real
+  `DEEPSEEK_API_KEY` in the launching environment; with no key the real process
+  exits **non-zero** (`MISSING_CREDENTIAL`) and the Run is recorded `failed` —
+  never a silent `exited`. See
+  [`ish869-dsh-0.2.1-rc.2.md`](ish869-dsh-0.2.1-rc.2.md) for what was and was not
+  run.
 - NOT verified here: anything beyond **one** Run's launch/observe/terminate. Task
   worktree creation, multi-writer control and FIX re-entry are ISH-760 — see
   [`run-lifecycle.md`](run-lifecycle.md). The real Factory E2E (ISH-762) is not
