@@ -12,7 +12,9 @@ import { intakeTask, recordReview, runMechanicalVerification, submitPhase, taskC
 import { insertTaskResult } from "../src/results";
 import { acceptRunSubmission, DUPLICATE_WRITER, listRuns } from "../src/dsh-runner";
 import { launchTaskRun } from "../src/run-lifecycle";
-import { defaultRunner, gitHead } from "../src/verify";
+import { defaultRunner, gitHead, type CommandRunner } from "../src/verify";
+import { upsertSandbox } from "../src/sandbox";
+import { sandboxVerifyTarget, type SandboxExec } from "../src/sandbox-verify";
 import { processPgid, spawnIdentityToken } from "../src/proc-identity";
 import { DEFAULT_INTEGRATOR_WORKER, pidAlive, runFactoryTask } from "../src/factory";
 import {
@@ -259,6 +261,74 @@ describe("Factory E2E: real worktree, fake headless dsh + independent reviewer",
 
     // A read-only merge gate was evaluated (never merged).
     expect(res.gate).not.toBeNull();
+  });
+
+  test("ISH-829: a sandbox-backed Task verifies IN the sandbox, never the host runner", async () => {
+    const dsh = fakeDsh("dsh-sbx", COMMITTING_DSH);
+    const id = newTask();
+    const rev = reviewerHarness(["pass"]);
+    let hostCalls = 0;
+    const hostSpy: CommandRunner = {
+      async run(s) {
+        hostCalls++;
+        return { name: s.name, required: true, outcome: "pass", exitCode: 0, output: "host", durationMs: 0 };
+      },
+    };
+    // A sandbox row is what selects the sandbox target (never the host runner).
+    const task0 = getTask(db, id)!;
+    upsertSandbox(db, {
+      taskId: id,
+      name: "relay-ish829-factory",
+      agent: "shell",
+      source: repo,
+      workspace: task0.worktree,
+      branch: task0.branch,
+      headSha: null,
+      state: "running",
+    });
+    // Fake `sbx exec`: HEAD is the LIVE produced head, the tree is clean, and
+    // every check command exits 0.
+    const exec: SandboxExec = {
+      async exec(_name, argv) {
+        const j = argv.join(" ");
+        if (j.includes("rev-parse HEAD")) return { code: 0, stdout: `${getTask(db, id)!.head_sha}\n`, stderr: "", timedOut: false };
+        if (j.includes("--porcelain")) return { code: 0, stdout: "", stderr: "", timedOut: false };
+        return { code: 0, stdout: "sbx-ran", stderr: "", timedOut: false };
+      },
+    };
+    const res = await runFactoryTask(db, id, {
+      ...factoryDeps(dsh, rev.spawner),
+      verifyRunner: hostSpy,
+      verifyTarget: (d, t, checks) => sandboxVerifyTarget(d, t, checks, { exec, headProbe: () => getTask(db, id)!.head_sha }),
+    });
+    expect(res.outcome).toBe("merge_ready");
+    expect(res.attempts[0].verifyOutcome).toBe("pass");
+    expect(hostCalls).toBe(0); // the host runner was NEVER reached
+  });
+
+  test("ISH-829: the independent reviewer reads a detached read-only worktree at the fixed head", async () => {
+    const dsh = fakeDsh("dsh-ro", COMMITTING_DSH);
+    const id = newTask();
+    const rev = reviewerHarness(["pass"]);
+    const roRoot = join(dir, "review-wt");
+    const res = await runFactoryTask(db, id, { ...factoryDeps(dsh, rev.spawner), reviewWorktreeRoot: roRoot });
+    expect(res.outcome).toBe("merge_ready");
+    expect(rev.calls).toHaveLength(1);
+    const cwd = rev.calls[0].cwd;
+    // The reviewer read a DETACHED worktree under the review root, not the writer's.
+    expect(cwd.startsWith(roRoot)).toBe(true);
+    const task = getTask(db, id)!;
+    expect(rev.calls[0].head).toBe(task.head_sha);
+    // The read-only worktree is torn down after the review.
+    expect(existsSync(cwd)).toBe(false);
+    // ISH-829 finding 5: the recorded evidence_ref is DURABLE — it does NOT live
+    // in the removed review worktree, so it still exists.
+    const row = db
+      .query(`SELECT evidence_ref FROM task_results WHERE task_id = ? AND kind = 'ReviewResult' ORDER BY id DESC LIMIT 1`)
+      .get(id) as { evidence_ref: string | null } | null;
+    expect(row?.evidence_ref).toBeTruthy();
+    expect(existsSync(row!.evidence_ref!)).toBe(true);
+    expect(row!.evidence_ref!.startsWith(cwd)).toBe(false);
   });
 
   test("a coding Run that exits nonzero canNOT advance (exit 0/final is not a submission)", async () => {

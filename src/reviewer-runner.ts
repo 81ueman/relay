@@ -99,6 +99,13 @@ export interface HeadlessReviewDeps {
   timeoutMs?: number;
   /** Review profile for duplicate-dispatch protection (default task/default). */
   profile?: string;
+  /**
+   * ISH-829: an INDEPENDENT read-only checkout at the task head, used instead of
+   * `task.worktree`. The coding writer never sees it (it is a detached worktree
+   * at the fixed HEAD), so a review can never be credited for the writer's live
+   * edits. Omitted -> the existing `task.worktree` path (old Herdr Reviewer).
+   */
+  reviewWorktree?: string;
 }
 
 export interface HeadlessReviewResult {
@@ -377,7 +384,7 @@ export async function runHeadlessReview(
   }
   const head = task.head_sha;
   if (!head) return refusal(`${REVIEW_HEAD_MISMATCH}: task ${taskId} has no recorded head to review`, task);
-  const worktree = task.worktree;
+  const worktree = deps.reviewWorktree ?? task.worktree;
   if (!worktree || !existsSync(worktree)) {
     return refusal(`${REVIEW_ERROR}: task ${taskId} has no live worktree to review`, task);
   }
@@ -429,8 +436,12 @@ export async function runHeadlessReview(
   const raw = `${proc.stdout}\n${proc.stderr}`;
   const verdict = extractReviewerVerdict(proc.stdout) ?? extractReviewerVerdict(proc.stderr);
 
-  // Retain the RAW reviewer output as evidence (never masquerade it as a dsh event).
-  const evidencePath = reviewEvidencePath(worktree, task.attempt, head);
+  // Retain the RAW reviewer output as evidence. ISH-829: this is written to a
+  // DURABLE base — the Task's own worktree — never inside a temporary
+  // `reviewWorktree` that the caller removes, so a recorded `evidence_ref` never
+  // dangles.
+  const evidenceBase = task.worktree ?? worktree;
+  const evidencePath = reviewEvidencePath(evidenceBase, task.attempt, head);
   try {
     mkdirSync(dirname(evidencePath), { recursive: true });
     writeFileSync(

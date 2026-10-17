@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { defaultDbPath, defaultSockPath, initControlPlane, now, openDb, outsideRepoDefault, STATE_DIR } from "./db";
+import { defaultDbPath, defaultSockPath, initControlPlane, now, openDb, outsideRepoDefault, projectRoot, STATE_DIR } from "./db";
 import {
   applyDbMove, configPath, describeDb, findLegacyDb, planDbMove, readConfig, resolveDb,
 } from "./db-location";
@@ -26,6 +26,7 @@ import {
 } from "./tasks";
 import { acceptTask, confirmMerged, intakeTask, recordReview, recordVerification, runMechanicalVerification, submitPhase, taskChecks } from "./workflow";
 import { defaultRunner, type CheckSpec } from "./verify";
+import { sandboxVerifyTarget } from "./sandbox-verify";
 import { acceptRunSubmission, getRun, listRuns, startDshRun } from "./dsh-runner";
 import { formatDshEvent, readDshEvents } from "./dsh-events";
 import { signalRunProcess } from "./run-signal";
@@ -1316,15 +1317,21 @@ async function main(): Promise<void> {
         if (!task) throw new Error(`unknown task: ${id}`);
         const checks = taskChecks(task);
         if (checks.length === 0) throw new Error(`task ${id} has no mechanical checks (intake it with --check name=command)`);
-        const cwd = flag(rest, "--cwd") ?? task.worktree ?? process.env.RELAY_VERIFY_CWD ?? process.cwd();
+        // ISH-829: a Task with a durable Coding Sandbox verifies INSIDE it unless
+        // an explicit --cwd override is given.
+        const explicitCwd = flag(rest, "--cwd");
+        const target = explicitCwd ? null : sandboxVerifyTarget(db, task, checks);
+        const cwd = explicitCwd ?? target?.cwd ?? task.worktree ?? process.env.RELAY_VERIFY_CWD ?? process.cwd();
         const { task: after, outcome, checks: executed, stale } = await runMechanicalVerification(db, id, {
           checks,
-          runner: defaultRunner,
+          runner: target?.runner ?? defaultRunner,
           cwd,
-          headSha: flag(rest, "--head") ?? undefined,
+          headProbe: target?.headProbe,
+          headSha: flag(rest, "--head") ?? target?.headSha ?? undefined,
         });
         for (const c of executed) {
-          console.log(`check ${c.name}: ${c.outcome}${c.exitCode === null ? "" : ` (exit ${c.exitCode})`}`);
+          const where = c.sandbox ? ` [sandbox:${c.sandbox}]` : "";
+          console.log(`check ${c.name}: ${c.outcome}${where}${c.exitCode === null ? "" : ` (exit ${c.exitCode})`}`);
         }
         console.log(`${after.id} verify=${outcome}${stale ? " stale-discarded" : ""} -> phase=${after.phase} state=${after.state}`);
         break;
@@ -1749,11 +1756,12 @@ async function main(): Promise<void> {
           const id = positionals(rest)[0];
           if (!id) {
             throw new Error(
-              "usage: relay run factory <task-id> [--max-attempts N] [--dsh BIN] [--reviewer CMD] [--model M] [--timeout 30m] [--json]"
+              "usage: relay run factory <task-id> [--max-attempts N] [--dsh BIN] [--reviewer CMD] [--model M] [--timeout 30m] [--review-worktrees DIR] [--json]"
             );
           }
           const timeoutRaw = flag(rest, "--timeout");
           const maxRaw = flag(rest, "--max-attempts");
+          const repoRoot = flag(rest, "--repo") ?? projectRoot();
           const result = await runFactoryTask(db, id, {
             repo: flag(rest, "--repo") ?? undefined,
             dshBin: flag(rest, "--dsh") ?? process.env.RELAY_DSH_BIN ?? undefined,
@@ -1762,6 +1770,9 @@ async function main(): Promise<void> {
             timeoutMs: timeoutRaw ? parseDuration(timeoutRaw) : undefined,
             permissionMode: flag(rest, "--permission") ?? undefined,
             maxAttempts: maxRaw ? Number(maxRaw) : undefined,
+            // ISH-829: the independent reviewer reads a detached read-only
+            // worktree at the fixed head, outside the writer's checkout.
+            reviewWorktreeRoot: flag(rest, "--review-worktrees") ?? join(repoRoot, STATE_DIR, "review-worktrees"),
           });
           if (hasFlag(rest, "--json")) {
             console.log(JSON.stringify(result, null, 2));
