@@ -100,13 +100,20 @@ never advance a Task.
 
 The local `sbx exec` client exiting is **not** the same as the in-VM dsh ending.
 On **every** non-`exited` outcome — a cancel, a timeout, a non-zero client exit,
-or a transport drop — Relay probes the sandbox
-(`pgrep -f 'dsh --profile headless'`), stops any surviving in-VM dsh, and records
-`orphaned: …`. If the in-VM process still will not die, the Run is deliberately
-left **non-terminal** so the per-sandbox single-writer guard continues to block a
-second writer; `relay run sandbox sweep --apply` resolves such a row after a
-restart. A terminal `error` event contradicting exit 0 is `failed`. No path
-fabricates a success.
+or a transport drop — Relay probes the sandbox and stops any surviving in-VM dsh,
+recording `orphaned: …`. The probe is **three-state** (`alive` / `gone` /
+`unknown`): a probe `sbx exec` that fails, or output with neither marker, is
+`unknown` and is treated like `alive`. The process pattern is written
+**self-excluding** (`[d]sh --profile headless`) so `pgrep`/`pkill` never match the
+`bash -lc …` line that runs them (on Linux they otherwise always report ALIVE).
+
+If the in-VM process is still not confirmed `gone` after the stop, the Run is
+deliberately left **non-terminal** so the per-sandbox single-writer guard
+continues to block a second writer. `relay run sandbox sweep --apply` resolves
+such a row after a restart: it re-probes after `pkill` and only marks the Run
+terminal when the dsh is confirmed `gone`; otherwise it leaves it non-terminal and
+reports `stopped:false`. A terminal `error` event contradicting exit 0 is
+`failed`. No path fabricates a success.
 
 ## The host `process.env` is not inherited
 

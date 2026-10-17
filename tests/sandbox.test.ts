@@ -13,12 +13,14 @@ import { childEnv } from "../src/child-env";
 import {
   acceptSandboxSubmission,
   applySandboxCleanup,
+  DSH_PROC_PATTERN,
   ensureTaskSandbox,
   fetchSandboxHead,
   findActiveSandboxWriter,
   launchTaskSandboxRun,
   planSandboxCleanup,
   sandboxDshAlive,
+  sandboxDshState,
   sandboxSubmitterError,
   sweepOrphanedSandboxRuns,
 } from "../src/sandbox-lifecycle";
@@ -37,7 +39,6 @@ import {
   type SbxCli,
   type SbxResult,
 } from "../src/sandbox";
-
 // ISH-828: Task-scoped Coding Sandbox lifecycle. A REAL temp git repo + a FAKE
 // `sbx` CLI and a FAKE `sbx exec` process keep the whole lifecycle deterministic
 // (no Docker, no sandbox, no network). The produced commit is simulated with a
@@ -108,6 +109,8 @@ class FakeSbx implements SbxCli {
   currentBranch: string | null = "main";
   /** When true, `pkill` does NOT stop the in-VM dsh (a stubborn orphan). */
   stubbornDsh = false;
+  /** When true, the pgrep/pkill probe exec itself fails (transport down). */
+  failProbe = false;
   failCreate = false;
   failLs = false;
   failDshVersion = false;
@@ -131,6 +134,9 @@ class FakeSbx implements SbxCli {
     }
     if (args[0] === "exec") {
       const joined = args.join(" ");
+      if (this.failProbe && (joined.includes("pgrep") || joined.includes("pkill"))) {
+        return { ok: false, code: 1, out: "", err: "probe boom" };
+      }
       // The in-VM dsh is stopped by pkill (unless it is stubborn).
       if (joined.includes("pkill")) {
         if (!this.stubbornDsh) this.dshAlive = false;
@@ -810,6 +816,80 @@ describe("round-2 findings", () => {
     expect(run.state).toBe("running");
     expect(run.error ?? "").toContain("non-terminal");
     expect(findActiveSandboxWriter(db, { sandboxName: l.sandbox.name })?.id).toBe(run.id);
+  });
+});
+
+describe("round-3 findings (in-VM liveness probe)", () => {
+  test("finding 1: the probe/pkill pattern does not match its own command line", () => {
+    const re = new RegExp(DSH_PROC_PATTERN);
+    // It matches a real dsh process line...
+    expect(re.test("dsh --profile headless")).toBe(true);
+    // ...but NOT the shell that runs the probe/pkill (the classic [d] trick).
+    expect(re.test(`pgrep -f '${DSH_PROC_PATTERN}' >/dev/null && echo ALIVE || echo GONE`)).toBe(false);
+    expect(re.test(`pkill -f '${DSH_PROC_PATTERN}' || true`)).toBe(false);
+  });
+
+  test("finding 2: a failed probe is 'unknown' and treated as alive (Run left non-terminal)", async () => {
+    const id = newTask();
+    const sbx = new FakeSbx();
+    sbx.dshAlive = true;
+    sbx.failProbe = true; // the transport that killed the client also fails the probe
+    const spawner = new FakeSpawner();
+    spawner.onSpawn = (p) => {
+      dshStream(p);
+      p.finish(1);
+    };
+    const l = await launchTaskSandboxRun(db, id, { source: repo, cli: sbx, spawner, outputRoot: outputRoot(), fastExitMs: 0 });
+    const run = await l.handle.wait();
+    expect(sandboxDshState(sbx, l.sandbox.name)).toBe("unknown");
+    expect(run.state).toBe("running");
+    expect(run.error ?? "").toMatch(/unknown|non-terminal/);
+    expect(findActiveSandboxWriter(db, { sandboxName: l.sandbox.name })?.id).toBe(run.id);
+  });
+
+  test("finding 3: the sweep re-probes and keeps a stubborn orphan non-terminal", async () => {
+    const id = newTask();
+    const sbx = new FakeSbx();
+    sbx.dshAlive = true;
+    sbx.stubbornDsh = true;
+    const spawner = new FakeSpawner();
+    spawner.onSpawn = (p) => {
+      dshStream(p);
+      p.finish(1);
+    };
+    const l = await launchTaskSandboxRun(db, id, { source: repo, cli: sbx, spawner, outputRoot: outputRoot(), fastExitMs: 0 });
+    await l.handle.wait();
+    // The host client is gone after the launch path returned.
+    db.query(`UPDATE runs SET pid = NULL, spawn_lstart = NULL WHERE id = ?`).run(l.handle.id);
+
+    const res = sweepOrphanedSandboxRuns(db, { apply: true, cli: sbx });
+    const o = res.orphaned.find((x) => x.runId === l.handle.id)!;
+    expect(o.inVmAlive).toBe(true);
+    expect(o.stopped).toBe(false);
+    expect(o.resolved).toBe(false);
+    const run = getRun(db, l.handle.id)!;
+    expect(run.state).toBe("running"); // NOT marked terminal
+    expect(run.error ?? "").toContain("non-terminal");
+    expect(findActiveSandboxWriter(db, { sandboxName: l.sandbox.name })?.id).toBe(run.id);
+  });
+
+  test("finding 3: the sweep confirms 'gone' after pkill and marks the Run terminal", async () => {
+    const id = newTask();
+    const sbx = new FakeSbx();
+    sbx.dshAlive = true; // non-stubborn: pkill will stop it
+    const spawner = new FakeSpawner();
+    spawner.onSpawn = (p) => dshStream(p); // never finishes -> row stays running
+    const l = await launchTaskSandboxRun(db, id, { source: repo, cli: sbx, spawner, outputRoot: outputRoot() });
+    db.query(`UPDATE runs SET pid = NULL, spawn_lstart = NULL WHERE id = ?`).run(l.handle.id);
+
+    const res = sweepOrphanedSandboxRuns(db, { apply: true, cli: sbx });
+    const o = res.orphaned.find((x) => x.runId === l.handle.id)!;
+    expect(o.stopped).toBe(true);
+    expect(o.resolved).toBe(true);
+    const run = getRun(db, l.handle.id)!;
+    expect(run.state).toBe("failed");
+    expect(run.error ?? "").toContain("orphaned");
+    expect(findActiveSandboxWriter(db, { sandboxName: l.sandbox.name })).toBeNull();
   });
 });
 

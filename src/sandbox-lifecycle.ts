@@ -77,6 +77,15 @@ import {
 
 const ORPHANED = "orphaned";
 
+/**
+ * The pattern that identifies the in-VM dsh process, written SELF-EXCLUDING: the
+ * bracket makes the regex NOT match the literal `[d]sh …` text inside the probe
+ * (or pkill) command's own argv. Without it, on Linux `pgrep -f 'dsh --profile
+ * headless'` matches the `bash -lc …` line that is running the probe itself and
+ * always reports ALIVE (round-3 finding 1).
+ */
+export const DSH_PROC_PATTERN = "[d]sh --profile headless";
+
 async function pumpLines(stream: ReadableStream<Uint8Array>, onLine: (line: string) => void): Promise<void> {
   const reader = stream.getReader();
   const dec = new TextDecoder();
@@ -482,10 +491,29 @@ function patchRun(db: Database, id: string, patch: RunPatchFull): Run {
   return getRun(db, id)!;
 }
 
-/** Probe whether the in-VM dsh process for this sandbox is still alive. */
+/** Liveness of the in-VM dsh: a probe failure is `unknown`, never `gone`. */
+export type DshLiveness = "alive" | "gone" | "unknown";
+
+/**
+ * Three-state liveness of the in-VM dsh. `unknown` covers a probe transport
+ * failure (`sbx exec` returned non-zero) OR output with neither marker. Callers
+ * MUST treat `unknown` as `alive` (fail closed): a probe failure must never admit
+ * a second writer into the same clone (round-3 finding 2).
+ */
+export function sandboxDshState(cli: SbxCli, name: string): DshLiveness {
+  const r = cli.run(
+    sbxExecArgv(name, bashLc(`pgrep -f '${DSH_PROC_PATTERN}' >/dev/null && echo ALIVE || echo GONE`))
+  );
+  if (!r.ok) return "unknown";
+  const out = r.out ?? "";
+  if (out.includes("ALIVE")) return "alive";
+  if (out.includes("GONE")) return "gone";
+  return "unknown";
+}
+
+/** Back-compat boolean: only a confirmed `gone` is false (see `sandboxDshState`). */
 export function sandboxDshAlive(cli: SbxCli, name: string): boolean {
-  const r = cli.run(sbxExecArgv(name, bashLc(`pgrep -f 'dsh --profile headless' >/dev/null && echo ALIVE || echo GONE`)));
-  return r.ok && r.out.includes("ALIVE");
+  return sandboxDshState(cli, name) !== "gone";
 }
 
 /**
@@ -654,8 +682,9 @@ export async function launchTaskSandboxRun(
 
   const stopInVmDsh = (): void => {
     // Killing the local client does NOT stop the in-VM dsh; signal it explicitly.
+    // The self-excluding pattern keeps pkill from signalling the shell running it.
     try {
-      cli.run(sbxExecArgv(binding.name, bashLc(`pkill -f 'dsh --profile headless' || true`)));
+      cli.run(sbxExecArgv(binding.name, bashLc(`pkill -f '${DSH_PROC_PATTERN}' || true`)));
     } catch {
       /* best effort */
     }
@@ -700,29 +729,34 @@ export async function launchTaskSandboxRun(
       }
     }
 
-    // Finding 2: probe the in-VM dsh on EVERY non-`exited` outcome (a non-zero
-    // client exit, a transport drop, a cancel or a timeout), not only
-    // cancel/timeout. A dead client with a live in-VM dsh is an orphan; stop it,
-    // and if it will not die leave the row NON-TERMINAL so the single-writer guard
-    // blocks a second writer into the same clone.
+    // Finding 2 (round 3): probe the in-VM dsh on EVERY non-`exited` outcome (a
+    // non-zero client exit, a transport drop, a cancel or a timeout), not only
+    // cancel/timeout. The probe is THREE-state; a failed probe is `unknown` and
+    // is treated like `alive`. A dead client with a live/unknown in-VM dsh is an
+    // orphan; stop it, and if it is still not confirmed gone leave the row
+    // NON-TERMINAL so the single-writer guard blocks a second writer.
     let orphanNote: string | null = null;
     if (state !== "exited") {
-      const firstAlive = sandboxDshAlive(cli, binding.name);
-      let alive = firstAlive;
-      if (alive) {
+      const first = sandboxDshState(cli, binding.name);
+      let current = first;
+      if (current !== "gone") {
         stopInVmDsh();
-        alive = sandboxDshAlive(cli, binding.name);
+        current = sandboxDshState(cli, binding.name);
       }
-      if (alive) {
-        const stuckError = `${ORPHANED}: in-VM dsh survived ${reason ?? `exit ${exitCode}`} and could not be stopped; Run left non-terminal to block a second writer`;
-        events({ t: "run.orphaned", reason, leftRunning: true });
+      if (current !== "gone") {
+        const stuckError = `${ORPHANED}: in-VM dsh ${
+          current === "unknown" ? "liveness is unknown (probe failed)" : "survived"
+        } after ${reason ?? `exit ${exitCode}`}; Run left non-terminal to block a second writer`;
+        events({ t: "run.orphaned", reason, leftRunning: true, liveness: current });
         const stuck = patchRun(db, runId, { state: "running", signal: reason, error: stuckError, session_id: sessionId });
-        logSandbox(db, taskId, "sandbox.run.orphaned", { runId, sandbox: binding.name, exitCode, reason, leftRunning: true });
+        logSandbox(db, taskId, "sandbox.run.orphaned", { runId, sandbox: binding.name, exitCode, reason, leftRunning: true, liveness: current });
         return stuck;
       }
-      if (firstAlive) {
-        orphanNote = `in-VM dsh survived ${reason ?? `exit ${exitCode}`} and was stopped`;
-        events({ t: "run.orphaned", reason, stopped: true });
+      if (first !== "gone") {
+        orphanNote = `in-VM dsh ${
+          first === "unknown" ? "liveness was unknown (probe failed)" : "survived"
+        } and is now stopped`;
+        events({ t: "run.orphaned", reason, stopped: true, firstLiveness: first });
       }
     }
 
@@ -857,7 +891,16 @@ export interface OrphanSweepOptions {
 
 export interface OrphanSweepResult {
   inspected: number;
-  orphaned: { runId: string; taskId: string; sandbox: string; inVmAlive: boolean; stopped: boolean; applied: boolean }[];
+  orphaned: {
+    runId: string;
+    taskId: string;
+    sandbox: string;
+    inVmAlive: boolean;
+    stopped: boolean;
+    /** True when the in-VM dsh is confirmed gone (the Run was marked terminal). */
+    resolved: boolean;
+    applied: boolean;
+  }[];
 }
 
 /**
@@ -866,6 +909,10 @@ export interface OrphanSweepResult {
  * (non-terminal, sandbox-backed, host client dead), stops the in-VM dsh when it
  * survived, and marks the Run `failed` with an `orphaned` error — never a
  * success. Dry-run by default; `apply: true` performs the transition.
+ *
+ * Round-3 finding 3: after `pkill` the sweep RE-PROBES. The Run is marked
+ * terminal only when the dsh is confirmed `gone`; a still-alive (or `unknown`)
+ * dsh leaves the row non-terminal and reports `stopped:false`.
  */
 export function sweepOrphanedSandboxRuns(db: Database, opts: OrphanSweepOptions = {}): OrphanSweepResult {
   const cli = opts.cli ?? realSbxCli;
@@ -877,21 +924,48 @@ export function sweepOrphanedSandboxRuns(db: Database, opts: OrphanSweepOptions 
   for (const run of rows) {
     if (hostSandboxClientAlive(run)) continue;
     const sandbox = run.sandbox_name!;
-    const inVmAlive = sandboxDshAlive(cli, sandbox);
+    const before = sandboxDshState(cli, sandbox);
     let stopped = false;
+    let resolved = before === "gone";
     if (apply) {
-      if (inVmAlive) {
-        cli.run(sbxExecArgv(sandbox, bashLc(`pkill -f 'dsh --profile headless' || true`)));
-        stopped = true;
+      if (!resolved) {
+        cli.run(sbxExecArgv(sandbox, bashLc(`pkill -f '${DSH_PROC_PATTERN}' || true`)));
+        const after = sandboxDshState(cli, sandbox);
+        if (after === "gone") {
+          resolved = true;
+          stopped = true;
+        }
       }
-      patchRun(db, run.id, {
-        state: "failed",
-        error: `orphaned: no live sbx exec client${inVmAlive ? " (in-VM dsh stopped)" : ""}`,
-        ended_at: now(),
+      if (resolved) {
+        patchRun(db, run.id, {
+          state: "failed",
+          error: `orphaned: no live sbx exec client${stopped ? " (in-VM dsh stopped)" : ""}`,
+          ended_at: now(),
+        });
+      } else {
+        // The in-VM dsh is still alive (or its liveness is unknown): keep the row
+        // non-terminal so the single-writer guard still blocks a second writer.
+        patchRun(db, run.id, {
+          error: `orphaned: in-VM dsh still ${before === "unknown" ? "unknown" : "alive"} after pkill; Run left non-terminal`,
+        });
+      }
+      logSandbox(db, run.task_id, "sandbox.run.orphaned", {
+        runId: run.id,
+        sandbox,
+        livenessBefore: before,
+        stopped,
+        resolved,
       });
-      logSandbox(db, run.task_id, "sandbox.run.orphaned", { runId: run.id, sandbox, inVmAlive, stopped });
     }
-    result.orphaned.push({ runId: run.id, taskId: run.task_id, sandbox, inVmAlive, stopped, applied: apply });
+    result.orphaned.push({
+      runId: run.id,
+      taskId: run.task_id,
+      sandbox,
+      inVmAlive: before !== "gone",
+      stopped,
+      resolved,
+      applied: apply,
+    });
   }
   return result;
 }

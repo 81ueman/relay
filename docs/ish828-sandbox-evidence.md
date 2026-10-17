@@ -122,6 +122,21 @@ not a Relay defect; the round-2 run above supplies the configured-provider path.
 8. **Host env boundary** — `src/child-env.ts` allowlist is used by both spawns
    (`dsh-runner`, `sbx exec`). Tests: `SECRET_X` never reaches either child.
 
+## Round-3 review findings — where each is proven
+
+1. **Self-matching probe** — the probe/pkill pattern is `[d]sh --profile headless`
+   (`DSH_PROC_PATTERN`), so `pgrep`/`pkill` do not match the `bash -lc …` line that
+   runs them. Test: the regex matches `dsh --profile headless` but not the probe or
+   pkill command line.
+2. **Three-state probe** — `sandboxDshState` returns `alive` / `gone` / `unknown`
+   (a failed probe `sbx exec`, or neither marker, is `unknown`). `unknown` is
+   treated like `alive`: the Run is left non-terminal. Test: a failed probe leaves
+   the Run `running` and the single-writer guard holding.
+3. **Sweep re-probes** — `sweepOrphanedSandboxRuns` re-probes after `pkill` and
+   marks the Run terminal only on a confirmed `gone`; a stubborn dsh leaves the
+   row non-terminal with `stopped:false, resolved:false`. Tests cover both the
+   stubborn and the resolved cases.
+
 ## Reproduce
 
 ```sh
