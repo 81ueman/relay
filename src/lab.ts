@@ -298,11 +298,12 @@ export async function deployTaskLab(labctl: Labctl, task: LabTask, opts: DeployL
   if (!r.ok) {
     const detail = redactSecrets((r.err || r.out || "").trim()).slice(0, 400);
     // A Task's lab name is DETERMINISTIC (`netlab-<owner>`), so on the codes that
-    // may have CREATED a lab — partial create (8), a client timeout (7 /
-    // `timedOut`), or "lab already exists" (6) — report that expected name so the
-    // caller can destroy it: a partial/timed-out deploy must never leak a lab.
+    // may have CREATED a lab — partial create (8), a LABCTL EXIT_TIMEOUT (7: the
+    // server may still be deploying), a client-side/Bun timeout (`timedOut`), or
+    // "lab already exists" (6) — report that expected name so the caller can
+    // destroy it: a partial/timed-out deploy must never leak a lab.
     // auth/API/usage/bundle errors create nothing, so `lab:null`.
-    const mayExist = r.code === 8 || r.code === 6 || r.timedOut === true;
+    const mayExist = r.code === 8 || r.code === 7 || r.code === 6 || r.timedOut === true;
     const expected = mayExist ? labNameForTask(task) : null;
     const tag = r.code === 8 ? LAB_NOT_RUNNING : r.code === 6 ? LAB_EXISTS : LAB_ERROR;
     return {

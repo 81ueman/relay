@@ -131,7 +131,8 @@ recorded `evidence_ref` never dangles after teardown.
 | check made the tree dirty | `inconclusive` (a fail still `fail`) | same |
 | missing recorded head | blocks (`runMechanicalVerification`) | `tests/verify.test.ts` |
 | sandbox row `failed`/`removed`/no workspace | fail-closed `not_run` (no host fallback) | `tests/sandbox-verify.test.ts` |
-| `labctl deploy` partial create (`exit 8`) / timeout / non-JSON | `ok:false`, deterministic lab name reported | `tests/lab.test.ts` |
+| `labctl deploy` may-have-created-lab (`exit 8/7/6`, or a client timeout) | `ok:false`, deterministic lab name reported | `tests/lab.test.ts` |
+| `labctl deploy` creates nothing (auth/API/bundle/usage) or non-JSON output | `ok:false`, `lab:null` | same |
 | deploy lands under a FOREIGN lab | refused + destroyed | same |
 | `inspect` foreign lab (before/after) | refused; `labctl` never invoked | same |
 | `inspect` node not running / no endpoint | `ok:false` | same |
@@ -156,7 +157,7 @@ starts clean), a **real** clone-mode sandbox, and drives the ISH-829 boundary:
 ```
 ISH-829 real sandbox smoke — repo …/relay-ish829-real-…/repo
   head 1f15949e406be4ebee755ee8d2d890bb360e1de5
-  smoke lab: relay-ish-829-ac80ed29
+  smoke lab: netlab-ish829-smoke-1700000000000
   ok 1. created clone-mode sandbox relay-ish829-real-… (agent shell)
   ok 2. clone HEAD matches the host HEAD (1f15949e406b)
   ok 3. clone starts CLEAN (the topology + labctl are committed)

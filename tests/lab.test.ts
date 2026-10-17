@@ -150,6 +150,14 @@ describe("deployTaskLab", () => {
     expect(r.lab).toBe(OWN);
   });
 
+  test("labctl EXIT_TIMEOUT (7) reports the deterministic lab name (a lab may appear after the client gave up)", async () => {
+    const lc = new FakeLabctl({ ok: false, code: 7, out: "", err: "labctl: request timed out after 30s: …" });
+    const r = await deployTaskLab(lc, task, { topology: "t.clab.yml", api: "https://lab:8090" });
+    expect(r.ok).toBe(false);
+    expect(r.code).toBe(7);
+    expect(r.lab).toBe(OWN); // never a leak: the caller destroys this name
+  });
+
   test("an EXISTING lab (exit 6) reports the name so it can be reclaimed", async () => {
     const lc = new FakeLabctl({ ok: false, code: 6, out: "", err: "lab already exists" });
     const r = await deployTaskLab(lc, task, { topology: "t.clab.yml", api: "https://lab:8090" });
