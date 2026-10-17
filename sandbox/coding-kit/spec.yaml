@@ -1,0 +1,107 @@
+schemaVersion: "2"
+kind: sandbox
+name: ishiul-coding
+displayName: Ishiul coding sandbox
+description: >-
+  Reproducible lightweight ARM64 coding sandbox for Ishiul work: dsh
+  0.2.0-rc.2 headless, the Rust/Cargo toolchain, Python with PyYAML, and uv.
+  It carries no NOS image and no inner containerlab: lab work happens on the
+  persistent Shared Lab (see labs/labctl). Git is used over the forwarded SSH
+  agent.
+version: 0.1.0
+sourceURL: https://github.com/81ueman/ishiul
+licenses:
+  - Apache-2.0
+
+# Fork the built-in `shell` agent so clone-mode wiring and the sandbox's own
+# Docker Engine come from the Docker-provided template. `extends` inherits the
+# full agent configuration; only the fields below change.
+extends: shell
+
+sandbox:
+  # Measured from a real sandbox run; see research/design/ish827-coding-kit-evidence.md.
+  # 745 MiB peak RSS on a mid-size crate's `cargo test`; 4 GiB is ~5x headroom.
+  resources:
+    cpu: 4
+    memory: 4g
+
+permissions:
+  network:
+    allow:
+      # dsh (DeepSeek harness) and npm
+      - registry.npmjs.org
+      - "*.npmjs.org"
+      # Rust toolchain and crates
+      - sh.rustup.rs
+      - static.rust-lang.org
+      - "*.rust-lang.org"
+      - crates.io
+      - index.crates.io
+      - static.crates.io
+      # Python and uv
+      - pypi.org
+      - files.pythonhosted.org
+      - astral.sh
+      # Git over SSH (GitHub redirects 22 -> 443; see files/home/.ssh/config)
+      - github.com
+      - api.github.com
+      - "*.github.com"
+      - "*.githubusercontent.com"
+      - ssh.github.com
+      # Model providers
+      - api.deepseek.com
+      - ollama.com
+      # apt (Ubuntu archive)
+      - archive.ubuntu.com
+      - security.ubuntu.com
+      - ports.ubuntu.com
+      - "*.ubuntu.com"
+      # Shared Lab, published on the host loopback by `sbx ports` (ISH-824).
+      # Only *fixed* host ports are allowed — never a bare `host.docker.internal`
+      # / `localhost`, which would authorize every TCP port on the host (incl. a
+      # TCP docker API / sshd). Both aliases are pinned because the egress proxy
+      # authorizes the published host binding as `localhost:<port>` while a
+      # client dials `host.docker.internal:<port>`. Extra node-management ports
+      # are added per deployment:
+      #   sbx policy allow network --sandbox <name> host.docker.internal:<port>
+      - host.docker.internal:49170   # clab-api-server HTTPS (host 49170 -> 8090)
+      - localhost:49170
+      - host.docker.internal:18002   # SR Linux gNMI TLS (1:1)
+      - localhost:18002
+
+setup:
+  install:
+    - description: "dsh 0.2.0-rc.2 (DeepSeek harness) pinned via npm"
+      command: "npm i -g @deepseek-ai/dsh@0.2.0-rc.2"
+      user: "0"
+    - description: "Build prerequisites: linker, pkg-config, protoc, Python + PyYAML"
+      command: >-
+        apt-get update &&
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends
+        build-essential pkg-config protobuf-compiler python3 python3-yaml
+        ca-certificates curl
+      user: "0"
+    - description: "Rust toolchain (rustup, minimal stable) as the agent user"
+      command: "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable"
+      user: "1000"
+    - description: "uv (Python tool/library runner) as the agent user"
+      command: "curl -LsSf https://astral.sh/uv/install.sh | sh"
+      user: "1000"
+    - description: "Persist the agent tool PATH for interactive and non-interactive bash"
+      command: >-
+        grep -q '.cargo/bin' /etc/sandbox-persistent.sh 2>/dev/null ||
+        printf '%s\n' 'export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$PATH"'
+        >> /etc/sandbox-persistent.sh
+      user: "0"
+  startup:
+    # Idempotent: labctl.py is one file and lives in the checked-out workspace,
+    # so the kit never keeps a second copy of it (single source of truth).
+    - description: "Install labctl from the workspace checkout"
+      command:
+        - "sh"
+        - "-c"
+        - >-
+          if [ -f "$WORKSPACE_DIR/labs/labctl/labctl.py" ]; then
+          sudo install -m 0755 "$WORKSPACE_DIR/labs/labctl/labctl.py" /usr/local/bin/labctl;
+          fi
+      user: "1000"
