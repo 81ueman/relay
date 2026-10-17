@@ -66,11 +66,19 @@ carries **one** 0.2.x code path (ISH-869).
   attribution). It does **not** pass `--session-id`: a FIX is a fresh Run.
 - **Credential precedence (dsh 0.2.1-rc.1 →):** headless reads the API key from
   the **environment / `.env`** and does **not** read a saved credential by
-  default (Web/Desktop keep the saved-credential path). Relay already injects a
-  provider key explicitly — the host runner via the `env` option, the sandbox via
-  `sbx exec -e` / the operator's `sbx secret set-custom` proxy — and never shares
-  the host `~/.dsh/.credentials.yaml` (see `src/child-env.ts`). With no key the
-  real `dsh --profile headless --json` emits `status turn_end reason=error`
+  default (Web/Desktop keep the saved-credential path). On the
+  `deepseek-official` route the key comes only from `DEEPSEEK_API_KEY` in the
+  launching environment. **Relay forwards only its allowlisted child env
+  (`src/child-env.ts`) and does NOT inject a DeepSeek provider key.** No CLI path
+  sets one: `relay run start` / `relay run launch` / `relay run factory` and
+  `tests/dsh-smoke.test.ts` pass no provider key `env`/`dshEnv` to `startDshRun`,
+  and `DEEPSEEK_API_KEY` is deliberately **not** on the allowlist. The operator
+  authenticates dsh through their **own provider configuration** (a dsh profile /
+  provider route, an injected `.env`, or a sandbox credential proxy); Relay never
+  shares the host `~/.dsh/.credentials.yaml`. A `deepseek-official` **host CLI**
+  Run on the pin therefore cannot authenticate until provider-key forwarding
+  lands under ISH-869 (deferred). With no key the real
+  `dsh --profile headless --json` emits `status turn_end reason=error`
   (`MISSING_CREDENTIAL`) **and exits non-zero**, so the Run is recorded `failed`
   (never a silent `exited`).
 
@@ -208,10 +216,12 @@ Session lives under `$DSH_HOME`). An unknown id is an error. Relay never passes
   (`startDshRun`) and the in-sandbox runner enforce the pin fail-closed: `dshBin
   --version` must be exactly `0.2.1-rc.2` or the Run is refused with
   `DSH_VERSION_MISMATCH` before any Run row or process. The authenticated
-  `deepseek-flash` smoke (`RELAY_DSH_SMOKE=1 …`) is **opt-in** and needs a real
-  `DEEPSEEK_API_KEY` in the launching environment; with no key the real process
-  exits **non-zero** (`MISSING_CREDENTIAL`) and the Run is recorded `failed` —
-  never a silent `exited`. See
+  `deepseek-flash` smoke (`RELAY_DSH_SMOKE=1 …`) is **opt-in**; Relay does not
+  forward a provider key to the host Run, so it needs the operator's **own dsh
+  provider configuration** (provider-key forwarding to the host Run is deferred
+  under ISH-869). With no key the real process exits **non-zero**
+  (`MISSING_CREDENTIAL`) and the Run is recorded `failed` — never a silent
+  `exited`. See
   [`ish869-dsh-0.2.1-rc.2.md`](ish869-dsh-0.2.1-rc.2.md) for what was and was not
   run.
 - NOT verified here: anything beyond **one** Run's launch/observe/terminate. Task

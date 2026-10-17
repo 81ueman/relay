@@ -103,10 +103,14 @@ Environment: Apple Silicon (`darwin/arm64`), `sbx v0.48.0`.
 
    This is the dsh 0.2.1-rc.1 headless credential-precedence change: headless
    reads `DEEPSEEK_API_KEY` from the **environment / `.env`**, not a saved
-   credential. Relay already injects a provider key explicitly (host runner
-   `env` option; sandbox `sbx exec -e` / the operator's `sbx secret set-custom`
-   proxy) and never shares the host `~/.dsh/.credentials.yaml`. Model route:
-   `deepseek-official` → `deepseek-flash` (V4.1-Flash).
+   credential. **Relay forwards only its allowlisted child env
+   (`src/child-env.ts`) and does NOT inject a DeepSeek provider key** — the host
+   CLI paths (`relay run start`/`launch`/`factory`) and `tests/dsh-smoke.test.ts`
+   pass no provider key `env`/`dshEnv`, and `DEEPSEEK_API_KEY` is not allowlisted.
+   The operator authenticates dsh through their **own provider configuration**
+   (their dsh profile / provider route, an injected `.env`, or a sandbox
+   credential proxy); Relay never shares the host `~/.dsh/.credentials.yaml`.
+   Model route: `deepseek-official` → `deepseek-flash` (V4.1-Flash).
 
 6. **The host Coding Worker guard (ISH-869 finding 1)** — the shared pin is now
    enforced in front of the host spawn too. Unit tests (no real dsh needed):
@@ -149,11 +153,15 @@ Environment: Apple Silicon (`darwin/arm64`), `sbx v0.48.0`.
     Received: "failed"        # MISSING_CREDENTIAL (see item 5)
   ```
 
-  Unblock by exporting a real key and re-running:
-
+  This is **not unblockable by exporting a key alone**: Relay forwards only its
+  allowlisted child env and does **not** inject `DEEPSEEK_API_KEY` into the host
+  Run (see item 5), so
+  `DEEPSEEK_API_KEY=... RELAY_DSH_SMOKE=1 bun test tests/dsh-smoke.test.ts` would
+  still fail closed. The authenticated `deepseek-flash` smoke needs **provider-key
+  forwarding to the host Run — deferred under ISH-869** — or an operator dsh
+  **provider configuration** that authenticates without an ambient
+  `DEEPSEEK_API_KEY`. The sandbox path uses the operator's credential proxy:
   ```sh
-  DEEPSEEK_API_KEY=... RELAY_DSH_SMOKE=1 bun test tests/dsh-smoke.test.ts
-  # or, inside a sandbox, with an operator credential proxy:
   RELAY_SANDBOX_SMOKE=1 RELAY_SANDBOX_AGENT=ishiul-coding \
     RELAY_SANDBOX_KEY_CMD=/abs/get-key.sh bun run smoke:sandbox:real
   ```
