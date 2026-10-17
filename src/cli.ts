@@ -44,6 +44,7 @@ import {
   sweepOrphanedSandboxRuns,
 } from "./sandbox-lifecycle";
 import { getSandbox as getTaskSandbox, listSandboxes } from "./sandbox";
+import { applyLabCleanup, planLabCleanup, type LabCleanupPlan } from "./lab-cleanup";
 import { providerDepsFromEnv } from "./provider-adapters";
 import { checkMergeGate, formatMergeGateDecision } from "./merge-gate";
 import { runFactoryTask } from "./factory";
@@ -161,6 +162,7 @@ DB: $RELAY_DB, else $RELAY_CONFIG/~/.config/relay/config.json {"db":...}, else t
 Spawn: RELAY_HERDR_WORKSPACE (required to spawn; else $HERDR_WORKSPACE_ID)
 Manual attach: requires a live Herdr agent (use --pane/--tab or $HERDR_PANE_ID/$HERDR_TAB_ID)
 Runtime cleanup: RELAY_RUNTIME_CLEANUP_GRACE_MS RELAY_ATTACH_TIMEOUT_MS RELAY_RESTART_COOLDOWN_MS
+Task Lab cleanup: RELAY_LAB_CLEANUP_CMD RELAY_LAB_CLEANUP_TIMEOUT_MS (trusted hook; owner = task id)
 Restart cap: RELAY_RESTART_CAP (default 3) RELAY_RESTART_CAP_WINDOW_MS (default 1800000)
 Herdr is required. RELAY_RUNTIME=mock is test-only.
 Help: relay <command> [subcommand] --help
@@ -179,7 +181,8 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
     about:
       "ISH-803/ISH-810 one-shot headless dsh Runs: 1 Run = 1 `dsh --profile headless --json` process = 1 coding attempt, in the Task's worktree, with NO Herdr pane/TUI/`dsh web`/wake/attach. Under <control-plane>/runs/<run-id>/: stdout.log (raw dsh JSONL), stderr.log (reasoning/errors), dsh.jsonl (the ORIGINAL dsh session/status/text/tool_call/tool_result/final events, per-Run evidence) and events.jsonl (Relay's own lifecycle log, kept distinct). A process `exit 0` or a terminal `final` does NOT complete anything — only `relay run submit` (a structured submission bound to the Run/Task/phase/attempt/branch/HEAD) advances the Task. `start` waits for the Run to reach a terminal state (there is no detached mode yet). Permissions are the worktree: $DSH_PERMISSION_MODE=workspace-write by default. " +
       "ISH-760 adds the Task lifecycle: `launch` owns ONE branch+worktree per Task, pins the task spec + verification steps + prior findings into the worktree BEFORE launch, and runs ONE disposable dsh Run per phase/attempt (a FIX is the SAME worktree + findings + a NEW Run). A second writer on the same worktree/branch is refused until the previous Run ends; different worktrees/branches may run in parallel. `worktree` creates/selects the worktree; `cleanup` reclaims it only when safe (real merge or --abort, no open PR, no active writer, no uncommitted changes, relay-owned) and retains the run logs. `relay run logs <run-id>` renders the read-only dsh session/status/text/tool_call/tool_result/final chronology from the per-Run dsh.jsonl (no TUI/Web UI needed). " +
-      "ISH-762 adds `relay run factory <task-id>`: the whole factory for ONE Task with no hand-driven pane for the coding — a real headless dsh Run implements, Relay mechanically VERIFYs the recorded HEAD, an INDEPENDENT headless Claude reviewer (`claude -p --output-format json`) returns a structured FIX/PASS (FIX = the SAME worktree + findings + a FRESH Run), and a PASS reaches read-only MergeReady. It never pushes, merges, accepts or writes a provider.",
+      "ISH-762 adds `relay run factory <task-id>`: the whole factory for ONE Task with no hand-driven pane for the coding — a real headless dsh Run implements, Relay mechanically VERIFYs the recorded HEAD, an INDEPENDENT headless Claude reviewer (`claude -p --output-format json`) returns a structured FIX/PASS (FIX = the SAME worktree + findings + a FRESH Run), and a PASS reaches read-only MergeReady. It never pushes, merges, accepts or writes a provider." +
+      " ISH-845: the same task-end `cleanup` (merged or --abort) also reclaims the Task's external Network Lab through the single trusted hook $RELAY_LAB_CLEANUP_CMD, invoked as `<cmd> <task-id>`; with no hook configured it is a no-op. Reaching MergeReady alone never cleans anything.",
     usage: [
       "relay run start <task-id> [--cwd DIR] [--prompt TEXT] [--permission MODE] [--timeout 30m] [--json]",
       "relay run launch <task-id> [--timeout 30m] [--permission MODE] [--json]",
@@ -666,6 +669,18 @@ function resolveText(args: string[], usageLine: string, flagName?: string): stri
     );
   }
   return text;
+}
+
+/**
+ * Render the Task-owned external Network Lab cleanup result that accompanies
+ * `relay run [sandbox] cleanup`. The hook is the single trusted
+ * `RELAY_LAB_CLEANUP_CMD`; with none configured this is a no-op.
+ */
+function printLabCleanup(lab: LabCleanupPlan): void {
+  const where = lab.cmd ? ` via ${lab.cmd}` : "";
+  console.log(`  lab cleanup: ${lab.status} (owner ${lab.ownerId})${where}`);
+  for (const reason of lab.reasons) console.log(`    skip: ${reason}`);
+  if (lab.error) console.log(`    error: ${lab.error}`);
 }
 
 async function main(): Promise<void> {
@@ -1766,15 +1781,22 @@ async function main(): Promise<void> {
         if (sub === "cleanup") {
           // ISH-760 safe cleanup: merged or explicit abort, no open PR, no active
           // writer, no uncommitted changes, relay-owned. Run logs are retained.
+          // ISH-845: the same task-end guard also reclaims the Task's external
+          // Network Lab via the trusted RELAY_LAB_CLEANUP_CMD hook (owner = task id).
           const id = positionals(rest)[0];
           if (!id) throw new Error("usage: relay run cleanup <task-id> [--abort REASON] [--apply] [--force] [--json]");
+          const abort = flag(rest, "--abort") ?? undefined;
+          const apply = hasFlag(rest, "--apply");
           const plan = applyWorkspaceCleanup(db, id, {
-            apply: hasFlag(rest, "--apply"),
+            apply,
             force: hasFlag(rest, "--force"),
-            abort: flag(rest, "--abort") ?? undefined,
+            abort,
           });
+          const lab = apply
+            ? applyLabCleanup(db, id, { apply: true, abort })
+            : planLabCleanup(db, id, { abort });
           if (hasFlag(rest, "--json")) {
-            console.log(JSON.stringify(plan, null, 2));
+            console.log(JSON.stringify({ ...plan, labCleanup: lab }, null, 2));
             break;
           }
           const verdict = plan.apply ? (plan.removed ? "REMOVED" : plan.remove ? "would remove" : "skipped") : "dry-run (pass --apply)";
@@ -1782,6 +1804,7 @@ async function main(): Promise<void> {
           console.log(`  worktree: ${plan.worktree ?? "-"}  branch: ${plan.branch ?? "-"}`);
           console.log(`  retained runs (evidence): ${plan.retainedRuns}`);
           for (const reason of plan.reasons) console.log(`  skip: ${reason}`);
+          printLabCleanup(lab);
           break;
         }
         if (sub === "sandbox") {
@@ -1907,18 +1930,23 @@ async function main(): Promise<void> {
           if (sandboxSub === "cleanup") {
             const id = positionals(srest)[0];
             if (!id) throw new Error("usage: relay run sandbox cleanup <task-id> [--abort REASON] [--apply] [--force] [--json]");
-            const plan = hasFlag(srest, "--apply")
+            const abort = flag(srest, "--abort") ?? undefined;
+            const apply = hasFlag(srest, "--apply");
+            const plan = apply
               ? applySandboxCleanup(db, id, {
                   apply: true,
                   force: hasFlag(srest, "--force"),
-                  abort: flag(srest, "--abort") ?? undefined,
+                  abort,
                 })
               : planSandboxCleanup(db, id, {
                   force: hasFlag(srest, "--force"),
-                  abort: flag(srest, "--abort") ?? undefined,
+                  abort,
                 });
+            // ISH-845: also reclaim the Task's external Network Lab (trusted hook,
+            // owner = task id); dry-run unless --apply.
+            const lab = apply ? applyLabCleanup(db, id, { apply: true, abort }) : planLabCleanup(db, id, { abort });
             if (hasFlag(srest, "--json") || hasFlag(rest, "--json")) {
-              console.log(JSON.stringify(plan, null, 2));
+              console.log(JSON.stringify({ ...plan, labCleanup: lab }, null, 2));
               break;
             }
             const verdict = plan.apply ? (plan.removed ? "REMOVED" : plan.remove ? "would remove" : "skipped") : "dry-run (pass --apply)";
@@ -1926,6 +1954,7 @@ async function main(): Promise<void> {
             console.log(`  sandbox: ${plan.name ?? "-"}  branch: ${plan.branch ?? "-"}  saved head: ${plan.savedHead ?? "-"}`);
             console.log(`  retained runs (evidence): ${plan.retainedRuns}`);
             for (const reason of plan.reasons) console.log(`  skip: ${reason}`);
+            printLabCleanup(lab);
             break;
           }
           throw new Error(

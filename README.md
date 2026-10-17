@@ -444,6 +444,27 @@ directory are saved; run logs are retained. One-command fixture smoke:
 `bun run smoke:sandbox`; the real-sandbox smoke is `bun run smoke:sandbox:real`
 (opt-in). See [`docs/sandbox-lifecycle.md`](docs/sandbox-lifecycle.md).
 
+### Task-owned Network Lab skill + cleanup hook (ISH-845)
+
+A coding Task may deploy an **arbitrary containerlab topology** on the shared
+Network Lab. Relay stays **containerlab-agnostic**: it models no network, no NOS
+and no topology, and adds **no `relay lab` command**. It knows only the Task's
+**owner id** (`labOwnerId` = the Task id, injected into the sandbox as
+`RELAY_LAB_OWNER`) and *when* cleanup is due. The `network-lab` skill
+([`skills/network-lab/SKILL.md`](skills/network-lab/SKILL.md), installed for the
+pinned dsh at the real Sandbox skill path `~/.agents/skills/` by
+`sandbox/coding-kit`) tells the agent to deploy with `labctl` under
+`--namespace "$RELAY_LAB_OWNER"`.
+
+`relay run [sandbox] cleanup <task-id>` reclaims the Task's external Lab through
+**one trusted, pre-configured hook**, `RELAY_LAB_CLEANUP_CMD`, invoked as
+`<cmd> <task-id>` (the only argument). A Task-prompt-derived shell/URL is never
+executed; with no hook configured it is a pure no-op. The hook runs only when
+the Task has **ended** (merged or `--abort`) — reaching `merge_ready` alone
+cleans nothing — and a non-zero exit, a missing hook or a timeout is **recorded**
+and **re-runnable**. Image and Shared-Lab VM management stay out of Relay. See
+[`docs/ish845-network-lab-skill.md`](docs/ish845-network-lab-skill.md).
+
 ### Historical cleanup: `relay gc`
 
 There was no supported purge for old worker/runtime/session/task rows (fleet

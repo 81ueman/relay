@@ -28,6 +28,7 @@ import {
 import { buildRunBrief, inheritFindings, taskBranchName, type RunFinding } from "./run-lifecycle";
 import { spawnIdentityToken } from "./proc-identity";
 import { childEnv } from "./child-env";
+import { labOwnerId } from "./lab-cleanup";
 import {
   DUPLICATE_SANDBOX_WRITER,
   SANDBOX_ERROR,
@@ -613,6 +614,10 @@ export async function launchTaskSandboxRun(
     DSH_PERMISSION_MODE: permissionMode,
     RELAY_RUN_ID: runId,
     RELAY_TASK_ID: taskId,
+    // ISH-845: the Task's external Lab owner id. The `network-lab` skill uses it
+    // as the lab `--namespace`/`name:`, so Relay can later clean up exactly this
+    // Task's labs (and nothing else).
+    RELAY_LAB_OWNER: labOwnerId(taskId),
     ...(opts.env ?? {}),
   };
   const sbxBin = opts.sbxBin ?? process.env.RELAY_SBX_BIN ?? "sbx";
