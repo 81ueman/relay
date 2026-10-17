@@ -38,6 +38,41 @@ export const LAB_CLEANUP_ENV = "RELAY_LAB_CLEANUP_CMD";
 export const LAB_CLEANUP_TIMEOUT_ENV = "RELAY_LAB_CLEANUP_TIMEOUT_MS";
 export const DEFAULT_LAB_CLEANUP_TIMEOUT_MS = 120_000;
 
+/**
+ * The `labctl` variables the trusted hook may receive from Relay's own
+ * environment. `childEnv()` is a small startup allowlist and deliberately does
+ * NOT carry these, so without this list a hook could never authenticate. They
+ * are passed to the **hook only** (as `execFileSync` `env` extras) — never to a
+ * dsh Run, which still gets exactly the explicit `-e` values Relay sets.
+ */
+export const LABCTL_ENV_ALLOWLIST = [
+  "LABCTL_API",
+  "LABCTL_USER",
+  "LABCTL_PASSWORD",
+  "LABCTL_PASSWORD_FILE",
+  "LABCTL_TOKEN",
+  "LABCTL_CA_CERT",
+  "LABCTL_BIN",
+] as const;
+
+/**
+ * The environment Relay gives the trusted hook: the owner id + Task id (for
+ * attribution), plus the narrow {@link LABCTL_ENV_ALLOWLIST} copied from Relay's
+ * environment. No task-prompt-derived value ever enters here.
+ */
+export function labCleanupHookEnv(
+  ownerId: string,
+  taskId: string,
+  sourceEnv: NodeJS.ProcessEnv = process.env
+): Record<string, string> {
+  const env: Record<string, string> = { RELAY_LAB_OWNER: ownerId, RELAY_TASK_ID: taskId };
+  for (const k of LABCTL_ENV_ALLOWLIST) {
+    const v = sourceEnv[k];
+    if (typeof v === "string" && v.length > 0) env[k] = v;
+  }
+  return env;
+}
+
 /** The durable record that Relay handed this Task's owner id to the sandbox. */
 export const LAB_OWNER_ASSIGNED_EVENT = "lab.owner_assigned";
 
@@ -263,7 +298,9 @@ export function applyLabCleanup(d: Database, taskId: string, opts: LabCleanupOpt
   const timeoutMs = opts.timeoutMs ?? envTimeoutMs();
   const result = runner.run([plan.cmd, plan.ownerId], {
     timeoutMs,
-    env: { RELAY_LAB_OWNER: plan.ownerId, RELAY_TASK_ID: taskId },
+    // The hook (only) receives the owner id and a narrow LABCTL_* set from
+    // Relay's environment, so the referenced hook can authenticate.
+    env: labCleanupHookEnv(plan.ownerId, taskId),
   });
 
   plan.exitCode = result.code;

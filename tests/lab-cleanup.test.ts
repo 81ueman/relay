@@ -328,3 +328,48 @@ describe("lab cleanup hook: real hook process", () => {
     expect(plan.status).toBe("timeout");
   });
 });
+
+describe("lab cleanup hook: the committed hook runs through Relay (round 3 finding 1)", () => {
+  test("Relay forwards a narrow LABCTL_* set to scripts/lab-cleanup.sh, which succeeds", () => {
+    const log = join(dir, "labctl-calls.log");
+    const fake = join(dir, "labctl");
+    writeFileSync(
+      fake,
+      `#!/bin/sh
+{
+  echo "argv: $*"
+  echo "creds API=\${LABCTL_API:-} USER=\${LABCTL_USER:-} PW=\${LABCTL_PASSWORD:+set}"
+} >> "${log}"
+case "$1" in inspect) echo '{}' ;; purge) echo '{}' ;; *) echo '{}' ;; esac
+exit 0
+`
+    );
+    chmodSync(fake, 0o755);
+
+    const id = newTask();
+    assignOwner(id);
+    markMerged(id);
+
+    const keys = ["LABCTL_BIN", "LABCTL_API", "LABCTL_USER", "LABCTL_PASSWORD", "HOME"] as const;
+    const saved: Record<string, string | undefined> = {};
+    for (const k of keys) saved[k] = process.env[k];
+    process.env.LABCTL_BIN = fake;
+    process.env.LABCTL_API = "https://lab.invalid";
+    process.env.LABCTL_USER = "agent";
+    process.env.LABCTL_PASSWORD = "s3cret";
+    process.env.HOME = dir; // deterministic: no operator creds file is sourced
+    try {
+      const hookPath = join(import.meta.dir, "..", "scripts", "lab-cleanup.sh");
+      const plan = applyLabCleanup(db, id, { apply: true, cmd: hookPath, runner: realLabCleanupRunner });
+      expect(plan.status).toBe("ok");
+      expect(plan.exitCode).toBe(0);
+      const seen = readFileSync(log, "utf8");
+      expect(seen).toContain("creds API=https://lab.invalid USER=agent PW=set");
+    } finally {
+      for (const k of keys) {
+        if (saved[k] === undefined) delete process.env[k];
+        else process.env[k] = saved[k];
+      }
+    }
+  });
+});

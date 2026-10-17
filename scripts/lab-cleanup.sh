@@ -18,7 +18,10 @@
 #
 # Connection/auth come from the environment (never argv): LABCTL_API,
 # LABCTL_USER + LABCTL_PASSWORD (or LABCTL_PASSWORD_FILE / LABCTL_TOKEN),
-# LABCTL_CA_CERT (else --insecure for the Lab's self-signed PoC cert).
+# LABCTL_CA_CERT (else --insecure for the Lab's self-signed PoC cert). Relay
+# forwards this narrow LABCTL_* set from its own environment to the hook only
+# (src/lab-cleanup.ts). An operator-owned file under $HOME is also honored, so a
+# deployment can keep the Lab secret out of Relay's environment entirely.
 set -eu
 
 OWNER="${1:?usage: lab-cleanup.sh <owner-id>}"
@@ -28,6 +31,19 @@ case "$OWNER" in
     exit 2
     ;;
 esac
+
+# Optional operator-owned credentials file: a fallback for a deployment that
+# keeps the Lab secret OUT of Relay's environment. It is sourced only when no
+# credential is already present, so an explicit environment always wins. $HOME is
+# on Relay's child-env allowlist, so this path is reachable when Relay runs the
+# hook.
+LABCTL_ENV_FILE="${LABCTL_ENV_FILE:-$HOME/.config/relay/labctl.env}"
+if [ -f "$LABCTL_ENV_FILE" ] &&
+   [ -z "${LABCTL_TOKEN:-}" ] && [ -z "${LABCTL_USER:-}" ] &&
+   [ -z "${LABCTL_PASSWORD:-}" ] && [ -z "${LABCTL_PASSWORD_FILE:-}" ]; then
+  # shellcheck disable=SC1090
+  . "$LABCTL_ENV_FILE"
+fi
 
 LABCTL="${LABCTL_BIN:-labctl}"
 TARGET="netlab-$OWNER"
@@ -62,9 +78,17 @@ for lab in $labs; do
 done
 
 # Recover a workspace directory left by a failed/timed-out deploy (no lab exists,
-# so `destroy` cannot reach it). A no-op when there is nothing to purge.
-if "$LABCTL" purge "$TARGET" --namespace "$OWNER" "$@" --json >/dev/null 2>&1; then
+# so `destroy` cannot reach it). Only labctl's EXIT_NOTFOUND (6: no remote dir,
+# or a lab still exists) is "nothing to purge"; any other failure (auth 4, API 5,
+# timeout 7, …) is FATAL — a hidden purge failure must not be reported as a
+# successful cleanup, or the leftover labdir leaks for good.
+purge_rc=0
+"$LABCTL" purge "$TARGET" --namespace "$OWNER" "$@" --json >/dev/null 2>&1 || purge_rc=$?
+if [ "$purge_rc" -eq 0 ]; then
   echo "lab-cleanup: purged leftover workspace $OWNER/$TARGET"
+elif [ "$purge_rc" -ne 6 ]; then
+  echo "lab-cleanup: purge failed (rc=$purge_rc) for $OWNER/$TARGET" >&2
+  exit "$purge_rc"
 fi
 
 echo "lab-cleanup: done owner=$OWNER (destroyed=$destroyed; images untouched)"

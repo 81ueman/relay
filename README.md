@@ -467,8 +467,11 @@ shell/URL is never executed; with no hook configured — or no owner ever assign
 and a non-zero exit, a missing hook or a timeout is **recorded** and
 **re-runnable** (`relay gc` refuses a Task whose Lab cleanup is still pending, so
 its owner id stays addressable). The reference hook selects the lab by exact
-owner name (`netlab-<owner>`), never by suffix. Image and Shared-Lab VM
-management stay out of Relay. See
+owner name (`netlab-<owner>`), never by suffix, and fails closed if its workspace
+purge does not succeed. Relay forwards a narrow, named `LABCTL_*` set
+(`LABCTL_ENV_ALLOWLIST`) to the **hook only** (never to the dsh Run), so the hook
+can authenticate without leaking host secrets into the sandbox. Image and
+Shared-Lab VM management stay out of Relay. See
 [`docs/ish845-network-lab-skill.md`](docs/ish845-network-lab-skill.md).
 
 ### Historical cleanup: `relay gc`

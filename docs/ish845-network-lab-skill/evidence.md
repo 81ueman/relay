@@ -162,7 +162,7 @@ Both `ghcr.io/nokia/srlinux:latest` (SR Linux) and `ceos:4.36.0.1F` (cEOS) remai
 | Done-when | Verdict | Evidence |
 | --- | --- | --- |
 | A real dsh Agent references the skill and completes deploy→inspect→gNMI/SSH observe→destroy on an arbitrary topology | **PASS** | §1 (real `dsh` run, skill loaded, all steps exit 0); §2 (`gnmic` + `sr_cli`) |
-| Relay holds the Task's external Lab owner id and can clean it; a Lab-unused Task does nothing extra | **PASS** | §3; owner id assigned durably (`lab.owner_assigned`) and never reused; `planLabCleanup` skips a Task with no assignment (`tests/lab-cleanup.test.ts`) |
+| Relay holds the Task's external Lab owner id and can clean it; a Lab-unused Task does nothing extra | **PASS** | §3; owner id assigned durably (`lab.owner_assigned`) and never reused; `planLabCleanup` skips a Task with no assignment; the committed hook runs **through Relay** with the forwarded `LABCTL_*` env (§7) |
 | Two Tasks' independent labs: ending one does not destroy the other | **PASS** | §3a (after T1 cleanup only `netlab-T2` remains); §3c (suffix decoy survives); two-task isolation test |
 | Failure injection (interruption/timeout, lab gone, auth error, Task crash) handled with evidence and re-runnable | **PASS** | §3b; `tests/lab-cleanup.test.ts` (auth error, timeout, missing executable) + `tests/gc.test.ts` (gc refuses a pending cleanup, so it stays re-runnable) |
 | One set of SR Linux/cEOS images remains in the Shared Lab after cleanup | **PASS** | §4 |
@@ -191,3 +191,24 @@ Both `ghcr.io/nokia/srlinux:latest` (SR Linux) and `ceos:4.36.0.1F` (cEOS) remai
 **Not verified:** cEOS was present in the cache but no cEOS topology was deployed
 (SR Linux was); many-node / concurrent-lab scale is untested; the provider route
 for the dsh run was Ollama-Cloud (no `DEEPSEEK_API_KEY` on this host).
+
+## 7. Round-3 review fixes
+
+1. **The hook can authenticate when Relay runs it** — `applyLabCleanup` now gives
+   the hook a narrow, explicitly named `LABCTL_*` set copied from Relay's own
+   environment (`labCleanupHookEnv` / `LABCTL_ENV_ALLOWLIST`: `API`, `USER`,
+   `PASSWORD`, `PASSWORD_FILE`, `TOKEN`, `CA_CERT`, `BIN`); the hook may instead
+   load `$HOME/.config/relay/labctl.env`. `tests/lab-cleanup.test.ts` runs the
+   committed `scripts/lab-cleanup.sh` **through `applyLabCleanup` +
+   `realLabCleanupRunner`** against a fake `labctl` and asserts the credentials
+   arrive and the result is `ok`. (The round-1 §3c live run invoked the hook by
+   hand; the through-Relay path is now covered by a test.) The design doc's
+   credential/isolation wording is corrected: the SSH agent socket *is* part of
+   the `childEnv()` startup allowlist for every Relay child; the reference hook
+   reads credentials from the environment (or the operator file), not "its own".
+2. **The workspace purge fails closed** — `scripts/lab-cleanup.sh` treats only
+   labctl's `EXIT_NOTFOUND` (6: no remote dir, or a lab still exists) as a no-op
+   and exits non-zero on any other purge failure (auth 4, API 5, timeout 7, …),
+   so a hidden purge failure can never be recorded as `lab.cleaned` and leak the
+   directory. `tests/lab-cleanup-hook.test.ts` covers purge `5`/`7` (hook exits
+   non-zero) and `6` (no-op).

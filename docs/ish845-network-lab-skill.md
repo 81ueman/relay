@@ -75,10 +75,21 @@ assignment, or one whose lab was cleaned, is gc-eligible as before.
 `applyLabCleanup` runs a **single fixed command**, `RELAY_LAB_CLEANUP_CMD`, as
 `[cmd, ownerId]`. It never uses a shell, never interpolates the Task prompt or
 any Run-derived URL/command, and passes no other argument — the hook cannot be
-pointed at another Task's lab. The child gets the small `childEnv()` allowlist
-plus `RELAY_LAB_OWNER`/`RELAY_TASK_ID`; **host secrets and the SSH agent are
-not** handed over, so the hook owns its own `labctl` credentials (loaded at
-runtime by the operator), matching ISH-845 scope 7.
+pointed at another Task's lab.
+
+The **hook process** gets: the small `childEnv()` startup allowlist (PATH, HOME,
+locale — and the SSH agent socket, as every Relay child does), plus
+`RELAY_LAB_OWNER`/`RELAY_TASK_ID`, plus a narrow, explicitly named `LABCTL_*` set
+(`LABCTL_ENV_ALLOWLIST`: `API`, `USER`, `PASSWORD`, `PASSWORD_FILE`, `TOKEN`,
+`CA_CERT`, `BIN`) copied **from Relay's own environment** in `labCleanupHookEnv`.
+A hook that prefers to keep the secret out of Relay's environment may instead
+load it from the operator-owned file `$HOME/.config/relay/labctl.env` (sourced
+only when the environment defines no credential, so the environment wins).
+
+The **dsh Run inside the sandbox** is a different boundary: it still gets only
+the explicit `-e` values Relay sets, so an unrelated host secret in Relay's
+environment does not reach the VM by default. No task-prompt-derived value is
+ever placed in the hook's argv or environment.
 
 Guards (mirroring the worktree/sandbox cleanup):
 
@@ -102,9 +113,19 @@ or prefix (so cleaning owner `T1` can never destroy another owner's `bgp-T1`, no
 a `netlab-T11`). It then purges the owner's leftover workspace directory
 (`labctl purge netlab-<owner> --namespace <owner>`, recovering a crashed/timed-out
 deploy with no lab), validates the owner id (`[A-Za-z0-9._-]`), and never touches
-images or the Shared Lab VM. `tests/lab-cleanup-hook.test.ts` runs the committed
-hook against a fake `labctl` with `netlab-T1`, `bgp-T1` (another owner) and
-`netlab-T11` and asserts only `netlab-T1` is destroyed.
+images or the Shared Lab VM.
+
+The purge **fails closed**: only labctl's `EXIT_NOTFOUND` (6 — no remote dir, or
+a lab still exists) is "nothing to purge"; any other failure (auth 4, API 5,
+timeout 7, …) exits the hook non-zero, so a hidden purge failure can never be
+recorded as a successful cleanup that leaks the directory.
+
+`tests/lab-cleanup-hook.test.ts` runs the committed hook against a fake `labctl`
+with `netlab-T1`, `bgp-T1` (another owner) and `netlab-T11` (only `netlab-T1` is
+destroyed), checks the purge/credential cases, and `tests/lab-cleanup.test.ts`
+runs the committed hook **through `applyLabCleanup` + `realLabCleanupRunner`**
+(a fake `labctl`) to prove Relay's forwarded `LABCTL_*` environment actually
+reaches it and the cleanup is `ok`.
 
 Relay never removes NOS images or the Shared Lab VM; the hook is required to
 destroy only the owner's containers/networks (the skill says the same).
@@ -123,6 +144,10 @@ network-specific Task schema. Relay never learns a topology.
 dry-run), the never-reused owner id, two-task isolation, failure injection (auth
 error, timeout, missing executable) and retry, and the real hook process.
 `tests/lab-cleanup-hook.test.ts` pins the committed hook's strict owner
-selection and purge. `tests/gc.test.ts` pins the pending-lab-cleanup skip.
+selection, its credential sources (environment + `$HOME/.config/relay/labctl.env`)
+and its fail-closed purge; `tests/lab-cleanup.test.ts` additionally runs the
+committed hook through `applyLabCleanup` + `realLabCleanupRunner` to prove the
+forwarded `LABCTL_*` environment reaches it. `tests/gc.test.ts` pins the
+pending-lab-cleanup skip.
 `tests/network-lab-skill.test.ts` pins the kit copy and the skill's contract.
 `formal/` is untouched, so no TLC run is required.
