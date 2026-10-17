@@ -19,7 +19,7 @@ licenses:
 extends: shell
 
 sandbox:
-  # Measured from a real sandbox run; see research/design/ish827-coding-kit-evidence.md.
+  # Measured from a real sandbox run; see docs/ish-827-coding-kit/evidence.md.
   # 745 MiB peak RSS on a mid-size crate's `cargo test`; 4 GiB is ~5x headroom.
   resources:
     cpu: 4
