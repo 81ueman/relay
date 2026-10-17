@@ -10,7 +10,7 @@ import {
   type DshEvent,
 } from "../src/dsh-events";
 
-// ISH-810 — the dsh 0.2.0-rc.2 `--json` JSONL decoder. Pure functions; no dsh,
+// ISH-810 — the dsh 0.2.1-rc.2 `--json` JSONL decoder. Pure functions; no dsh,
 // no network. Proves a bounded projection is decoded safely and that a
 // malformed/truncated line is surfaced, never silently accepted as an event.
 

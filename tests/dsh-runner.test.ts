@@ -184,7 +184,7 @@ function dshLine(obj: Record<string, unknown>): string {
   return `${JSON.stringify(obj)}\n`;
 }
 
-/** A minimal, ordered dsh 0.2.0-rc.2 JSONL run: session -> text -> final. */
+/** A minimal, ordered dsh 0.2.1-rc.2 JSONL run: session -> text -> final. */
 function emitHappyJsonl(p: FakeProcess, sessionId: string, text = "SMOKE_OK"): void {
   p.writeOut(dshLine({ type: "session", sessionId, cwd: "/tmp/wt" }));
   p.writeOut(dshLine({ type: "status", phase: "turn_start", turn: 1 }));

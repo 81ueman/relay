@@ -14,7 +14,7 @@ import { readDshEvents } from "../src/dsh-events";
 //
 //   RELAY_DSH_SMOKE=1 bun test tests/dsh-smoke.test.ts
 //
-// It proves the pinned 0.2.0-rc.2 CLI contract end to end: the process runs in
+// It proves the pinned 0.2.1-rc.2 CLI contract end to end: the process runs in
 // the Task worktree without Herdr, stdout is the dsh `--json` JSONL, a real tool
 // call + result are captured as per-Run evidence, a Session ID is recognized, and
 // a clean exit 0 still does NOT submit the Task.

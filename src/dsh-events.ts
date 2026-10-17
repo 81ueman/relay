@@ -1,5 +1,5 @@
 /**
- * ISH-810 — dsh 0.2.0-rc.2 headless **JSONL execution events**.
+ * ISH-810 / ISH-869 — dsh 0.2.1-rc.2 headless **JSONL execution events**.
  *
  * `dsh --profile headless --json <task>` (or `... --json - < task.md`) writes
  * newline-delimited JSON events to STDOUT: an initial `session`
@@ -21,7 +21,7 @@
 
 import { readFileSync } from "node:fs";
 
-/** The event types dsh 0.2.0-rc.2 is known to emit. Unknown types are tolerated. */
+/** The event types dsh 0.2.1-rc.2 is known to emit. Unknown types are tolerated. */
 export const DSH_EVENT_TYPES = [
   "session",
   "status",

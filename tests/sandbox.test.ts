@@ -17,7 +17,9 @@ import {
   ensureTaskSandbox,
   fetchSandboxHead,
   findActiveSandboxWriter,
+  isPinnedDsh,
   launchTaskSandboxRun,
+  PINNED_DSH_VERSION,
   planSandboxCleanup,
   sandboxDshAlive,
   sandboxDshState,
@@ -103,7 +105,7 @@ class FakeSbx implements SbxCli {
   created: string[] = [];
   calls: string[][] = [];
   headSha = "a".repeat(40);
-  dshVersion = "0.2.0-rc.2";
+  dshVersion = "0.2.1-rc.2";
   dshAlive = false;
   /** The branch the fake clone is on (set by a `git checkout` exec). */
   currentBranch: string | null = "main";
@@ -397,6 +399,43 @@ describe("sandbox Run: one disposable dsh per attempt", () => {
     expect(dshJsonl).toContain('"type":"tool_call"');
     // The mapping reflects the produced head.
     expect(getSandbox(db, id)!.head_sha).toBe(produced);
+  });
+
+  // ISH-869: a single pinned dsh build, fail-closed on any other version.
+  test("isPinnedDsh matches ONLY the exact pinned build (never a 0.2.x fallback)", () => {
+    expect(PINNED_DSH_VERSION).toBe("0.2.1-rc.2");
+    expect(isPinnedDsh("0.2.1-rc.2")).toBe(true);
+    expect(isPinnedDsh("dsh 0.2.1-rc.2")).toBe(true); // tolerant of a `dsh ` prefix
+    expect(isPinnedDsh("0.2.0-rc.2")).toBe(false); // the previous baseline
+    expect(isPinnedDsh("0.2.1-rc.1")).toBe(false);
+    expect(isPinnedDsh("0.2.1-rc.20")).toBe(false); // no loose substring match
+    expect(isPinnedDsh("latest")).toBe(false);
+    expect(isPinnedDsh(null)).toBe(false);
+    expect(isPinnedDsh("")).toBe(false);
+  });
+
+  test("ISH-869: an OLD dsh in the sandbox fails the launch closed (no silent pass)", async () => {
+    const id = newTask();
+    const sbx = new FakeSbx();
+    sbx.dshVersion = "0.2.0-rc.2"; // the pre-ISH-869 baseline is still installed
+    const spawner = new FakeSpawner();
+    // installDsh:false keeps the stale build in place, so the guard (not a reinstall) must refuse.
+    await expect(
+      launchTaskSandboxRun(db, id, { source: repo, cli: sbx, spawner, outputRoot: outputRoot(), installDsh: false })
+    ).rejects.toThrow(new RegExp(`${SANDBOX_ERROR}.*0\\.2\\.0-rc\\.2.*${PINNED_DSH_VERSION}`));
+    expect(spawner.procs.length).toBe(0); // no dsh process was ever started
+    expect(listRuns(db, { taskId: id }).length).toBe(0); // and no Run row was recorded
+  });
+
+  test("ISH-869: a MISSING dsh (install disabled) also fails the launch closed", async () => {
+    const id = newTask();
+    const sbx = new FakeSbx();
+    sbx.failDshVersion = true; // `dsh --version` cannot resolve
+    const spawner = new FakeSpawner();
+    await expect(
+      launchTaskSandboxRun(db, id, { source: repo, cli: sbx, spawner, outputRoot: outputRoot(), installDsh: false })
+    ).rejects.toThrow(new RegExp(`${SANDBOX_ERROR}.*dsh none`));
+    expect(spawner.procs.length).toBe(0);
   });
 
   test("refuses a second writer while a Run holds the sandbox", async () => {

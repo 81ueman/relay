@@ -4,7 +4,7 @@ import { join } from "node:path";
 
 // ISH-845: the `network-lab` skill has exactly one source of truth and one
 // installed copy. The real dsh sandbox cannot see this repo, so the Coding Kit
-// embeds a copy at the path dsh 0.2.0-rc.2 actually scans for user skills
+// embeds a copy at the path dsh 0.2.1-rc.2 actually scans for user skills
 // (`$AGENTS_HOME/skills` → `~/.agents/skills`); this test fails if the two
 // drift, so the installed skill is always the reviewed one.
 

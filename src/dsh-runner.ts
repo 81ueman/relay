@@ -29,7 +29,7 @@ import {
  * ONLY one Run's launch / observe / terminate; Task worktrees, single-writer
  * control and FIX re-entry are ISH-760.
  *
- * PINNED CLI CONTRACT (dsh **0.2.0-rc.2**): the app is
+ * PINNED CLI CONTRACT (dsh **0.2.1-rc.2**, unchanged from 0.2.0-rc.2): the app is
  * `dsh --profile headless --json <task...>` (multiple words joined by spaces, or
  * `--json -` to read the task from stdin). STDERR carries provider reasoning and
  * errors; STDOUT is newline-delimited JSON **execution events** — `session`
