@@ -1,5 +1,5 @@
 import { describe, expect, test, beforeEach, afterEach } from "bun:test";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, existsSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, existsSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -17,6 +17,7 @@ import { registerWorker } from "../src/workers";
 import {
   acceptRunSubmission,
   assertNoActiveWriter,
+  DSH_VERSION_MISMATCH,
   findActiveWriter,
   getRun,
   listRuns,
@@ -24,6 +25,7 @@ import {
   type DshProcess,
   type DshSpawner,
 } from "../src/dsh-runner";
+import { PINNED_DSH_VERSION } from "../src/dsh-version";
 
 // ISH-803 one-shot headless dsh runner. Everything here drives a FAKE process —
 // no real dsh, no network — so the lifecycle (exit / crash / cancel / malformed
@@ -103,15 +105,38 @@ class FakeSpawner implements DshSpawner {
 
 let dir = "";
 let db: Database;
+/** Dir for fake `dsh` executables the host-runner tests use (ISH-869). */
+let dshBinDir = "";
+
+/**
+ * Write a fake host `dsh` that answers `--version` with `version` (or with a
+ * non-zero exit when `version` is null) and is otherwise inert.
+ */
+function fakeDshBin(name: string, version: string | null): string {
+  const p = join(dshBinDir, name);
+  const body =
+    version === null
+      ? "exit 2\n"
+      : `if [ "$1" = "--version" ]; then echo ${version}; exit 0; fi\nexit 0\n`;
+  writeFileSync(p, `#!/bin/sh\n${body}`);
+  chmodSync(p, 0o755);
+  return p;
+}
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "relay-dsh-run-"));
   process.env.RELAY_DB = join(dir, "state.db");
   db = openDb(process.env.RELAY_DB);
+  // ISH-869: the host runner probes `<dshBin> --version`; the fake-process tests
+  // point it at a pinned fake so the guard passes without a real host dsh.
+  dshBinDir = join(dir, "bin");
+  mkdirSync(dshBinDir, { recursive: true });
+  process.env.RELAY_DSH_BIN = fakeDshBin("dsh-pinned", PINNED_DSH_VERSION);
 });
 
 afterEach(() => {
   db.close();
+  delete process.env.RELAY_DSH_BIN;
   rmSync(dir, { recursive: true, force: true });
 });
 
@@ -340,8 +365,8 @@ describe("one-shot headless dsh Run lifecycle", () => {
     spawner.onSpawn = (p) => p.finish(0);
     const h = await startDshRun(db, { taskId: id, spawner, outputRoot });
     await h.wait();
-    expect(spawner.argv[0][0]).toBe("dsh");
-    expect(spawner.argv[0].slice(0, 4)).toEqual(["dsh", "--profile", "headless", "--json"]);
+    expect(spawner.argv[0][0]).toBe(process.env.RELAY_DSH_BIN!);
+    expect(spawner.argv[0].slice(1, 5)).toEqual(["--profile", "headless", "--json", expect.any(String)]);
     expect(spawner.argv[0][4]).toContain(`# Task ${id}`);
     // Permission boundary: workspace-write by default, and the Run is identified.
     expect(spawner.envs[0].DSH_PERMISSION_MODE).toBe("workspace-write");
@@ -638,7 +663,7 @@ describe("relay run start always reaches a terminal state (finding 3)", () => {
     const { id, cwd } = newGitTask();
     const binDir = mkdtempSync(join(tmpdir(), "relay-dsh-bin-"));
     const bin = join(binDir, "dsh-fake.sh");
-    writeFileSync(bin, "#!/bin/sh\necho final\nsleep 0.2\necho done\nexit 0\n");
+    writeFileSync(bin, '#!/bin/sh\nif [ "$1" = "--version" ]; then echo 0.2.1-rc.2; exit 0; fi\necho final\nsleep 0.2\necho done\nexit 0\n');
     chmodSync(bin, 0o755);
     const cli = join(import.meta.dir, "..", "src", "cli.ts");
     const p = Bun.spawnSync(["bun", cli, "run", "start", id, "--cwd", cwd], {
@@ -667,6 +692,7 @@ describe("relay run logs: read-only dsh event history (ISH-810)", () => {
       bin,
       [
         "#!/bin/sh",
+        'if [ "$1" = "--version" ]; then echo 0.2.1-rc.2; exit 0; fi',
         `printf '%s\\n' '{"type":"session","sessionId":"session-cli-1111-2222-3333-4444-555555555555","cwd":"/tmp"}'`,
         `printf '%s\\n' '{"type":"tool_call","callId":"c1","tool":"read","input":{"file_path":"note.txt"}}'`,
         `printf '%s\\n' '{"type":"tool_result","callId":"c1","status":"completed","result":"hello-from-file"}'`,
@@ -825,5 +851,57 @@ describe("ISH-808: a cancelled task is terminal on the Run path", () => {
     expect(getRun(db, h.id)!.state).toBe("cancelled");
     expect(() => acceptRunSubmission(db, { runId: h.id })).toThrow(/RUN_SUBMISSION_REJECTED/);
     expect(getTask(db, id)!.state).toBe("cancelled");
+  });
+});
+
+// ISH-869 finding 1: the HOST headless Coding Worker (`relay run start`/`factory`
+// -> startDshRun) must be the exact pinned dsh, and a mismatch must fail closed
+// BEFORE any Run row or process.
+describe("ISH-869: the host Coding Worker is pinned (fail closed)", () => {
+  test("a host dsh that is not the pin is refused before any Run row or process", async () => {
+    const { id, outputRoot } = newTask();
+    const old = fakeDshBin("dsh-old", "0.2.0-rc.2");
+    const spawner = new FakeSpawner();
+    await expect(startDshRun(db, { taskId: id, spawner, outputRoot, dshBin: old })).rejects.toThrow(
+      new RegExp(`^${DSH_VERSION_MISMATCH}`)
+    );
+    expect(spawner.procs.length).toBe(0); // no process was spawned
+    expect(listRuns(db, { taskId: id })).toHaveLength(0); // and no Run row was written
+  });
+
+  test("a host dsh whose `--version` fails is refused (no version is not the pin)", async () => {
+    const { id, outputRoot } = newTask();
+    const broken = fakeDshBin("dsh-broken", null);
+    const spawner = new FakeSpawner();
+    await expect(startDshRun(db, { taskId: id, spawner, outputRoot, dshBin: broken })).rejects.toThrow(
+      new RegExp(`^${DSH_VERSION_MISMATCH}`)
+    );
+    expect(spawner.procs.length).toBe(0);
+    expect(listRuns(db, { taskId: id })).toHaveLength(0);
+  });
+
+  test("an unpinned default from PATH/RELAY_DSH_BIN is refused", async () => {
+    const { id, outputRoot } = newTask();
+    process.env.RELAY_DSH_BIN = fakeDshBin("dsh-old-env", "0.2.1-rc.1");
+    const spawner = new FakeSpawner();
+    await expect(startDshRun(db, { taskId: id, spawner, outputRoot })).rejects.toThrow(
+      new RegExp(`^${DSH_VERSION_MISMATCH}`)
+    );
+    expect(spawner.procs.length).toBe(0);
+    expect(listRuns(db, { taskId: id })).toHaveLength(0);
+  });
+
+  test("the pinned host dsh is admitted and runs", async () => {
+    const { id, outputRoot } = newTask();
+    const spawner = new FakeSpawner();
+    spawner.onSpawn = (p) => {
+      emitHappyJsonl(p, "session-pinned-host");
+      p.finish(0);
+    };
+    const h = await startDshRun(db, { taskId: id, spawner, outputRoot, fastExitMs: 0 });
+    const run = await h.wait();
+    expect(run.state).toBe("exited");
+    expect(run.exit_code).toBe(0);
+    expect(run.session_id).toBe("session-pinned-host");
   });
 });

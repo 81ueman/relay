@@ -9,6 +9,7 @@ import { getTask, claimTask, claimNext } from "../src/tasks";
 import { registerWorker } from "../src/workers";
 import { intakeTask, recordReview, recordVerification } from "../src/workflow";
 import { getRun, listRuns, type DshProcess, type DshSpawner } from "../src/dsh-runner";
+import { PINNED_DSH_VERSION } from "../src/dsh-version";
 import {
   applyWorkspaceCleanup,
   buildRunBrief,
@@ -90,6 +91,18 @@ function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", ["-C", cwd, ...args], { encoding: "utf-8" }).trim();
 }
 
+/**
+ * ISH-869: the host runner probes `<dshBin> --version`; the fake-process tests
+ * below point `RELAY_DSH_BIN` at a fake that reports the pin.
+ */
+function pinnedDshBin(): string {
+  const p = join(dir, "bin", "dsh-pinned");
+  mkdirSync(join(dir, "bin"), { recursive: true });
+  writeFileSync(p, `#!/bin/sh\nif [ "$1" = "--version" ]; then echo ${PINNED_DSH_VERSION}; exit 0; fi\nexit 0\n`);
+  chmodSync(p, 0o755);
+  return p;
+}
+
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "relay-ish760-"));
   repo = join(dir, "repo");
@@ -105,10 +118,13 @@ beforeEach(() => {
   registerWorker(db, "impl", { role: "worker" });
   registerWorker(db, "rev", { role: "reviewer" });
   issueSeq = 0;
+  // ISH-869: launchTaskRun -> startDshRun probes `<dshBin> --version`.
+  process.env.RELAY_DSH_BIN = pinnedDshBin();
 });
 
 afterEach(() => {
   db.close();
+  delete process.env.RELAY_DSH_BIN;
   rmSync(dir, { recursive: true, force: true });
 });
 
@@ -182,7 +198,8 @@ describe("single-writer: one disposable Run per phase/attempt", () => {
     expect(run.cwd).toBe(launched.worktree);
     expect(spawner.cwds[0]).toBe(launched.worktree);
     // ISH-810: the pinned headless CLI now carries `--json` before the task.
-    expect(spawner.argv[0].slice(0, 4)).toEqual(["dsh", "--profile", "headless", "--json"]);
+    expect(spawner.argv[0][0]).toBe(process.env.RELAY_DSH_BIN!);
+    expect(spawner.argv[0].slice(1, 5)).toEqual(["--profile", "headless", "--json", expect.any(String)]);
     expect(spawner.argv[0][4]).toContain(`# Task ${id}`);
     expect(run.generation).toBe(run.attempt);
     // The brief is pinned IN the worktree before launch.
@@ -261,7 +278,7 @@ describe("single-writer is atomic ACROSS PROCESSES (finding 1)", () => {
     const binDir = join(dir, "bin");
     mkdirSync(binDir, { recursive: true });
     const dsh = join(binDir, "dsh-race");
-    writeFileSync(dsh, "#!/bin/sh\nsleep 1.5\nexit 0\n");
+    writeFileSync(dsh, '#!/bin/sh\nif [ "$1" = "--version" ]; then echo 0.2.1-rc.2; exit 0; fi\nsleep 1.5\nexit 0\n');
     chmodSync(dsh, 0o755);
 
     const fixture = join(import.meta.dir, "fixtures", "ish760-race.ts");

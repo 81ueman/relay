@@ -28,6 +28,7 @@ import {
 import { buildRunBrief, inheritFindings, taskBranchName, type RunFinding } from "./run-lifecycle";
 import { spawnIdentityToken } from "./proc-identity";
 import { childEnv } from "./child-env";
+import { isPinnedDsh, PINNED_DSH_VERSION } from "./dsh-version";
 import { labOwnerId, LAB_OWNER_ASSIGNED_EVENT } from "./lab-cleanup";
 import {
   DUPLICATE_SANDBOX_WRITER,
@@ -77,13 +78,11 @@ import {
  */
 
 /**
- * ISH-869: the EXACT dsh build Relay pins for headless Runs and the Coding
- * Sandbox kit. It must match `sandbox/coding-kit/spec.yaml`'s `npm i -g
- * @deepseek-ai/dsh@<version>`; a floating `latest`/`alpha` or a second 0.2.x
- * code path is deliberately NOT introduced. DeepSeek-V4.1-Flash-1017 requires
- * dsh >= 0.2.1-rc.1; relay pins the 2026-10-17 `0.2.1-rc.2` build.
+ * ISH-869: `PINNED_DSH_VERSION` / `isPinnedDsh` live in the shared
+ * `src/dsh-version.ts` (one constant for BOTH the host runner and the sandbox).
+ * Re-exported here so existing sandbox imports keep working.
  */
-export const PINNED_DSH_VERSION = "0.2.1-rc.2";
+export { isPinnedDsh, PINNED_DSH_VERSION } from "./dsh-version";
 
 const ORPHANED = "orphaned";
 
@@ -269,6 +268,8 @@ export function sandboxDshVersion(cli: SbxCli, name: string, opts: { workdir?: s
 export interface PrepareSandboxOptions {
   dshVersion?: string;
   installDsh?: boolean;
+  /** The in-VM dsh executable to probe/install (default `dsh`). */
+  dshBin?: string;
   cli?: SbxCli;
 }
 
@@ -287,11 +288,14 @@ export function prepareSandboxDsh(
 ): { version: string | null; installed: boolean } {
   const cli = opts.cli ?? realSbxCli;
   const want = opts.dshVersion ?? PINNED_DSH_VERSION;
-  const have = sandboxDshVersion(cli, binding.name, { workdir: binding.workspace });
+  // ISH-869 finding 2: probe and install the SAME binary the Run will spawn, so
+  // the guard can never bless a different executable than the one that runs.
+  const bin = opts.dshBin ?? "dsh";
+  const have = sandboxDshVersion(cli, binding.name, { workdir: binding.workspace, dshBin: bin });
   if (have && isPinnedDsh(have, want)) return { version: have, installed: false };
   if (opts.installDsh === false) return { version: have, installed: false };
   const r = cli.run(
-    sbxExecArgv(binding.name, bashLc(`npm i -g @deepseek-ai/dsh@${want} >/dev/null 2>&1 && dsh --version`), {
+    sbxExecArgv(binding.name, bashLc(`npm i -g @deepseek-ai/dsh@${want} >/dev/null 2>&1 && ${bin} --version`), {
       workdir: binding.workspace,
     }),
     { timeoutMs: 15 * 60_000 }
@@ -299,16 +303,6 @@ export function prepareSandboxDsh(
   if (!r.ok) return { version: have, installed: false };
   const v = (r.out || "").trim().split("\n").pop() ?? null;
   return { version: v, installed: true };
-}
-
-/**
- * True when `version` (a `dsh --version` line, possibly prefixed like
- * `dsh 0.2.1-rc.2`) names EXACTLY `want`. An old/mismatched build is a failure,
- * not a fallback: Relay has one pinned dsh, never a floating or dual-version one.
- */
-export function isPinnedDsh(version: string | null, want = PINNED_DSH_VERSION): boolean {
-  if (!version) return false;
-  return version.trim().split(/\s+/).includes(want);
 }
 
 // ---------------------------------------------------------------------------
@@ -564,7 +558,7 @@ export async function launchTaskSandboxRun(
   // Refuse BEFORE pinning/writing when the sandbox already has a live writer.
   assertNoActiveSandboxWriter(db, { sandboxName: binding.name, branch: binding.branch });
 
-  const dsh = prepareSandboxDsh(binding, { installDsh: opts.installDsh, cli });
+  const dsh = prepareSandboxDsh(binding, { installDsh: opts.installDsh, cli, dshBin: opts.dshBin });
   logSandbox(db, taskId, "sandbox.dsh", { name: binding.name, version: dsh.version, installed: dsh.installed });
   // ISH-869 fail-closed: a sandbox still on an OLD dsh (e.g. the 0.2.0-rc.2
   // baseline left by an earlier Task) must NOT be started as a success. There is

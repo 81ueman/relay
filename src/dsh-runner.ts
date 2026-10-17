@@ -8,6 +8,7 @@ import type { Run, RunState, Task } from "./schema";
 import { isTerminalTaskState } from "./schema";
 import { spawnIdentityToken } from "./proc-identity";
 import { childEnv } from "./child-env";
+import { isPinnedDsh, PINNED_DSH_VERSION, readDshVersion } from "./dsh-version";
 import { gitHead } from "./verify";
 import { submitImplementationFromRun, type RunImplementation } from "./workflow";
 import {
@@ -160,6 +161,9 @@ export function listRuns(
 
 /** ISH-760: a second writer into the same worktree/branch is refused. */
 export const DUPLICATE_WRITER = "DUPLICATE_WRITER";
+
+/** ISH-869: the host headless `dsh` is not the pinned build — refuse to spawn. */
+export const DSH_VERSION_MISMATCH = "DSH_VERSION_MISMATCH";
 
 export interface ActiveWriterQuery {
   /** The worktree the candidate writer would run in. */
@@ -425,6 +429,22 @@ export async function startDshRun(db: Database, opts: StartRunOptions): Promise<
   assertNoActiveWriter(db, { cwd, branch });
 
   const dshBin = opts.dshBin ?? process.env.RELAY_DSH_BIN ?? "dsh";
+  // ISH-869 fail-closed: the HOST Coding Worker must be the exact pinned dsh.
+  // Probe `--version` BEFORE any Run row or spawn, so an old/mismatched build
+  // (e.g. a 0.2.0-rc.2 `dsh` on PATH) can never be run as a normal success.
+  const hostDshVersion = readDshVersion(dshBin);
+  if (!isPinnedDsh(hostDshVersion)) {
+    const message =
+      `${DSH_VERSION_MISMATCH}: ${dshBin} reports ${hostDshVersion ?? "no version"}, but Relay pins ` +
+      `@deepseek-ai/dsh@${PINNED_DSH_VERSION}; refusing to start a Run (an old version is never a silent pass)`;
+    logEvent(db, {
+      source: "dsh-runner",
+      taskId: task.id,
+      type: "dsh.version_mismatch",
+      payload: { dshBin, want: PINNED_DSH_VERSION, got: hostDshVersion },
+    });
+    throw new Error(message);
+  }
   const permissionMode = opts.permissionMode ?? DEFAULT_PERMISSION_MODE;
   const spawner = opts.spawner ?? bunDshSpawner;
   const fastExitMs = opts.fastExitMs ?? DEFAULT_FAST_EXIT_MS;
