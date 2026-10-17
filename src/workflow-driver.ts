@@ -3,9 +3,10 @@ import { findTaskResult } from "./results";
 import type { Task } from "./schema";
 import { TERMINAL_TASK_STATES } from "./schema";
 import { getTask } from "./tasks";
-import { defaultRunner, type CommandRunner } from "./verify";
+import { defaultRunner, type CheckSpec, type CommandRunner } from "./verify";
 import { runMechanicalVerification, taskChecks } from "./workflow";
 import { runMergeGates } from "./merge-gate";
+import type { VerifyTarget } from "./sandbox-verify";
 import {
   NO_AUTHORITY,
   reconcileTaskFromProvider,
@@ -33,6 +34,12 @@ const TERMINAL_STATE_SQL = TERMINAL_TASK_STATES.map((s) => `'${s}'`).join(",");
 export interface WorkflowDeps {
   /** The read-only command runner used by mechanical verify (default: real). */
   verifyRunner?: CommandRunner;
+  /**
+   * ISH-829: choose the VERIFY target for a Task. A Task with a durable Coding
+   * Sandbox verifies INSIDE that sandbox at the recorded HEAD; returning null
+   * falls back to `verifyRunner`/host cwd. This is the single sandbox/host switch.
+   */
+  verifyTarget?: (db: Database, task: Task, checks: CheckSpec[]) => VerifyTarget | null;
   /**
    * Fallback working directory for mechanical verify when a task records no
    * `worktree`. Prefer the per-task worktree; this is only a default.
@@ -103,17 +110,21 @@ export async function runPendingMechanicalVerifications(
   for (const t of pendingMechanicalVerifications(db)) {
     const checks = taskChecks(t);
     if (checks.length === 0) continue; // nothing mechanical to run
-    // Bind the run to the TASK's own worktree when recorded, so the commands run
-    // against the recorded revision rather than the daemon's checkout.
-    const cwd = t.worktree ?? fallbackCwd;
+    // ISH-829: a Task with a Coding Sandbox verifies INSIDE it at the recorded
+    // HEAD; otherwise bind to the TASK's own worktree (or the fallback cwd).
+    const target = deps.verifyTarget?.(db, t, checks) ?? null;
+    const cwd = target?.cwd ?? t.worktree ?? fallbackCwd;
     try {
       const { outcome, stale } = await runMechanicalVerification(db, t.id, {
         checks,
-        runner,
+        runner: target?.runner ?? runner,
         cwd,
-        headProbe: deps.verifyHeadProbe,
+        headSha: target?.headSha,
+        headProbe: target?.headProbe ?? deps.verifyHeadProbe,
       });
+      const where = target?.sandbox ? `sandbox:${target.sandbox}` : "host";
       actions.push(stale ? `verify-stale:${t.id}` : `verify-${outcome}:${t.id}`);
+      if (target?.sandbox) actions.push(`verify-target:${where}:${t.id}`);
     } catch (e) {
       actions.push(`verify-error:${t.id}`);
       const live = getTask(db, t.id);

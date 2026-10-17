@@ -261,6 +261,23 @@ describe("Factory E2E: real worktree, fake headless dsh + independent reviewer",
     expect(res.gate).not.toBeNull();
   });
 
+  test("ISH-829: the independent reviewer reads a detached read-only worktree at the fixed head", async () => {
+    const dsh = fakeDsh("dsh-ro", COMMITTING_DSH);
+    const id = newTask();
+    const rev = reviewerHarness(["pass"]);
+    const roRoot = join(dir, "review-wt");
+    const res = await runFactoryTask(db, id, { ...factoryDeps(dsh, rev.spawner), reviewWorktreeRoot: roRoot });
+    expect(res.outcome).toBe("merge_ready");
+    expect(rev.calls).toHaveLength(1);
+    const cwd = rev.calls[0].cwd;
+    // The reviewer read a DETACHED worktree under the review root, not the writer's.
+    expect(cwd.startsWith(roRoot)).toBe(true);
+    const task = getTask(db, id)!;
+    expect(rev.calls[0].head).toBe(task.head_sha);
+    // The read-only worktree is torn down after the review.
+    expect(existsSync(cwd)).toBe(false);
+  });
+
   test("a coding Run that exits nonzero canNOT advance (exit 0/final is not a submission)", async () => {
     const dsh = fakeDsh("dsh-fail", "exit 1\n");
     const id = newTask();

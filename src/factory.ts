@@ -1,12 +1,14 @@
 import type { Database } from "bun:sqlite";
-import { now } from "./db";
+import { join } from "node:path";
+import { now, projectRoot } from "./db";
 import { logEvent } from "./events";
 import { getTask, claimTask } from "./tasks";
 import { getWorker, registerWorker } from "./workers";
 import { INTEGRATOR_ROLE, REVIEWER_ROLE } from "./schema";
 import type { Run, RunState, Task, TaskState } from "./schema";
 import { isCanonicalToken, processPgid, spawnIdentityToken } from "./proc-identity";
-import { defaultRunner, type CommandRunner } from "./verify";
+import { defaultRunner, type CheckSpec, type CommandRunner } from "./verify";
+import type { VerifyTarget } from "./sandbox-verify";
 import { runMechanicalVerification, submitPhase, taskChecks } from "./workflow";
 import { acceptRunSubmission, getRun } from "./dsh-runner";
 import { launchTaskRun, type LaunchRunOptions } from "./run-lifecycle";
@@ -16,6 +18,7 @@ import {
   type ReviewerSpawner,
 } from "./reviewer-runner";
 import { checkMergeGate, type MergeGateDecision, type MergeGateDeps } from "./merge-gate";
+import { prepareReadOnlyReviewWorktree, removeReviewWorktree } from "./review-workspace";
 
 /**
  * ISH-762 Factory driver.
@@ -64,6 +67,11 @@ export interface FactoryDeps {
   dshEnv?: Record<string, string>;
   /** Mechanical verify runner (default: the real command runner). */
   verifyRunner?: CommandRunner;
+  /**
+   * ISH-829: choose the VERIFY target for a Task (Coding Sandbox vs host). Null
+   * falls back to `verifyRunner` in the Task worktree.
+   */
+  verifyTarget?: (db: Database, task: Task, checks: CheckSpec[]) => VerifyTarget | null;
   /** The independent reviewer process (default: real `claude`); fake in tests. */
   reviewerSpawner?: ReviewerSpawner;
   reviewerCommand?: string;
@@ -82,6 +90,12 @@ export interface FactoryDeps {
    * "cannot-be-killed -> keep fencing" path.
    */
   terminateOrphan?: (pid: number) => Promise<boolean>;
+  /**
+   * ISH-829: when set, the independent reviewer runs in a DETACHED read-only
+   * worktree at the fixed head (created under this directory), not the writer's
+   * live worktree. Unset -> existing behavior (the writer's worktree).
+   */
+  reviewWorktreeRoot?: string;
 }
 
 export interface FactoryAttempt {
@@ -500,10 +514,14 @@ export async function runFactoryTask(
         }
         const cwd = task.worktree;
         if (!cwd) return { taskId, outcome: "blocked", head: task.head_sha, attempts, gate: null, reason: "no worktree", steps };
+        // ISH-829: verify INSIDE the Task's Coding Sandbox when it has one.
+        const target = deps.verifyTarget?.(db, task, checks) ?? null;
         const v = await runMechanicalVerification(db, taskId, {
           checks,
-          runner: deps.verifyRunner ?? defaultRunner,
-          cwd,
+          runner: target?.runner ?? deps.verifyRunner ?? defaultRunner,
+          cwd: target?.cwd ?? cwd,
+          headSha: target?.headSha,
+          headProbe: target?.headProbe,
         });
         if (current) current.verifyOutcome = v.outcome;
         if (v.stale) {
@@ -523,12 +541,33 @@ export async function runFactoryTask(
         continue;
       }
       case "review": {
-        const r = await runHeadlessReview(db, taskId, {
-          spawner: deps.reviewerSpawner,
-          command: deps.reviewerCommand,
-          model: deps.reviewerModel,
-          reviewerWorker,
-        });
+        // ISH-829: the independent reviewer reads a DETACHED read-only checkout
+        // at the fixed head (when configured), never the writer's live worktree.
+        const reviewHead = task.head_sha;
+        let reviewWorktree: string | undefined;
+        if (deps.reviewWorktreeRoot && reviewHead) {
+          const ws = prepareReadOnlyReviewWorktree(
+            deps.repo ?? projectRoot(),
+            reviewHead,
+            join(deps.reviewWorktreeRoot, `${taskId}-${task.attempt}-${reviewHead.slice(0, 10)}`)
+          );
+          if (!ws.ok) {
+            return { taskId, outcome: "blocked", head: reviewHead, attempts, gate: null, reason: `review workspace: ${ws.error}`, steps };
+          }
+          reviewWorktree = ws.path ?? undefined;
+        }
+        let r;
+        try {
+          r = await runHeadlessReview(db, taskId, {
+            spawner: deps.reviewerSpawner,
+            command: deps.reviewerCommand,
+            model: deps.reviewerModel,
+            reviewerWorker,
+            reviewWorktree,
+          });
+        } finally {
+          if (reviewWorktree) removeReviewWorktree(deps.repo ?? projectRoot(), reviewWorktree);
+        }
         if (current) current.reviewVerdict = r.outcome === "refused" ? "refused" : r.outcome;
         if (r.outcome === "refused") {
           return { taskId, outcome: "review_refused", head: getTask(db, taskId)!.head_sha, attempts, gate: null, reason: r.error, steps };

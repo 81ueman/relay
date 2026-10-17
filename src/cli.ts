@@ -26,6 +26,7 @@ import {
 } from "./tasks";
 import { acceptTask, confirmMerged, intakeTask, recordReview, recordVerification, runMechanicalVerification, submitPhase, taskChecks } from "./workflow";
 import { defaultRunner, type CheckSpec } from "./verify";
+import { sandboxVerifyTarget } from "./sandbox-verify";
 import { acceptRunSubmission, getRun, listRuns, startDshRun } from "./dsh-runner";
 import { formatDshEvent, readDshEvents } from "./dsh-events";
 import { signalRunProcess } from "./run-signal";
@@ -1316,15 +1317,21 @@ async function main(): Promise<void> {
         if (!task) throw new Error(`unknown task: ${id}`);
         const checks = taskChecks(task);
         if (checks.length === 0) throw new Error(`task ${id} has no mechanical checks (intake it with --check name=command)`);
-        const cwd = flag(rest, "--cwd") ?? task.worktree ?? process.env.RELAY_VERIFY_CWD ?? process.cwd();
+        // ISH-829: a Task with a durable Coding Sandbox verifies INSIDE it unless
+        // an explicit --cwd override is given.
+        const explicitCwd = flag(rest, "--cwd");
+        const target = explicitCwd ? null : sandboxVerifyTarget(db, task, checks);
+        const cwd = explicitCwd ?? target?.cwd ?? task.worktree ?? process.env.RELAY_VERIFY_CWD ?? process.cwd();
         const { task: after, outcome, checks: executed, stale } = await runMechanicalVerification(db, id, {
           checks,
-          runner: defaultRunner,
+          runner: target?.runner ?? defaultRunner,
           cwd,
-          headSha: flag(rest, "--head") ?? undefined,
+          headProbe: target?.headProbe,
+          headSha: flag(rest, "--head") ?? target?.headSha ?? undefined,
         });
         for (const c of executed) {
-          console.log(`check ${c.name}: ${c.outcome}${c.exitCode === null ? "" : ` (exit ${c.exitCode})`}`);
+          const where = c.sandbox ? ` [sandbox:${c.sandbox}]` : "";
+          console.log(`check ${c.name}: ${c.outcome}${where}${c.exitCode === null ? "" : ` (exit ${c.exitCode})`}`);
         }
         console.log(`${after.id} verify=${outcome}${stale ? " stale-discarded" : ""} -> phase=${after.phase} state=${after.state}`);
         break;

@@ -37,6 +37,19 @@ export interface ExecutedCheck {
   /** Tail of stdout+stderr (bounded), for evidence. */
   output: string;
   durationMs: number;
+  /**
+   * ISH-829: the Coding Sandbox the check ran in. Absent for a host run, so an
+   * evidence reader can tell "ran inside the Task sandbox" from "ran on the host".
+   */
+  sandbox?: string;
+  /** ISH-829: the checkout HEAD the check was bound to (or null if unreadable). */
+  head?: string | null;
+  /** ISH-829: the in-sandbox command hit its hard timeout (outcome `not_run`). */
+  timedOut?: boolean;
+  /** ISH-829: bounded stdout tail (host runs keep only the combined `output`). */
+  stdout?: string;
+  /** ISH-829: bounded stderr tail (host runs keep only the combined `output`). */
+  stderr?: string;
 }
 
 /** Runs ONE check. Read-only w.r.t. the repo: it only observes the exit code. */

@@ -11,6 +11,7 @@ import {
   type PrState,
   type PrView,
 } from "./providers";
+import { defaultVerifyTarget } from "./sandbox-verify";
 
 /**
  * ISH-759 real provider adapters — GET-ONLY.
@@ -352,5 +353,9 @@ export function providerDepsFromEnv(env: EnvLike = process.env, exec: Exec = def
     checks: github,
     authorizedReviewers: authorizedReviewers.length > 0 ? authorizedReviewers : [DEFAULT_REVIEW_OWNER],
     authority: NO_AUTHORITY,
+    // ISH-829: mechanical VERIFY of a Task with a durable Coding Sandbox runs
+    // INSIDE that sandbox at the recorded HEAD; a Task without one falls back to
+    // the host runner (see runPendingMechanicalVerifications).
+    verifyTarget: defaultVerifyTarget,
   };
 }
