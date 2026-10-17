@@ -4,105 +4,127 @@ Measured on the host that ran the ISH-822/827 work (`sbx v0.48.0`, Docker
 Sandboxes on Apple Silicon). Raw per-Run files are committed under
 [`ish828-sandbox-evidence/`](ish828-sandbox-evidence/).
 
-## Command
+## Round 2 — decisive real acceptance (`exited` → fetch → submit)
+
+### Command
 
 ```sh
 RELAY_SANDBOX_SMOKE=1 \
-RELAY_SANDBOX_EVIDENCE_DIR="$TMPDIR/ish828-evidence" \
-RELAY_SANDBOX_AGENT="$HOME/ghq/github.com/81ueman/ishiul/sandbox/coding-kit" \
+RELAY_SANDBOX_EVIDENCE_DIR="$TMPDIR/ish828-evidence2" \
+RELAY_SANDBOX_AGENT="$PWD/sandbox/coding-kit" \
+RELAY_SANDBOX_KEY_CMD="$TMPDIR/ish822-helper/get-ollama-key.sh" \
   bun scripts/ish828-real-smoke.ts
 ```
 
-The script creates a throwaway **main checkout**, lets Relay create a real
-clone-mode sandbox from it, runs a real `dsh` inside via `sbx exec`, then tears the
-sandbox down. It refuses to run without `RELAY_SANDBOX_SMOKE=1`.
+The provider route is the ISH-822/827 recipe: an **Ollama-Cloud `--patch`
+overlay** plus an `sbx secret set-custom` **credential proxy** (the real key stays
+on the host; the sandbox only sees a `sbx-cs-…` placeholder). The smoke creates a
+throwaway **main checkout**, has Relay create a real clone-mode sandbox, runs a
+real `dsh` inside it, and tears it down. It refuses to run without
+`RELAY_SANDBOX_SMOKE=1`.
 
-## Output (verbatim)
+### Output (verbatim)
 
 ```
-ISH-828 real sandbox smoke — agent/kit: /Users/81ueman/ghq/github.com/81ueman/ishiul/sandbox/coding-kit
+ISH-828 real sandbox smoke — agent/kit: /Users/81ueman/.herdr/worktrees/relay/devin-ish-828-ish828/sandbox/coding-kit
 sbx version: sbx version v0.48.0 5caf923e0587d376848f6f388eca3e0f5ca00e2d
-  ok 1. sbx is reachable and logged in
-  ... sandbox relay-ish-828-real-1792200236622 (workspace /private/var/folders/2l/lk91l4dd1ysb1jfw7bkw0nrh0000gn/T/relay-ish828-real-l6Bjh2/repo)
+provider route: ollama-cloud overlay + secret proxy (/private/var/folders/.../ish822-helper/get-ollama-key.sh)
+  ok 1. `sbx ls --json` succeeded (sbx is reachable and logged in)
+  ... sandbox relay-ish-828-real-1792213291301-1f93603d (workspace /private/var/folders/.../repo)
   ok 2. dsh is present inside the sandbox (0.2.0-rc.2)
-  ... real dsh Run run-2b926777: state=failed exit=1 session=session-0b65a11d-901e-453d-9578-afdeeec648b5
-  ... dsh JSONL (first line): {"type":"session","sessionId":"session-0b65a11d-901e-453d-9578-afdeeec648b5","cwd":"/private/var/folders/.../repo"}
-  ... dsh stderr tail:
-dsh: MISSING_CREDENTIAL: llm-deepseek: no API key for provider route "deepseek-official"; store DEEPSEEK_API_KEY through the credentials service (the web Models page writes it), or export DEEPSEEK_API_KEY in the launching environment
-  ok 3. Run evidence dir exists (.../runs/run-2b926777)
-  ok 4. a real dsh stream or a real error was recorded (no silent no-op)
-  ... run did not exit 0 (exit 1); skipping the commit assertion
-  ok 5. cleanup plans without acting; sandbox named
-  ok 6. the sandbox was stopped and removed (relay-ish-828-real-1792200236622)
-  ok 7. the mapping records the removal
-  ok 8. the Run evidence survived teardown
+  ok 3. provider credential proxy installed (sbx-cs-2vL6H6F2Iud5hYsC)
+  ... real dsh Run run-c49b0f5c: state=exited exit=0 session=session-ff341c18-ecf1-4896-b87b-89cd36e48a1e
+  ok 4. Run evidence dir exists (.../runs/run-c49b0f5c)
+  ok 5. a real dsh stream or a real error was recorded (no silent no-op)
+  ok 6. produced commit fetched to the host (8327d41e6378)
+  ok 7. the fetched head is a real commit object
+  ok 8. the structured submission advanced the Task
+  ok 9. cleanup plans without acting; sandbox named
+  ok 10. the sandbox was stopped and removed (relay-ish-828-real-1792213291301-1f93603d)
+  ok 11. the mapping records the removal
+  ok 12. the Run evidence survived teardown
 
-PASS — 8 checks
+PASS — 12 checks
 ```
-
-## What is proven
-
-| Claim | Result |
-| --- | --- |
-| `sbx create --clone` from a **main checkout** via Relay | ✅ `relay-ish-828-real-…` created, private clone at the host path |
-| Real `dsh` 0.2.0-rc.2 present **inside** the microVM | ✅ read via `sbx exec … dsh --version` |
-| A real headless `dsh` Run started with `sbx exec` | ✅ real `session` event with a session id, JSONL captured |
-| Original dsh JSONL + Relay events as per-Run evidence | ✅ `dsh.jsonl` / `stdout.log` / `stderr.log` / `events.jsonl` / `spec.md` |
-| Brief pinned into the clone | ✅ no `sandbox.brief_pin_failed` (after the `.relay` mkdir fix) |
-| Fail **closed** on a dsh failure | ✅ `state=failed`, `exit=1`, `producedHead=null`, no submission |
-| Teardown saves evidence first, then removes the VM | ✅ `sbx stop` + `sbx rm`; `docs/…/events.jsonl` retained |
 
 ### Raw Relay event log ([`events.jsonl`](ish828-sandbox-evidence/events.jsonl))
 
 ```
-{"t":"run.started","runId":"run-2b926777","sandbox":"relay-ish-828-real-…","phase":"implement","attempt":0,"baseHead":"2e4f7f3e…"}
+{"t":"run.started","runId":"run-c49b0f5c","sandbox":"relay-ish-828-real-…","phase":"implement","attempt":0,"baseHead":"82a58e3ac55d…"}
 {"t":"dsh.event","type":"session"}
-{"t":"dsh.event","type":"status"}  (×4)
+{"t":"dsh.event","type":"text"}
+{"t":"dsh.event","type":"tool_call","callId":"call_xlphtmyt"}
+{"t":"dsh.event","type":"tool_result","callId":"call_xlphtmyt"}
+… 7 tool_call/tool_result pairs …
 {"t":"dsh.event","type":"final"}
-{"t":"stderr","v":"dsh: MISSING_CREDENTIAL: …"}
-{"t":"run.exited","state":"failed","exitCode":1,"producedHead":null,"sessionId":"session-0b65a11d-…","dsh":{"total":6,"session":1,"status":4,"final":1,…}}
+{"t":"run.exited","state":"exited","exitCode":0,"durationMs":27708,"sessionId":"session-ff341c18-…",
+ "baseHead":"82a58e3ac55d2d3196bdaa983fe63707c17f37d0",
+ "producedHead":"8327d41e6378321974c92e6d621b7078fb577af8",
+ "dsh":{"total":40,"session":1,"status":16,"text":3,"thinking":5,"toolCall":7,"toolResult":7,"final":1,"error":0,"malformed":0,"truncated":0},
+ "terminal":"final","turnReason":"completed"}
 ```
 
-### Raw dsh JSONL ([`dsh.jsonl`](ish828-sandbox-evidence/dsh.jsonl))
+### Raw dsh JSONL ([`dsh.jsonl`](ish828-sandbox-evidence/dsh.jsonl), excerpts)
 
 ```
-{"type":"session","sessionId":"session-0b65a11d-…","cwd":"/private/var/folders/…/repo"}
-{"type":"status","phase":"turn_start","turn":1}
-{"type":"status","phase":"step_start","turn":1,"step":1}
-{"type":"status","phase":"step_end","turn":1,"step":1}
-{"type":"status","phase":"turn_end","turn":1,"reason":{"kind":"error","error":{"message":"llm-deepseek: no API key …","code":"MISSING_CREDENTIAL"}}}
-{"type":"final","text":""}
+{"type":"session","sessionId":"session-ff341c18-ecf1-4896-b87b-89cd36e48a1e","cwd":"/private/var/folders/.../repo"}
+{"type":"tool_call","callId":"call_xlphtmyt","tool":"bash","input":{"command":"pwd && git status --short --branch && git log --oneline -3",…}}
+{"type":"tool_call","callId":"call_3wakqab2","tool":"write","input":{"file_path":"…/repo/SMOKE.md","content":"ISH-828-OK\n"}}
+{"type":"tool_call","callId":"call_jsjz1rg1","tool":"bash","input":{"command":"git add SMOKE.md && git commit -m \"docs: add SMOKE.md with ISH-828-OK\" && git log --oneline -2 && …"}}
+{"type":"tool_result","callId":"call_jsjz1rg1","status":"completed","result":"[relay/ish-828-real-1792213291301 8327d41] docs: add SMOKE.md with ISH-828-OK\n…"}
+{"type":"status","phase":"turn_end","turn":1,"reason":{"kind":"completed"}}
+{"type":"final","text":"Done. … Commit: `8327d41 docs: add SMOKE.md with ISH-828-OK` …"}
 ```
 
-## Expected vs. measured, and the blocker
+The sandbox clone committed `8327d41e6378321974c92e6d621b7078fb577af8` on
+`relay/ish-828-real-1792213291301`; Relay's `git fetch sandbox-<name>` brought it
+to the host, `git cat-file -t` confirmed a commit object, and
+`acceptSandboxSubmission` advanced the Task. Teardown then removed the VM while
+retaining the Run evidence.
 
-- **Expected:** the Run writes `SMOKE.md` and commits it; Relay fetches
-  `sandbox-<name>/<branch>` and reports `exited`.
-- **Measured:** the Relay plumbing is correct end to end, but the **model call**
-  fails inside the sandbox: `MISSING_CREDENTIAL: llm-deepseek: no API key for
-  provider route "deepseek-official"`. This is a **sandbox provider
-  configuration** matter (the ISH-827 kit ships `dsh` but no DeepSeek key; the
-  ISH-822 PoC supplied an Ollama-Cloud overlay + credential proxy), **not** a
-  Relay defect — exactly the ISH-822 caveat. Relay failed **closed** (no commit
-  invented, no submission).
-- The smoke therefore HARD-asserts only the plumbing Relay owns (clone creation,
-  dsh presence, `sbx exec` streaming, JSONL evidence, host fetch/cleanup) and
-  records the real dsh outcome. An operator with a provider configured (e.g. the
-  ISH-822 credential proxy) gets the `exited` path and a real fetched commit.
+## Round 1 — fail-closed negative case (no provider configured)
 
-## Bugs this real smoke caught (not visible to the fake tests)
+Without `RELAY_SANDBOX_KEY_CMD`, the same smoke produced a real dsh `session`
+event and then `MISSING_CREDENTIAL: … deepseek-official`. Relay recorded
+`state=failed`, `exitCode=1`, `producedHead=null`, and refused submission — no
+commit was invented. This is the environment's provider gap (the ISH-822 caveat),
+not a Relay defect; the round-2 run above supplies the configured-provider path.
+
+## Bugs the real smoke caught (not visible to the fake tests)
 
 1. `sbx exec` was spawned **without the `sbx` binary prefix** (`Executable not
    found in $PATH: "exec"`). Fixed in `launchTaskSandboxRun`; the fake spawner now
    asserts `argv[0]` is the sbx binary.
 2. The brief `sbx cp` failed because the destination `.relay` directory did not
-   exist in the clone (`tar extract failed … Cannot open`). Fixed by
-   `mkdir -p .relay` in the clone before the copy; the event
-   `sandbox.brief_pin_failed` no longer appears.
+   exist in the clone. Fixed by `mkdir -p .relay` in the clone before the copy;
+   `sandbox.brief_pin_failed` no longer appears (verified in the round-2
+   `events.jsonl`).
+
+## Round-2 review findings — where each is proven
+
+1. **Pre-ISH-828 DB open** — `idx_runs_sandbox` removed from `SCHEMA`; `migrate()`
+   adds it after `ALTER TABLE`. `tests/sandbox.test.ts` opens a DB whose `runs`
+   table predates the column.
+2. **Failed client probes/stops the in-VM dsh** — every non-`exited` outcome
+   probes and stops; a stubborn in-VM dsh leaves the row non-terminal. Unit tests
+   cover both a stopped orphan and a blocked second writer.
+3. **No wrong-branch HEAD** — `fetchSandboxHead` has no `FETCH_HEAD` fallback when
+   a branch is bound; `ensureSandboxBranch` is fatal and verifies the checked-out
+   branch. Test: a fetched unrelated branch is refused.
+4. **No unfetched commit destroyed** — `applySandboxCleanup` fetches and pins the
+   branch tip under `refs/relay-sandbox/<name>` before `rm`; a failed fetch
+   refuses removal. Test: a commit from an exit-1 Run is saved then removed.
+5. **Unique sandbox names** — `relay-<slug>-<hash8>` from the stable Task id. Test:
+   same issue/slice across providers yields distinct names.
+6. **`sbx ls` failure is not "no sandboxes"** — `sbxList` returns an `ok` result;
+   callers fail closed. Tests: ensure keeps the mapping; cleanup refuses.
+7. **Decisive real acceptance** — this document + the round-2 run above.
+8. **Host env boundary** — `src/child-env.ts` allowlist is used by both spawns
+   (`dsh-runner`, `sbx exec`). Tests: `SECRET_X` never reaches either child.
 
 ## Reproduce
 
 ```sh
 bun run smoke:sandbox                 # fake sbx/exec, real local git fetch (no Docker)
-RELAY_SANDBOX_SMOKE=1 bun run smoke:sandbox:real   # real Docker Sandbox
+RELAY_SANDBOX_SMOKE=1 bun run smoke:sandbox:real   # real Docker Sandbox (needs a provider)
 ```

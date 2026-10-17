@@ -3,12 +3,13 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Database } from "bun:sqlite";
+import { Database } from "bun:sqlite";
 import { openDb } from "../src/db";
 import { getTask } from "../src/tasks";
 import { registerWorker } from "../src/workers";
 import { intakeTask } from "../src/workflow";
-import { getRun, listRuns, type DshProcess, type DshSpawner } from "../src/dsh-runner";
+import { getRun, listRuns, startDshRun, type DshProcess, type DshSpawner } from "../src/dsh-runner";
+import { childEnv } from "../src/child-env";
 import {
   acceptSandboxSubmission,
   applySandboxCleanup,
@@ -103,7 +104,12 @@ class FakeSbx implements SbxCli {
   headSha = "a".repeat(40);
   dshVersion = "0.2.0-rc.2";
   dshAlive = false;
+  /** The branch the fake clone is on (set by a `git checkout` exec). */
+  currentBranch: string | null = "main";
+  /** When true, `pkill` does NOT stop the in-VM dsh (a stubborn orphan). */
+  stubbornDsh = false;
   failCreate = false;
+  failLs = false;
   failDshVersion = false;
   handler?: (args: string[]) => SbxResult | null;
 
@@ -113,6 +119,7 @@ class FakeSbx implements SbxCli {
     if (custom) return custom;
     const ok = (out = ""): SbxResult => ({ ok: true, code: 0, out, err: "" });
     if (args[0] === "ls") {
+      if (this.failLs) return { ok: false, code: 1, out: "", err: "ls boom" };
       return ok(JSON.stringify(this.created.map((name) => ({ name, agent: "shell", status: "running" }))));
     }
     if (args[0] === "create") {
@@ -124,7 +131,18 @@ class FakeSbx implements SbxCli {
     }
     if (args[0] === "exec") {
       const joined = args.join(" ");
+      // The in-VM dsh is stopped by pkill (unless it is stubborn).
+      if (joined.includes("pkill")) {
+        if (!this.stubbornDsh) this.dshAlive = false;
+        return ok("");
+      }
+      if (joined.includes("git checkout")) {
+        const m = joined.match(/git checkout (?:-b )?([^\s;&|]+)/);
+        if (m) this.currentBranch = m[1];
+        return ok("");
+      }
       if (joined.includes("rev-parse HEAD")) return ok(this.headSha);
+      if (joined.includes("rev-parse --abbrev-ref HEAD")) return ok(this.currentBranch ?? "");
       if (joined.includes("pgrep")) return ok(this.dshAlive ? "ALIVE" : "GONE");
       if (joined.includes("--version")) {
         return this.failDshVersion ? { ok: false, code: 1, out: "", err: "not found" } : ok(this.dshVersion);
@@ -240,14 +258,21 @@ describe("sbx boundary (arg builders + parsing)", () => {
     ]);
   });
 
-  test("sandboxNameForTask is deterministic, sbx-safe and slice-qualified", () => {
+  test("sandboxNameForTask is deterministic, sbx-safe, slice-qualified and unique per Task", () => {
     const a = sandboxNameForTask({ id: "T1", issue_id: "ISH-828", slice: "" } as never);
     const b = sandboxNameForTask({ id: "T1", issue_id: "ISH-828", slice: "" } as never);
     expect(a).toBe(b);
-    expect(a).toBe("relay-ish-828");
-    expect(sandboxNameForTask({ id: "T2", issue_id: "ISH-828", slice: "api/part one" } as never)).toBe(
-      "relay-ish-828-api-part-one"
-    );
+    expect(a.startsWith("relay-ish-828")).toBe(true);
+    expect(a.length).toBeLessThanOrEqual(60);
+    expect(/^[a-z0-9][a-z0-9.-]*$/.test(a)).toBe(true);
+    // Finding 5: the stable Task-id hash distinguishes same-slug Tasks.
+    const t2 = sandboxNameForTask({ id: "T2", issue_id: "ISH-828", slice: "" } as never);
+    expect(t2).not.toBe(a);
+    // Two providers, same issue id + slice, still differ (task identity includes provider).
+    const p1 = sandboxNameForTask({ id: "T10", issue_id: "ISH-828", slice: "api/part one" } as never);
+    const p2 = sandboxNameForTask({ id: "T11", issue_id: "ISH-828", slice: "api/part one" } as never);
+    expect(p1).not.toBe(p2);
+    expect(p1.startsWith("relay-ish-828-api-part-one")).toBe(true);
   });
 
   test("parseSandboxList tolerates malformed output and keeps only named rows", () => {
@@ -329,7 +354,6 @@ describe("sandbox Run: one disposable dsh per attempt", () => {
       // The sbx exec must target the sandbox and run the pinned dsh CLI.
       expect(argv[0]).toBe("sbx");
       expect(argv[1]).toBe("exec");
-      expect(argv).toContain("relay-ish-828-0");
       expect(argv.slice(argv.indexOf("dsh"))).toEqual([
         "dsh",
         "--profile",
@@ -568,15 +592,63 @@ describe("safe sandbox cleanup (evidence-retaining)", () => {
     expect(listRuns(db, { taskId: id }).length).toBe(1);
   });
 
-  test("refuses to destroy a produced commit that was never fetched", async () => {
+  test("finding 4: a commit from a failed Run is fetched and saved before the VM is removed", async () => {
     const id = newTask();
     const sbx = new FakeSbx();
     const spawner = new FakeSpawner();
-    await launched(id, sbx, spawner);
-    updateSandboxState(db, id, { head_sha: null });
+    // A Run that COMMITS and then exits non-zero (e.g. a provider error after the
+    // commit). Its exit code is 1, so no head_sha is recorded by the Run itself.
+    spawner.onSpawn = (p) => {
+      dshStream(p);
+      p.finish(1);
+    };
+    const l = await launchTaskSandboxRun(db, id, { source: repo, cli: sbx, spawner, outputRoot: outputRoot(), fastExitMs: 0 });
+    const produced = publishFakeSandboxCommit(l.sandbox.name, l.sandbox.branch);
+    const run = await l.handle.wait();
+    expect(run.state).toBe("failed");
+    expect(run.head_sha).toBeNull();
+    expect(getSandbox(db, id)!.head_sha).toBeNull();
+
     const plan = planSandboxCleanup(db, id, { abort: "operator", cli: sbx });
-    expect(plan.remove).toBe(false);
-    expect(plan.reasons.join(";")).toMatch(/no commit was fetched/);
+    expect(plan.remove).toBe(true); // the dry run cannot know; apply must fetch
+
+    const applied = applySandboxCleanup(db, id, { apply: true, abort: "operator", cli: sbx });
+    expect(applied.removed).toBe(true);
+    // The commit was pinned under a durable host ref and recorded, then removed.
+    expect(getSandbox(db, id)!.head_sha).toBe(produced);
+    const ref = git(repo, "rev-parse", `refs/relay-sandbox/${l.sandbox.name}`);
+    expect(ref).toBe(produced);
+  });
+
+  test("finding 4: a failed pre-removal fetch refuses to remove the VM", async () => {
+    const id = newTask();
+    const sbx = new FakeSbx();
+    const spawner = new FakeSpawner();
+    spawner.onSpawn = (p) => {
+      dshStream(p);
+      p.finish(1);
+    };
+    const l = await launchTaskSandboxRun(db, id, { source: repo, cli: sbx, spawner, outputRoot: outputRoot(), fastExitMs: 0 });
+    await l.handle.wait();
+    // No `sandbox-<name>` host remote exists, so the pre-removal fetch must fail.
+    const applied = applySandboxCleanup(db, id, { apply: true, abort: "operator", cli: sbx });
+    expect(applied.removed).toBe(false);
+    expect(applied.reasons.join(";")).toMatch(/could not confirm the sandbox commit is saved/);
+    expect(getSandbox(db, id)!.state).not.toBe("removed");
+  });
+
+  test("finding 6: a failed `sbx ls` refuses to assume the sandbox is gone", async () => {
+    const id = newTask();
+    const sbx = new FakeSbx();
+    const spawner = new FakeSpawner();
+    const { run } = await launched(id, sbx, spawner);
+    sbx.failLs = true;
+    const applied = applySandboxCleanup(db, id, { apply: true, abort: "operator", cli: sbx });
+    expect(applied.removed).toBe(false);
+    expect(getSandbox(db, id)!.state).not.toBe("removed");
+    expect(applied.reasons.join(";")).toMatch(/sbx ls failed/);
+    // The Run evidence is untouched.
+    expect(existsSync(run.output_dir)).toBe(true);
   });
 
   test("refuses when a Run's evidence directory is missing", async () => {
@@ -601,6 +673,143 @@ describe("safe sandbox cleanup (evidence-retaining)", () => {
     expect(plan.reasons.join(";")).toMatch(/active run/);
     l.handle.cancel("done");
     await l.handle.wait();
+  });
+});
+
+describe("round-2 findings", () => {
+  test("finding 1: opens a DB whose runs table predates ISH-828 (no sandbox_name)", () => {
+    const p = join(dir, "old.db");
+    const old = new Database(p, { create: true });
+    old.exec(`CREATE TABLE runs (
+      id TEXT PRIMARY KEY, task_id TEXT NOT NULL, phase TEXT NOT NULL, attempt INTEGER NOT NULL DEFAULT 0,
+      generation INTEGER NOT NULL DEFAULT 0, cwd TEXT NOT NULL, branch TEXT, head_sha TEXT, base_head_sha TEXT,
+      prompt TEXT NOT NULL DEFAULT '', spec_path TEXT, output_dir TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'starting',
+      pid INTEGER, exit_code INTEGER, signal TEXT, session_id TEXT, stdout_path TEXT, stderr_path TEXT, events_path TEXT,
+      dsh_events_path TEXT, spawn_lstart TEXT, error TEXT, fast_exit INTEGER NOT NULL DEFAULT 0, started_at INTEGER NOT NULL,
+      ended_at INTEGER, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);`);
+    old.close();
+    const reopened = openDb(p);
+    const cols = reopened.query("PRAGMA table_info(runs)").all() as { name: string }[];
+    expect(cols.some((c) => c.name === "sandbox_name")).toBe(true);
+    const idx = reopened.query("PRAGMA index_list(runs)").all() as { name: string }[];
+    expect(idx.some((i) => i.name === "idx_runs_sandbox")).toBe(true);
+    reopened.close();
+  });
+
+  test("finding 8: childEnv is an allowlist, not all of process.env", () => {
+    const env = childEnv({ PATH: "/bin", HOME: "/home/x", SECRET_X: "leak", DEEPSEEK_API_KEY: "k" }, { EXPLICIT: "ok" });
+    expect(env.PATH).toBe("/bin");
+    expect(env.HOME).toBe("/home/x");
+    expect(env.SECRET_X).toBeUndefined();
+    expect(env.DEEPSEEK_API_KEY).toBeUndefined();
+    expect(env.EXPLICIT).toBe("ok");
+  });
+
+  test("finding 8: an unrelated host var does not reach the sandbox child spawn", async () => {
+    process.env.SECRET_X = "leak-me";
+    try {
+      const id = newTask();
+      const sbx = new FakeSbx();
+      const spawner = new FakeSpawner();
+      spawner.onSpawn = (p) => {
+        dshStream(p);
+        p.finish(0);
+      };
+      await launchTaskSandboxRun(db, id, { source: repo, cli: sbx, spawner, outputRoot: outputRoot(), fastExitMs: 0 });
+      expect(spawner.envs[0].SECRET_X).toBeUndefined();
+      expect(spawner.envs[0].PATH).toBe(process.env.PATH ?? "");
+    } finally {
+      delete process.env.SECRET_X;
+    }
+  });
+
+  test("finding 8: an unrelated host var does not reach the dsh child spawn", async () => {
+    process.env.SECRET_X = "leak-me";
+    try {
+      const id = newTask();
+      const spawner = new FakeSpawner();
+      spawner.onSpawn = (p) => {
+        dshStream(p);
+        p.finish(0);
+      };
+      const handle = await startDshRun(db, { taskId: id, cwd: repo, spawner, outputRoot: outputRoot() });
+      await handle.wait();
+      expect(spawner.envs[0].SECRET_X).toBeUndefined();
+      expect(spawner.envs[0].PATH).toBe(process.env.PATH ?? "");
+    } finally {
+      delete process.env.SECRET_X;
+    }
+  });
+
+  test("finding 3: fetchSandboxHead refuses an absent branch instead of using FETCH_HEAD", () => {
+    const producer = join(dir, "prod3");
+    mkdirSync(producer, { recursive: true });
+    git(producer, "init", "-q", "-b", "other");
+    git(producer, "config", "user.email", "x@y.z");
+    git(producer, "config", "user.name", "x");
+    writeFileSync(join(producer, "f.txt"), "x\n");
+    git(producer, "add", "f.txt");
+    git(producer, "commit", "-q", "-m", "other commit");
+    const bare = join(dir, "bare3.git");
+    git(producer, "init", "-q", "--bare", bare);
+    git(producer, "remote", "add", "origin", bare);
+    git(producer, "push", "-q", "origin", "other:refs/heads/other");
+    git(repo, "remote", "add", sandboxRemote("relay-x"), bare);
+    const f = fetchSandboxHead(repo, "relay-x", "relay/absent-branch");
+    expect(f.ok).toBe(false);
+    expect(f.sha).toBeNull();
+  });
+
+  test("finding 5: two Tasks with the same issue/slice get distinct sandboxes", () => {
+    const a = intakeTask(db, { provider: "p1", issueId: "ISH-900", slice: "s", codeChange: true, title: "a" });
+    const b = intakeTask(db, { provider: "p2", issueId: "ISH-900", slice: "s", codeChange: true, title: "b" });
+    const sbx = new FakeSbx();
+    const na = ensureTaskSandbox(db, a.id, { source: repo, cli: sbx }).name;
+    const nb = ensureTaskSandbox(db, b.id, { source: repo, cli: sbx }).name;
+    expect(na).not.toBe(nb);
+  });
+
+  test("finding 6: a failed `sbx ls` during ensure does not mark the mapping lost", () => {
+    const id = newTask();
+    const sbx = new FakeSbx();
+    ensureTaskSandbox(db, id, { source: repo, cli: sbx });
+    sbx.failLs = true;
+    expect(() => ensureTaskSandbox(db, id, { source: repo, cli: sbx })).toThrow(/could not list sandboxes/);
+    expect(getSandbox(db, id)!.state).toBe("running");
+  });
+
+  test("finding 2: a non-zero client exit with a live in-VM dsh is orphaned, stopped, and frees the writer", async () => {
+    const id = newTask();
+    const sbx = new FakeSbx();
+    sbx.dshAlive = true;
+    const spawner = new FakeSpawner();
+    spawner.onSpawn = (p) => {
+      dshStream(p);
+      p.finish(1);
+    };
+    const l = await launchTaskSandboxRun(db, id, { source: repo, cli: sbx, spawner, outputRoot: outputRoot(), fastExitMs: 0 });
+    const run = await l.handle.wait();
+    expect(run.state).toBe("failed");
+    expect(run.error ?? "").toContain("orphaned");
+    expect(sbx.calls.some((c) => c.join(" ").includes("pkill"))).toBe(true);
+    expect(findActiveSandboxWriter(db, { sandboxName: l.sandbox.name })).toBeNull();
+  });
+
+  test("finding 2: a stubborn in-VM dsh leaves the Run non-terminal to block a second writer", async () => {
+    const id = newTask();
+    const sbx = new FakeSbx();
+    sbx.dshAlive = true;
+    sbx.stubbornDsh = true;
+    const spawner = new FakeSpawner();
+    spawner.onSpawn = (p) => {
+      dshStream(p);
+      p.finish(1);
+    };
+    const l = await launchTaskSandboxRun(db, id, { source: repo, cli: sbx, spawner, outputRoot: outputRoot(), fastExitMs: 0 });
+    const run = await l.handle.wait();
+    expect(run.state).toBe("running");
+    expect(run.error ?? "").toContain("non-terminal");
+    expect(findActiveSandboxWriter(db, { sandboxName: l.sandbox.name })?.id).toBe(run.id);
   });
 });
 

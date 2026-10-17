@@ -97,6 +97,7 @@ class FakeSpawner implements DshSpawner {
 
 class FakeSbx implements SbxCli {
   created: string[] = [];
+  currentBranch = "main";
   headSha = "b".repeat(40);
   run(args: string[]): SbxResult {
     const ok = (out = ""): SbxResult => ({ ok: true, code: 0, out, err: "" });
@@ -108,7 +109,13 @@ class FakeSbx implements SbxCli {
     }
     if (args[0] === "exec") {
       const joined = args.join(" ");
+      if (joined.includes("git checkout")) {
+        const m = joined.match(/git checkout (?:-b )?([^\s;&|]+)/);
+        if (m) this.currentBranch = m[1];
+        return ok("");
+      }
       if (joined.includes("rev-parse HEAD")) return ok(this.headSha);
+      if (joined.includes("rev-parse --abbrev-ref HEAD")) return ok(this.currentBranch);
       if (joined.includes("--version")) return ok("0.2.0-rc.2");
       return ok("");
     }

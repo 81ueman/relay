@@ -27,6 +27,7 @@ import {
 } from "./dsh-events";
 import { buildRunBrief, inheritFindings, taskBranchName, type RunFinding } from "./run-lifecycle";
 import { spawnIdentityToken } from "./proc-identity";
+import { childEnv } from "./child-env";
 import {
   DUPLICATE_SANDBOX_WRITER,
   SANDBOX_ERROR,
@@ -75,12 +76,6 @@ import {
  */
 
 const ORPHANED = "orphaned";
-
-function baseEnv(): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const [k, v] of Object.entries(process.env)) if (typeof v === "string") out[k] = v;
-  return out;
-}
 
 async function pumpLines(stream: ReadableStream<Uint8Array>, onLine: (line: string) => void): Promise<void> {
   const reader = stream.getReader();
@@ -167,8 +162,15 @@ export function ensureTaskSandbox(db: Database, taskId: string, opts: EnsureSand
 
   const live = getSandbox(db, taskId);
   if (live && live.state !== "removed" && live.state !== "failed") {
-    const { present } = sbxSandboxState(cli, live.name);
-    if (present) {
+    const st = sbxSandboxState(cli, live.name);
+    // Finding 6: a LISTING FAILURE is not "no sandboxes". Fail closed: do not
+    // mark the mapping lost, and do not risk recreating a name that may exist.
+    if (!st.ok) {
+      throw new Error(
+        `${SANDBOX_ERROR}: could not list sandboxes while reusing ${live.name} (${st.error}); refusing to recreate it`
+      );
+    }
+    if (st.present) {
       const branch = live.branch ?? task.branch ?? taskBranchName(task);
       // A stopped sandbox is still reusable; `sbx exec` starts it again.
       const state = live.state === "stopped" ? "stopped" : "running";
@@ -185,7 +187,7 @@ export function ensureTaskSandbox(db: Database, taskId: string, opts: EnsureSand
         state,
       };
     }
-    // The mapping says the sandbox is live but sbx no longer knows it.
+    // Confirmed absent: the mapping says live, sbx no longer knows it.
     updateSandboxState(db, taskId, { state: "failed" });
     logSandbox(db, taskId, "sandbox.lost", { name: live.name });
   }
@@ -195,7 +197,7 @@ export function ensureTaskSandbox(db: Database, taskId: string, opts: EnsureSand
   const branch = task.branch ?? taskBranchName(task);
   upsertSandbox(db, { taskId, name, agent, source, workspace: source, branch, state: "creating" });
 
-  const created = cli.run(sbxCreateArgv({ name, agent, source, clone: true, cpus: opts.cpus, memory: opts.memory }));
+  const created = cli.run(sbxCreateArgv({ name, agent, source, cpus: opts.cpus, memory: opts.memory }));
   if (!created.ok) {
     updateSandboxState(db, taskId, { state: "failed" });
     logSandbox(db, taskId, "sandbox.create_failed", { name, agent, source, error: created.err || created.out });
@@ -203,22 +205,31 @@ export function ensureTaskSandbox(db: Database, taskId: string, opts: EnsureSand
   }
 
   // The clone mirrors the host path inside the VM (ISH-822). Put it on the Task
-  // branch so every Run commits onto the branch Relay later fetches.
-  ensureSandboxBranch(cli, name, source, branch);
+  // branch so every Run commits onto the branch Relay later fetches. Finding 3: a
+  // failed branch setup is FATAL — a Run must never commit onto an unrelated
+  // branch and be recorded with the wrong produced HEAD.
+  if (!ensureSandboxBranch(cli, name, source, branch)) {
+    updateSandboxState(db, taskId, { state: "failed" });
+    logSandbox(db, taskId, "sandbox.branch_failed", { name, source, branch });
+    throw new Error(`${SANDBOX_ERROR}: could not check out branch ${branch} in sandbox ${name}`);
+  }
   const binding = updateSandboxState(db, taskId, { state: "running", workspace: source, branch });
   logSandbox(db, taskId, "sandbox.created", { name, agent, source, branch, output: created.out.slice(0, 500) });
   return { taskId, name, agent, source, workspace: binding?.workspace ?? source, branch, created: true, state: "running" };
 }
 
-/** Ensure `branch` exists in the sandbox clone and is checked out. */
-function ensureSandboxBranch(cli: SbxCli, name: string, workspace: string, branch: string): void {
+/**
+ * Ensure `branch` exists in the sandbox clone and is checked out. Returns false on
+ * any failure (the caller treats that as fatal — see finding 3).
+ */
+function ensureSandboxBranch(cli: SbxCli, name: string, workspace: string, branch: string): boolean {
   const script = `git rev-parse --verify --quiet refs/heads/${branch} >/dev/null && git checkout ${branch} || git checkout -b ${branch}`;
   const r = cli.run(sbxExecArgv(name, bashLc(script), { workdir: workspace }));
-  if (!r.ok) {
-    // Not fatal: a later Run can still operate on the clone's default branch;
-    // record it rather than hiding it.
-    return;
-  }
+  if (!r.ok) return false;
+  // Confirm the clone is actually ON the branch (a compound `&& ||` can exit 0
+  // for the wrong reason, so verify rather than trust the exit code).
+  const cur = cli.run(sbxExecArgv(name, ["git", "rev-parse", "--abbrev-ref", "HEAD"], { workdir: workspace }));
+  return cur.ok && cur.out.trim() === branch;
 }
 
 /** The in-clone HEAD (used as the Run's base/staleness fence). */
@@ -315,6 +326,11 @@ export interface FetchedHead {
  * `git fetch sandbox-<name>` in the MAIN checkout and resolve the produced HEAD.
  * This is the ONLY way a sandbox Run's commit reaches the host; a failure means
  * the Run cannot be submitted and must fail closed.
+ *
+ * Finding 3: when a `branch` is given, the produced HEAD is ONLY
+ * `<remote>/<branch>`. There is NO `FETCH_HEAD` fallback — `git fetch` may write
+ * FETCH_HEAD to whatever ref it saw first, so accepting it could record an
+ * unrelated commit as the Task branch's head.
  */
 export function fetchSandboxHead(source: string, name: string, branch: string | null): FetchedHead {
   const remote = sandboxRemote(name);
@@ -325,10 +341,11 @@ export function fetchSandboxHead(source: string, name: string, branch: string | 
   if (branch) {
     const r = hostGit(source, ["rev-parse", `${remote}/${branch}`]);
     if (r.ok && /^[0-9a-f]{7,40}$/.test(r.out.trim())) return { ok: true, sha: r.out.trim(), remote };
+    return { ok: false, sha: null, remote, error: `no ref ${remote}/${branch} after fetch` };
   }
   const fh = hostGit(source, ["rev-parse", "FETCH_HEAD"]);
   if (fh.ok && /^[0-9a-f]{7,40}$/.test(fh.out.trim())) return { ok: true, sha: fh.out.trim(), remote };
-  return { ok: false, sha: null, remote, error: `no ref for ${remote}/${branch ?? "(default)"}` };
+  return { ok: false, sha: null, remote, error: `no ref for ${remote} (no branch bound)` };
 }
 
 // ---------------------------------------------------------------------------
@@ -345,6 +362,12 @@ export interface LaunchSandboxOptions extends EnsureSandboxOptions {
   fastExitMs?: number;
   /** Extra `sbx exec -e` env for the Run (never the whole host env). */
   env?: Record<string, string>;
+  /**
+   * Extra dsh arguments inserted before `--json` (operator provider overlay, e.g.
+   * `["--patch", "/home/agent/dsh-overlay.yml"]`). Provider config is the
+   * operator's, not Relay's.
+   */
+  dshArgs?: string[];
   installDsh?: boolean;
   /** The sbx executable (default `sbx`, or $RELAY_SBX_BIN). */
   sbxBin?: string;
@@ -557,7 +580,7 @@ export async function launchTaskSandboxRun(
   const permissionMode = opts.permissionMode ?? DEFAULT_PERMISSION_MODE;
   const fastExitMs = opts.fastExitMs ?? DEFAULT_FAST_EXIT_MS;
   const dshBin = opts.dshBin ?? "dsh";
-  const runArgv = [dshBin, "--profile", "headless", "--json", briefText];
+  const runArgv = [dshBin, "--profile", "headless", ...(opts.dshArgs ?? []), "--json", briefText];
   const execEnv: Record<string, string> = {
     DSH_PERMISSION_MODE: permissionMode,
     RELAY_RUN_ID: runId,
@@ -570,7 +593,9 @@ export async function launchTaskSandboxRun(
 
   let proc: DshProcess;
   try {
-    proc = spawner.spawn(argv, { cwd: binding.source, env: baseEnv() });
+    // ISH-828 finding 8: the sbx client gets the small child allowlist, not all
+    // of process.env. Only the explicit -e values above enter the VM.
+    proc = spawner.spawn(argv, { cwd: binding.source, env: childEnv() });
   } catch (e) {
     const message = `spawn failed: ${e instanceof Error ? e.message : String(e)}`;
     events({ t: "run.failed", error: message });
@@ -655,6 +680,7 @@ export async function launchTaskSandboxRun(
 
     let state: RunState;
     let fetchedHead: string | null = null;
+    let fetchError: string | null = null;
     let errorText: string | null = null;
 
     if (reason === "timeout") state = "timeout";
@@ -668,21 +694,36 @@ export async function launchTaskSandboxRun(
       const fetched = fetchSandboxHead(binding.source, binding.name, binding.branch);
       if (!fetched.ok) {
         state = "failed";
-        errorText = fetched.error ?? "fetch failed";
+        fetchError = fetched.error ?? "fetch failed";
       } else {
         fetchedHead = fetched.sha;
       }
     }
 
-    // Distinguish a cancelled/timed-out CLIENT from a still-running in-VM dsh.
-    if (state !== "exited" && state !== "failed") {
-      if (sandboxDshAlive(cli, binding.name)) {
+    // Finding 2: probe the in-VM dsh on EVERY non-`exited` outcome (a non-zero
+    // client exit, a transport drop, a cancel or a timeout), not only
+    // cancel/timeout. A dead client with a live in-VM dsh is an orphan; stop it,
+    // and if it will not die leave the row NON-TERMINAL so the single-writer guard
+    // blocks a second writer into the same clone.
+    let orphanNote: string | null = null;
+    if (state !== "exited") {
+      const firstAlive = sandboxDshAlive(cli, binding.name);
+      let alive = firstAlive;
+      if (alive) {
         stopInVmDsh();
-        errorText = `${ORPHANED}: in-VM dsh survived ${reason ?? "process end"}; stopped`;
-        events({ t: "run.orphaned", reason });
+        alive = sandboxDshAlive(cli, binding.name);
       }
-    } else if (state === "failed" && reason === null && !failure) {
-      // exit != 0 with no signal: nothing to probe.
+      if (alive) {
+        const stuckError = `${ORPHANED}: in-VM dsh survived ${reason ?? `exit ${exitCode}`} and could not be stopped; Run left non-terminal to block a second writer`;
+        events({ t: "run.orphaned", reason, leftRunning: true });
+        const stuck = patchRun(db, runId, { state: "running", signal: reason, error: stuckError, session_id: sessionId });
+        logSandbox(db, taskId, "sandbox.run.orphaned", { runId, sandbox: binding.name, exitCode, reason, leftRunning: true });
+        return stuck;
+      }
+      if (firstAlive) {
+        orphanNote = `in-VM dsh survived ${reason ?? `exit ${exitCode}`} and was stopped`;
+        events({ t: "run.orphaned", reason, stopped: true });
+      }
     }
 
     if (fast) events({ t: "run.fast_exit", durationMs, exitCode });
@@ -700,7 +741,8 @@ export async function launchTaskSandboxRun(
       turnReason,
     });
     errorText =
-      errorText ??
+      (orphanNote ? `${ORPHANED}: ${orphanNote}` : null) ??
+      fetchError ??
       failure ??
       (state === "exited" ? null : reason ? `run ${reason}` : terminalError ?? `exit ${exitCode}`);
 
@@ -882,9 +924,14 @@ export interface SandboxCleanupPlan {
 /**
  * Plan (and, with `apply`, perform) a SAFE sandbox teardown. Removal is allowed
  * only when the Task is really merged OR explicitly aborted; no Run still holds
- * the sandbox; the produced commit was fetched (`sandbox.head_sha`) OR there is
- * no commit to lose; and every Run's log directory still exists on the host. The
+ * the sandbox; and every Run's log directory still exists on the host. The
  * `runs` rows and their output dirs are RETAINED as evidence.
+ *
+ * Finding 4: the produced commit is confirmed SAFE by `applySandboxCleanup`, which
+ * `git fetch`es the sandbox immediately before removal — so a Run that committed
+ * and then exited non-zero (head_sha never recorded) cannot be silently destroyed.
+ * This plan cannot fetch (it is a dry run), so it must not treat a missing
+ * `head_sha` as "no commit".
  */
 export function planSandboxCleanup(db: Database, taskId: string, opts: SandboxCleanupOptions = {}): SandboxCleanupPlan {
   const task = getTask(db, taskId);
@@ -923,14 +970,6 @@ export function planSandboxCleanup(db: Database, taskId: string, opts: SandboxCl
   const active = findActiveSandboxWriter(db, { sandboxName: sandbox.name, branch: sandbox.branch });
   if (active) reasons.push(`active run ${active.id} (${active.state}) still holds sandbox ${sandbox.name}`);
 
-  // Never destroy a commit before it is on the host. If the sandbox ever
-  // produced a commit and no HEAD was fetched, refuse (force does not override:
-  // losing the produced commit is not recoverable).
-  const anyExit0 = runs.some((r) => r.exit_code === 0);
-  if (anyExit0 && !sandbox.head_sha) {
-    reasons.push("the sandbox produced a Run with exit 0 but no commit was fetched to the host");
-  }
-
   // Every Run's evidence directory must still exist on the host before teardown.
   for (const r of runs) {
     if (!r.output_dir || !existsSync(r.output_dir)) {
@@ -942,6 +981,44 @@ export function planSandboxCleanup(db: Database, taskId: string, opts: SandboxCl
   return plan;
 }
 
+export interface SavedTip {
+  ok: boolean;
+  tip: string | null;
+  savedRef?: string;
+  error?: string;
+}
+
+/**
+ * Fetch the sandbox's branch tip to the host and make sure it can never be lost:
+ * if the tip is not already the recorded `head_sha`, pin it under a durable host
+ * ref (`refs/relay-sandbox/<name>`) and record it. Returns `ok:false` when the
+ * fetch/resolve fails — the caller must then NOT destroy the VM.
+ */
+export function saveSandboxTip(db: Database, taskId: string, sandbox: Sandbox): SavedTip {
+  const remote = sandboxRemote(sandbox.name);
+  const fetched = hostGit(sandbox.source, ["fetch", remote]);
+  if (!fetched.ok) {
+    return { ok: false, tip: null, error: `git fetch ${remote} failed: ${(fetched.err || fetched.out).slice(0, 200)}` };
+  }
+  let tip: string | null = null;
+  if (sandbox.branch) {
+    const r = hostGit(sandbox.source, ["rev-parse", `${remote}/${sandbox.branch}`]);
+    if (r.ok && /^[0-9a-f]{7,40}$/.test(r.out.trim())) tip = r.out.trim();
+  } else {
+    const r = hostGit(sandbox.source, ["rev-parse", "FETCH_HEAD"]);
+    if (r.ok && /^[0-9a-f]{7,40}$/.test(r.out.trim())) tip = r.out.trim();
+  }
+  if (!tip) return { ok: true, tip: null };
+  if (sandbox.head_sha && tip === sandbox.head_sha) return { ok: true, tip };
+
+  // Not yet saved: pin it under a durable host ref so removal cannot lose it.
+  const ref = `refs/relay-sandbox/${sandbox.name}`;
+  const upd = hostGit(sandbox.source, ["update-ref", ref, tip]);
+  if (!upd.ok) return { ok: false, tip, error: `git update-ref ${ref} failed: ${(upd.err || upd.out).slice(0, 200)}` };
+  updateSandboxState(db, taskId, { head_sha: tip });
+  return { ok: true, tip, savedRef: ref };
+}
+
 export function applySandboxCleanup(db: Database, taskId: string, opts: SandboxCleanupOptions = {}): SandboxCleanupPlan {
   const plan = planSandboxCleanup(db, taskId, opts);
   if (!plan.apply || !plan.name) return plan;
@@ -950,8 +1027,29 @@ export function applySandboxCleanup(db: Database, taskId: string, opts: SandboxC
     return plan;
   }
   const cli = opts.cli ?? realSbxCli;
-  const { present } = sbxSandboxState(cli, plan.name);
-  if (present) {
+  const sandbox = getSandbox(db, taskId)!;
+
+  // Finding 6: a failed `sbx ls` is not a confirmed absence. Fail closed.
+  const st = sbxSandboxState(cli, plan.name);
+  if (!st.ok) {
+    plan.reasons.push(`sbx ls failed: ${st.error ?? "unknown"}; refusing to assume the sandbox is gone`);
+    plan.remove = false;
+    return plan;
+  }
+
+  // Finding 4: confirm the produced commit is on the host BEFORE destroying the VM.
+  // (A confirmed-absent sandbox has nothing to save.)
+  let savedRef: string | null = null;
+  if (st.present) {
+    const saved = saveSandboxTip(db, taskId, sandbox);
+    if (!saved.ok) {
+      plan.reasons.push(`could not confirm the sandbox commit is saved: ${saved.error ?? "unknown"}`);
+      plan.remove = false;
+      return plan;
+    }
+    if (saved.tip) plan.savedHead = saved.tip;
+    savedRef = saved.savedRef ?? null;
+
     cli.run(["stop", plan.name]);
     const rm = cli.run(["rm", "--force", plan.name]);
     if (!rm.ok) {
@@ -967,6 +1065,8 @@ export function applySandboxCleanup(db: Database, taskId: string, opts: SandboxC
     branch: plan.branch,
     abort: opts.abort ?? null,
     savedHead: plan.savedHead,
+    savedRef,
+    confirmedAbsent: !st.present,
     retainedRuns: plan.retainedRuns,
   });
   return plan;

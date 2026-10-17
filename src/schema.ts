@@ -808,7 +808,10 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 CREATE INDEX IF NOT EXISTS idx_runs_task ON runs(task_id, phase, attempt);
 CREATE INDEX IF NOT EXISTS idx_runs_state ON runs(state);
-CREATE INDEX IF NOT EXISTS idx_runs_sandbox ON runs(sandbox_name);
+-- NOTE: idx_runs_sandbox (runs.sandbox_name) is created by migrate(), NOT here.
+-- SCHEMA runs before migrate() (see openDb), and a pre-ISH-828 runs table has
+-- no sandbox_name column yet, so an index on it here would break opening every
+-- existing control-plane DB.
 
 -- ISH-828: one durable Task -> Coding Sandbox mapping. The Task owns a private
 -- in-container Git clone (Docker Sandboxes clone mode, created from the MAIN

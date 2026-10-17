@@ -1,8 +1,10 @@
 import type { Database } from "bun:sqlite";
 import { execFileSync, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { dirname } from "node:path";
 import { now, projectRoot } from "./db";
 import { logEvent } from "./events";
+import { childEnv } from "./child-env";
 import type { Sandbox, SandboxState, Task } from "./schema";
 
 /**
@@ -77,6 +79,8 @@ export const realSbxCli: SbxCli = {
         stdio: ["ignore", "pipe", "pipe"],
         timeout: opts.timeoutMs,
         maxBuffer: 64 * 1024 * 1024,
+        // ISH-828: the sbx client gets the small child allowlist, not all of process.env.
+        env: childEnv(),
       });
       return { ok: true, code: 0, out: out.trim(), err: "" };
     } catch (e) {
@@ -85,22 +89,17 @@ export const realSbxCli: SbxCli = {
   },
 };
 
-/** `sbx create --clone --name <name> <agent> <source>` argv. */
+/** `sbx create --clone --name <name> <agent> <source>` argv. Always clone mode. */
 export function sbxCreateArgv(opts: {
   name: string;
   agent: string;
   source: string;
-  clone?: boolean;
   cpus?: number;
   memory?: string;
-  env?: Record<string, string>;
 }): string[] {
-  const argv = ["create"];
-  if (opts.clone !== false) argv.push("--clone");
-  argv.push("--name", opts.name);
+  const argv = ["create", "--clone", "--name", opts.name];
   if (opts.cpus && opts.cpus > 0) argv.push("--cpus", String(opts.cpus));
   if (opts.memory) argv.push("--memory", opts.memory);
-  for (const [k, v] of Object.entries(opts.env ?? {})) argv.push("-e", `${k}=${v}`);
   argv.push(opts.agent, opts.source);
   return argv;
 }
@@ -153,19 +152,35 @@ export function parseSandboxList(out: string): SandboxListEntry[] {
   }
 }
 
-export function sbxList(cli: SbxCli = realSbxCli, opts: SbxRunOptions = {}): SandboxListEntry[] {
+export function sbxList(cli: SbxCli = realSbxCli, opts: SbxRunOptions = {}): SbxListResult {
   const r = cli.run(["ls", "--json"], opts);
-  if (!r.ok) return [];
-  return parseSandboxList(r.out);
+  if (!r.ok) {
+    return { ok: false, sandboxes: [], error: r.err || `sbx ls exited ${r.code ?? "?"}` };
+  }
+  return { ok: true, sandboxes: parseSandboxList(r.out) };
 }
 
+export interface SbxListResult {
+  /** False when `sbx ls` itself failed (never confused with an empty list). */
+  ok: boolean;
+  sandboxes: SandboxListEntry[];
+  error?: string;
+}
+
+/**
+ * Whether `name` is present, distinguishing a LISTING FAILURE (`ok:false`) from a
+ * confirmed absent entry (`ok:true, present:false`). Callers must fail closed on
+ * `ok:false` — never treat a transient `ls` error as "no sandboxes".
+ */
 export function sbxSandboxState(
   cli: SbxCli,
   name: string,
   opts: SbxRunOptions = {}
-): { present: boolean; entry: SandboxListEntry | null } {
-  const entry = sbxList(cli, opts).find((s) => s.name === name) ?? null;
-  return { present: entry !== null, entry };
+): { ok: boolean; present: boolean; entry: SandboxListEntry | null; error?: string } {
+  const listing = sbxList(cli, opts);
+  if (!listing.ok) return { ok: false, present: false, entry: null, error: listing.error };
+  const entry = listing.sandboxes.find((s) => s.name === name) ?? null;
+  return { ok: true, present: entry !== null, entry };
 }
 
 // ---------------------------------------------------------------------------
@@ -173,15 +188,22 @@ export function sbxSandboxState(
 // ---------------------------------------------------------------------------
 
 const SBX_NAME_RE = /[^a-zA-Z0-9.-]+/g;
-/** sbx names must start with a letter/number and contain only [A-Za-z0-9.-]. */
+/**
+ * The sandbox name a Task owns: `relay-<issue-or-id>[-<slice>]-<hash8>`. The
+ * trailing hash is derived from the Task's STABLE `id`, so two Tasks that share a
+ * sanitised/truncated issue+slice slug (e.g. different providers, or an id that
+ * collides after sanitising) still get distinct sandboxes ("別Taskは別Sandbox").
+ * sbx names start with a letter/number and use only [A-Za-z0-9.-]; max 60 chars.
+ */
 export function sandboxNameForTask(task: Pick<Task, "id" | "issue_id" | "slice">): string {
+  const hash = createHash("sha256").update(task.id).digest("hex").slice(0, 8);
   const base = (task.issue_id ?? task.id).toLowerCase();
   const slug = base.replace(SBX_NAME_RE, "-").replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, "");
   const slice = (task.slice ?? "").trim();
   const suffix = slice ? `-${slice.replace(SBX_NAME_RE, "-").replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, "")}` : "";
-  const name = `relay-${(slug || task.id.toLowerCase())}${suffix}`.slice(0, 60);
-  // Never end on a separator (sbx is lenient, but keep it a clean identifier).
-  return name.replace(/[-.]+$/, "") || "relay-task";
+  // "relay-" (6) + slug (<=44) + "-" (1) + hash (8) <= 60.
+  const body = `${slug || "task"}${suffix}`.slice(0, 44).replace(/[-.]+$/, "");
+  return `relay-${body}-${hash}`;
 }
 
 /** The host git remote sbx configures for `<name>`'s clone (see ISH-822/828). */

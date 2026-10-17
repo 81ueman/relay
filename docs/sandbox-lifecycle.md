@@ -38,7 +38,10 @@ relay run sandbox cleanup <task-id> [--abort REASON] [--apply] [--force] [--json
 - **name / branch / HEAD mapping** — persisted one row per Task in the
   `sandboxes` table (`task_id`, `name`, `agent`, `source`, `workspace`, `branch`,
   `head_sha`, `state`, `evidence_dir`), and `runs.sandbox_name` links each Run to
-  its sandbox. The name is the deterministic `relay-<issue|id>[-<slice>]`.
+  its sandbox. The name is `relay-<issue|id>[-<slice>]-<hash8>`: the trailing hash
+  is derived from the Task's stable `id`, so two Tasks that sanitise/truncate to
+  the same slug (different providers, colliding ids) still get **distinct**
+  sandboxes.
 - **reuse** — a second call, and every FIX, **selects the same sandbox** (no
   second clone). This is what makes a FIX the *same sandbox*.
 
@@ -86,19 +89,34 @@ and the `base_head_sha` start fence); a newer Run for the same
 
 At Run end, if the process exited 0, Relay runs
 `git fetch sandbox-<name>` in the main checkout and resolves
-`sandbox-<name>/<branch>` (else `FETCH_HEAD`). That fetched SHA is the Run's
-`head_sha` and the revision `relay run sandbox submit` binds to. **A fetch failure
-fails the Run closed** (`failed`, no `head_sha`): a commit Relay cannot see can
+`sandbox-<name>/<branch>`. That fetched SHA is the Run's `head_sha` and the
+revision `relay run sandbox submit` binds to. When a branch is bound there is
+**no `FETCH_HEAD` fallback** — `git fetch` can point `FETCH_HEAD` at whatever ref
+it saw first, so accepting it could record an unrelated commit. A fetch failure
+fails the Run closed (`failed`, no `head_sha`): a commit Relay cannot see can
 never advance a Task.
 
-## Fail-closed on cancel / timeout / orphan
+## Fail-closed on cancel / timeout / client failure / orphan
 
 The local `sbx exec` client exiting is **not** the same as the in-VM dsh ending.
-Cancelling or timing out a Run kills the client, then probes the sandbox
-(`pgrep -f 'dsh --profile headless'`); if the in-VM process survived it is stopped
-explicitly and the Run's `error` records `orphaned: …`. A timeout is `timeout`; a
-cancel is `cancelled`; a terminal `error` event contradicting exit 0 is `failed`.
-No path fabricates a success.
+On **every** non-`exited` outcome — a cancel, a timeout, a non-zero client exit,
+or a transport drop — Relay probes the sandbox
+(`pgrep -f 'dsh --profile headless'`), stops any surviving in-VM dsh, and records
+`orphaned: …`. If the in-VM process still will not die, the Run is deliberately
+left **non-terminal** so the per-sandbox single-writer guard continues to block a
+second writer; `relay run sandbox sweep --apply` resolves such a row after a
+restart. A terminal `error` event contradicting exit 0 is `failed`. No path
+fabricates a success.
+
+## The host `process.env` is not inherited
+
+Both child spawns (the host dsh runner and the `sbx exec` client) get a small
+explicit allowlist (`src/child-env.ts`): `PATH`, `HOME`, locale, `SSH_AUTH_SOCK`,
+and the sbx/dsh/Docker client config. An unrelated host variable (a secret, a CI
+token) never reaches the child by default; a caller injects what a Run actually
+needs through the explicit `env`/`dshArgs` options, and only those `-e` values
+enter the VM. A provider overlay is an operator concern:
+`dshArgs: ["--patch", "/home/agent/dsh-overlay.yml"]` plus the credential proxy.
 
 ## Safe teardown (evidence-retaining)
 
@@ -108,13 +126,17 @@ No path fabricates a success.
 - the Task is **really merged** or explicitly **aborted** (`--abort <reason>`),
   with no open PR;
 - no Run still holds the sandbox;
-- if any Run exited 0, the produced commit was **fetched** (`sandbox.head_sha`);
-- **every** Run's evidence directory still exists on the host.
+- **every** Run's evidence directory still exists on the host;
+- a confirmed `sbx ls` (a listing failure is never treated as "gone").
 
-`--force` does **not** override the commit/evidence guards: losing a produced
-commit is not recoverable. The `runs` rows and their output directories are
-**never** deleted by cleanup, and the Shared Lab VM / NOS images are a separate
-system this lifecycle never touches.
+Immediately before removal, `applySandboxCleanup` `git fetch`es
+`sandbox-<name>` and resolves the branch tip. If the tip differs from the recorded
+`head_sha` — the case where a Run committed and then exited non-zero — it is
+pinned under a durable host ref (`refs/relay-sandbox/<name>`) and recorded, so a
+produced commit can never be destroyed unseen. If the fetch fails, removal is
+**refused**. The `runs` rows and their output directories are **never** deleted by
+cleanup, and the Shared Lab VM / NOS images are a separate system this lifecycle
+never touches.
 
 ## Isolation
 
@@ -129,15 +151,21 @@ provider, no bridge, no `relay lab`.
 
 - **Verified** (`bun test`, `bun run smoke:sandbox`): the `sbx` argv boundary
   (`--clone` from the main checkout; a linked worktree is refused); the durable
-  Task→sandbox mapping and idempotent reuse; dsh launch via `sbx exec` with the
-  JSONL/evidence pipeline; single-writer refusal; submit/refuse fences; a FIX
-  reusing the same sandbox with the previous findings pinned; and safe cleanup
-  (dry-run, abort, missing commit, missing evidence dir, active writer). All with
-  a **fake** `sbx`/`sbx exec` and a **real** local git remote for the fetch.
+  Task→sandbox mapping, hash-suffixed unique names, and idempotent reuse; dsh
+  launch via `sbx exec` with the JSONL/evidence pipeline; single-writer refusal;
+  submit/refuse fences; a FIX reusing the same sandbox with the previous findings
+  pinned; fail-closed on cancel/timeout/**client failure**/orphan (including a
+  stubborn in-VM dsh left non-terminal) and the restart sweep; the pre-removal
+  fetch-and-save of a commit from a failed Run; `sbx ls` failure as a refusal; and
+  the child-env allowlist. All with a **fake** `sbx`/`sbx exec` and a **real**
+  local git remote for the fetch, plus a **real-DB** reopen from the pre-ISH-828
+  schema.
 - **Real sandbox smoke** — `RELAY_SANDBOX_SMOKE=1 bun run smoke:sandbox:real`
   creates a real clone-mode sandbox from a throwaway main checkout, runs a real
-  `dsh`, fetches the produced commit and removes the sandbox. Evidence is recorded
-  in [`docs/ish828-sandbox-evidence.md`](ish828-sandbox-evidence.md).
+  `dsh`, fetches the produced commit and removes the sandbox. With
+  `RELAY_SANDBOX_KEY_CMD` it installs the Ollama-Cloud overlay + credential proxy
+  so the run commits. Evidence is recorded in
+  [`docs/ish828-sandbox-evidence.md`](ish828-sandbox-evidence.md).
 - **NOT verified here**: any provider push/PR/merge (Relay adds no such
   authority); the Shared Lab / NOS / `labctl` (ISH-824/844/845); and removal of the
   obsolete worktree/attached-worker lanes (ISH-805).
