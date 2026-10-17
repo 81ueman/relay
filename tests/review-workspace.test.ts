@@ -1,7 +1,7 @@
 import { describe, expect, test, beforeEach, afterEach } from "bun:test";
 import { Database } from "bun:sqlite";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb } from "../src/db";
@@ -130,5 +130,26 @@ describe("runHeadlessReview on an independent read-only worktree", () => {
     } finally {
       removeReviewWorktree(repo, ro);
     }
+  });
+
+  test("review evidence is written to a DURABLE base, outside the review worktree", async () => {
+    const head = git(repo, "rev-parse", "HEAD");
+    const t = intakeTask(db, { provider: "test", issueId: "ISH-829-rev2", codeChange: true, headSha: head });
+    claimTask(db, t.id, "impl");
+    submitPhase(db, t.id, "impl");
+    claimTask(db, t.id, "ver");
+    recordVerification(db, t.id, "ver", { passed: true });
+
+    const ro = join(dir, "review-ro");
+    expect(prepareReadOnlyReviewWorktree(repo, head, ro).ok).toBe(true);
+    const { spawner } = harness();
+    // The reviewer runs in the ephemeral `ro`, but evidence is pinned under the
+    // durable writer repo — so removing `ro` cannot delete it.
+    const r = await runHeadlessReview(db, t.id, { spawner, reviewWorktree: ro, evidenceDir: repo });
+    expect(r.outcome).toBe("pass");
+    expect(r.evidenceRef).toBeTruthy();
+    expect(r.evidenceRef!.startsWith(repo)).toBe(true);
+    removeReviewWorktree(repo, ro);
+    expect(existsSync(r.evidenceRef!)).toBe(true); // still there after teardown
   });
 });

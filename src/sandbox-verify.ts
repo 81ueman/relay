@@ -143,6 +143,32 @@ export function sandboxHeadProbeSync(sandbox: string, workspace: string): string
   return /^[0-9a-f]{7,40}$/.test(sha) ? sha : null;
 }
 
+/**
+ * The clone's working-tree cleanliness, read THROUGH the exec seam:
+ * `git -C <workspace> status --porcelain --untracked-files=all`. `clean` = empty
+ * output; `dirty` = any modified/untracked (non-ignored) path; `unknown` = the
+ * probe itself failed (a transport error is never treated as clean).
+ *
+ * The HEAD fence alone is not enough: a writer's uncommitted edit, or a check
+ * that rewrites the source, would still be judged as the bound HEAD. A non-clean
+ * tree therefore never yields a PASS.
+ */
+export type SandboxTreeState = "clean" | "dirty" | "unknown";
+
+export async function sandboxTreeState(
+  exec: SandboxExec,
+  sandbox: string,
+  workspace: string,
+  timeoutMs = 30_000
+): Promise<SandboxTreeState> {
+  const r = await exec.exec(sandbox, ["git", "-C", workspace, "status", "--porcelain", "--untracked-files=all"], {
+    workdir: workspace,
+    timeoutMs,
+  });
+  if (r.error || r.timedOut || r.code !== 0) return "unknown";
+  return r.stdout.trim().length === 0 ? "clean" : "dirty";
+}
+
 // ---------------------------------------------------------------------------
 // Evidence
 // ---------------------------------------------------------------------------
@@ -208,9 +234,14 @@ function tail(s: string): string {
 
 /**
  * A `CommandRunner` that runs each check INSIDE the sandbox at the bound HEAD.
- * The HEAD is verified before and after every command; a moved or unreadable
- * HEAD makes that check `inconclusive`/`not_run`, so a PASS is only ever
- * credited to the revision the command actually saw.
+ *
+ * Every check is fenced on BOTH the HEAD and the working tree, before and after:
+ *   - unreadable/different HEAD before      -> `not_run` (the command never runs);
+ *   - a dirty/unknown tree before           -> `not_run`;
+ *   - a non-zero exit                       -> `fail`;
+ *   - a HEAD that moved while it ran        -> `inconclusive`;
+ *   - a tree the check made dirty/unknowable -> `inconclusive`.
+ * A PASS is therefore only credited to a clean checkout at the exact bound HEAD.
  */
 export function sandboxCommandRunner(binding: SandboxVerifyBinding): CommandRunner {
   return {
@@ -219,7 +250,9 @@ export function sandboxCommandRunner(binding: SandboxVerifyBinding): CommandRunn
       const timeoutMs = spec.timeoutMs ?? DEFAULT_CHECK_TIMEOUT_MS;
       const started = Date.now();
       void _opts;
+
       const before = await sandboxExecHead(binding.exec, binding.sandbox, binding.workspace);
+      const treeBefore = before === null ? "unknown" : await sandboxTreeState(binding.exec, binding.sandbox, binding.workspace);
 
       const finish = (r: {
         outcome: CheckOutcome;
@@ -227,6 +260,7 @@ export function sandboxCommandRunner(binding: SandboxVerifyBinding): CommandRunn
         stdout: string;
         stderr: string;
         timedOut: boolean;
+        headAfter?: string | null;
       }): ExecutedCheck => {
         const stdout = tail(r.stdout);
         const stderr = tail(r.stderr);
@@ -240,12 +274,14 @@ export function sandboxCommandRunner(binding: SandboxVerifyBinding): CommandRunn
           sandbox: binding.sandbox,
           head: binding.head,
           timedOut: r.timedOut,
+          headBefore: before,
+          headAfter: r.headAfter ?? null,
           stdout,
           stderr,
         };
       };
 
-      // FENCE 1 (pre): the clone must be at the bound head before anything runs.
+      // FENCE 1 (pre): the clone must be at the bound head AND clean.
       if (before === null) {
         return finish({ outcome: "not_run", exitCode: null, stdout: "", stderr: `could not read the sandbox HEAD in ${binding.workspace}`, timedOut: false });
       }
@@ -258,30 +294,41 @@ export function sandboxCommandRunner(binding: SandboxVerifyBinding): CommandRunn
           timedOut: false,
         });
       }
+      if (treeBefore !== "clean") {
+        return finish({
+          outcome: "not_run",
+          exitCode: null,
+          stdout: "",
+          stderr: `sandbox working tree is ${treeBefore} before the check (a dirty checkout is never verified)`,
+          timedOut: false,
+        });
+      }
 
       const res = await binding.exec.exec(binding.sandbox, ["bash", "-lc", spec.command], {
         workdir: binding.workspace,
         timeoutMs,
       });
 
-      // FENCE 2 (post): re-read the HEAD so a command that moved it (or a
-      // concurrent writer) cannot yield a trusted PASS.
+      // FENCE 2 (post): re-read the HEAD and the tree so a command that moved the
+      // HEAD or dirtied the checkout (or a concurrent writer) cannot yield a PASS.
       const after = await sandboxExecHead(binding.exec, binding.sandbox, binding.workspace);
+      const treeAfter = after === null ? "unknown" : await sandboxTreeState(binding.exec, binding.sandbox, binding.workspace);
 
       let outcome: CheckOutcome;
-      if (res.error) outcome = "not_run";
-      else if (res.timedOut) outcome = "not_run";
+      if (res.error || res.timedOut) outcome = "not_run";
+      else if (res.code !== 0) outcome = "fail";
       else if (after === null || after !== binding.head) outcome = "inconclusive";
-      else outcome = res.code === 0 ? "pass" : "fail";
+      else if (treeAfter !== "clean") outcome = "inconclusive";
+      else outcome = "pass";
 
-      const executed = finish({
+      return finish({
         outcome,
         exitCode: res.code,
         stdout: res.stdout,
         stderr: res.error ? `${res.stderr}\n${res.error}` : res.stderr,
         timedOut: res.timedOut,
+        headAfter: after,
       });
-      return executed;
     },
   };
 }
@@ -302,16 +349,14 @@ export function evidenceSandboxRunner(
   return {
     async run(spec, opts): Promise<ExecutedCheck> {
       index += 1;
-      const headBefore = await sandboxExecHead(binding.exec, binding.sandbox, binding.workspace);
       const executed = await inner.run(spec, opts);
-      const headAfter = await sandboxExecHead(binding.exec, binding.sandbox, binding.workspace);
       if (onEvidence) {
         onEvidence({
           sandbox: binding.sandbox,
           workspace: binding.workspace,
           boundHead: binding.head,
-          headBefore,
-          headAfter,
+          headBefore: executed.headBefore ?? null,
+          headAfter: executed.headAfter ?? null,
           name: spec.name,
           command: spec.command,
           required: spec.required !== false,
@@ -338,13 +383,23 @@ export function evidenceSandboxRunner(
  * A `Labctl` that runs `labctl` INSIDE the Coding Sandbox (`sbx exec … labctl`).
  * The sandbox→Lab connection is then an ordinary sandbox-policy TCP management
  * connection, never a host `bash -lc`.
+ *
+ * `env` is forwarded explicitly as `sbx exec -e K=V` (the sandbox never inherits
+ * the host environment). Lab credentials (`LABCTL_TOKEN`, or `LABCTL_USER` +
+ * `LABCTL_PASSWORD`) belong here — they are NOT read from the host implicitly and
+ * are never logged. Prefer `LABCTL_TOKEN`, since a value on argv is visible in
+ * the host process table.
  */
-export function sandboxLabctl(binding: Pick<SandboxVerifyBinding, "sandbox" | "workspace" | "exec">): Labctl {
+export function sandboxLabctl(
+  binding: Pick<SandboxVerifyBinding, "sandbox" | "workspace" | "exec">,
+  env: Record<string, string> = {}
+): Labctl {
   return {
     async run(args: string[], opts: LabctlRunOptions = {}): Promise<LabctlResult> {
       const r = await binding.exec.exec(binding.sandbox, ["labctl", ...args], {
         workdir: binding.workspace,
         timeoutMs: opts.timeoutMs,
+        env,
       });
       return {
         ok: r.code === 0 && !r.error && !r.timedOut,
@@ -374,14 +429,52 @@ export interface VerifyTarget {
   sandbox?: string;
 }
 
-/** Reads a Task's durable Coding Sandbox safe for VERIFY reuse (or null). */
-export function sandboxForVerify(db: Database, task: Task) {
+/** A `CommandRunner` that refuses every check with a fail-closed reason. */
+export function notRunRunner(reason: string, sandbox?: string): CommandRunner {
+  return {
+    async run(spec): Promise<ExecutedCheck> {
+      return {
+        name: spec.name,
+        required: spec.required !== false,
+        outcome: "not_run",
+        exitCode: null,
+        output: reason,
+        durationMs: 0,
+        sandbox,
+        head: null,
+        timedOut: false,
+        stdout: "",
+        stderr: reason,
+      };
+    },
+  };
+}
+
+/**
+ * A Task's durable Coding Sandbox suitability for VERIFY:
+ *   - no sandbox row at all      -> `null`  (the host runner is the fallback);
+ *   - a row that cannot be used  -> `{ ok:false, reason }` (fail closed: the
+ *     caller must NOT fall back to host `bash -lc` on generated code);
+ *   - a usable row               -> `{ ok:true, sandbox, workspace }`.
+ */
+export type SandboxForVerify =
+  | { ok: true; sandbox: NonNullable<ReturnType<typeof getSandbox>>; workspace: string }
+  | { ok: false; reason: string };
+
+export function sandboxForVerify(db: Database, task: Task): SandboxForVerify | null {
   const sandbox = getSandbox(db, task.id);
   if (!sandbox) return null;
-  if (sandbox.state === "removed" || sandbox.state === "failed") return null;
+  if (sandbox.state === "removed") {
+    return { ok: false, reason: `task ${task.id} Coding Sandbox ${sandbox.name} was removed; refusing to fall back to host bash -lc` };
+  }
+  if (sandbox.state === "failed") {
+    return { ok: false, reason: `task ${task.id} Coding Sandbox ${sandbox.name} is failed; refusing to fall back to host bash -lc` };
+  }
   const workspace = sandbox.workspace ?? task.worktree ?? null;
-  if (!workspace) return null;
-  return { sandbox, workspace };
+  if (!workspace) {
+    return { ok: false, reason: `task ${task.id} Coding Sandbox ${sandbox.name} has no workspace; refusing to fall back to host bash -lc` };
+  }
+  return { ok: true, sandbox, workspace };
 }
 
 export interface SandboxVerifyDeps {
@@ -394,9 +487,11 @@ export interface SandboxVerifyDeps {
 
 /**
  * Resolve the VERIFY target for a Task. A Task with a durable Coding Sandbox
- * verifies INSIDE it at the recorded HEAD; a Task with no (usable) sandbox
- * returns null, and the caller falls back to the host runner. This is the ONE
- * place the sandbox/host choice is made, so it is easy to test.
+ * verifies INSIDE it at the recorded HEAD. A Task with NO sandbox row returns
+ * null (the caller falls back to the host runner); a Task whose sandbox row
+ * exists but is unusable returns a fail-closed `not_run` target — never null, so
+ * generated code is never run on the host. This is the ONE place the
+ * sandbox/host choice is made, so it is easy to test.
  */
 export function sandboxVerifyTarget(
   db: Database,
@@ -406,8 +501,20 @@ export function sandboxVerifyTarget(
 ): VerifyTarget | null {
   const found = sandboxForVerify(db, task);
   if (!found) return null;
-  const exec = deps.exec ?? realSandboxExec;
   const head = task.head_sha;
+  if (!found.ok) {
+    // A sandbox row exists but cannot be used: fail closed. The pre-run head
+    // binding is satisfied (`() => head`) so the RUNNER's `not_run` is what
+    // blocks — never the host runner.
+    return {
+      runner: notRunRunner(found.reason, undefined),
+      cwd: task.worktree ?? "",
+      headSha: head ?? undefined,
+      headProbe: () => head ?? null,
+      sandbox: undefined,
+    };
+  }
+  const exec = deps.exec ?? realSandboxExec;
   // Default evidence: a JSONL line per check under the sandbox's evidence dir.
   const onEvidence =
     deps.onEvidence ??

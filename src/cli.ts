@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { defaultDbPath, defaultSockPath, initControlPlane, now, openDb, outsideRepoDefault, STATE_DIR } from "./db";
+import { defaultDbPath, defaultSockPath, initControlPlane, now, openDb, outsideRepoDefault, projectRoot, STATE_DIR } from "./db";
 import {
   applyDbMove, configPath, describeDb, findLegacyDb, planDbMove, readConfig, resolveDb,
 } from "./db-location";
@@ -1756,11 +1756,12 @@ async function main(): Promise<void> {
           const id = positionals(rest)[0];
           if (!id) {
             throw new Error(
-              "usage: relay run factory <task-id> [--max-attempts N] [--dsh BIN] [--reviewer CMD] [--model M] [--timeout 30m] [--json]"
+              "usage: relay run factory <task-id> [--max-attempts N] [--dsh BIN] [--reviewer CMD] [--model M] [--timeout 30m] [--review-worktrees DIR] [--json]"
             );
           }
           const timeoutRaw = flag(rest, "--timeout");
           const maxRaw = flag(rest, "--max-attempts");
+          const repoRoot = flag(rest, "--repo") ?? projectRoot();
           const result = await runFactoryTask(db, id, {
             repo: flag(rest, "--repo") ?? undefined,
             dshBin: flag(rest, "--dsh") ?? process.env.RELAY_DSH_BIN ?? undefined,
@@ -1769,6 +1770,9 @@ async function main(): Promise<void> {
             timeoutMs: timeoutRaw ? parseDuration(timeoutRaw) : undefined,
             permissionMode: flag(rest, "--permission") ?? undefined,
             maxAttempts: maxRaw ? Number(maxRaw) : undefined,
+            // ISH-829: the independent reviewer reads a detached read-only
+            // worktree at the fixed head, outside the writer's checkout.
+            reviewWorktreeRoot: flag(rest, "--review-worktrees") ?? join(repoRoot, STATE_DIR, "review-worktrees"),
           });
           if (hasFlag(rest, "--json")) {
             console.log(JSON.stringify(result, null, 2));

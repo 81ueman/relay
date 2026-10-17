@@ -53,13 +53,16 @@ export interface Labctl {
 
 const LAB_SLUG_RE = /[^a-zA-Z0-9.-]+/g;
 
+/** The Task identity a lab operation is scoped to. */
+export type LabTask = Pick<Task, "id" | "issue_id">;
+
 /**
  * The lab name a Task owns: `relay-<issue-or-id>-<hash8>`. The trailing hash is
  * derived from the STABLE Task id (not the issue string), so two Tasks that
  * sanitise to the same slug still get distinct labs — the same rule ISH-828 uses
  * for sandbox names, so a Task's sandbox and its lab line up.
  */
-export function labNameForTask(task: Pick<Task, "id" | "issue_id">): string {
+export function labNameForTask(task: LabTask): string {
   const hash = createHash("sha256").update(task.id).digest("hex").slice(0, 8);
   const base = (task.issue_id ?? task.id).toLowerCase().replace(LAB_SLUG_RE, "-").replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, "");
   const body = (base || "task").slice(0, 44).replace(/[-.]+$/, "");
@@ -72,14 +75,21 @@ export function labNameForTask(task: Pick<Task, "id" | "issue_id">): string {
  * value of `labNameForTask`. A lab that does not match is FOREIGN and must be
  * refused before inspect/destroy (`別 Task Lab への誤アクセス`).
  */
-export function ownsLab(task: Pick<Task, "id" | "issue_id">, lab: string | null | undefined): boolean {
+export function ownsLab(task: LabTask, lab: string | null | undefined): boolean {
   return !!lab && lab === labNameForTask(task);
 }
 
-export function assertOwnLab(task: Pick<Task, "id" | "issue_id">, lab: string | null | undefined): void {
+/** Throws `LAB_FOREIGN` when `lab` is not this Task's own lab. */
+export function assertOwnLab(task: LabTask, lab: string | null | undefined): void {
   if (!ownsLab(task, lab)) {
     throw new Error(`${LAB_FOREIGN}: lab '${lab ?? "none"}' is not owned by task ${task.id} (expected ${labNameForTask(task)})`);
   }
+}
+
+/** The `LAB_FOREIGN` refusal as a value (for operations that return a result). */
+export function foreignLabError(task: LabTask, lab: string | null | undefined): string | null {
+  if (ownsLab(task, lab)) return null;
+  return `${LAB_FOREIGN}: lab '${lab ?? "none"}' is not owned by task ${task.id} (expected ${labNameForTask(task)})`;
 }
 
 // ---------------------------------------------------------------------------
@@ -270,8 +280,12 @@ export interface DeployLabResult {
  * a reachable management endpoint. A partial create, an API error, a timeout,
  * or a malformed result is `ok:false` — the caller must BLOCK, never PASS. The
  * Lab's image cache is untouched (no image verb is ever invoked).
+ *
+ * The returned lab is checked against the Task's OWN name; a topology that
+ * deploys under another Task's lab name is refused AND torn down so it is not
+ * left running (`別 Task Lab への誤アクセス`).
  */
-export async function deployTaskLab(labctl: Labctl, opts: DeployLabOptions): Promise<DeployLabResult> {
+export async function deployTaskLab(labctl: Labctl, task: LabTask, opts: DeployLabOptions): Promise<DeployLabResult> {
   const requireEndpoints = opts.requireEndpoints !== false;
   const r = await labctl.run(labctlDeployArgv(opts), { timeoutMs: opts.timeoutMs });
   if (!r.ok) {
@@ -288,6 +302,20 @@ export async function deployTaskLab(labctl: Labctl, opts: DeployLabOptions): Pro
   const o = asRecord(parsed);
   const lab = o ? str(o.lab) : null;
   if (!o || !lab) return { ok: false, lab: null, nodes: [], error: `${LAB_ERROR}: labctl deploy JSON has no lab name`, code: r.code };
+
+  // Ownership: refuse a lab that is not this Task's own, and tear it down so a
+  // mis-named topology cannot keep touching the Shared Lab.
+  if (!ownsLab(task, lab)) {
+    await destroyTaskLab(labctl, task, { lab, api: opts.api, insecure: opts.insecure, timeoutMs: opts.timeoutMs, allowForeign: true }).catch(() => undefined);
+    return {
+      ok: false,
+      lab,
+      nodes: [],
+      error: `${LAB_FOREIGN}: deployed lab '${lab}' is not owned by task ${task.id} (expected ${labNameForTask(task)}); destroyed it`,
+      code: r.code,
+    };
+  }
+
   const rawNodes = Array.isArray(o.nodes) ? o.nodes : [];
   const nodes: LabNode[] = [];
   for (const n of rawNodes) {
@@ -326,14 +354,19 @@ export async function deployTaskLab(labctl: Labctl, opts: DeployLabOptions): Pro
 }
 
 /**
- * Read the lab back with `inspect --json`, enforce that `expectedLab` is the lab
- * the Running task owns, that every node is `running`, and (when required) that
- * at least one TCP management endpoint is published. Fails closed.
+ * Read the lab back with `inspect --json`, enforcing that `lab` is the Task's
+ * OWN lab (never another Task's), that every node is `running`, and (when
+ * required) that at least one TCP management endpoint is published. Fails closed.
+ *
+ * A foreign lab name is refused BEFORE `labctl` is invoked.
  */
 export async function inspectTaskLab(
   labctl: Labctl,
+  task: LabTask,
   opts: LabctlApiOptions & { lab: string; reachHost?: string; timeoutMs?: number; requireEndpoints?: boolean }
 ): Promise<LabInspectParse> {
+  const foreign = foreignLabError(task, opts.lab);
+  if (foreign) return { ok: false, error: foreign };
   const r = await labctl.run(labctlInspectArgv(opts), { timeoutMs: opts.timeoutMs });
   if (!r.ok) {
     const detail = redactSecrets((r.err || r.out || "").trim()).slice(0, 400);
@@ -368,15 +401,23 @@ export interface DestroyLabResult {
 }
 
 /**
- * Destroy the Task's lab after the checks. A failed destroy is `ok:false` (a
- * cleanup failure must never be silently swallowed into a PASS). Images are
- * never touched: no `purge`/image verb is used; containerlab `destroy` keeps the
- * image cache.
+ * Destroy the Task's own lab after the checks. A failed destroy is `ok:false` (a
+ * cleanup failure must never be silently swallowed into a PASS). Images are never
+ * touched: no `purge`/image verb is used; containerlab `destroy` keeps the image
+ * cache.
+ *
+ * A foreign lab name is refused BEFORE `labctl` is invoked. (deploy-time refusal
+ * uses this with the Task's own name to tear down a mis-named deploy.)
  */
 export async function destroyTaskLab(
   labctl: Labctl,
-  opts: LabctlApiOptions & { lab: string; timeoutMs?: number }
+  task: LabTask,
+  opts: LabctlApiOptions & { lab: string; timeoutMs?: number; allowForeign?: boolean }
 ): Promise<DestroyLabResult> {
+  if (!opts.allowForeign) {
+    const foreign = foreignLabError(task, opts.lab);
+    if (foreign) return { ok: false, error: foreign, code: null };
+  }
   const r = await labctl.run(labctlDestroyArgv(opts), { timeoutMs: opts.timeoutMs });
   if (!r.ok) {
     const detail = redactSecrets((r.err || r.out || "").trim()).slice(0, 400);

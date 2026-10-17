@@ -11,8 +11,10 @@ import { intakeTask, runMechanicalVerification, submitPhase } from "../src/workf
 import { isBlockingOutcome, runChecks, type CheckSpec } from "../src/verify";
 import { upsertSandbox } from "../src/sandbox";
 import {
+  defaultVerifyTarget,
   evidenceSandboxRunner,
   jsonlEvidenceSink,
+  notRunRunner,
   sandboxCommandRunner,
   sandboxLabctl,
   sandboxVerifyTarget,
@@ -34,22 +36,34 @@ class FakeSbxExec implements SandboxExec {
   /** Values returned by successive `git rev-parse HEAD` reads. */
   heads: (string | null)[] = [];
   headDefault: string | null = HEAD;
+  /** Working-tree states returned by successive `git status --porcelain` reads. */
+  trees: ("clean" | "dirty" | "unknown")[] = [];
+  treeDefault: "clean" | "dirty" | "unknown" = "clean";
   command: (argv: string[]) => SandboxExecResult = () => ({ code: 0, stdout: "ok", stderr: "", timedOut: false });
-  calls: { name: string; argv: string[]; workdir?: string; timeoutMs?: number }[] = [];
+  calls: { name: string; argv: string[]; workdir?: string; timeoutMs?: number; env?: Record<string, string> }[] = [];
 
   async exec(name: string, argv: string[], opts: SandboxExecOptions = {}): Promise<SandboxExecResult> {
-    this.calls.push({ name, argv, workdir: opts.workdir, timeoutMs: opts.timeoutMs });
-    if (argv.join(" ").includes("rev-parse HEAD")) {
+    this.calls.push({ name, argv, workdir: opts.workdir, timeoutMs: opts.timeoutMs, env: opts.env });
+    const joined = argv.join(" ");
+    if (joined.includes("rev-parse HEAD")) {
       const v = this.heads.length > 0 ? (this.heads.shift() as string | null) : this.headDefault;
       if (v === null) return { code: 1, stdout: "", stderr: "not a git repo", timedOut: false };
       return { code: 0, stdout: `${v}\n`, stderr: "", timedOut: false };
     }
+    if (joined.includes("status") && joined.includes("--porcelain")) {
+      const t = this.trees.length > 0 ? this.trees.shift()! : this.treeDefault;
+      if (t === "unknown") return { code: 1, stdout: "", stderr: "status failed", timedOut: false };
+      return { code: 0, stdout: t === "dirty" ? " M src/x.ts\n?? extra.ts\n" : "", stderr: "", timedOut: false };
+    }
     return this.command(argv);
   }
 
-  /** Non-HEAD calls (the actual checks). */
+  /** Non-HEAD, non-status calls (the actual checks + labctl). */
   get checkCalls() {
-    return this.calls.filter((c) => !c.argv.join(" ").includes("rev-parse HEAD"));
+    return this.calls.filter((c) => {
+      const j = c.argv.join(" ");
+      return !j.includes("rev-parse HEAD") && !(j.includes("status") && j.includes("--porcelain"));
+    });
   }
 }
 
@@ -59,6 +73,15 @@ const binding = (exec: SandboxExec, over: Partial<SandboxVerifyBinding> = {}): S
   head: HEAD,
   exec,
   ...over,
+});
+
+describe("notRunRunner", () => {
+  test("refuses every check with its reason (the fail-closed target)", async () => {
+    const r = await notRunRunner("no usable sandbox", "sbx-x").run({ name: "a", command: "true", required: true }, { cwd: "/x" });
+    expect(r.outcome).toBe("not_run");
+    expect(r.output).toBe("no usable sandbox");
+    expect(r.sandbox).toBe("sbx-x");
+  });
 });
 
 describe("sandboxCommandRunner", () => {
@@ -124,6 +147,39 @@ describe("sandboxCommandRunner", () => {
     exec.heads = [HEAD, OTHER];
     const r = await sandboxCommandRunner(binding(exec)).run({ name: "test", command: "git commit --allow-empty -m x" }, { cwd: "/x" });
     expect(r.outcome).toBe("inconclusive");
+  });
+
+  test("a DIRTY clone is NOT_RUN and the command does not run", async () => {
+    const exec = new FakeSbxExec();
+    exec.treeDefault = "dirty"; // uncommitted edits present at the bound HEAD
+    const r = await sandboxCommandRunner(binding(exec)).run({ name: "test", command: "bun test" }, { cwd: "/x" });
+    expect(r.outcome).toBe("not_run");
+    expect(r.output).toContain("dirty");
+    expect(exec.checkCalls).toHaveLength(0);
+  });
+
+  test("an UNKNOWN tree state (status probe failed) is NOT_RUN", async () => {
+    const exec = new FakeSbxExec();
+    exec.treeDefault = "unknown";
+    const r = await sandboxCommandRunner(binding(exec)).run({ name: "test", command: "bun test" }, { cwd: "/x" });
+    expect(r.outcome).toBe("not_run");
+    expect(exec.checkCalls).toHaveLength(0);
+  });
+
+  test("a check that DIRTIES the tree (exit 0) is INCONCLUSIVE, never a pass", async () => {
+    const exec = new FakeSbxExec();
+    exec.trees = ["clean", "dirty"]; // clean before, dirty after
+    const r = await sandboxCommandRunner(binding(exec)).run({ name: "test", command: "echo x > generated.ts" }, { cwd: "/x" });
+    expect(r.outcome).toBe("inconclusive");
+  });
+
+  test("a check that fails AND dirties the tree is still a FAIL", async () => {
+    const exec = new FakeSbxExec();
+    exec.trees = ["clean", "dirty"];
+    exec.command = () => ({ code: 1, stdout: "", stderr: "boom", timedOut: false });
+    const r = await sandboxCommandRunner(binding(exec)).run({ name: "test", command: "false" }, { cwd: "/x" });
+    expect(r.outcome).toBe("fail");
+    expect(r.exitCode).toBe(1);
   });
 });
 
@@ -207,6 +263,13 @@ describe("sandboxLabctl: labctl runs inside the sandbox, not the host", () => {
     expect(bad.ok).toBe(false);
     expect(bad.timedOut).toBe(true);
   });
+
+  test("forwards the Lab credential env to `sbx exec -e`, never the host env", async () => {
+    const exec = new FakeSbxExec();
+    const labctl = sandboxLabctl(binding(exec), { LABCTL_TOKEN: "secret-token" });
+    await labctl.run(["inspect", "x", "--json"]);
+    expect(exec.checkCalls[0].env).toEqual({ LABCTL_TOKEN: "secret-token" });
+  });
 });
 
 describe("other-task lab: a Task never inspects/destroys another Task's lab", () => {
@@ -244,6 +307,17 @@ describe("sandboxVerifyTarget", () => {
   test("a task with no sandbox has no sandbox target (host fallback)", () => {
     const id = verifyTask();
     expect(sandboxVerifyTarget(db, getTask(db, id)!, [{ name: "a", command: "true" }])).toBeNull();
+    // The default resolver (the Factory/daemon default) agrees: no row -> null,
+    // so only a real Coding Sandbox row can ever pre-empt the host runner.
+    expect(defaultVerifyTarget(db, getTask(db, id)!, [{ name: "a", command: "true" }])).toBeNull();
+  });
+
+  test("defaultVerifyTarget resolves a sandbox row to a non-null sandbox target", () => {
+    const id = verifyTask();
+    upsertSandbox(db, { taskId: id, name: "relay-ish-829-dflt", agent: "shell", source: "/repo", workspace: "/workspace/repo", branch: "main", headSha: HEAD, state: "running" });
+    const target = defaultVerifyTarget(db, getTask(db, id)!, [{ name: "a", command: "true" }]);
+    expect(target).not.toBeNull();
+    expect(target!.sandbox).toBe("relay-ish-829-dflt");
   });
 
   test("a task with a live sandbox target binds to the sandbox + recorded head", () => {
@@ -267,7 +341,7 @@ describe("sandboxVerifyTarget", () => {
     expect(target.headSha).toBe(HEAD);
   });
 
-  test("a removed sandbox is not reused", () => {
+  test("a removed sandbox row yields a fail-closed target, never a host fallback", async () => {
     const id = verifyTask();
     upsertSandbox(db, {
       taskId: id,
@@ -279,7 +353,28 @@ describe("sandboxVerifyTarget", () => {
       headSha: HEAD,
       state: "removed",
     });
-    expect(sandboxVerifyTarget(db, getTask(db, id)!, [{ name: "a", command: "true" }])).toBeNull();
+    const target = sandboxVerifyTarget(db, getTask(db, id)!, [{ name: "a", command: "true" }]);
+    expect(target).not.toBeNull();
+    const { outcome, task } = await runMechanicalVerification(db, id, {
+      checks: [{ name: "a", command: "true" }],
+      runner: target!.runner,
+      cwd: target!.cwd,
+      headSha: target!.headSha,
+      headProbe: target!.headProbe,
+    });
+    expect(outcome).toBe("not_run");
+    expect(task.phase).toBe("verify");
+    expect(task.state).toBe("blocked_human");
+  });
+
+  test("a failed sandbox row yields a fail-closed target too", async () => {
+    const id = verifyTask();
+    upsertSandbox(db, { taskId: id, name: "relay-ish-829-failed", agent: "shell", source: "/repo", workspace: "/workspace/repo", branch: "main", headSha: HEAD, state: "failed" });
+    const target = sandboxVerifyTarget(db, getTask(db, id)!, [{ name: "a", command: "true" }]);
+    expect(target).not.toBeNull();
+    const r = await target!.runner.run({ name: "a", command: "true", required: true }, { cwd: target!.cwd });
+    expect(r.outcome).toBe("not_run");
+    expect(r.output).toContain("failed");
   });
 
   test("a same-HEAD sandbox run reaches PASS and advances to review", async () => {

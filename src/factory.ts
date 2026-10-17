@@ -8,7 +8,7 @@ import { INTEGRATOR_ROLE, REVIEWER_ROLE } from "./schema";
 import type { Run, RunState, Task, TaskState } from "./schema";
 import { isCanonicalToken, processPgid, spawnIdentityToken } from "./proc-identity";
 import { defaultRunner, type CheckSpec, type CommandRunner } from "./verify";
-import type { VerifyTarget } from "./sandbox-verify";
+import { defaultVerifyTarget, type VerifyTarget } from "./sandbox-verify";
 import { runMechanicalVerification, submitPhase, taskChecks } from "./workflow";
 import { acceptRunSubmission, getRun } from "./dsh-runner";
 import { launchTaskRun, type LaunchRunOptions } from "./run-lifecycle";
@@ -448,6 +448,10 @@ export async function runFactoryTask(
   const maxAttempts = Math.max(1, deps.maxAttempts ?? 4);
   const reviewerWorker = deps.reviewerWorker ?? DEFAULT_REVIEWER_WORKER;
   const integratorWorker = deps.integratorWorker ?? DEFAULT_INTEGRATOR_WORKER;
+  // ISH-829: default to the durable-Coding-Sandbox VERIFY target. It returns null
+  // for a Task with no sandbox row, so a worktree Task is unchanged; a
+  // sandbox-backed Task can never silently fall back to host `bash -lc`.
+  const resolveVerifyTarget = deps.verifyTarget ?? defaultVerifyTarget;
   if (!getWorker(db, reviewerWorker)) registerWorker(db, reviewerWorker, { role: REVIEWER_ROLE, agentKind: "claude" });
   if (!getWorker(db, integratorWorker)) registerWorker(db, integratorWorker, { role: INTEGRATOR_ROLE, agentKind: "relay" });
 
@@ -515,7 +519,7 @@ export async function runFactoryTask(
         const cwd = task.worktree;
         if (!cwd) return { taskId, outcome: "blocked", head: task.head_sha, attempts, gate: null, reason: "no worktree", steps };
         // ISH-829: verify INSIDE the Task's Coding Sandbox when it has one.
-        const target = deps.verifyTarget?.(db, task, checks) ?? null;
+        const target = resolveVerifyTarget(db, task, checks) ?? null;
         const v = await runMechanicalVerification(db, taskId, {
           checks,
           runner: target?.runner ?? deps.verifyRunner ?? defaultRunner,

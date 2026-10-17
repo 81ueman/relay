@@ -46,6 +46,10 @@ export interface ExecutedCheck {
   head?: string | null;
   /** ISH-829: the in-sandbox command hit its hard timeout (outcome `not_run`). */
   timedOut?: boolean;
+  /** ISH-829: the HEAD just before the command (the value the fence judged). */
+  headBefore?: string | null;
+  /** ISH-829: the HEAD just after the command. */
+  headAfter?: string | null;
   /** ISH-829: bounded stdout tail (host runs keep only the combined `output`). */
   stdout?: string;
   /** ISH-829: bounded stderr tail (host runs keep only the combined `output`). */
