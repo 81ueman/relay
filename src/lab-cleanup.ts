@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { now } from "./db";
 import { logEvent } from "./events";
 import { getTask } from "./tasks";
-import { isTerminalTaskState } from "./schema";
+import { isTerminalTaskState, type Task } from "./schema";
 import { childEnv } from "./child-env";
 
 /**
@@ -13,9 +13,11 @@ import { childEnv } from "./child-env";
  * Network Lab. Relay does NOT model networks, NOS or topologies; it knows only
  * two things:
  *
- *   1. the Task's **owner identifier** — a stable string derived from the Task
- *      (`labOwnerId`), injected into the Coding Sandbox as `RELAY_LAB_OWNER` and
- *      used by the `network-lab` skill as the lab `--namespace` and `name:`; and
+ *   1. the Task's **owner identifier** — a stable, never-reused string derived
+ *      from the Task (`labOwnerId(task)` = id + `created_at`), recorded durably
+ *      when it is handed out (`lab.owner_assigned`), injected into the Coding
+ *      Sandbox as `RELAY_LAB_OWNER`, and used by the `network-lab` skill as the
+ *      lab `--namespace` and `name:`; and
  *   2. that a cleanup is due **when the Task ends** (merged or explicitly
  *      aborted) — never merely because it reached `merge_ready`.
  *
@@ -36,15 +38,21 @@ export const LAB_CLEANUP_ENV = "RELAY_LAB_CLEANUP_CMD";
 export const LAB_CLEANUP_TIMEOUT_ENV = "RELAY_LAB_CLEANUP_TIMEOUT_MS";
 export const DEFAULT_LAB_CLEANUP_TIMEOUT_MS = 120_000;
 
+/** The durable record that Relay handed this Task's owner id to the sandbox. */
+export const LAB_OWNER_ASSIGNED_EVENT = "lab.owner_assigned";
+
 /**
- * The Task's external Lab owner identifier. Deterministic and Task-unique: two
- * Tasks can never share an owner id, so a cleanup for one Task can never name —
- * let alone destroy — another Task's Lab. This is the only "registration":
- * Relay already holds the Task id, and the sandbox learns the same value as
- * `RELAY_LAB_OWNER`.
+ * The Task's external Lab owner identifier.
+ *
+ * It embeds the Task's `created_at` as well as its id so it is **never reused**:
+ * `relay gc` can delete a terminal Task (freeing its id for `nextTaskId`), but a
+ * later Task with the same id has a different `created_at`, so it can never take
+ * over the earlier Task's Lab identity — and its cleanup can never target the
+ * earlier Task's Lab. The value matches the containerlab/naming charset
+ * (`[A-Za-z0-9._-]`).
  */
-export function labOwnerId(taskId: string): string {
-  return taskId;
+export function labOwnerId(task: Pick<Task, "id" | "created_at">): string {
+  return `${task.id}-${task.created_at}`;
 }
 
 export interface LabCleanupResult {
@@ -127,22 +135,71 @@ function configuredCmd(opts: LabCleanupOptions): string | null {
   return raw.length > 0 ? raw : null;
 }
 
+/** Whether a trusted Lab cleanup hook is configured for this process. */
+export function labCleanupHookConfigured(env: NodeJS.ProcessEnv = process.env): boolean {
+  return ((env[LAB_CLEANUP_ENV] ?? "") as string).trim().length > 0;
+}
+
+/**
+ * The owner id Relay actually handed out for this Task, or null when none was
+ * ever assigned (the Task never ran through the Coding Sandbox, so it has no
+ * external Lab). Read from the durable `lab.owner_assigned` record — never
+ * recomputed — so a Task whose Lab owner was never handed out is never cleaned.
+ */
+export function assignedLabOwner(d: Database, taskId: string): string | null {
+  const row = d
+    .query(`SELECT payload_json FROM events WHERE task_id = ? AND type = ? ORDER BY rowid DESC LIMIT 1`)
+    .get(taskId, LAB_OWNER_ASSIGNED_EVENT) as { payload_json: string } | undefined;
+  if (!row) return null;
+  try {
+    const payload = JSON.parse(row.payload_json) as { ownerId?: unknown };
+    return typeof payload.ownerId === "string" && payload.ownerId.length > 0 ? payload.ownerId : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The non-terminal Run that still holds this Task (or null). */
+export function findActiveTaskRun(d: Database, taskId: string): { id: string; state: string } | null {
+  const row = d
+    .query(`SELECT id, state FROM runs WHERE task_id = ? AND state IN ('starting','running') ORDER BY created_at DESC, rowid DESC LIMIT 1`)
+    .get(taskId) as { id: string; state: string } | undefined;
+  return row ?? null;
+}
+
+/**
+ * Whether a Task has an unfinished Lab cleanup: Relay assigned an owner id (so a
+ * lab *may* exist) and the latest `lab.*` event is not a success. Used by
+ * `planGc` to refuse deleting such a Task, so its owner id stays addressable and
+ * the cleanup stays re-runnable. A Task with no assignment is not pending.
+ */
+export function labCleanupPending(d: Database, taskId: string): boolean {
+  const row = d
+    .query(
+      `SELECT type FROM events WHERE task_id = ? AND type IN (?, 'lab.cleaned', 'lab.cleanup_failed') ORDER BY rowid DESC LIMIT 1`
+    )
+    .get(taskId, LAB_OWNER_ASSIGNED_EVENT) as { type: string } | undefined;
+  if (!row) return false;
+  return row.type !== "lab.cleaned";
+}
+
 /**
  * Decide whether the Task's Lab cleanup is due, WITHOUT running anything.
  *
- * Mirrors the worktree/sandbox cleanup guards: the Task must have really ended
- * (merged, or an explicit `--abort`). A Task parked at `merge_ready` has NOT
- * ended and is refused, and a Task with no configured hook is a pure no-op —
- * a Lab-unused Task therefore causes no subprocess and no external call.
+ * Guards, in order: a hook is configured; Relay actually assigned an owner id
+ * (a Lab-unused Task is skipped — no external call); no Run still holds the
+ * Task; and the Task has really ended (merged, or an explicit `--abort`). A Task
+ * parked at `merge_ready` has NOT ended and is refused.
  */
-export function planLabCleanup(db: Database, taskId: string, opts: LabCleanupOptions = {}): LabCleanupPlan {
-  const task = getTask(db, taskId);
+export function planLabCleanup(d: Database, taskId: string, opts: LabCleanupOptions = {}): LabCleanupPlan {
+  const task = getTask(d, taskId);
   if (!task) throw new Error(`unknown task: ${taskId}`);
   const cmd = configuredCmd(opts);
   const reasons: string[] = [];
+  const assigned = assignedLabOwner(d, taskId);
   const plan: LabCleanupPlan = {
     taskId,
-    ownerId: labOwnerId(task.id),
+    ownerId: assigned ?? labOwnerId(task),
     cmd,
     remove: false,
     apply: opts.apply === true,
@@ -156,6 +213,13 @@ export function planLabCleanup(db: Database, taskId: string, opts: LabCleanupOpt
     reasons.push(`no ${LAB_CLEANUP_ENV} configured (no external Lab cleanup hook)`);
     return plan;
   }
+  if (!assigned) {
+    reasons.push("no lab owner assigned (this task never ran a Coding Sandbox lab)");
+    return plan;
+  }
+
+  const active = findActiveTaskRun(d, taskId);
+  if (active) reasons.push(`active run ${active.id} (${active.state}) still holds task ${taskId}`);
 
   const merged = task.merged_at !== null;
   const aborted = !!opts.abort;
@@ -182,11 +246,11 @@ export function planLabCleanup(db: Database, taskId: string, opts: LabCleanupOpt
  * never thrown: the Lab cleanup is re-runnable by simply invoking cleanup
  * again, and a failure must not abort the rest of Task teardown.
  */
-export function applyLabCleanup(db: Database, taskId: string, opts: LabCleanupOptions = {}): LabCleanupPlan {
-  const plan = planLabCleanup(db, taskId, opts);
+export function applyLabCleanup(d: Database, taskId: string, opts: LabCleanupOptions = {}): LabCleanupPlan {
+  const plan = planLabCleanup(d, taskId, opts);
   if (!plan.apply) return plan;
   if (!plan.remove || !plan.cmd) {
-    logEvent(db, {
+    logEvent(d, {
       source: "lab-cleanup",
       taskId,
       type: "lab.cleanup_skipped",
@@ -214,7 +278,7 @@ export function applyLabCleanup(db: Database, taskId: string, opts: LabCleanupOp
     plan.cleaned = true;
   }
 
-  logEvent(db, {
+  logEvent(d, {
     source: "lab-cleanup",
     taskId,
     type: plan.cleaned ? "lab.cleaned" : "lab.cleanup_failed",

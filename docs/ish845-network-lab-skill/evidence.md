@@ -3,7 +3,7 @@
 **Issue:** ISH-845 (`[agent][lab] Network Lab skill and task-owned lab cleanup
 hook`) — companion to [`../ish845-network-lab-skill.md`](../ish845-network-lab-skill.md).
 **Host:** macOS (Darwin), arm64; Docker Sandboxes `sbx v0.48.0`.
-**Date:** 2026-10-17 (UTC).
+**Dates:** 2026-10-17 (UTC) — §1–§4 from round 1, §3c/§6 from the round-2 fix.
 
 Everything below was run against the **live Shared Lab** (`sbx` sandbox
 `ish824-lab`, `clab-api-server` v0.8.0, real `ghcr.io/nokia/srlinux:latest`) and
@@ -23,8 +23,8 @@ committed under [`evidence/`](evidence/). Secrets are not recorded.
 sandbox/user skill, `/home/agent/.agents/skills/network-lab/SKILL.md`
 (`@deepseek-ai/dsh-skill-filesystem` → `FileSystemSkillProvider.roots`,
 `$AGENTS_HOME/skills`). The exact same file is what the Coding Kit ships
-(`sbx kit inspect ./sandbox/coding-kit` → `Files: 2 home`, including the skill
-path; `tests/network-lab-skill.test.ts` pins the byte-for-byte copy).
+(`sbx kit inspect ./sandbox/coding-kit` → `Files: 2 home`; the kit copy is pinned
+byte-for-byte by `tests/network-lab-skill.test.ts`).
 
 A real headless run (`dsh --profile headless --patch … --json`) was given only
 "use the `network-lab` skill to run a real network E2E owned by this task". The
@@ -42,20 +42,11 @@ and then, on the live Lab:
 | destroy | `labctl destroy --name "netlab-$RELAY_LAB_OWNER" --api "$LABCTL_API" --insecure --json` → `{"destroyed":true,…}` | `0` |
 | confirm | `labctl inspect --json --api "$LABCTL_API" --insecure` → `{}` | `0` |
 
-`dsh` exited `0` and its `final` reports the whole run. The topology the agent
-wrote contains a **task-owned** lab name (`netlab-<owner>`) and a
-`startup-config` asset applied to the node.
-
-This run also **corrected two real skill bugs**, which are now fixed in
-`skills/network-lab/SKILL.md`:
-
-1. `labctl` reads the topology `name:` **verbatim** — it does not shell-expand
-   `$RELAY_LAB_OWNER`, and the API rejects `Invalid characters in lab name`. The
-   skill now says to **write** the owner id into `name:` before deploying.
-2. `--insecure` is a **per-subcommand** option: `labctl --insecure deploy …`
-   fails `unrecognized arguments`; for `exec` it must precede `<lab>/<node>`
-   (everything after `--` is the remote command). The skill now shows the
-   correct placement, and that `destroy` takes `--name` (no `--namespace`).
+This run also **corrected two real skill bugs**, now fixed in
+`skills/network-lab/SKILL.md`: `labctl` reads the topology `name:` **verbatim**
+(no shell expansion — write the owner id in), and `--insecure` is a
+**per-subcommand** option (before `<lab>/<node>` for `exec`); `destroy` takes
+`--name` (no `--namespace`).
 
 ## 2. gNMI / NOS observation on the live Lab
 
@@ -66,10 +57,8 @@ $ labctl inspect netlab-T1 --json --reach-host localhost …
 srl1 [(22, "localhost:18021"), (57400, "localhost:18011")]
 $ gnmic -a localhost:18011 -u admin -p '…' --skip-verify -e json_ietf get --path /system/name/host-name
 [ { "source": "localhost:18011", … "values": { "…host-name": "srl1" } } ]      # exit 0
-$ labctl exec netlab-T1/srl1 -- sr_cli info system name
-    host-name srl1
-$ labctl exec netlab-T1/srl2 -- sr_cli info system name
-    host-name srl2                                                              # startup-config applied
+$ labctl exec netlab-T1/srl1 -- sr_cli info system name   →  host-name srl1
+$ labctl exec netlab-T1/srl2 -- sr_cli info system name   →  host-name srl2     # startup-config applied
 ```
 
 Raw: [`evidence/gnmi-observation.txt`](evidence/gnmi-observation.txt),
@@ -78,23 +67,23 @@ Raw: [`evidence/gnmi-observation.txt`](evidence/gnmi-observation.txt),
 
 ## 3. Relay holds the owner id and cleans only that Task's lab
 
-Two real labs were deployed, one per Task, named and namespaced by the owner id:
-`netlab-T1` (namespace `T1`) and `netlab-T2` (namespace `T2`) —
-[`evidence/labctl-labs-both-tasks.json`](evidence/labctl-labs-both-tasks.json)
-shows both.
+> Round-1 evidence below used a pre-commit hook variant and an owner id equal to
+> the task id (`T1`/`T2`). The **round-2 fix** makes the owner id never-reused
+> (`<id>-<created_at>`) and ships the hardened reference hook; the new behaviour
+> is covered by `tests/lab-cleanup.test.ts`, `tests/lab-cleanup-hook.test.ts`
+> and `tests/gc.test.ts`, plus the live §3c check.
 
-The single trusted hook (`RELAY_LAB_CLEANUP_CMD`) is invoked as
-`<cmd> <task-id>`; it lists the Labs and destroys only the owner's own
-(`name == netlab-<owner>`), never touching images or other Tasks' labs.
+Two real labs were deployed one per Task — `netlab-T1` (namespace `T1`) and
+`netlab-T2` (namespace `T2`) —
+[`evidence/labctl-labs-both-tasks.json`](evidence/labctl-labs-both-tasks.json).
 
 ### 3a. T1 — plan, then apply
 
 ```console
 $ relay run cleanup T1 --abort "ISH-845 evidence" --json        # dry-run
-  labCleanup.status = "dry-run"   ownerId = "T1"
+  labCleanup.status = "dry-run"
 $ relay run cleanup T1 --abort "ISH-845 evidence" --apply --json
-  labCleanup = { ownerId: "T1", status: "ok", cleaned: true, exitCode: 0 }
-
+  labCleanup = { status: "ok", cleaned: true, exitCode: 0 }
 $ labctl inspect --json …   →  ["netlab-T2"]                    # T1 gone, T2 intact
 ```
 
@@ -109,11 +98,9 @@ A hook that reports an auth error (exit `4`) was injected:
 ```console
 $ RELAY_LAB_CLEANUP_CMD=…/lab-cleanup-authfail.sh relay run cleanup T2 --abort … --apply --json
   labCleanup = { status: "failed", exitCode: 4, error: "labctl: authentication failed (injected)" }
-
 $ labctl inspect --json …   →  ["netlab-T2"]                    # cleanup failed ⇒ lab NOT destroyed
 $ relay run cleanup T2 --abort … --apply --json
   labCleanup = { status: "ok", cleaned: true }
-
 $ labctl inspect --json …   →  {}                               # retry succeeded
 ```
 
@@ -122,16 +109,38 @@ Raw: [`evidence/relay-cleanup-t2-failure-injection.json`](evidence/relay-cleanup
 [`evidence/relay-cleanup-t2-retry.json`](evidence/relay-cleanup-t2-retry.json),
 [`evidence/labctl-labs-final.json`](evidence/labctl-labs-final.json).
 
-The durable Relay events (also the retry of a hook that had failed for **missing
-credentials**, exit `1`, before the operator file was provisioned) are committed
-as [`evidence/relay-lab-cleanup-events.jsonl`](evidence/relay-lab-cleanup-events.jsonl):
+The durable Relay events (including the retry of a hook that had failed for
+**missing credentials**, exit `1`) are committed as
+[`evidence/relay-lab-cleanup-events.jsonl`](evidence/relay-lab-cleanup-events.jsonl):
 
 ```
-T1 lab.cleanup_failed {exitCode:1}     ← hook ran without labctl creds (fail closed, recorded)
-T1 lab.cleaned        {exitCode:0}     ← retry succeeded
-T2 lab.cleanup_failed {exitCode:4}     ← injected auth error, recorded
-T2 lab.cleaned        {exitCode:0}     ← retry succeeded
+T1 lab.cleanup_failed {exitCode:1}   ← hook ran without labctl creds (fail closed, recorded)
+T1 lab.cleaned        {exitCode:0}   ← retry succeeded
+T2 lab.cleanup_failed {exitCode:4}   ← injected auth error, recorded
+T2 lab.cleaned        {exitCode:0}   ← retry succeeded
 ```
+
+### 3c. The committed hook, run live, selects strictly by owner (round 2)
+
+`scripts/lab-cleanup.sh` (the documented `RELAY_LAB_CLEANUP_CMD`) was copied into
+the coding sandbox and run against the live Lab with two labs present:
+`netlab-agent845b` (owner `agent845b`) and `bgp-agent845b` in **another** owner's
+namespace — the exact name-suffix trap.
+
+```console
+$ sh /home/agent/lab-cleanup.sh agent845b
+lab-cleanup: destroying netlab-agent845b (owner=agent845b)
+{ "destroyed": true, "lab": "netlab-agent845b", … }
+lab-cleanup: done owner=agent845b (destroyed=1; images untouched)   # HOOK_EXIT=0
+
+$ labctl inspect --json …   →  ["bgp-agent845b"]                    # the decoy SURVIVED
+```
+
+Raw: [`evidence/hook-live-run.txt`](evidence/hook-live-run.txt),
+[`evidence/labctl-labs-after-hook.json`](evidence/labctl-labs-after-hook.json).
+The companion unit test (`tests/lab-cleanup-hook.test.ts`) pins the same rule
+against a fake `labctl` with `netlab-T1`, `bgp-T1` and `netlab-T11`, asserting
+only `netlab-T1` is destroyed.
 
 ## 4. NOS images are retained after cleanup
 
@@ -152,15 +161,33 @@ Both `ghcr.io/nokia/srlinux:latest` (SR Linux) and `ceos:4.36.0.1F` (cEOS) remai
 
 | Done-when | Verdict | Evidence |
 | --- | --- | --- |
-| A real dsh Agent references the skill and completes deploy→inspect→gNMI/SSH observe→destroy on an arbitrary topology | **PASS** | §1 (real `dsh` run, skill loaded, deploy/inspect/exec/destroy all exit 0); §2 (`gnmic` + `sr_cli`) |
-| Relay holds the Task's external Lab owner id and can clean it; a Lab-unused Task does nothing extra | **PASS** | §3; `labOwnerId` = task id, injected as `RELAY_LAB_OWNER`; no hook configured ⇒ pure no-op (`tests/lab-cleanup.test.ts`) |
-| Two Tasks' independent labs: ending one does not destroy the other | **PASS** | §3a — after T1 cleanup only `netlab-T2` remains |
-| Failure injection (interruption/timeout, lab gone, auth error, Task crash) handled with evidence and re-runnable | **PASS** | §3b — exit 4 recorded, lab intact, retry succeeds; timeout + missing-executable + crash cases in `tests/lab-cleanup.test.ts` |
+| A real dsh Agent references the skill and completes deploy→inspect→gNMI/SSH observe→destroy on an arbitrary topology | **PASS** | §1 (real `dsh` run, skill loaded, all steps exit 0); §2 (`gnmic` + `sr_cli`) |
+| Relay holds the Task's external Lab owner id and can clean it; a Lab-unused Task does nothing extra | **PASS** | §3; owner id assigned durably (`lab.owner_assigned`) and never reused; `planLabCleanup` skips a Task with no assignment (`tests/lab-cleanup.test.ts`) |
+| Two Tasks' independent labs: ending one does not destroy the other | **PASS** | §3a (after T1 cleanup only `netlab-T2` remains); §3c (suffix decoy survives); two-task isolation test |
+| Failure injection (interruption/timeout, lab gone, auth error, Task crash) handled with evidence and re-runnable | **PASS** | §3b; `tests/lab-cleanup.test.ts` (auth error, timeout, missing executable) + `tests/gc.test.ts` (gc refuses a pending cleanup, so it stays re-runnable) |
 | One set of SR Linux/cEOS images remains in the Shared Lab after cleanup | **PASS** | §4 |
-| A human can still use `labctl` without Relay | **PASS** | §1–§3 used plain `labctl` from the host and the sandbox; the hook is a normal `labctl` script; `labctl` is unchanged |
+| A human can still use `labctl` without Relay | **PASS** | §1–§3 used plain `labctl`; the hook is a normal `labctl` script; `labctl` is unchanged |
 | No `relay lab` network command is added | **PASS** | `relay run [sandbox] cleanup` only; no `relay lab` exists |
 
-**Not verified here:** cEOS was present in the cache but no cEOS topology was
-deployed (SR Linux was); many-node / concurrent-lab scale is untested (per the
-ISH-844 limits); the provider route for the dsh run was Ollama-Cloud (no
-`DEEPSEEK_API_KEY` on this host).
+## 6. Round-2 review fixes
+
+1. **Active-run guard** — `planLabCleanup` now refuses while any `runs` row for
+   the Task is `starting`/`running`, even with `--abort` (`tests/lab-cleanup.test.ts`:
+   active Run + `--abort` ⇒ skipped, hook not called).
+2. **Never-reused owner id** — `labOwnerId` = `<id>-<created_at>`; **and**
+   `planGc` skips a terminal Task whose latest `lab.*` event is not `lab.cleaned`
+   while a hook is configured (`tests/gc.test.ts`). After gc the Task survives, so
+   the cleanup stays addressable and re-runnable, and a reused Task id cannot
+   collide with or destroy the earlier Task's lab.
+3. **Committed, strict reference hook** — [`scripts/lab-cleanup.sh`](../../scripts/lab-cleanup.sh)
+   selects exactly `netlab-<owner>` (never by suffix) and purges the owner's
+   leftover workspace; pinned by `tests/lab-cleanup-hook.test.ts` and exercised
+   live in §3c.
+4. **Owner assignment recorded / skipped** — `launchTaskSandboxRun` writes
+   `lab.owner_assigned`; `planLabCleanup` skips with reason `no lab owner
+   assigned` when absent, so a Lab-unused Task makes **no** external call even
+   with a hook configured (`tests/lab-cleanup.test.ts`).
+
+**Not verified:** cEOS was present in the cache but no cEOS topology was deployed
+(SR Linux was); many-node / concurrent-lab scale is untested; the provider route
+for the dsh run was Ollama-Cloud (no `DEEPSEEK_API_KEY` on this host).

@@ -28,7 +28,7 @@ import {
 import { buildRunBrief, inheritFindings, taskBranchName, type RunFinding } from "./run-lifecycle";
 import { spawnIdentityToken } from "./proc-identity";
 import { childEnv } from "./child-env";
-import { labOwnerId } from "./lab-cleanup";
+import { labOwnerId, LAB_OWNER_ASSIGNED_EVENT } from "./lab-cleanup";
 import {
   DUPLICATE_SANDBOX_WRITER,
   SANDBOX_ERROR,
@@ -610,14 +610,23 @@ export async function launchTaskSandboxRun(
   const fastExitMs = opts.fastExitMs ?? DEFAULT_FAST_EXIT_MS;
   const dshBin = opts.dshBin ?? "dsh";
   const runArgv = [dshBin, "--profile", "headless", ...(opts.dshArgs ?? []), "--json", briefText];
+  // ISH-845: record the Task's external Lab owner id durably as it is handed to
+  // the sandbox, so `planLabCleanup` can tell a Lab-using Task from one that
+  // never had an owner (and never issues a spurious external cleanup call).
+  const labOwner = labOwnerId(fresh);
+  logEvent(db, {
+    source: "lab-cleanup",
+    taskId,
+    type: LAB_OWNER_ASSIGNED_EVENT,
+    payload: { ownerId: labOwner, sandbox: binding.name, phase: run.phase, attempt: run.attempt },
+  });
   const execEnv: Record<string, string> = {
     DSH_PERMISSION_MODE: permissionMode,
     RELAY_RUN_ID: runId,
     RELAY_TASK_ID: taskId,
-    // ISH-845: the Task's external Lab owner id. The `network-lab` skill uses it
-    // as the lab `--namespace`/`name:`, so Relay can later clean up exactly this
-    // Task's labs (and nothing else).
-    RELAY_LAB_OWNER: labOwnerId(taskId),
+    // The `network-lab` skill uses it as the lab `--namespace`/`name:`, so Relay
+    // can later clean up exactly this Task's labs (and nothing else).
+    RELAY_LAB_OWNER: labOwner,
     ...(opts.env ?? {}),
   };
   const sbxBin = opts.sbxBin ?? process.env.RELAY_SBX_BIN ?? "sbx";
