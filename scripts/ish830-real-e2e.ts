@@ -577,8 +577,11 @@ async function stageNos(dir: string, api: string, insecure: boolean): Promise<vo
       raw: (sshLeg.trim() || "sshpass unavailable").slice(0, LEG_RAW_CAP),
     });
     // gnmic's OWN output: the section minus the harness's echoed command line,
-    // which itself contains `host-name` and must not satisfy the gate.
-    const gnmiSection = (out.split("--- real gNMI leg (published :57400) ---")[1] ?? "").split("NOS_CHECK_DONE")[0].trim();
+    // which itself contains `host-name` and must not satisfy the gate. The
+    // section ends at `GNMI_LEG_OK`/`GNMI_LEG_FAIL` (not the destroy JSON).
+    const gnmiLines = (out.split("--- real gNMI leg (published :57400) ---")[1] ?? "").split("\n");
+    const gnmiEnd = gnmiLines.findIndex((l) => /^GNMI_LEG_(OK|FAIL)$/.test(l.trim()));
+    const gnmiSection = (gnmiEnd === -1 ? gnmiLines : gnmiLines.slice(0, gnmiEnd + 1)).join("\n").trim();
     const gnmiOutput = gnmiSection
       .split("\n")
       .filter((l) => !l.startsWith("gNMI command:"))
