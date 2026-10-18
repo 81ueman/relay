@@ -1,0 +1,296 @@
+{
+  "task": {
+    "id": "T1",
+    "headSha": "a47818918846b32bff5e7e21aaf3f946bf469d3a",
+    "branch": "relay/ish885b-e2e-mvdin8r5",
+    "prUrl": "https://github.com/81ueman/relay/pull/39",
+    "prRepo": "81ueman/relay",
+    "prBase": "main",
+    "attempt": 0,
+    "phase": "merge_ready",
+    "state": "queued",
+    "mergedAt": null
+  },
+  "architecture": "read-only Relay; Agent-owned GitHub writes; independent Claude native review",
+  "repo": "81ueman/relay",
+  "base": "main",
+  "startedAt": "2026-10-18T07:40:39.410Z",
+  "runsRoot": "/var/folders/2l/lk91l4dd1ysb1jfw7bkw0nrh0000gn/T/ish885b-e2e-runs-mvdin81d",
+  "legs": [
+    {
+      "leg": "env.gh",
+      "verdict": "PASS",
+      "detail": "gh authenticated as 81ueman"
+    },
+    {
+      "leg": "env.dsh",
+      "verdict": "PASS",
+      "detail": "dsh 0.2.1-rc.2 (pin 0.2.1-rc.2)"
+    },
+    {
+      "leg": "env.claude",
+      "verdict": "PASS",
+      "detail": "claude 2.1.292 (Claude Code)"
+    },
+    {
+      "leg": "env.sbx-github-credential",
+      "verdict": "PASS",
+      "detail": "a global sbx CUSTOM secret binds GH_TOKEN to api.github.com (placeholder sbx-cs-62TD7…)"
+    },
+    {
+      "leg": "coding-sandbox",
+      "verdict": "PASS",
+      "detail": "dsh Agent runs inside Coding Sandbox relay-ish-885b-e2e-1f93603d (kit /Users/81ueman/.herdr/worktrees/relay/devin-ish885-real-agent-e2e/sandbox/coding-kit)"
+    },
+    {
+      "leg": "sandbox-known-hosts",
+      "verdict": "PASS",
+      "detail": "pinned ssh.github.com host key (8 line(s))"
+    },
+    {
+      "leg": "sandbox-gh-config",
+      "verdict": "PASS",
+      "detail": "wrote ~/.config/gh/hosts.yml with the proxy placeholder (93 bytes)"
+    },
+    {
+      "leg": "sandbox-gh-api",
+      "verdict": "PASS",
+      "detail": "sandbox gh authenticated as 81ueman (hosts.yml proxy placeholder, GH_TOKEN unset)"
+    },
+    {
+      "leg": "dsh-agent-push",
+      "verdict": "PASS",
+      "detail": "dsh Agent ran git push in the Coding Sandbox (2 GitHub-write tool call(s))"
+    },
+    {
+      "leg": "dsh-agent-pr-write",
+      "verdict": "PASS",
+      "detail": "dsh Agent ran `gh pr create`/`gh pr edit` in the Coding Sandbox"
+    },
+    {
+      "leg": "dsh-agent-pr-created",
+      "verdict": "PASS",
+      "detail": "a real PR #39 exists for relay/ish885b-e2e-mvdin8r5"
+    },
+    {
+      "leg": "relay-zero-github-writes",
+      "verdict": "PASS",
+      "detail": "no GitHub write argv in src/ (static)"
+    },
+    {
+      "leg": "claude-native-NG@A",
+      "verdict": "FAIL",
+      "detail": "no NG review on the PR"
+    },
+    {
+      "leg": "claude-native-PASS@B",
+      "verdict": "PASS",
+      "detail": "native review 5561989573 by 81ueman OK @ a478189188"
+    },
+    {
+      "leg": "distinct-reviewed-heads-A-B",
+      "verdict": "FAIL",
+      "detail": "A/B not both present as distinct reviewed HEADs"
+    },
+    {
+      "leg": "full-chain",
+      "verdict": "FAIL",
+      "detail": "outcome=merge_ready fixIdx=-1 passIdx=-1"
+    }
+  ],
+  "githubWriter": "dsh/DeepSeek Coding Agent (from dsh.jsonl tool calls)",
+  "independentClaudeJudgment": "NOT_PROVEN",
+  "relayGithubWrites": "NONE (no write argv in src/)",
+  "result": "FAIL",
+  "steps": [
+    {
+      "step": "intake",
+      "taskId": "T1",
+      "branch": "relay/ish885b-e2e-mvdin8r5",
+      "prRepo": "81ueman/relay",
+      "prBase": "main",
+      "check": {
+        "name": "ish885b-fixture",
+        "command": "test -f docs/ish885b/AGENT-E2E.md && grep -q '^# ISH-885b Agent E2E$' docs/ish885b/AGENT-E2E.md && test -f src/ish885b/duration.ts",
+        "required": true
+      },
+      "at": "2026-10-18T07:40:40.338Z"
+    },
+    {
+      "step": "sandbox-created",
+      "name": "relay-ish-885b-e2e-1f93603d",
+      "agent": "/Users/81ueman/.herdr/worktrees/relay/devin-ish885-real-agent-e2e/sandbox/coding-kit",
+      "workspace": "/Users/81ueman/ghq/github.com/81ueman/relay",
+      "branch": "relay/ish885b-e2e-mvdin8r5",
+      "created": true,
+      "at": "2026-10-18T07:42:42.889Z"
+    },
+    {
+      "step": "factory-result",
+      "outcome": "merge_ready",
+      "head": "a47818918846b32bff5e7e21aaf3f946bf469d3a",
+      "reason": null,
+      "attempts": [
+        {
+          "attempt": 0,
+          "runId": "run-a5bcc307",
+          "baseHead": "f6be5e5a3da7b8ff08c040642385c00659736fef",
+          "producedHead": "a47818918846b32bff5e7e21aaf3f946bf469d3a",
+          "verifyOutcome": "pass",
+          "reviewVerdict": "pass",
+          "phase": "implement"
+        }
+      ],
+      "gate": "BLOCKED",
+      "at": "2026-10-18T07:46:40.582Z"
+    },
+    {
+      "step": "dsh-gh-pr-create",
+      "command": "gh pr create --repo 81ueman/relay --head relay/ish885b-e2e-mvdin8r5 --base main --title \"ISH-885b: real Agent-owned PR fixture\" --body $'## Summary\\n- add `parseDuration` in `src/ish885b/duration.ts` for concatenated, case-insensitive duration components with exact half-up millisecond rounding and `-1` on malformed input\\n- add `docs/ish885b/AGENT-E2E.md` with the required first line\\n- add focused contract tests covering valid units/components, decimals, rounding, case-insensitivity, and malformed inputs\\n\\n## Checks\\n- `bun run typecheck` (pass)\\n- `bun test tests/ish885b-duration.test.ts` (5 pass)\\n- full `bun test` was also run; the new suite passes, with two unrelated pre-existing failures (`factory.test.ts` reused-PID timeout race and `singleton.test.ts` stale-socket creation in this sandbox)\\n\\nThis PR is part of the ISH-885b agent-owned PR E2E fixture. It must not be merged by the agent.'",
+      "result": "https://github.com/81ueman/relay/pull/39\n",
+      "at": "2026-10-18T07:46:40.584Z"
+    },
+    {
+      "step": "task-final",
+      "id": "T1",
+      "headSha": "a47818918846b32bff5e7e21aaf3f946bf469d3a",
+      "branch": "relay/ish885b-e2e-mvdin8r5",
+      "prUrl": "https://github.com/81ueman/relay/pull/39",
+      "prRepo": "81ueman/relay",
+      "prBase": "main",
+      "attempt": 0,
+      "phase": "merge_ready",
+      "state": "queued",
+      "mergedAt": null,
+      "at": "2026-10-18T07:46:40.584Z"
+    }
+  ],
+  "factoryResult": {
+    "outcome": "merge_ready",
+    "head": "a47818918846b32bff5e7e21aaf3f946bf469d3a",
+    "reason": null,
+    "attempts": [
+      {
+        "attempt": 0,
+        "runId": "run-a5bcc307",
+        "baseHead": "f6be5e5a3da7b8ff08c040642385c00659736fef",
+        "producedHead": "a47818918846b32bff5e7e21aaf3f946bf469d3a",
+        "verifyOutcome": "pass",
+        "reviewVerdict": "pass",
+        "phase": "implement"
+      }
+    ],
+    "gate": "BLOCKED"
+  },
+  "actorEvidence": {
+    "agentGithubWrites": [
+      "git push origin HEAD:refs/heads/relay/ish885b-e2e-mvdin8r5",
+      "gh pr create --repo 81ueman/relay --head relay/ish885b-e2e-mvdin8r5 --base main --title \"ISH-885b: real Agent-owned PR fixture\" --body $'## Summary\\n- add `parseDuration` in `src/ish885b/duration.ts` for concatenated, case-insensitive duration components with exact half-up millisecond rounding and `-1` on malformed input\\n- add `docs/ish885b/AGENT-E2E.md` with the required first line\\n- add focused contract tests covering valid units/components, decimals, rounding, case-insensitivity, and malformed inputs\\n\\n## Checks\\n- `bun run typecheck` (pass)\\n- `bun test tests/ish885b-duration.test.ts` (5 pass)\\n- full `bun test` was also run; the new suite passes, with two unrelated pre-existing failures (`factory.test.ts` reused-PID timeout race and `singleton.test.ts` stale-socket creation in this sandbox)\\n\\nThis PR is part of the ISH-885b agent-owned PR E2E fixture. It must not be merged by the agent.'"
+    ],
+    "agentGithubWriteDetails": [
+      {
+        "command": "git push origin HEAD:refs/heads/relay/ish885b-e2e-mvdin8r5",
+        "result": "[stderr]\nremote: \nremote: Create a pull request for 'relay/ish885b-e2e-mvdin8r5' on GitHub by visiting:        \nremote:      https://github.com/81ueman/relay/pull/new/relay/ish885b-e2e-mvdin8r5        \nremote: \nTo github.com:81ueman/relay.git\n * [new branch]      HEAD -> relay/ish885b-e2e-mvdin8r5\n"
+      },
+      {
+        "command": "gh pr create --repo 81ueman/relay --head relay/ish885b-e2e-mvdin8r5 --base main --title \"ISH-885b: real Agent-owned PR fixture\" --body $'## Summary\\n- add `parseDuration` in `src/ish885b/duration.ts` for concatenated, case-insensitive duration components with exact half-up millisecond rounding and `-1` on malformed input\\n- add `docs/ish885b/AGENT-E2E.md` with the required first line\\n- add focused contract tests covering valid units/components, decimals, rounding, case-insensitivity, and malformed inputs\\n\\n## Checks\\n- `bun run typecheck` (pass)\\n- `bun test tests/ish885b-duration.test.ts` (5 pass)\\n- full `bun test` was also run; the new suite passes, with two unrelated pre-existing failures (`factory.test.ts` reused-PID timeout race and `singleton.test.ts` stale-socket creation in this sandbox)\\n\\nThis PR is part of the ISH-885b agent-owned PR E2E fixture. It must not be merged by the agent.'",
+        "result": "https://github.com/81ueman/relay/pull/39\n"
+      }
+    ],
+    "runs": [
+      {
+        "runId": "run-a5bcc307",
+        "state": "submitted",
+        "exitCode": 0,
+        "headSha": "a47818918846b32bff5e7e21aaf3f946bf469d3a",
+        "baseHeadSha": "f6be5e5a3da7b8ff08c040642385c00659736fef",
+        "dshJsonl": "/var/folders/2l/lk91l4dd1ysb1jfw7bkw0nrh0000gn/T/ish885b-e2e-runs-mvdin81d/run-a5bcc307/dsh.jsonl"
+      }
+    ]
+  },
+  "reviews": [
+    {
+      "id": 5561989573,
+      "author": "81ueman",
+      "state": "COMMENTED",
+      "headSha": "a47818918846b32bff5e7e21aaf3f946bf469d3a",
+      "marker": "OK"
+    }
+  ],
+  "chainProven": false,
+  "cleanup": {
+    "prClosed": true,
+    "branchDeleted": true,
+    "sandboxRemoved": true,
+    "tempDir": "/var/folders/2l/lk91l4dd1ysb1jfw7bkw0nrh0000gn/T/relay-ish885b-real-adluCr"
+  },
+  "finishedAt": "2026-10-18T07:46:45.966Z",
+  "ngArc": "NOT_PROVEN",
+  "ngArcReason": "Across four real runs the dsh/DeepSeek Agent satisfied the acceptance on the first attempt, so the independent Claude reviewer correctly returned PASS at a single reviewed HEAD (no NG@A -> FIX -> PASS@B). Manufacturing a deficient first attempt (a partial A, or a pre-filled verdict) is the stand-in the spec forbids.",
+  "history": [
+    {
+      "run": 1,
+      "fixture": "doc",
+      "pr": null,
+      "note": "sandbox gh unconfigured; gh pr create failed",
+      "factory": "blocked NO_PR_IDENTITY"
+    },
+    {
+      "run": 2,
+      "fixture": "doc",
+      "pr": null,
+      "note": "Agent pushed but never ran gh pr create",
+      "factory": "blocked NO_PR_IDENTITY"
+    },
+    {
+      "run": 3,
+      "fixture": "doc",
+      "pr": null,
+      "note": "kit sandbox SBX_CRED_GITHUB_MODE=none -> gh 401",
+      "factory": "blocked NO_PR_IDENTITY"
+    },
+    {
+      "run": 4,
+      "fixture": "doc",
+      "pr": null,
+      "note": "dsh strips GH_TOKEN from the Agent shell -> gh auth login",
+      "factory": "blocked NO_PR_IDENTITY"
+    },
+    {
+      "run": 5,
+      "fixture": "doc",
+      "pr": 36,
+      "head": "c2665f6932",
+      "review": 5561933089,
+      "verdict": "OK",
+      "factory": "merge_ready"
+    },
+    {
+      "run": 6,
+      "fixture": "6-item checklist",
+      "pr": 37,
+      "head": "4d5a18ccc9",
+      "review": 5561944232,
+      "verdict": "OK",
+      "factory": "merge_ready"
+    },
+    {
+      "run": "7b",
+      "fixture": "rounding conflict",
+      "pr": 38,
+      "head": "bceb0bb8b6",
+      "review": 5561965729,
+      "verdict": "OK",
+      "factory": "merge_ready"
+    },
+    {
+      "run": 8,
+      "fixture": "parser contract",
+      "pr": 39,
+      "head": "a478189188",
+      "review": 5561989573,
+      "verdict": "OK",
+      "factory": "merge_ready"
+    }
+  ]
+}
