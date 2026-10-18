@@ -16,7 +16,7 @@ in `relay/` (not moved back to `ishiul`).
 | `src/dsh-version.ts` | `PINNED_DSH_VERSION = "0.2.1-rc.2"`, `isPinnedDsh`, `readDshVersion` — the ONE constant + guard used by **both** the host runner and the sandbox |
 | `src/sandbox-lifecycle.ts` | re-exports the shared pin; `prepareSandboxDsh` installs/probes it and the launch guard enforces it |
 | `src/dsh-runner.ts` | the host `startDshRun` guard (`DSH_VERSION_MISMATCH`) |
-| `sandbox/coding-kit/spec.yaml` | `npm i -g @deepseek-ai/dsh@0.2.1-rc.2` (the fresh-sandbox provision) |
+| `sandbox/coding-kit/spec.yaml` | `npm i -g @deepseek-ai/dsh@0.2.1-rc.2` (the fresh-sandbox provision; **ISH-830c** adds the `ollama-cloud` `headless` profile alongside it) |
 | `sandbox/README.md`, `docs/dsh-headless-runner.md`, `docs/sandbox-lifecycle.md`, `docs/factory-e2e.md`, `README.md` | version references |
 | `tests/*`, `scripts/ish828-smoke.ts`, `scripts/ish762-real-smoke.ts` | pinned fixtures/comments |
 
@@ -171,6 +171,13 @@ Environment: Apple Silicon (`darwin/arm64`), `sbx v0.48.0`.
   RELAY_SANDBOX_SMOKE=1 RELAY_SANDBOX_AGENT=ishiul-coding \
     RELAY_SANDBOX_KEY_CMD=/abs/get-key.sh bun run smoke:sandbox:real
   ```
+  **ISH-830c** moves the sandbox route off dsh's shipped provider default: the
+  Coding Kit now provisions the `headless` profile
+  (`sandbox/coding-kit/files/home/.dsh/profiles/headless/`) pinned to the
+  `ollama-cloud` pi-ai provider with `apiKeyEnv: OLLAMA_CLOUD_V41_API_KEY`, so a
+  headless Run authenticates through the operator's `sbx` credential proxy rather
+  than needing the older per-Run `--patch` overlay. See
+  [`ish830c-kit-dsh-profile.md`](ish830c-kit-dsh-profile.md).
 - **The real Factory E2E** (ISH-762) was not run here.
 - No provider push / PR / merge was performed by this change (Relay adds no
   such authority); the PR for this issue is opened by the owner flow, unmerged.
