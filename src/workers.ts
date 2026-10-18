@@ -8,7 +8,22 @@ export type WorkerRow = Worker;
 export function registerWorker(
   db: Database,
   id: string,
-  opts: { role?: string; agentKind?: string; runtimeId?: string; sessionId?: string; cwd?: string; command?: string } = {}
+  opts: {
+    role?: string;
+    agentKind?: string;
+    runtimeId?: string;
+    sessionId?: string;
+    cwd?: string;
+    command?: string;
+    /**
+     * ISH-904: the INITIAL state of a newly registered worker (default
+     * `starting`, the attach-time state). A headless principal Relay itself
+     * drives (the Factory reviewer/integrator) starts `idle`: there is no pane
+     * to attach, so leaving it `starting` made the dashboard report a permanent
+     * stuck attach.
+     */
+    state?: WorkerState;
+  } = {}
 ): Worker {
   const t = now();
   const existing = db.query(`SELECT * FROM workers WHERE id = ?`).get(id) as Worker | null;
@@ -33,12 +48,57 @@ export function registerWorker(
   db.query(
     `INSERT INTO workers (id, role, agent_kind, runtime_id, cwd, command, opencode_session_id, state, current_task_id,
       generation, last_seen_at, last_progress_at, nudged_at, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, 'starting', NULL, 0, ?, ?, NULL, ?, ?)`
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, ?, ?, NULL, ?, ?)`
   ).run(
     id, opts.role ?? "worker", opts.agentKind ?? "opencode", opts.runtimeId ?? null, opts.cwd ?? null, opts.command ?? null,
-    opts.sessionId ?? null, t, t, t, t
+    opts.sessionId ?? null, opts.state ?? "starting", t, t, t, t
   );
-  logEvent(db, { source: "cli", workerId: id, type: "worker.registered", payload: { role: opts.role ?? "worker", agentKind: opts.agentKind ?? "opencode" } });
+  logEvent(db, { source: "cli", workerId: id, type: "worker.registered", payload: { role: opts.role ?? "worker", agentKind: opts.agentKind ?? "opencode", state: opts.state ?? "starting" } });
+  return getWorker(db, id)!;
+}
+
+/**
+ * ISH-904: a principal Relay drives HEADLESSLY — the Factory's
+ * `claude-review` reviewer and `factory-integrator` integrator — has no Herdr
+ * tab/pane of its own. `agent_kind` is the durable marker (the Factory registers
+ * them as `claude`/`relay`); no new column is needed. Such a worker must never
+ * be reported as "no visible runtime pane" or "starting for a while (attach
+ * stuck?)" by the dashboard, which is what made the two ATTENTION surfaces
+ * disagree after a factory run.
+ */
+export function isHeadlessWorker(w: Pick<Worker, "agent_kind">): boolean {
+  return w.agent_kind === "claude" || w.agent_kind === "relay";
+}
+
+/**
+ * Register a headless principal in `idle` (never `starting`) and repair a row
+ * left `starting` by an older factory run. The worker's ROLE is preserved when it
+ * already exists (a non-reviewer principal must still be refused by the ordinary
+ * authority check, never silently promoted). Its `agent_kind` is aligned to the
+ * headless kind when it has no runtime/session yet, so the dashboard knows no
+ * pane is expected.
+ */
+export function ensureHeadlessWorker(
+  db: Database,
+  id: string,
+  opts: { role?: string; agentKind?: string } = {}
+): Worker {
+  let existing = getWorker(db, id);
+  if (!existing) return registerWorker(db, id, { ...opts, state: "idle" });
+  if (opts.agentKind && existing.agent_kind !== opts.agentKind && !existing.runtime_id && !existing.opencode_session_id) {
+    db.query(`UPDATE workers SET agent_kind = ?, updated_at = ? WHERE id = ?`).run(opts.agentKind, now(), id);
+    logEvent(db, {
+      source: "cli",
+      workerId: id,
+      type: "worker.normalized",
+      payload: { wasKind: existing.agent_kind, agentKind: opts.agentKind, reason: "headless" },
+    });
+    existing = getWorker(db, id)!;
+  }
+  if (existing.state === "starting") {
+    db.query(`UPDATE workers SET state = 'idle', updated_at = ? WHERE id = ? AND state = 'starting'`).run(now(), id);
+    logEvent(db, { source: "cli", workerId: id, type: "worker.normalized", payload: { was: "starting", state: "idle", reason: "headless" } });
+  }
   return getWorker(db, id)!;
 }
 

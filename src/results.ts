@@ -24,6 +24,69 @@ export interface TaskResultInput {
   evidenceRef?: string | null;
   reason?: string | null;
   payload?: unknown;
+  /**
+   * ISH-904: a DELIBERATE replacement of the result with this id. Without it a
+   * repeated write for the same (task, phase, attempt, kind) is idempotent (the
+   * existing row is returned); with it the existing row is replaced in place so
+   * a superseding verdict does not hit the identity UNIQUE constraint.
+   */
+  supersedes?: number;
+}
+
+/** The durable error code a failed result write reports (never a crash only). */
+export const RESULT_WRITE_ERROR = "RESULT_WRITE_ERROR";
+
+/** A structured-result write failed. Callers must not swallow this as a refusal. */
+export class ResultWriteError extends Error {
+  constructor(message: string, readonly cause?: unknown) {
+    super(message);
+    this.name = "ResultWriteError";
+  }
+}
+
+export function isResultWriteError(e: unknown): e is ResultWriteError {
+  return e instanceof ResultWriteError;
+}
+
+/**
+ * ISH-904: a failed result write must never leave a Task half-applied. Park it
+ * `blocked_internal` with the concrete error (idempotent: the same reason is
+ * recorded once). Deliberately a direct SQL write: this module must not import
+ * the task/workflow machine (import cycle) and the block must survive even when
+ * the caller's transaction rolls back — it is best-effort here and retried by
+ * the Factory's own catch outside the failed transaction.
+ */
+export function markTaskBlockedInternal(db: Database, taskId: string, reason: string): void {
+  try {
+    const task = db.query(`SELECT state FROM tasks WHERE id = ?`).get(taskId) as { state: string } | null;
+    if (!task) return;
+    if (task.state === "done" || task.state === "failed" || task.state === "cancelled") return;
+    const t = now();
+    db.transaction(() => {
+      db.query(
+        `UPDATE tasks SET state = 'blocked_internal', assignee = NULL, lease_until = NULL,
+           lease_token = lease_token + 1, updated_at = ? WHERE id = ?`
+      ).run(t, taskId);
+      const seen = db
+        .query(`SELECT id FROM task_notes WHERE task_id = ? AND kind = 'blocked_internal' AND body = ? LIMIT 1`)
+        .get(taskId, reason) as { id: number } | null;
+      if (!seen) {
+        db.query(`INSERT INTO task_notes (task_id, worker_id, kind, body, created_at) VALUES (?, 'relay', 'blocked_internal', ?, ?)`).run(
+          taskId,
+          reason,
+          t
+        );
+      }
+      logEvent(db, {
+        source: "workflow",
+        taskId,
+        type: "task.blocked_internal",
+        payload: { reason, source: "result-write" },
+      });
+    })();
+  } catch {
+    /* the original write failure is the actionable error; parking is best effort */
+  }
 }
 
 export function getTaskResult(db: Database, id: number): TaskResult | null {
@@ -158,37 +221,118 @@ export function findMergedResult(db: Database, taskId: string): TaskResult | nul
   );
 }
 
+/**
+ * Write one structured result.
+ *
+ * ISH-904: a repeated write for the same (task, phase, attempt, kind) is
+ * IDEMPOTENT — the existing row is returned instead of crashing on the identity
+ * UNIQUE constraint when a Factory retry/resume replays a stage. A caller that
+ * deliberately REPLACES a result (a superseding review verdict) passes
+ * `supersedes: <id>`; the row is then updated in place (same id, same
+ * (task, phase, attempt, kind) identity), which is what makes `--supersedes`
+ * actually accept the replacement verdict at the same attempt.
+ *
+ * On any OTHER write failure the Task is parked `blocked_internal` with the
+ * concrete error and a `ResultWriteError` is thrown — callers must rethrow it
+ * rather than treating it as a normal refusal, so a half-applied phase is never
+ * left behind.
+ */
 export function insertTaskResult(db: Database, r: TaskResultInput): TaskResult {
+  const existing = findTaskResult(db, r.taskId, r.phase, r.attempt, r.kind);
+  if (existing && r.supersedes === undefined) {
+    logEvent(db, {
+      source: "workflow",
+      workerId: r.workerId ?? null,
+      taskId: r.taskId,
+      type: "workflow.result.idempotent",
+      payload: { id: existing.id, phase: r.phase, attempt: r.attempt, kind: r.kind },
+    });
+    return existing;
+  }
   const t = now();
-  const row = db
-    .query(
-      `INSERT INTO task_results
-         (task_id, phase, attempt, kind, worker_id, passed, head_sha, profile, evidence_ref, reason, payload_json, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    )
-    .run(
-      r.taskId,
-      r.phase,
-      r.attempt,
-      r.kind,
-      r.workerId ?? null,
-      r.passed === undefined || r.passed === null ? null : r.passed ? 1 : 0,
-      r.headSha ?? null,
-      r.profile ?? null,
-      r.evidenceRef ?? null,
-      r.reason ?? null,
-      JSON.stringify(r.payload ?? {}),
-      t
-    );
-  const id = Number(row.lastInsertRowid);
-  logEvent(db, {
-    source: "workflow",
-    workerId: r.workerId ?? null,
-    taskId: r.taskId,
-    type: `workflow.result.${r.kind}`,
-    payload: { id, phase: r.phase, attempt: r.attempt, passed: r.passed ?? null, head: r.headSha ?? null, reason: r.reason ?? null },
-  });
-  return getTaskResult(db, id)!;
+  try {
+    if (existing && r.supersedes !== undefined) {
+      // A deliberate replacement of an existing result row. The row id is kept so
+      // a `result:<id>` reference and the attempt history stay resolvable.
+      db.query(
+        `UPDATE task_results
+            SET worker_id = ?, passed = ?, head_sha = ?, profile = ?, evidence_ref = ?,
+                reason = ?, payload_json = ?, created_at = ?
+          WHERE id = ?`
+      ).run(
+        r.workerId ?? null,
+        r.passed === undefined || r.passed === null ? null : r.passed ? 1 : 0,
+        r.headSha ?? null,
+        r.profile ?? null,
+        r.evidenceRef ?? null,
+        r.reason ?? null,
+        JSON.stringify(r.payload ?? {}),
+        t,
+        existing.id
+      );
+      logEvent(db, {
+        source: "workflow",
+        workerId: r.workerId ?? null,
+        taskId: r.taskId,
+        type: "workflow.result.superseded",
+        payload: { id: existing.id, phase: r.phase, attempt: r.attempt, kind: r.kind, supersedes: r.supersedes },
+      });
+      return getTaskResult(db, existing.id)!;
+    }
+    const row = db
+      .query(
+        `INSERT OR IGNORE INTO task_results
+           (task_id, phase, attempt, kind, worker_id, passed, head_sha, profile, evidence_ref, reason, payload_json, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        r.taskId,
+        r.phase,
+        r.attempt,
+        r.kind,
+        r.workerId ?? null,
+        r.passed === undefined || r.passed === null ? null : r.passed ? 1 : 0,
+        r.headSha ?? null,
+        r.profile ?? null,
+        r.evidenceRef ?? null,
+        r.reason ?? null,
+        JSON.stringify(r.payload ?? {}),
+        t
+      );
+    // INSERT OR IGNORE: a concurrent writer may have won the identity race. The
+    // row that exists is authoritative; never crash the caller for that.
+    const id = Number(row.lastInsertRowid);
+    if (!id || Number(row.changes) === 0) {
+      const winner = findTaskResult(db, r.taskId, r.phase, r.attempt, r.kind);
+      if (winner) {
+        logEvent(db, {
+          source: "workflow",
+          workerId: r.workerId ?? null,
+          taskId: r.taskId,
+          type: "workflow.result.idempotent",
+          payload: { id: winner.id, phase: r.phase, attempt: r.attempt, kind: r.kind },
+        });
+        return winner;
+      }
+      throw new Error("result insert was ignored and no existing row could be read");
+    }
+    logEvent(db, {
+      source: "workflow",
+      workerId: r.workerId ?? null,
+      taskId: r.taskId,
+      type: `workflow.result.${r.kind}`,
+      payload: { id, phase: r.phase, attempt: r.attempt, passed: r.passed ?? null, head: r.headSha ?? null, reason: r.reason ?? null },
+    });
+    return getTaskResult(db, id)!;
+  } catch (e) {
+    if (isResultWriteError(e)) throw e;
+    const detail = e instanceof Error ? e.message : String(e);
+    const message = `${RESULT_WRITE_ERROR}: ${r.kind} for ${r.taskId} phase '${r.phase}' attempt ${r.attempt} failed: ${detail}`;
+    // Best effort: when this runs inside the caller's transaction the block rolls
+    // back with it; the Factory's catch re-applies it after the rollback.
+    markTaskBlockedInternal(db, r.taskId, message);
+    throw new ResultWriteError(message, e);
+  }
 }
 
 /**

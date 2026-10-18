@@ -26,8 +26,9 @@ import {
 } from "../src/run-lifecycle";
 
 // ISH-760: the Task worktree + disposable dsh Run lifecycle, single-writer.
-// A REAL temp git repo + a FAKE dsh process (no real dsh, no network) keep the
-// whole lifecycle deterministic.
+// A REAL temp git repo + a FAKE dsh process keep the whole lifecycle
+// deterministic; remotes are local bare repos (the one unreachable-remote test
+// asserts the fetched-or-warn fallback, not a live network path).
 
 class FakeProcess implements DshProcess {
   pid: number;
@@ -319,6 +320,95 @@ describe("ISH-904: the workspace is self-contained (git dir + common dir inside)
     expect(existsSync(join(b.worktree, "remote-only.txt"))).toBe(true);
   });
 
+  test("ISH-904: a STALE source origin/main is FETCHED before the Task branch is cut", () => {
+    const remote = join(dir, "remote.git");
+    execFileSync("git", ["clone", "-q", "--bare", repo, remote]);
+    git(repo, "remote", "add", "origin", remote);
+    git(repo, "fetch", "-q", "origin");
+    const stale = git(repo, "rev-parse", "refs/remotes/origin/main");
+    // The remote advances; the source does NOT fetch (the overnight factory shape).
+    const scratch = join(dir, "scratch-fetch");
+    execFileSync("git", ["clone", "-q", remote, scratch]);
+    execFileSync("git", ["-C", scratch, "config", "user.email", "r@test"]);
+    execFileSync("git", ["-C", scratch, "config", "user.name", "r-test"]);
+    writeFileSync(join(scratch, "fresh.txt"), "fresh\n");
+    execFileSync("git", ["-C", scratch, "add", "fresh.txt"]);
+    execFileSync("git", ["-C", scratch, "commit", "-q", "-m", "remote moved"]);
+    execFileSync("git", ["-C", scratch, "push", "-q", "origin", "HEAD:refs/heads/main"]);
+    const fresh = git(scratch, "rev-parse", "HEAD");
+    expect(git(repo, "rev-parse", "refs/remotes/origin/main")).toBe(stale);
+
+    const id = newTask();
+    const warnings: string[] = [];
+    const b = ensureTaskWorktree(db, id, { repo, onWarning: (m) => warnings.push(m) });
+    expect(git(b.worktree, "rev-parse", "HEAD")).toBe(fresh);
+    expect(git(b.worktree, "rev-parse", "HEAD")).not.toBe(stale);
+    expect(b.base).toBe("origin/main");
+    expect(b.baseSha).toBe(fresh);
+    expect(b.warnings ?? []).toEqual([]);
+    expect(warnings).toEqual([]);
+  });
+
+  test("ISH-904: a recorded pr_base resolves to origin/<base>, never the stale local branch", () => {
+    const remote = join(dir, "remote.git");
+    execFileSync("git", ["clone", "-q", "--bare", repo, remote]);
+    git(repo, "remote", "add", "origin", remote);
+    git(repo, "fetch", "-q", "origin");
+    // The remote moves ahead; source local `main` stays behind.
+    const scratch = join(dir, "scratch-prbase");
+    execFileSync("git", ["clone", "-q", remote, scratch]);
+    execFileSync("git", ["-C", scratch, "config", "user.email", "r@test"]);
+    execFileSync("git", ["-C", scratch, "config", "user.name", "r-test"]);
+    writeFileSync(join(scratch, "prbase.txt"), "prbase\n");
+    execFileSync("git", ["-C", scratch, "add", "prbase.txt"]);
+    execFileSync("git", ["-C", scratch, "commit", "-q", "-m", "remote moved"]);
+    execFileSync("git", ["-C", scratch, "push", "-q", "origin", "HEAD:refs/heads/main"]);
+    const fresh = git(scratch, "rev-parse", "HEAD");
+    const localMain = git(repo, "rev-parse", "refs/heads/main");
+    expect(fresh).not.toBe(localMain);
+
+    const t = intakeTask(db, {
+      provider: "test",
+      issueId: `ISH-904-pr-base-${issueSeq++}`,
+      codeChange: true,
+      title: "pr base",
+      prBase: "main",
+    });
+    const b = ensureTaskWorktree(db, t.id, { repo });
+    expect(b.base).toBe("origin/main");
+    expect(git(b.worktree, "rev-parse", "HEAD")).toBe(fresh);
+    expect(existsSync(join(b.worktree, "prbase.txt"))).toBe(true);
+  });
+
+  test("ISH-904: an explicit base behind origin/main WARNS (never silent)", () => {
+    const remote = join(dir, "remote.git");
+    execFileSync("git", ["clone", "-q", "--bare", repo, remote]);
+    git(repo, "remote", "add", "origin", remote);
+    git(repo, "fetch", "-q", "origin");
+    const staleMain = git(repo, "rev-parse", "refs/heads/main");
+    const scratch = join(dir, "scratch-warn");
+    execFileSync("git", ["clone", "-q", remote, scratch]);
+    execFileSync("git", ["-C", scratch, "config", "user.email", "r@test"]);
+    execFileSync("git", ["-C", scratch, "config", "user.name", "r-test"]);
+    writeFileSync(join(scratch, "ahead.txt"), "ahead\n");
+    execFileSync("git", ["-C", scratch, "add", "ahead.txt"]);
+    execFileSync("git", ["-C", scratch, "commit", "-q", "-m", "ahead"]);
+    execFileSync("git", ["-C", scratch, "push", "-q", "origin", "HEAD:refs/heads/main"]);
+    const fresh = git(scratch, "rev-parse", "HEAD");
+
+    const id = newTask();
+    const seen: string[] = [];
+    const b = ensureTaskWorktree(db, id, { repo, base: "main", onWarning: (m) => seen.push(m) });
+    // The explicit base is still honoured (the operator named it)...
+    expect(git(b.worktree, "rev-parse", "HEAD")).toBe(staleMain);
+    // ...but it is NEVER silent about being behind the freshly fetched trunk.
+    const warning = (b.warnings ?? []).join("\n");
+    expect(warning).toContain("behind origin/main");
+    expect(warning).toContain(staleMain.slice(0, 10));
+    expect(warning).toContain(fresh.slice(0, 10));
+    expect(seen.join("\n")).toContain("behind origin/main");
+  });
+
   test("the default base works when the source has no LOCAL main (origin/main is the only main)", () => {
     const remote = join(dir, "remote.git");
     execFileSync("git", ["clone", "-q", "--bare", repo, remote]);
@@ -358,11 +448,12 @@ describe("ISH-904: the workspace is self-contained (git dir + common dir inside)
     expect(existsSync(join(b.worktree, "pushed.txt"))).toBe(true);
   });
 
-  test("creating a workspace never touches the network (the remote is unreachable)", () => {
+  test("a failed origin refresh WARNS but still creates the workspace from local refs", () => {
     git(repo, "remote", "add", "origin", "https://unreachable.invalid/never.git");
     const id = newTask();
     const b = ensureTaskWorktree(db, id, { repo });
     expect(b.created).toBe(true);
+    expect((b.warnings ?? []).join("\n")).toContain("could not refresh origin");
     expect(git(b.worktree, "remote", "get-url", "origin")).toBe("https://unreachable.invalid/never.git");
     expect(git(b.worktree, "rev-parse", "--abbrev-ref", "HEAD")).toBe(b.branch);
   });

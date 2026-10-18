@@ -9,6 +9,7 @@ import {
   findSubmissionForAttempt,
   findTaskResult,
   findUnresolvedNgAtHead,
+  getTaskResult,
   insertTaskResult,
   notifyGatewayTo,
 } from "./results";
@@ -1046,9 +1047,12 @@ export interface ReviewOptions {
   /** Source label for the result payload (e.g. "github-marker"). */
   source?: string;
   /**
-   * ISH-759: explicitly SUPERSEDE an unresolved NG at this head by naming its
-   * result id. Without it, a PASS at a head that still carries an NG is refused
-   * (an unresolved NG never becomes PASS from a later OK alone).
+   * ISH-759/ISH-904: explicitly SUPERSEDE an unresolved NG (a PASS at a head
+   * that still carries an NG is otherwise refused), AND — on a `merge_ready`
+   * task whose PR cannot be merged — name the PASS being replaced so the Task can
+   * return to `implement` at attempt+1 with `reason` as the FIX brief. A
+   * superseding result is written as a REPLACEMENT (same identity, same id)
+   * instead of hitting DUPLICATE_DISPATCH/the identity UNIQUE constraint.
    */
   supersedesResultId?: number;
 }
@@ -1078,8 +1082,56 @@ export function recordReview(db: Database, taskId: string, reviewerId: string, o
   if (!task) throw new Error(`unknown task: ${taskId}`);
   if (!isCodeTask(task)) throw new Error(`${WORKFLOW_ERROR}: ${taskId} is not a code-change task`);
   const phase = phaseOf(task);
+  const suppliedSupersede =
+    opts.supersedesResultId !== undefined ? getTaskResult(db, opts.supersedesResultId) : null;
+  if (opts.supersedesResultId !== undefined) {
+    if (!suppliedSupersede) {
+      throw new Error(`${WORKFLOW_ERROR}: --supersedes result ${opts.supersedesResultId} was not found`);
+    }
+    if (suppliedSupersede.task_id !== taskId || suppliedSupersede.kind !== "ReviewResult") {
+      throw new Error(
+        `${WORKFLOW_ERROR}: --supersedes result ${suppliedSupersede.id} is not a ReviewResult for ${taskId}`
+      );
+    }
+  }
+  // ISH-904: a `merge_ready` task whose PR cannot be merged has NO supported
+  // route back. A superseding FAIL re-opens the SAME task at attempt+1 (the
+  // reason becomes the FIX brief) instead of requiring SQLite surgery. Without
+  // an explicit --supersedes the CURRENT passing review is the deliberate
+  // replacement, so the operator does not need to know its result id.
+  const reopenMergeReady =
+    phase === "merge_ready" &&
+    (opts.verdict === "fix" || opts.verdict === "fail") &&
+    (task.state === "queued" || task.state === "review") &&
+    task.merged_at === null;
   if (task.state !== "review" || phase !== "review") {
-    throw new Error(`${WORKFLOW_ERROR}: cannot record a review for ${taskId} (state ${task.state}, phase ${phase})`);
+    if (!reopenMergeReady) {
+      throw new Error(`${WORKFLOW_ERROR}: cannot record a review for ${taskId} (state ${task.state}, phase ${phase})`);
+    }
+  }
+  let supersedeTarget = suppliedSupersede;
+  if (reopenMergeReady) {
+    supersedeTarget = supersedeTarget ?? findPassingReview(db, taskId, task.attempt);
+    if (!supersedeTarget) {
+      throw new Error(
+        `${WORKFLOW_ERROR}: cannot re-open ${taskId} from merge_ready: no passing review for attempt ${task.attempt}`
+      );
+    }
+    if (supersedeTarget.passed !== 1) {
+      throw new Error(
+        `${WORKFLOW_ERROR}: cannot re-open ${taskId} from merge_ready: result ${supersedeTarget.id} is not a PASS`
+      );
+    }
+    if (!(opts.reason ?? "").trim()) {
+      throw new Error(
+        `${WORKFLOW_ERROR}: a merge_ready rework needs --reason "<why the PR is not mergeable>" (the FIX brief)`
+      );
+    }
+    if (!task.head_sha || (supersedeTarget.head_sha ?? null) !== task.head_sha) {
+      throw new Error(
+        `${HEAD_MISMATCH}: cannot re-open ${taskId} from merge_ready: the superseded PASS is not at the current head ${task.head_sha ?? "none"}`
+      );
+    }
   }
   const external = opts.externalReviewer?.trim();
   const identity = external ?? reviewerId;
@@ -1129,7 +1181,13 @@ export function recordReview(db: Database, taskId: string, reviewerId: string, o
   // refused. The base is recorded for evidence, but is NOT the identity (a base name
   // can recur on a revert).
   const base = task.pr_base ?? null;
-  if (findReviewForHead(db, taskId, head, profile)) {
+  const resultPhase = reopenMergeReady ? supersedeTarget!.phase : phase;
+  const resultAttempt = reopenMergeReady ? supersedeTarget!.attempt : task.attempt;
+  const supersedesId = supersedeTarget?.id;
+  // A DELIBERATE supersede is exactly what lets a replacement verdict through:
+  // it skips duplicate-dispatch and is written as a replacement (same id) rather
+  // than a second row for the same (task, phase, attempt, kind).
+  if (!supersedesId && findReviewForHead(db, taskId, head, profile)) {
     throw new Error(
       `${DUPLICATE_DISPATCH}: ${taskId} head ${head} already has a review (profile '${profile}') in this review epoch`
     );
@@ -1139,14 +1197,14 @@ export function recordReview(db: Database, taskId: string, reviewerId: string, o
   // DUPLICATE_DISPATCH; a *different profile's* later OK hits this rule instead.
   if (opts.verdict === "pass") {
     const ng = findUnresolvedNgAtHead(db, taskId, head);
-    if (ng && ng.id !== opts.supersedesResultId) {
+    if (ng && ng.id !== supersedesId) {
       throw new Error(
         `${UNRESOLVED_NG}: ${taskId} head ${head ?? "none"} still carries an unresolved NG (result ${ng.id}); ` +
         `a later OK alone does not clear it — fix the head or supersede the NG explicitly`
       );
     }
   }
-  assertNoResult(db, taskId, phase, task.attempt, "ReviewResult");
+  if (!supersedesId) assertNoResult(db, taskId, phase, task.attempt, "ReviewResult");
 
   const basePayload = {
     source: opts.source ?? (external ? "external" : "worker"),
@@ -1154,15 +1212,15 @@ export function recordReview(db: Database, taskId: string, reviewerId: string, o
     // The base BRANCH this review judged — recorded for evidence. The duplicate
     // guard uses the review EPOCH, not this value.
     base,
-    ...(opts.supersedesResultId ? { supersedes: opts.supersedesResultId } : {}),
+    ...(supersedesId ? { supersedes: supersedesId } : {}),
   };
 
   if (opts.verdict === "pass") {
     const updated = db.transaction(() => {
       const result = insertTaskResult(db, {
         taskId,
-        phase,
-        attempt: task.attempt,
+        phase: resultPhase,
+        attempt: resultAttempt,
         kind: "ReviewResult",
         workerId: identity,
         passed: true,
@@ -1171,6 +1229,7 @@ export function recordReview(db: Database, taskId: string, reviewerId: string, o
         reason: opts.reason ?? null,
         evidenceRef: opts.evidence ?? null,
         payload: basePayload,
+        ...(supersedesId ? { supersedes: supersedesId } : {}),
       });
       const u = applyPhase(db, task, "integration", {
         state: "queued",
@@ -1189,8 +1248,8 @@ export function recordReview(db: Database, taskId: string, reviewerId: string, o
     const updated = db.transaction(() => {
       const result = insertTaskResult(db, {
         taskId,
-        phase,
-        attempt: task.attempt,
+        phase: resultPhase,
+        attempt: resultAttempt,
         kind: "ReviewResult",
         workerId: identity,
         passed: false,
@@ -1199,6 +1258,7 @@ export function recordReview(db: Database, taskId: string, reviewerId: string, o
         reason: opts.reason ?? null,
         evidenceRef: opts.evidence ?? null,
         payload: { ...basePayload, blocked: true },
+        ...(supersedesId ? { supersedes: supersedesId } : {}),
       });
       return getTask(db, taskId)!;
     })();
@@ -1213,11 +1273,14 @@ export function recordReview(db: Database, taskId: string, reviewerId: string, o
   }
 
   // fix (alias fail): rework on the SAME task at a new attempt, head cleared.
+  // ISH-904: from `merge_ready` this is the supported route back when the PR is
+  // not mergeable — the superseded PASS is replaced by this FAIL, the reason is
+  // the next FIX brief, and the attempt advances.
   const updated = db.transaction(() => {
     const result = insertTaskResult(db, {
       taskId,
-      phase,
-      attempt: task.attempt,
+      phase: resultPhase,
+      attempt: resultAttempt,
       kind: "ReviewResult",
       workerId: identity,
       passed: false,
@@ -1226,6 +1289,7 @@ export function recordReview(db: Database, taskId: string, reviewerId: string, o
       reason: opts.reason ?? null,
       evidenceRef: opts.evidence ?? null,
       payload: basePayload,
+      ...(supersedesId ? { supersedes: supersedesId } : {}),
     });
     const u = applyPhase(db, task, "implement", {
       state: "queued",
@@ -1237,6 +1301,19 @@ export function recordReview(db: Database, taskId: string, reviewerId: string, o
     if (!external) releaseWorker(db, reviewerId, taskId);
     return u;
   })();
+  if (reopenMergeReady) {
+    logEvent(db, {
+      source: "workflow",
+      taskId,
+      type: "workflow.review_reopened",
+      payload: {
+        from: "merge_ready",
+        supersedes: supersedesId ?? null,
+        attempt: task.attempt + 1,
+        reason: opts.reason ?? null,
+      },
+    });
+  }
   requestReconcile(db, `review-fix:${taskId}`);
   return updated;
 }

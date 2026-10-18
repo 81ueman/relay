@@ -5,12 +5,12 @@ import { now } from "./db";
 import { logEvent } from "./events";
 import { getTask, reviewHeldByLiveReviewer } from "./tasks";
 import { inheritFindings } from "./run-lifecycle";
-import { findSubmissionForAttempt } from "./results";
+import { findSubmissionForAttempt, isResultWriteError } from "./results";
 import { REVIEWER_ROLE } from "./schema";
 import type { Task } from "./schema";
 import { gitHead } from "./verify";
 import { recordReview, taskChecks } from "./workflow";
-import { getWorker, registerWorker } from "./workers";
+import { ensureHeadlessWorker, getWorker } from "./workers";
 import {
   headsMatch,
   latestReviewInvalidationAt,
@@ -399,49 +399,138 @@ function normalizeVerdict(raw: Record<string, unknown>): ReviewerVerdict | null 
  * `claude --output-format json` envelope, a bare JSON object, a JSONL stream, a
  * fenced block, or JSON embedded in prose. Returns null when there is NO
  * structured verdict (which is always a refusal, never a pass).
+ *
+ * ISH-904: the FIRST balanced `{…}` object carrying a `verdict` key wins. The old
+ * "outermost {...}" span failed on a real Opus review that began with prose
+ * ("Still reviewing: …") and then emitted a well-formed verdict object: the span
+ * swallowed the surrounding prose and the paid review was discarded.
  */
 export function extractReviewerVerdict(raw: string): ReviewerVerdict | null {
-  if (!raw || !raw.trim()) return null;
+  return extractReviewerVerdictDetailed(raw).verdict;
+}
+
+/** A verdict plus WHY it could not be extracted (`null` when one was found). */
+export interface ReviewerVerdictExtraction {
+  verdict: ReviewerVerdict | null;
+  error: string | null;
+}
+
+/**
+ * ISH-904: the detailed form of `extractReviewerVerdict`. The error is carried
+ * into the `REVIEW_NO_STRUCTURED_RESULT` refusal so an unparseable candidate
+ * ("wrong JSON") is distinguishable from no JSON at all.
+ */
+export function extractReviewerVerdictDetailed(raw: string): ReviewerVerdictExtraction {
+  return extractVerdictDetailed(raw, 0);
+}
+
+function extractVerdictDetailed(raw: string, depth: number): ReviewerVerdictExtraction {
+  if (!raw || !raw.trim()) return { verdict: null, error: "reviewer produced no output" };
+  if (depth > 3) return { verdict: null, error: "nested reviewer result is too deep to parse safely" };
+  const errors: string[] = [];
+  const see = (value: unknown): ReviewerVerdict | null => {
+    if (!isRecord(value)) {
+      errors.push("JSON value is not an object");
+      return null;
+    }
+    if (typeof value.result === "string") {
+      const inner = extractVerdictDetailed(value.result, depth + 1);
+      if (inner.verdict) return inner.verdict;
+      if (inner.error) errors.push(inner.error);
+    }
+    const v = normalizeVerdict(value);
+    if (v) return v;
+    if (Object.prototype.hasOwnProperty.call(value, "verdict")) {
+      errors.push(`unknown verdict ${JSON.stringify(value.verdict)}`);
+    } else if (typeof value.result !== "string") {
+      errors.push("JSON object has no 'verdict' key");
+    }
+    return null;
+  };
+
   const direct = tryJson(raw.trim());
   if (isRecord(direct)) {
-    if (typeof direct.result === "string") {
-      const inner = tryJson(direct.result.trim());
-      if (isRecord(inner)) {
-        const v = normalizeVerdict(inner);
-        if (v) return v;
+    const v = see(direct);
+    if (v) return { verdict: v, error: null };
+  }
+  // JSONL: the FIRST line carrying a verdict wins (document order).
+  for (const line of raw.split("\n")) {
+    const o = tryJson(line.trim());
+    if (!isRecord(o)) continue;
+    const v = see(o);
+    if (v) return { verdict: v, error: null };
+  }
+  for (const m of raw.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)) {
+    const inner = extractVerdictDetailed(m[1] ?? "", depth + 1);
+    if (inner.verdict) return inner;
+    if (inner.error) errors.push(inner.error);
+  }
+  // The FIRST balanced {...} object carrying a verdict key. Balanced (string and
+  // escape aware), so braces inside a finding message cannot truncate it.
+  for (const obj of balancedJsonObjects(raw)) {
+    if (obj.error) {
+      errors.push(`JSON parse error: ${obj.error}`);
+      continue;
+    }
+    const v = see(obj.value);
+    if (v) return { verdict: v, error: null };
+  }
+  const unique = [...new Set(errors)];
+  return {
+    verdict: null,
+    error:
+      unique.length > 0
+        ? unique.slice(0, 3).join("; ")
+        : "no JSON object carrying a 'verdict' key in the reviewer output",
+  };
+}
+
+interface BalancedJsonObject {
+  text: string;
+  value: unknown;
+  error: string | null;
+}
+
+/** Every balanced `{…}` span, in document order, with its JSON parse outcome. */
+function balancedJsonObjects(raw: string): BalancedJsonObject[] {
+  const out: BalancedJsonObject[] = [];
+  for (let i = 0; i < raw.length; i++) {
+    if (raw[i] !== "{") continue;
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    let end = -1;
+    for (let j = i; j < raw.length; j++) {
+      const ch = raw[j];
+      if (inString) {
+        if (escaped) escaped = false;
+        else if (ch === "\\") escaped = true;
+        else if (ch === '"') inString = false;
+        continue;
+      }
+      if (ch === '"') inString = true;
+      else if (ch === "{") depth++;
+      else if (ch === "}") {
+        depth--;
+        if (depth === 0) {
+          end = j;
+          break;
+        }
       }
     }
-    const v = normalizeVerdict(direct);
-    if (v) return v;
-  }
-  // JSONL: last line carrying a verdict wins.
-  for (const line of raw.split("\n").reverse()) {
-    const o = tryJson(line.trim());
-    if (isRecord(o)) {
-      const v = normalizeVerdict(o);
-      if (v) return v;
+    if (end < 0) continue; // unbalanced: no candidate
+    const text = raw.slice(i, end + 1);
+    let value: unknown;
+    let error: string | null = null;
+    try {
+      value = JSON.parse(text);
+    } catch (e) {
+      error = e instanceof Error ? e.message : String(e);
     }
+    out.push({ text, value, error });
+    i = end;
   }
-  // A fenced json block.
-  const fence = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  if (fence) {
-    const o = tryJson(fence[1].trim());
-    if (isRecord(o)) {
-      const v = normalizeVerdict(o);
-      if (v) return v;
-    }
-  }
-  // The outermost {...} span.
-  const b = raw.indexOf("{");
-  const e = raw.lastIndexOf("}");
-  if (b >= 0 && e > b) {
-    const o = tryJson(raw.slice(b, e + 1));
-    if (isRecord(o)) {
-      const v = normalizeVerdict(o);
-      if (v) return v;
-    }
-  }
-  return null;
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -669,9 +758,9 @@ export async function runHeadlessReview(
   const reviewerWorker = deps.reviewerWorker ?? DEFAULT_REVIEWER_WORKER;
   // Register ONLY when absent: an existing worker keeps its own role, so a
   // non-reviewer principal is refused by `recordReview` (never silently promoted).
-  if (!getWorker(db, reviewerWorker)) {
-    registerWorker(db, reviewerWorker, { role: REVIEWER_ROLE, agentKind: "claude" });
-  }
+  // ISH-904: a headless reviewer is registered `idle`, never `starting` — there is
+  // no pane to attach, so a `starting` row was a permanent stuck-attach ATTENTION.
+  ensureHeadlessWorker(db, reviewerWorker, { role: REVIEWER_ROLE, agentKind: "claude" });
   // Explicit independence precheck (recordReview re-enforces it as the authority
   // of record): a principal that neither holds REVIEWER_ROLE nor the review claim
   // can never review — a fake/foreign reviewer identity is refused up front.
@@ -714,7 +803,12 @@ export async function runHeadlessReview(
     ...(native?.allowedTools ? { allowedTools: native.allowedTools } : {}),
   });
   const raw = `${proc.stdout}\n${proc.stderr}`;
-  const verdict = extractReviewerVerdict(proc.stdout) ?? extractReviewerVerdict(proc.stderr);
+  // ISH-904: parse the FIRST balanced verdict object even when the reviewer
+  // wrapped it in prose; keep the concrete parse error for the refusal reason.
+  const stdoutParse = extractReviewerVerdictDetailed(proc.stdout);
+  const stderrParse = stdoutParse.verdict ? { verdict: null, error: null } : extractReviewerVerdictDetailed(proc.stderr);
+  const verdict = stdoutParse.verdict ?? stderrParse.verdict;
+  const parseError = stdoutParse.error ?? stderrParse.error ?? "reviewer returned no structured verdict";
 
   // Retain the RAW reviewer output as evidence. ISH-829: this is written to a
   // DURABLE base — the Task's own worktree — never inside a temporary
@@ -779,9 +873,9 @@ export async function runHeadlessReview(
       source: "factory",
       taskId,
       type: "factory.review_refused",
-      payload: { reason: REVIEW_NO_STRUCTURED_RESULT, head, exitCode: proc.exitCode, evidence: evidencePath },
+      payload: { reason: REVIEW_NO_STRUCTURED_RESULT, detail: parseError, head, exitCode: proc.exitCode, evidence: evidencePath },
     });
-    return refusal(REVIEW_NO_STRUCTURED_RESULT, task, { evidenceRef: evidencePath, raw });
+    return refusal(`${REVIEW_NO_STRUCTURED_RESULT}: ${parseError}`, task, { evidenceRef: evidencePath, raw });
   }
   if (verdict.verdict !== "blocked") {
     if (!verdict.head || verdict.head !== head) {
@@ -931,6 +1025,10 @@ export async function runHeadlessReview(
       raw,
     };
   } catch (e) {
+    // ISH-904: a failed RESULT WRITE is not a review refusal. Rethrow it so the
+    // Factory can park the Task blocked_internal instead of leaving the review
+    // phase half-applied; the write itself already recorded the concrete error.
+    if (isResultWriteError(e)) throw e;
     const msg = e instanceof Error ? e.message : String(e);
     // A reviewer that is not independent (the submitter, or lacks the role) is a
     // fail-closed refusal, not a crash.

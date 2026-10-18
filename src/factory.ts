@@ -3,14 +3,14 @@ import { dirname, join } from "node:path";
 import { defaultDbPath, now, projectRoot } from "./db";
 import { logEvent } from "./events";
 import { getTask, claimTask } from "./tasks";
-import { getWorker, registerWorker } from "./workers";
+import { ensureHeadlessWorker } from "./workers";
 import { INTEGRATOR_ROLE, REVIEWER_ROLE } from "./schema";
 import type { Run, RunState, Task, TaskState } from "./schema";
 import { isCanonicalToken, processPgid, spawnIdentityToken } from "./proc-identity";
 import { defaultRunner, type CheckSpec, type CommandRunner } from "./verify";
 import { defaultVerifyTarget, type VerifyTarget } from "./sandbox-verify";
 import { runMechanicalVerification, submitPhase, taskChecks } from "./workflow";
-import { findTaskResult } from "./results";
+import { findTaskResult, isResultWriteError, markTaskBlockedInternal } from "./results";
 import { acceptRunSubmission, getRun, type DshSpawner } from "./dsh-runner";
 import { launchTaskRun, type LaunchRunOptions } from "./run-lifecycle";
 import { getSandbox, SANDBOX_ERROR, type SbxCli } from "./sandbox";
@@ -131,6 +131,12 @@ export interface FactoryDeps {
    * the produced commit before the reviewer runs; otherwise the Factory BLOCKS.
    */
   prBinding?: PrBindingDeps;
+  /**
+   * ISH-904: receive non-fatal worktree/base warnings (e.g. the resolved base is
+   * behind `origin/main`). The Factory also adds them to `steps`; the CLI prints
+   * them to stderr so a stale base is never silent.
+   */
+  onWarning?: (message: string) => void;
 }
 
 export interface FactoryAttempt {
@@ -197,6 +203,23 @@ const RUN_TERMINAL_STATES: ReadonlySet<RunState> = new Set<RunState>([
  * fail-closed form, so a NEW state is non-runnable by default.
  */
 const FACTORY_RUNNABLE_STATES: ReadonlySet<TaskState> = new Set<TaskState>(["queued", "running", "review"]);
+
+/**
+ * ISH-904: a plain `relay task add` task (`code_change=0`, `phase=NULL`) is not
+ * factory-runnable. The old fallthrough said only `unhandled phase null`, which
+ * told an operator nothing. This is the ONE actionable refusal, used by the
+ * up-front guard (before any worktree is created) and by the unhandled-phase
+ * branch for a task that somehow becomes non-code/phase-less mid-run.
+ */
+export function factoryNotCodeChangeReason(task: Pick<Task, "id" | "code_change" | "phase">): string | null {
+  if (task.code_change !== 1) {
+    return `${FACTORY_ERROR}: task ${task.id} is not a code-change task: re-intake with \`relay task intake --code-change\``;
+  }
+  if (task.phase === null) {
+    return `${FACTORY_ERROR}: task ${task.id} has no workflow phase (not a code-change task): re-intake with \`relay task intake --code-change\``;
+  }
+  return null;
+}
 
 /** True when the process id is a live process (EPERM means alive-but-not-ours). */
 export function pidAlive(pid: number | null): boolean {
@@ -493,6 +516,7 @@ async function implementOnce(
       timeoutMs: deps.timeoutMs,
       fastExitMs: deps.fastExitMs,
       env: deps.dshEnv,
+      onWarning: deps.onWarning,
     };
     const launched = await launchTaskRun(db, task.id, opts);
     run = await launched.handle.wait();
@@ -523,6 +547,10 @@ function finishImplement(db: Database, run: Run, deps: FactoryDeps): ImplementRe
     if (run.sandbox_name) acceptSandboxSubmission(db, { runId: run.id });
     else acceptRunSubmission(db, { runId: run.id });
   } catch (e) {
+    // ISH-904: a failed RESULT WRITE is not a submission refusal. Rethrow it so
+    // the Factory's outer catch parks the Task `blocked_internal` with the real
+    // error instead of reporting a misleading SUBMIT_REFUSED/coding failure.
+    if (isResultWriteError(e)) throw e;
     // A refused submission (stale/superseded run, moved head/phase, sandbox
     // mismatch) NEVER advances the Task; surface a fail-closed outcome.
     return {
@@ -728,12 +756,23 @@ export async function runFactoryTask(
   const maxAttempts = Math.max(1, deps.maxAttempts ?? 4);
   const reviewerWorker = deps.reviewerWorker ?? DEFAULT_REVIEWER_WORKER;
   const integratorWorker = deps.integratorWorker ?? DEFAULT_INTEGRATOR_WORKER;
+  // ISH-904: refuse a NON-code-change / phase-less Task UP FRONT — before any
+  // worktree is created — with the one actionable instruction. The old path fell
+  // through to `unhandled phase null` and only then created nothing useful.
+  const initial = getTask(db, taskId);
+  if (!initial) throw new Error(`unknown task: ${taskId}`);
+  const notCodeChange = factoryNotCodeChangeReason(initial);
+  if (notCodeChange) {
+    return { taskId, outcome: "blocked", head: initial.head_sha, attempts: [], gate: null, reason: notCodeChange, steps: [] };
+  }
   // ISH-829: default to the durable-Coding-Sandbox VERIFY target. It returns null
   // for a Task with no sandbox row, so a worktree Task is unchanged; a
   // sandbox-backed Task can never silently fall back to host `bash -lc`.
   const resolveVerifyTarget = deps.verifyTarget ?? defaultVerifyTarget;
-  if (!getWorker(db, reviewerWorker)) registerWorker(db, reviewerWorker, { role: REVIEWER_ROLE, agentKind: "claude" });
-  if (!getWorker(db, integratorWorker)) registerWorker(db, integratorWorker, { role: INTEGRATOR_ROLE, agentKind: "relay" });
+  // ISH-904: these principals are headless — register them `idle` (never
+  // `starting`) so neither surface reports a permanent stuck attach.
+  ensureHeadlessWorker(db, reviewerWorker, { role: REVIEWER_ROLE, agentKind: "claude" });
+  ensureHeadlessWorker(db, integratorWorker, { role: INTEGRATOR_ROLE, agentKind: "relay" });
 
   const attempts: FactoryAttempt[] = [];
   const steps: string[] = [];
@@ -745,7 +784,17 @@ export async function runFactoryTask(
     steps.push(s);
     logEvent(db, { source: "factory", taskId, type: "factory.step", payload: { step: s } });
   };
+  // Base/worktree warnings are part of the Factory result (steps) and are also
+  // forwarded to an operator callback (the CLI prints them).
+  const runDeps: FactoryDeps = {
+    ...deps,
+    onWarning: (m: string) => {
+      push(`warning: ${m}`);
+      deps.onWarning?.(m);
+    },
+  };
 
+  try {
   for (let guard = 0; guard < guardMax; guard++) {
     const task = getTask(db, taskId);
     if (!task) throw new Error(`unknown task: ${taskId}`);
@@ -766,7 +815,7 @@ export async function runFactoryTask(
     const phase = task.phase;
     switch (phase) {
       case "implement": {
-        const impl = await implementOnce(db, task, deps);
+        const impl = await implementOnce(db, task, runDeps);
         if (current) {
           current.runId = impl.run?.id ?? null;
           current.baseHead = impl.run?.base_head_sha ?? null;
@@ -936,9 +985,28 @@ export async function runFactoryTask(
         return { taskId, outcome: "merge_ready", head: getTask(db, taskId)!.head_sha, attempts, gate, reason: null, steps };
       }
       default: {
-        return { taskId, outcome: "blocked", head: task.head_sha, attempts, gate: null, reason: `unhandled phase ${String(phase)}`, steps };
+        const reason = factoryNotCodeChangeReason(task) ?? `unhandled phase ${String(phase)}`;
+        return { taskId, outcome: "blocked", head: task.head_sha, attempts, gate: null, reason, steps };
       }
     }
+  }
+  } catch (e) {
+    // ISH-904: a result-write (or any other Factory) failure must not leave a
+    // half-applied phase behind. Park the Task blocked_internal with the concrete
+    // error and return a structured blocked result instead of crashing.
+    const detail = e instanceof Error ? e.message : String(e);
+    const reason = detail.startsWith(FACTORY_ERROR) ? detail : `${FACTORY_ERROR}: ${detail}`;
+    markTaskBlockedInternal(db, taskId, reason);
+    logEvent(db, { source: "factory", taskId, type: "factory.blocked_internal", payload: { reason } });
+    return {
+      taskId,
+      outcome: "blocked",
+      head: getTask(db, taskId)?.head_sha ?? null,
+      attempts,
+      gate: null,
+      reason,
+      steps,
+    };
   }
   return { taskId, outcome: "max_attempts", head: getTask(db, taskId)!.head_sha, attempts, gate: null, reason: "guard exhausted", steps };
 }

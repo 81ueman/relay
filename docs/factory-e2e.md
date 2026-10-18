@@ -95,9 +95,17 @@ bun test tests/factory.test.ts              # the fixture suite
 
 # the pilot entrypoint (one Task, real dsh + real Claude by default)
 relay run factory <task-id> [--repo DIR] [--dsh BIN] [--reviewer CMD] [--model M] \
-  [--max-attempts N] [--timeout 30m] [--json]
+  [--max-attempts N] [--permission MODE] [--timeout 30m] [--json]
 # overrides also via RELAY_DSH_BIN / RELAY_REVIEW_CMD / RELAY_REVIEW_MODEL
 ```
+
+The factory runs **code-change tasks only** (`relay task intake --code-change`); a
+plain `relay task add` task is refused up front, before any worktree is created,
+with that re-intake instruction. VERIFY requires **at least one REQUIRED**
+`--check name=command` recorded at intake, else the outcome is `no_checks`. The
+task branch is cut from the SOURCE repo's freshly fetched `origin/main` (or the
+task's `pr_base`); a resolved base behind `origin/main` is reported as a warning
+and in the Factory `steps`, never silently accepted.
 
 `--json` prints the `FactoryResult`: `outcome`, `head`, per-attempt
 `runId`/`verifyOutcome`/`reviewVerdict`, the read-only `gate` decision, and the
