@@ -62,6 +62,16 @@ import {
 // The opt-in guard lives in the `import.meta.main` entry block at the bottom of
 // this file, so the module can be imported (e.g. by tests) without running.
 
+// ISH-830c: the factory stage's Task sandbox is created from the Coding Kit so its
+// dsh `headless` profile resolves the `ollama-cloud` provider route (the kit ships
+// `files/home/.dsh/profiles/headless/`). A bare `shell` sandbox has no profile and
+// dsh falls back to the `deepseek-official` route, which needs DEEPSEEK_API_KEY.
+const CODING_KIT = join(import.meta.dir, "..", "sandbox", "coding-kit");
+
+// A missing Shared-Lab API credential is an owner/operator prerequisite, not a
+// product failure: the factory stage records it BLOCKED (never a false PASS).
+const MISSING_LAB_CREDS = /no LABCTL_TOKEN|no LABCTL_USER|LABCTL_PASSWORD credentials|labctl\.env is empty/i;
+
 // ---------------------------------------------------------------------------
 // result bookkeeping (a JSON record is printed at the end)
 // ---------------------------------------------------------------------------
@@ -944,7 +954,10 @@ async function stageFactory(dir: string, api: string, insecure: boolean): Promis
   const factoryLab = labNameForTask(taskLab);
   let factoryLabDeployed: string | null = null;
   try {
-    const binding = ensureTaskSandbox(db, task.id, { source: repo, agent: "shell", cli: realSbxCli });
+    // ISH-830c: the Coding Kit (not a bare `shell`) so the Run's dsh resolves the
+    // `ollama-cloud` headless route and authenticates through the operator's sbx
+    // credential proxy (the global `OLLAMA_CLOUD_V41_API_KEY` secret).
+    const binding = ensureTaskSandbox(db, task.id, { source: repo, agent: CODING_KIT, cli: realSbxCli });
     sbName = binding.name;
     // The clone mirrors the resolved MAIN-checkout path (e.g. /private/var/... on
     // macOS), which may differ from the mkdtemp path — use the binding's.
@@ -974,9 +987,11 @@ async function stageFactory(dir: string, api: string, insecure: boolean): Promis
     // The Task's lab name is DETERMINISTIC: record it BEFORE the run so a VERIFY
     // that fails after `deploy` (and leaves the lab up) is torn down in `finally`.
     factoryLabDeployed = factoryLab;
-    // ISH-869: the in-Sandbox dsh route (`deepseek-official`) reads
-    // `DEEPSEEK_API_KEY` from the Run env; forward it when the operator exports it.
-    const dshEnv = process.env.DEEPSEEK_API_KEY ? { DEEPSEEK_API_KEY: process.env.DEEPSEEK_API_KEY } : undefined;
+    // ISH-830c: the Run's dsh now uses the kit's `ollama-cloud` headless route, so
+    // the credential is the operator's sbx proxy secret (env
+    // `OLLAMA_CLOUD_V41_API_KEY`, set inside the sandbox by `sbx secret`). Relay
+    // forwards no provider key; with no (global) secret the Run fails CLOSED with
+    // `MISSING_CREDENTIAL … ollama-cloud`, never a false PASS.
     const result = await runFactoryTask(db, task.id, {
       repo,
       dshBin: process.env.RELAY_DSH_BIN ?? "dsh",
@@ -985,7 +1000,6 @@ async function stageFactory(dir: string, api: string, insecure: boolean): Promis
       maxAttempts: 2,
       sandboxCli: realSbxCli,
       reviewWorktreeRoot: join(dir, "review-wt"),
-      ...(dshEnv ? { dshEnv } : {}),
     });
     const t = getTask(db, task.id)!;
     // Find the real dsh Run and read its raw failure evidence, so a missing
@@ -1021,6 +1035,13 @@ async function stageFactory(dir: string, api: string, insecure: boolean): Promis
     } else if (/MISSING_CREDENTIAL|no credential|no API key/i.test(raw)) {
       const why = raw.split("\n").find((l) => /MISSING_CREDENTIAL|no credential|no API key/i.test(l))?.trim() ?? "";
       record("factory", "BLOCKED", `real factory fails CLOSED (no provider credential, no false PASS): ${detail}`, { raw: why });
+    } else if (MISSING_LAB_CREDS.test(raw)) {
+      // ISH-830c: the dsh IMPLEMENT leg now runs on the kit's `ollama-cloud` route
+      // (the Run above produced a HEAD); the factory then blocks only because the
+      // Shared-Lab API credentials are absent — an owner prerequisite, not the
+      // provider route. Record it precisely (never a PASS, never a generic FAIL).
+      const why = raw.split("\n").find((l) => MISSING_LAB_CREDS.test(l))?.trim() ?? "";
+      record("factory", "BLOCKED", `real factory is BLOCKED on Shared-Lab credentials (owner prerequisite), not on the provider route: ${detail}`, { raw: why });
     } else {
       record("factory", "FAIL", detail, { raw: raw.slice(-800) });
     }
@@ -1044,7 +1065,12 @@ async function stageFactory(dir: string, api: string, insecure: boolean): Promis
         record("factory.lab-cleanup", "PASS", `${factoryLabDeployed} destroyed`);
       } else {
         const ins = await labctl.run(labctlInspectArgv({ lab: factoryLabDeployed, api, insecure }));
-        record("factory.lab-cleanup", ins.code === 6 ? "PASS" : "FAIL", `destroy ${factoryLabDeployed}: ${del.error ?? "failed"}; inspect exit ${ins.code}`);
+        const noCreds = MISSING_LAB_CREDS.test(`${del.error ?? ""} ${ins.err ?? ""} ${ins.out ?? ""}`);
+        record(
+          "factory.lab-cleanup",
+          noCreds ? "BLOCKED" : ins.code === 6 ? "PASS" : "FAIL",
+          `destroy ${factoryLabDeployed}: ${del.error ?? "failed"}; inspect exit ${ins.code}`
+        );
       }
     }
     const sb = getSandbox(db, task.id);

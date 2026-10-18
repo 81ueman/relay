@@ -89,6 +89,24 @@ The host worktree runner (`relay run start` / `relay run factory` → `startDshR
 applies the **same** guard to its host `dshBin` (or `$RELAY_DSH_BIN`, or `dsh` on
 `PATH`) before writing any Run row, so an old host dsh is never a silent pass.
 
+### The sandbox `headless` profile (ISH-830c)
+
+The Kit ships the sandbox user's dsh `headless` profile
+(`files/home/.dsh/profiles/headless/` → `$DSH_HOME/profiles/headless`, default
+`~/.dsh`): an empty `cordis.yml`, the `@deepseek-ai/dsh-base` +
+`@deepseek-ai/dsh-headless` bundle workspace (`package.json` +
+`pnpm-workspace.yaml`), and a `cordis.patch.yml` that pins the default model to
+the `ollama-cloud` pi-ai provider with `deepseek-v4.1-flash:1017`. Because the
+pinned `@deepseek-ai/dsh@0.2.1-rc.2` npm build ships no `ollama-cloud` catalog,
+the provider is declared **explicitly** (`apiKeyEnv: OLLAMA_CLOUD_V41_API_KEY`,
+`api: openai-completions`, `baseURL: https://ollama.com/v1`, and the model id).
+That makes a headless Run authenticate through the operator's `sbx` credential
+proxy instead of falling back to dsh's shipped `deepseek-official` route (which
+needs a key the sandbox does not have). The kit stores no key value. A sandbox
+created before this profile must be recreated (the profile is copied at create
+time), and the sandbox must be created **from the Kit**
+(`RELAY_SANDBOX_AGENT=sandbox/coding-kit`), not a bare `shell`.
+
 ## Single-writer, staleness and duplicate submission
 
 Single-writer is **per sandbox**: `assertNoActiveSandboxWriter` refuses a launch
@@ -141,7 +159,11 @@ explicit allowlist (`src/child-env.ts`): `PATH`, `HOME`, locale, `SSH_AUTH_SOCK`
 and the sbx/dsh/Docker client config. An unrelated host variable (a secret, a CI
 token) never reaches the child by default; a caller injects what a Run actually
 needs through the explicit `env`/`dshArgs` options, and only those `-e` values
-enter the VM. A provider overlay is an operator concern:
+enter the VM. A provider overlay is an operator concern. The preferred form is
+**kit-provisioned**: the Coding Kit ships the dsh `headless` profile
+(`sandbox/coding-kit/files/home/.dsh/profiles/headless/`, ISH-830c) so a headless
+Run resolves the `ollama-cloud` provider and the operator supplies the credential
+through the `sbx` proxy. A per-Run override remains available:
 `dshArgs: ["--patch", "/home/agent/dsh-overlay.yml"]` plus the credential proxy.
 
 ## Safe teardown (evidence-retaining)

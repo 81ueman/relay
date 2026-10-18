@@ -275,8 +275,10 @@ silent leak. When `LABCTL_API` is unset the `factory` stage is skipped as `BLOCK
 `trap 'labctl destroy …' EXIT`, so **every** VERIFY attempt tears down its own lab
 even if it fails after `deploy`.
 
-**Provider credential.** The stage forwards `DEEPSEEK_API_KEY` into the Sandbox Run
-when the operator exports it (`dshEnv`), and runs `warmLab()` whenever a Lab stage
+**Provider credential.** *(Updated by ISH-830c.)* The stage creates its Task
+sandbox from the Coding Kit and forwards **no** provider key: the kit's `headless`
+profile resolves the `ollama-cloud` route and the credential comes from the
+operator's `sbx` proxy secret. The stage runs `warmLab()` whenever a Lab stage
 runs, so the factory VERIFY cannot hit a stopped Shared Lab API.
 
 ## BLOCKED / NOT_RUN (do not treat as PASS)
@@ -295,6 +297,12 @@ runs, so the factory VERIFY cannot hit a stopped Shared Lab API.
   `DEEPSEEK_API_KEY`. **Consequently the full chain — real dsh IMPLEMENT → real
   SR Linux VERIFY → independent Claude FIX → fresh dsh Run → re-VERIFY → Claude
   PASS → MergeReady — was NOT RUN end-to-end.**
+
+  > **Superseded (ISH-830c).** This record is the PR #20 measurement. The
+  > follow-up makes the Coding Kit provision the sandbox `headless` profile at the
+  > `ollama-cloud` route, and the `factory` stage now creates its Task sandbox
+  > from that kit, so the in-sandbox Run no longer resolves `deepseek-official`.
+  > See [`ish830c-kit-dsh-profile.md`](ish830c-kit-dsh-profile.md).
 - **Real SSH and real gNMI are now `PASS` — measured, not claimed.** The two
   legs above ran from the Coding Sandbox at head `7eedfb2` and produced real
   evidence, recorded verbatim: `nos.ssh.raw` carries the banner + the
@@ -341,12 +349,16 @@ no TLC run is required (AGENTS.md).
 ## Not verified / follow-ups
 
 - The **real model chain** (DeepSeek IMPLEMENT → Claude FIX → PASS → MergeReady):
-  BLOCKED on a provider credential. Export `DEEPSEEK_API_KEY` and re-run the
-  `factory` stage (`RELAY_ISH830_E2E=1 LABCTL_API=… … ISH830_STAGES=factory bun
-  scripts/ish830-real-e2e.ts`): the harness forwards `DEEPSEEK_API_KEY` into the
-  Sandbox Run (`dshEnv`) and runs `warmLab()`, so the Run can reach the provider;
-  `PASS` is credited only when the FIX→fresh-Run→PASS chain and the HEAD equality
-  hold.
+  BLOCKED on the provider and Shared-Lab credentials. **Prerequisites
+  (ISH-830c):** a **global** `sbx` custom secret (target `ollama.com`, env
+  `OLLAMA_CLOUD_V41_API_KEY`) and a sandbox created **after** it from the Coding
+  Kit (`./sandbox/coding-kit`), plus `LABCTL_API` and the Shared-Lab credentials
+  (`LABCTL_USER`/`LABCTL_PASSWORD` or `LABCTL_TOKEN`). Re-run the `factory` stage
+  (`RELAY_ISH830_E2E=1 LABCTL_API=… … ISH830_STAGES=factory bun
+  scripts/ish830-real-e2e.ts`); the harness forwards **no** provider key — the
+  Run's dsh reads the credential from the sandbox env via the kit's `headless`
+  profile (see [`ish830c-kit-dsh-profile.md`](ish830c-kit-dsh-profile.md)). `PASS`
+  is credited only when the FIX→fresh-Run→PASS chain and the HEAD equality hold.
 - Real SSH and real gNMI read-backs now run (`nos.ssh` / `nos.gnmi` `PASS`). The
   **Coding Kit's** `gnmic` install is pinned and validated (`sbx kit validate`),
   and a unit test (`tests/ish830-e2e.test.ts`) keeps the kit and harness gnmic

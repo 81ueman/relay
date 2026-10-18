@@ -74,7 +74,11 @@ carries **one** 0.2.x code path (ISH-869).
   `tests/dsh-smoke.test.ts` pass no provider key `env`/`dshEnv` to `startDshRun`,
   and `DEEPSEEK_API_KEY` is deliberately **not** on the allowlist. The operator
   authenticates dsh through their **own provider configuration** (a dsh profile /
-  provider route, an injected `.env`, or a sandbox credential proxy).
+  provider route, an injected `.env`, or a sandbox credential proxy). The Coding
+  Kit (ISH-830c) provisions that provider for the sandbox path: it ships a
+  `headless` profile that declares the `ollama-cloud` provider explicitly
+  (`OLLAMA_CLOUD_V41_API_KEY` + `deepseek-v4.1-flash:1017`), which the operator's
+  `sbx` proxy fills — see [`sandbox-lifecycle.md`](sandbox-lifecycle.md).
   **Host vs. sandbox isolation differs.** Inside a **Coding Sandbox** the VM has
   no host `HOME`, so Relay does not share the host `~/.dsh` (including
   `.credentials.yaml`) with a sandbox Run. On the **host** path, though,
