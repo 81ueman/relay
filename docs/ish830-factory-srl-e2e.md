@@ -52,7 +52,8 @@ host disk/RAM + timestamp: recorded by `env.host-resources` (`df -h /`, `hw.mems
 ## Result summary (raw)
 
 Run at head `7eedfb2` — the round-3 fix commit (the PASS detail reports the
-attempt that succeeded, i.e. the CONNECT-proxy fallback's exit + command):
+attempt that succeeded; **this run took the direct path, `SSH_EXIT=0`**, and the
+CONNECT-proxy fallback branch is covered by the unit test only):
 
 ```
 === ISH-830 E2E summary ===
