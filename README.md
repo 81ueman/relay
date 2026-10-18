@@ -1612,6 +1612,14 @@ inline path emits no trailing newline (the off-by-one that scrolled the pane).
 The alt-screen + pause/scroll behaviour is verified in a real tmux emulator
 (history stays flat; the top line survives; paused scroll reads the clipped tail).
 
+## ISH-885b fixture
+
+A real-agent GitHub E2E fixture: the coding Agent owns the push and the pull
+request, and Relay never writes to GitHub. See
+[`docs/ish885b/AGENT-E2E.md`](docs/ish885b/AGENT-E2E.md) for the end-to-end
+description and [`docs/ish885b/CHANGELOG.md`](docs/ish885b/CHANGELOG.md) for the
+change note.
+
 ## Layout
 
 ```text
