@@ -930,6 +930,13 @@ export interface OrphanSweepOptions {
   /** Actually stop the in-VM dsh and mark the Run (default: plan only). */
   apply?: boolean;
   cli?: SbxCli;
+  /**
+   * Restrict the sweep to a single Run id (the Factory's adoption scopes it to
+   * the one Run it adopted, so a concurrent Task's just-inserted `starting` Run
+   * is never touched). Omit to sweep every non-terminal sandbox Run (the
+   * operator `relay run sandbox sweep`).
+   */
+  runId?: string;
 }
 
 export interface OrphanSweepResult {
@@ -960,9 +967,13 @@ export interface OrphanSweepResult {
 export function sweepOrphanedSandboxRuns(db: Database, opts: OrphanSweepOptions = {}): OrphanSweepResult {
   const cli = opts.cli ?? realSbxCli;
   const apply = opts.apply === true;
-  const rows = db
-    .query(`SELECT * FROM runs WHERE state IN ('starting','running') AND sandbox_name IS NOT NULL`)
-    .all() as Run[];
+  const rows = (
+    opts.runId
+      ? db
+          .query(`SELECT * FROM runs WHERE id = ? AND state IN ('starting','running') AND sandbox_name IS NOT NULL`)
+          .all(opts.runId)
+      : db.query(`SELECT * FROM runs WHERE state IN ('starting','running') AND sandbox_name IS NOT NULL`).all()
+  ) as Run[];
   const result: OrphanSweepResult = { inspected: rows.length, orphaned: [] };
   for (const run of rows) {
     if (hostSandboxClientAlive(run)) continue;

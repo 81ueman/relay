@@ -42,6 +42,29 @@ The Factory is **sequencing only**: every transition is the ordinary durable
 result (`acceptRunSubmission`, `runMechanicalVerification`, `recordReview`,
 `submitPhase`). There is no parallel state machine.
 
+## Sandbox-backed Tasks (ISH-878)
+
+A Task that already has a **durable Coding Sandbox binding** (a `sandboxes` row,
+created by `relay run sandbox create`) is implemented **INSIDE that Sandbox**,
+not in a host worktree:
+
+- **IMPLEMENT/FIX** reuses ISH-828's `launchTaskSandboxRun` — one disposable
+  `dsh` inside the Task's durable clone per attempt. A FIX is a **new Run on the
+  SAME Sandbox** with the findings inherited; the Sandbox is created **once**.
+- The produced commit is fetched back to the host (`git fetch sandbox-<name>`)
+  and advanced **only** through `acceptSandboxSubmission` (the ISH-760 fence plus
+  the Sandbox identity/HEAD fence). An `exit 0` / `final` alone never advances.
+- **VERIFY** runs through ISH-829's Sandbox runner at the recorded HEAD; the
+  **reviewer** reads the independent fixed-HEAD checkout.
+- A Sandbox that is **removed/failed**, or a launch that cannot be created/
+  probed, **fails closed**: the Task never falls back to the host worktree. A
+  Task with **no** Sandbox row keeps the host-worktree behaviour above.
+- On restart/re-entry the Factory **adopts** the live Sandbox Run and never
+  starts a duplicate writer; a Run whose `sbx exec` client is gone is resolved by
+  the ISH-828 sweep, which marks it terminal `failed` **only** once the in-VM dsh
+  is confirmed gone — so the single-writer fence is never released under a live
+  writer.
+
 ## Commands
 
 ```sh
