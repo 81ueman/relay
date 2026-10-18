@@ -107,7 +107,7 @@ Usage:
   relay result accept <task-id> [--worker <id>]
   relay verify <task-id> [--cwd <dir>] [--head SHA]   # mechanical verify (Relay runs the commands)
   relay merge-check <task-id> [--json] [--authority merge]   # read-only HEAD-bound merge readiness (dry-run)
-  relay pr bind <task-id> [--publish] [--head SHA] [--json]   # bind the produced commit to a real PR (re-read/verify; --publish is an authorized write)
+  relay pr bind <task-id> [--publish] [--json]   # bind the produced commit (task.head_sha) to a real PR (re-read/verify; --publish is an authorized write)
 
   relay next [--worker <id>] [--role <r>] [--any-role]
   relay claim <task-id> [--worker <id>] [--role <r>] [--any-role]
@@ -333,8 +333,8 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
   },
   pr: {
     about:
-      "ISH-880 Task↔PR binding. Bridges a Sandbox-produced commit to a real GitHub PR and binds the PR's CURRENT remote HEAD to the SAME Task/attempt. By default it is READ-ONLY: it re-reads an already-recorded PR (owner/repo#n) and requires its live head to equal the produced commit; a moved/unreadable PR, a different repo, or no recorded identity is BLOCKED (never a fake pass). With `--publish` it may push the produced commit and find-or-create the PR through normal `git`/`gh` — an EXPLICIT point-of-use write grant, opt-in per invocation; it never merges, approves, deletes a branch or writes Linear. Requires RELAY_PROVIDER_GITHUB=gh for the read-only reader.",
-    usage: ["relay pr bind <task-id> [--publish] [--head SHA] [--repo R] [--base REF] [--json]"],
+      "ISH-880 Task↔PR binding. Bridges a Sandbox-produced commit to a real GitHub PR and binds the PR's CURRENT remote HEAD to the SAME Task/attempt. The head is ALWAYS the Task's produced commit (`task.head_sha`, a full 40-hex SHA) — there is no caller-supplied head. By default it is READ-ONLY: it re-reads an already-recorded PR (owner/repo#n) and requires its live head to equal the produced commit; a moved/unreadable PR, a different/fork repo, or no recorded identity is BLOCKED (never a fake pass). With `--publish` it may push the produced commit and find-or-create the PR through normal `git`/`gh` — an EXPLICIT point-of-use write grant, opt-in per invocation; it never merges, approves, deletes a branch or writes Linear. Requires RELAY_PROVIDER_GITHUB=gh for the read-only reader.",
+    usage: ["relay pr bind <task-id> [--publish] [--repo R] [--base REF] [--json]"],
   },
   "task list": { about: "List tasks (id, state, priority, role, assignee, plan, depends, title).", usage: ["relay task list [--state <state>]"] },
   "task show": { about: "Print one task as JSON (includes depends_on). Notes go to stderr so stdout stays parseable; --json emits ONE document with the task, its dependencies and its notes.", usage: ["relay task show <id> [--json]"] },
@@ -1381,7 +1381,6 @@ async function main(): Promise<void> {
           github: base.github,
           publisher: publish ? new GitGhPrPublisher(projectRoot(), defaultExec) : undefined,
           authority,
-          expectedHead: flag(args, "--head") ?? undefined,
           repo: flag(args, "--repo") ?? undefined,
           base: flag(args, "--base") ?? undefined,
         });

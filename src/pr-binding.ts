@@ -3,7 +3,6 @@ import { logEvent } from "./events";
 import type { Task } from "./schema";
 import { getTask } from "./tasks";
 import {
-  headsMatch,
   NO_AUTHORITY,
   parsePrUrl,
   type GitHubReadOnly,
@@ -49,6 +48,7 @@ export const PR_BINDING_ERROR = "PR_BINDING";
 export type PrBindBlockCode =
   | "NOT_CODE_TASK"
   | "NO_PRODUCED_HEAD"
+  | "HEAD_MISMATCH"
   | "PROVIDER_UNREADABLE"
   | "PR_UNREADABLE"
   | "PR_NOT_OPEN"
@@ -91,8 +91,6 @@ export interface PublishRequest {
   base: string | null;
   title: string;
   body: string;
-  /** An existing PR to update/keep instead of creating a new one (crash retry). */
-  existing: PrRef | null;
 }
 
 export interface PublishResult {
@@ -118,6 +116,62 @@ export interface GitGhPublisherOptions {
   remote?: string;
 }
 
+/** Full 40-hex commit SHAs only — a short/abbreviated SHA is never an identity. */
+const FULL_SHA_RE = /^[0-9a-f]{40}$/i;
+
+export function isFullCommitSha(sha: string | null | undefined): sha is string {
+  return typeof sha === "string" && FULL_SHA_RE.test(sha);
+}
+
+/**
+ * True only when both are the SAME full 40-hex commit (case-insensitive). This
+ * replaces `headsMatch` (which accepts a PREFIX in either direction) so a PR
+ * head can never be matched to — or rewrite the produced commit with — an
+ * abbreviated or merely-similar SHA.
+ */
+export function sameCommitSha(a: string | null | undefined, b: string | null | undefined): boolean {
+  return isFullCommitSha(a) && isFullCommitSha(b) && a.toLowerCase() === b.toLowerCase();
+}
+
+/** Normalize `owner/name` for a case-insensitive comparison. */
+export function normalizeRepo(repo: string): string {
+  return repo.trim().toLowerCase();
+}
+
+/**
+ * Parse a git remote URL to its `owner/name`, or null when it is not a GitHub
+ * remote. Understands `https://github.com/O/R(.git)?` (with optional userinfo),
+ * `git@github.com:O/R(.git)?` and `ssh://git@github.com[:port]/O/R(.git)?`.
+ *
+ * This exists so the publisher's "the remote points at the target repo" guard
+ * compares PARSED owner/name — a substring test would accept `relay-private`,
+ * `relay-fork` and `x81ueman/relay` for `81ueman/relay`.
+ */
+export function parseGitRemote(url: string): string | null {
+  const s = (url ?? "").trim();
+  let m = s.match(/^git@github\.com:([^/\s]+)\/([^/\s]+?)(?:\.git)?\/?$/i);
+  if (m) return `${m[1]}/${m[2]}`;
+  m = s.match(/^ssh:\/\/git@github\.com(?::\d+)?\/([^/\s]+)\/([^/\s]+?)(?:\.git)?\/?$/i);
+  if (m) return `${m[1]}/${m[2]}`;
+  m = s.match(/^https?:\/\/(?:[^@/\s]+@)?github\.com\/([^/\s]+)\/([^/\s]+?)(?:\.git)?\/?$/i);
+  if (m) return `${m[1]}/${m[2]}`;
+  return null;
+}
+
+/**
+ * True only when a PR's HEAD branch is provably in `repo` — never a fork. A
+ * `gh pr list --head <branch>` lookup returns CROSS-REPOSITORY (fork) PRs, so a
+ * fork PR with a same-named branch at the same SHA must never be adopted as the
+ * Task's PR. Fail-closed: a view whose provenance is unknown (no explicit
+ * `isCrossRepository: false` and no matching head repo) is NOT trusted.
+ */
+export function prHeadRepoSafe(view: PrView, repo: string | null): boolean {
+  if (view.isCrossRepository === true) return false;
+  const headRepo = (view.headRepo ?? "").trim();
+  if (repo && headRepo) return normalizeRepo(headRepo) === normalizeRepo(repo);
+  return repo ? view.isCrossRepository === false : true;
+}
+
 /**
  * The real publisher: push the produced commit to the repo's GitHub remote, then
  * find-or-create the PR with the `gh` CLI (normal `git`/`gh`, no new engine).
@@ -135,14 +189,22 @@ export class GitGhPrPublisher implements PrPublisher {
   publish(req: PublishRequest): PublishResult {
     const remote = this.opts.remote ?? "origin";
     const url = this.exec(["git", "-C", this.repoDir, "remote", "get-url", remote]);
-    if (!url.ok || !url.stdout.includes(req.repo)) {
-      return { ok: false, ref: null, created: false, error: `remote ${remote} does not point at ${req.repo}` };
+    // Parse the remote to owner/name and require CASE-INSENSITIVE EQUALITY with
+    // the target repo. A substring test would accept `relay-private`,
+    // `relay-fork` and `x81ueman/relay` for `81ueman/relay`.
+    const remoteRepo = url.ok ? parseGitRemote(url.stdout) : null;
+    if (!remoteRepo || normalizeRepo(remoteRepo) !== normalizeRepo(req.repo)) {
+      return {
+        ok: false,
+        ref: null,
+        created: false,
+        error: `remote ${remote} (${url.stdout.trim() || "unreadable"}) does not point at ${req.repo}`,
+      };
     }
     const push = this.exec(["git", "-C", this.repoDir, "push", remote, `${req.headSha}:refs/heads/${req.branch}`]);
     if (!push.ok) {
       return { ok: false, ref: null, created: false, error: `git push failed: ${(push.stderr || push.stdout).slice(0, 200)}` };
     }
-    if (req.existing) return { ok: true, ref: req.existing, created: false };
     const found = this.findOpenPr(req.repo, req.branch);
     if (found) return { ok: true, ref: found, created: false };
     const created = this.exec([
@@ -162,14 +224,33 @@ export class GitGhPrPublisher implements PrPublisher {
     return { ok: true, ref, created: true };
   }
 
+  /**
+   * Find an OPEN, SAME-REPO PR for `branch`. `gh pr list --head` also returns
+   * cross-repository (fork) PRs, so a fork PR is SKIPPED — its head branch is in
+   * another repo, and adopting it would bind the Task to a stranger's PR. A
+   * skipped fork is fail-closed: the caller then attempts `gh pr create`.
+   */
   private findOpenPr(repo: string, branch: string): PrRef | null {
-    const r = this.exec(["gh", "pr", "list", "--repo", repo, "--head", branch, "--state", "open", "--limit", "1", "--json", "url,number"]);
+    const r = this.exec([
+      "gh", "pr", "list", "--repo", repo, "--head", branch, "--state", "open", "--limit", "10",
+      "--json", "url,number,isCrossRepository,headRepository",
+    ]);
     if (!r.ok) return null;
     try {
-      const arr = JSON.parse(r.stdout) as { url?: string; number?: number }[];
-      if (!Array.isArray(arr) || arr.length === 0) return null;
-      const j = arr[0];
-      return parsePrUrl(j.url ?? (j.number ? `${repo}#${j.number}` : null), repo);
+      const arr = JSON.parse(r.stdout) as {
+        url?: string;
+        number?: number;
+        isCrossRepository?: boolean;
+        headRepository?: { nameWithOwner?: string } | null;
+      }[];
+      if (!Array.isArray(arr)) return null;
+      for (const j of arr) {
+        if (j.isCrossRepository === true) continue;
+        const headRepo = j.headRepository?.nameWithOwner;
+        if (headRepo && normalizeRepo(headRepo) !== normalizeRepo(repo)) continue;
+        return parsePrUrl(j.url ?? (j.number ? `${repo}#${j.number}` : null), repo);
+      }
+      return null;
     } catch {
       return null;
     }
@@ -234,7 +315,10 @@ function viewLink(view: PrView) {
 export function bindTaskPr(db: Database, taskId: string, deps: PrBindingDeps = {}): PrBindingResult {
   const task = getTask(db, taskId);
   if (!task) throw new Error(`unknown task: ${taskId}`);
-  const expectedHead = deps.expectedHead !== undefined ? deps.expectedHead : task.head_sha;
+  // The produced commit is the ONLY head a PR may be bound to. A caller-supplied
+  // `expectedHead` may only RESTATE it (never override it), so a CLI `--head`
+  // can never rewrite task.head_sha to a commit that was never produced.
+  const expectedHead = task.head_sha ?? null;
   const repo = deps.repo ?? task.pr_repo ?? null;
 
   const blocked = (
@@ -271,8 +355,9 @@ export function bindTaskPr(db: Database, taskId: string, deps: PrBindingDeps = {
   ): PrBindingResult => {
     const linked = linkTask(db, taskId, viewLink(view));
     // linkTask is a no-op on a terminal task / a settled head: a binding that
-    // did not actually land on the produced commit is not a binding.
-    if (!linked.head_sha || !headsMatch(linked.head_sha, expectedHead!)) {
+    // did not actually land on the produced commit is not a binding. EXACT full
+    // SHA (case-insensitive), never a prefix.
+    if (!sameCommitSha(linked.head_sha, expectedHead)) {
       return blocked("STALE", `linked head ${short(linked.head_sha)} != produced commit ${short(expectedHead)}`, view.ref, view.headSha, created);
     }
     const ref = view.ref;
@@ -296,10 +381,20 @@ export function bindTaskPr(db: Database, taskId: string, deps: PrBindingDeps = {
     if (repo && view.ref.repo !== repo) {
       return blocked("REPO_CHANGED", `PR repo ${view.ref.repo} != the task's recorded repo ${repo}`, ref, view.headSha);
     }
+    // A fork PR (the head branch lives in another repo) is never the Task's PR,
+    // even at the same branch name and SHA.
+    if (!prHeadRepoSafe(view, repo ?? ref.repo)) {
+      return blocked(
+        "REPO_CHANGED",
+        `PR ${ref.repo}#${ref.number} head repo ${view.headRepo || "(unknown)"} is not ${repo ?? ref.repo} (cross-repository/fork)`,
+        ref,
+        view.headSha
+      );
+    }
     if (view.state !== "open") {
       return blocked("PR_NOT_OPEN", `PR ${ref.repo}#${ref.number} is ${view.state}, not open`, ref, view.headSha);
     }
-    if (!view.headSha || !headsMatch(view.headSha, expectedHead!)) {
+    if (!sameCommitSha(view.headSha, expectedHead)) {
       return blocked(
         "HEAD_MOVED",
         `PR head ${short(view.headSha)} != the produced commit ${short(expectedHead)}`,
@@ -312,6 +407,15 @@ export function bindTaskPr(db: Database, taskId: string, deps: PrBindingDeps = {
 
   if (!task.code_change) return blocked("NOT_CODE_TASK", `task ${taskId} is not a code-change task`);
   if (!expectedHead) return blocked("NO_PRODUCED_HEAD", "the task records no produced commit to bind");
+  if (!isFullCommitSha(expectedHead)) {
+    return blocked("NO_PRODUCED_HEAD", `the task head ${short(expectedHead)} is not a full 40-hex commit SHA`);
+  }
+  if (deps.expectedHead !== undefined && !sameCommitSha(deps.expectedHead, expectedHead)) {
+    return blocked(
+      "HEAD_MISMATCH",
+      `expected head ${short(deps.expectedHead)} != the produced commit ${short(expectedHead)} (a binding may only restate the produced commit)`
+    );
+  }
   if (!deps.github) return blocked("PROVIDER_UNREADABLE", "no read-only GitHub reader is configured");
 
   // 1. Explicit identity wins: re-read only (never publish over a recorded PR).
@@ -324,13 +428,24 @@ export function bindTaskPr(db: Database, taskId: string, deps: PrBindingDeps = {
 
   // 2. Crash-retry adoption: an existing PR for THIS repo+branch whose head is
   // the produced commit. Repo AND head are both required, so this is not
-  // branch-name-only identity inference.
+  // branch-name-only identity inference. A FORK PR (same branch name + SHA) is
+  // rejected instead of adopted.
   const found = repo && task.branch ? deps.github.findPullRequestForBranch(repo, task.branch) : null;
-  if (found && found.headSha && headsMatch(found.headSha, expectedHead)) {
-    if (found.state !== "open") {
-      return blocked("PR_NOT_OPEN", `adoptable PR ${found.ref.repo}#${found.ref.number} is ${found.state}`, found.ref, found.headSha);
+  if (found) {
+    if (!prHeadRepoSafe(found, repo)) {
+      return blocked(
+        "REPO_CHANGED",
+        `adoptable PR ${found.ref.repo}#${found.ref.number} head repo ${found.headRepo || "(unknown)"} is not ${repo} (cross-repository/fork)`,
+        found.ref,
+        found.headSha
+      );
     }
-    return bound("adopted", found, false, "pr.adopted");
+    if (found.headSha && sameCommitSha(found.headSha, expectedHead)) {
+      if (found.state !== "open") {
+        return blocked("PR_NOT_OPEN", `adoptable PR ${found.ref.repo}#${found.ref.number} is ${found.state}`, found.ref, found.headSha);
+      }
+      return bound("adopted", found, false, "pr.adopted");
+    }
   }
 
   // 3. Publish — only with an explicit point-of-use grant AND a publisher.
@@ -349,7 +464,6 @@ export function bindTaskPr(db: Database, taskId: string, deps: PrBindingDeps = {
     base: deps.base ?? task.pr_base ?? null,
     title: deps.title ?? task.title ?? taskId,
     body: deps.body ?? "",
-    existing: found ? found.ref : null,
   });
   if (!published.ok || !published.ref) {
     return blocked("PUBLISH_FAILED", published.error ?? "the publisher returned no PR", null, null, published.created);

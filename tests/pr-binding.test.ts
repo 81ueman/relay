@@ -24,8 +24,12 @@ import {
 import {
   bindTaskPr,
   GitGhPrPublisher,
+  isFullCommitSha,
+  parseGitRemote,
+  prHeadRepoSafe,
   PR_BINDING_ERROR,
   resolveTaskPrRef,
+  sameCommitSha,
   type PrPublisher,
   type PublishRequest,
 } from "../src/pr-binding";
@@ -72,6 +76,8 @@ function prView(headSha: string, over: Partial<PrView> = {}): PrView {
     mergeable: "mergeable",
     labels: [],
     updatedAt: "2026-01-01T00:00:00Z",
+    isCrossRepository: false,
+    headRepo: REPO,
     ...over,
   };
 }
@@ -344,7 +350,7 @@ describe("GitGhPrPublisher: normal git/gh, find-or-create, remote guard", () => 
       return { ok: false, stdout: "", stderr: "unexpected" };
     });
     const p = new GitGhPrPublisher("/repo", exec);
-    const r = p.publish({ repo: REPO, branch: BRANCH, headSha: HEAD, base: "main", title: "t", body: "b", existing: null });
+    const r = p.publish({ repo: REPO, branch: BRANCH, headSha: HEAD, base: "main", title: "t", body: "b" });
 
     expect(r.ok).toBe(true);
     expect(r.created).toBe(true);
@@ -366,7 +372,7 @@ describe("GitGhPrPublisher: normal git/gh, find-or-create, remote guard", () => 
       return { ok: false, stdout: "", stderr: "unexpected" };
     });
     const p = new GitGhPrPublisher("/repo", exec);
-    const r = p.publish({ repo: REPO, branch: BRANCH, headSha: HEAD, base: "main", title: "t", body: "b", existing: null });
+    const r = p.publish({ repo: REPO, branch: BRANCH, headSha: HEAD, base: "main", title: "t", body: "b" });
 
     expect(r.ok).toBe(true);
     expect(r.created).toBe(false);
@@ -386,9 +392,210 @@ describe("GitGhPrPublisher: normal git/gh, find-or-create, remote guard", () => 
       return { ok: true, stdout: "[]", stderr: "" };
     });
     const p = new GitGhPrPublisher("/repo", exec);
-    const r = p.publish({ repo: REPO, branch: BRANCH, headSha: HEAD, base: null, title: "t", body: "", existing: null });
+    const r = p.publish({ repo: REPO, branch: BRANCH, headSha: HEAD, base: null, title: "t", body: "" });
 
     expect(r.ok).toBe(false);
     expect(pushed).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Round-2 findings.
+// ---------------------------------------------------------------------------
+
+describe("finding 1: the git remote guard parses owner/name, never a substring", () => {
+  test("parseGitRemote understands the three GitHub remote forms", () => {
+    expect(parseGitRemote("git@github.com:81ueman/relay.git")).toBe("81ueman/relay");
+    expect(parseGitRemote("git@github.com:81ueman/relay")).toBe("81ueman/relay");
+    expect(parseGitRemote("https://github.com/81ueman/relay.git")).toBe("81ueman/relay");
+    expect(parseGitRemote("https://github.com/81ueman/relay")).toBe("81ueman/relay");
+    expect(parseGitRemote("https://user:token@github.com/81ueman/relay.git")).toBe("81ueman/relay");
+    expect(parseGitRemote("ssh://git@github.com/81ueman/relay.git")).toBe("81ueman/relay");
+    expect(parseGitRemote("ssh://git@github.com:22/81ueman/relay.git")).toBe("81ueman/relay");
+    expect(parseGitRemote("https://gitlab.com/81ueman/relay.git")).toBeNull();
+    expect(parseGitRemote("/local/path")).toBeNull();
+  });
+
+  function publisherExec(remoteUrl: string) {
+    const calls: string[][] = [];
+    const exec: Exec = (argv) => {
+      calls.push(argv);
+      const j = argv.join(" ");
+      if (j.includes("remote get-url")) return { ok: true, stdout: `${remoteUrl}\n`, stderr: "" };
+      if (argv[0] === "git" && argv.includes("push")) return { ok: true, stdout: "", stderr: "" };
+      if (j.includes("pr list")) return { ok: true, stdout: "[]", stderr: "" };
+      if (j.includes("pr create")) return { ok: true, stdout: `https://github.com/${REPO}/pull/42\n`, stderr: "" };
+      return { ok: false, stdout: "", stderr: "unexpected" };
+    };
+    return { calls, exec };
+  }
+
+  const negatives: [string, string][] = [
+    ["a -private suffix", "git@github.com:81ueman/relay-private.git"],
+    ["a -fork suffix", "git@github.com:81ueman/relay-fork.git"],
+    ["a prefixed owner", "git@github.com:x81ueman/relay.git"],
+    ["another owner", "https://github.com/someone-else/relay.git"],
+  ];
+  for (const [label, remote] of negatives) {
+    test(`refuses to push when the remote differs by ${label}`, () => {
+      const { calls, exec } = publisherExec(remote);
+      const p = new GitGhPrPublisher("/repo", exec);
+      const r = p.publish({ repo: REPO, branch: BRANCH, headSha: HEAD, base: "main", title: "t", body: "b" });
+      expect(r.ok).toBe(false);
+      expect(calls.some((c) => c[0] === "git" && c.includes("push"))).toBe(false);
+    });
+  }
+
+  test("accepts the exact repo case-insensitively", () => {
+    const { exec } = publisherExec("git@github.com:81UEMAN/Relay.git");
+    const p = new GitGhPrPublisher("/repo", exec);
+    const r = p.publish({ repo: REPO, branch: BRANCH, headSha: HEAD, base: "main", title: "t", body: "b" });
+    expect(r.ok).toBe(true);
+  });
+});
+
+describe("finding 2: a FORK PR is never adopted or bound", () => {
+  test("pass 2 adoption rejects a same-branch, same-SHA fork PR (REPO_CHANGED)", () => {
+    const id = newTask({ prRepo: REPO });
+    linkTask(db, id, { branch: BRANCH, headSha: HEAD });
+    const gh = new FakeGitHub().putPullRequest(
+      prView(HEAD, { isCrossRepository: true, headRepo: "fork-owner/relay" })
+    );
+    const pub = new FakePublisher(() => ({ ref: { repo: REPO, number: 7 }, created: true }));
+
+    const r = bindTaskPr(db, id, { github: gh, publisher: pub, authority: WRITE });
+
+    expect(r.status).toBe("blocked");
+    expect(r.reason).toContain("REPO_CHANGED");
+    expect(pub.calls).toHaveLength(0); // never published over a fork
+    expect(getTask(db, id)!.pr_url).toBeNull();
+  });
+
+  test("a recorded identity whose PR head is in a fork repo is REPO_CHANGED", () => {
+    const id = newTask({ prRepo: REPO, prUrl: `${REPO}#7`, head: HEAD });
+    linkTask(db, id, { branch: BRANCH, headSha: HEAD });
+    const gh = new FakeGitHub().putPullRequest(
+      prView(HEAD, { isCrossRepository: true, headRepo: "fork-owner/relay" })
+    );
+
+    const r = bindTaskPr(db, id, { github: gh });
+
+    expect(r.status).toBe("blocked");
+    expect(r.reason).toContain("REPO_CHANGED");
+    expect(getTask(db, id)!.head_sha).toBe(HEAD);
+  });
+
+  test("an unknown-provenance view fails closed when the repo is known", () => {
+    const id = newTask({ prRepo: REPO, prUrl: `${REPO}#7`, head: HEAD });
+    linkTask(db, id, { branch: BRANCH, headSha: HEAD });
+    const bare = prView(HEAD);
+    delete bare.isCrossRepository;
+    delete bare.headRepo;
+    const gh = new FakeGitHub().putPullRequest(bare);
+
+    const r = bindTaskPr(db, id, { github: gh });
+
+    expect(r.status).toBe("blocked");
+    expect(r.reason).toContain("REPO_CHANGED");
+  });
+
+  test("prHeadRepoSafe classifies same-repo, fork flag, head-repo mismatch and unknown", () => {
+    expect(prHeadRepoSafe(prView(HEAD), REPO)).toBe(true);
+    expect(prHeadRepoSafe(prView(HEAD, { isCrossRepository: true }), REPO)).toBe(false);
+    expect(prHeadRepoSafe(prView(HEAD, { headRepo: "fork/relay" }), REPO)).toBe(false);
+    const unknown = { ...prView(HEAD), isCrossRepository: undefined, headRepo: "" };
+    expect(prHeadRepoSafe(unknown, REPO)).toBe(false);
+  });
+
+  test("GitGhPrPublisher find-or-create SKIPS a fork PR and creates the same-repo PR", () => {
+    let created = 0;
+    const exec: Exec = (argv) => {
+      const j = argv.join(" ");
+      if (j.includes("remote get-url")) return { ok: true, stdout: `git@github.com:${REPO}.git\n`, stderr: "" };
+      if (argv[0] === "git" && argv.includes("push")) return { ok: true, stdout: "", stderr: "" };
+      if (j.includes("pr list"))
+        return {
+          ok: true,
+          stdout: JSON.stringify([
+            {
+              url: `https://github.com/${REPO}/pull/5`,
+              number: 5,
+              isCrossRepository: true,
+              headRepository: { nameWithOwner: "fork-owner/relay" },
+            },
+          ]),
+          stderr: "",
+        };
+      if (j.includes("pr create")) {
+        created++;
+        return { ok: true, stdout: `https://github.com/${REPO}/pull/6\n`, stderr: "" };
+      }
+      return { ok: false, stdout: "", stderr: "unexpected" };
+    };
+    const p = new GitGhPrPublisher("/repo", exec);
+    const r = p.publish({ repo: REPO, branch: BRANCH, headSha: HEAD, base: "main", title: "t", body: "b" });
+
+    expect(r.ok).toBe(true);
+    expect(r.created).toBe(true);
+    expect(r.ref).toEqual({ repo: REPO, number: 6 });
+    expect(created).toBe(1);
+  });
+});
+
+describe("finding 3: the bound head is an EXACT full 40-hex SHA", () => {
+  test("isFullCommitSha / sameCommitSha reject prefixes and different SHAs", () => {
+    expect(isFullCommitSha(HEAD)).toBe(true);
+    expect(isFullCommitSha(HEAD.slice(0, 7))).toBe(false);
+    expect(isFullCommitSha(null)).toBe(false);
+    expect(sameCommitSha(HEAD, HEAD.toUpperCase())).toBe(true);
+    expect(sameCommitSha(HEAD.slice(0, 7), HEAD)).toBe(false);
+    expect(sameCommitSha(HEAD, MOVED)).toBe(false);
+  });
+
+  test("a prefix --head neither binds nor rewrites the produced commit", () => {
+    const id = newTask({ prRepo: REPO, prUrl: `${REPO}#7`, head: HEAD });
+    linkTask(db, id, { branch: BRANCH, headSha: HEAD });
+    const gh = new FakeGitHub().putPullRequest(prView(MOVED));
+
+    const r = bindTaskPr(db, id, { github: gh, expectedHead: "ab" });
+
+    expect(r.status).toBe("blocked");
+    expect(r.reason).toContain("HEAD_MISMATCH");
+    expect(getTask(db, id)!.head_sha).toBe(HEAD); // never rewritten
+  });
+
+  test("a full but DIFFERENT --head is refused", () => {
+    const id = newTask({ prRepo: REPO, prUrl: `${REPO}#7`, head: HEAD });
+    linkTask(db, id, { branch: BRANCH, headSha: HEAD });
+    const gh = new FakeGitHub().putPullRequest(prView(MOVED));
+
+    const r = bindTaskPr(db, id, { github: gh, expectedHead: MOVED });
+
+    expect(r.status).toBe("blocked");
+    expect(r.reason).toContain("HEAD_MISMATCH");
+    expect(getTask(db, id)!.head_sha).toBe(HEAD);
+  });
+
+  test("an abbreviated PR head never matches a full produced commit (no prefix match)", () => {
+    const id = newTask({ prRepo: REPO, prUrl: `${REPO}#7`, head: HEAD });
+    linkTask(db, id, { branch: BRANCH, headSha: HEAD });
+    const gh = new FakeGitHub().putPullRequest(prView(HEAD.slice(0, 7)));
+
+    const r = bindTaskPr(db, id, { github: gh });
+
+    expect(r.status).toBe("blocked");
+    expect(r.reason).toContain("HEAD_MOVED");
+    expect(getTask(db, id)!.head_sha).toBe(HEAD);
+  });
+
+  test("a restated identical --head (case-insensitive) is accepted", () => {
+    const id = newTask({ prRepo: REPO, prUrl: `${REPO}#7`, head: HEAD });
+    linkTask(db, id, { branch: BRANCH, headSha: HEAD });
+    const gh = new FakeGitHub().putPullRequest(prView(HEAD));
+
+    const r = bindTaskPr(db, id, { github: gh, expectedHead: HEAD.toUpperCase() });
+
+    expect(r.status).toBe("bound");
+    expect(getTask(db, id)!.head_sha).toBe(HEAD);
   });
 });

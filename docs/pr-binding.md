@@ -42,18 +42,28 @@ commit; the recorded `head_sha`/`pr_url` are only written through `linkTask`.
 ## Fail-closed rules
 
 - A **moved** PR head (`HEAD_MOVED`), an **unreadable** provider/PR
-  (`PROVIDER_UNREADABLE`/`PR_UNREADABLE`), a **different repo** (`REPO_CHANGED`),
-  a **non-open** PR (`PR_NOT_OPEN`) or a **missing produced commit**
-  (`NO_PRODUCED_HEAD`) is **BLOCKED** — never a fake `review_pass`, never a
+  (`PROVIDER_UNREADABLE`/`PR_UNREADABLE`), a **different/fork repo**
+  (`REPO_CHANGED` — the PR's head branch must be in the Task's own repo, never a
+  fork), a **non-open** PR (`PR_NOT_OPEN`), a **missing/non-full produced commit**
+  (`NO_PRODUCED_HEAD`) or a caller-supplied head that is not the produced commit
+  (`HEAD_MISMATCH`) is **BLOCKED** — never a fake `review_pass`, never a
   silently-accepted stale commit.
+- The bound head is the **exact full 40-hex produced commit** (case-insensitive
+  equality, never a prefix in either direction) and it is the Task's own
+  `head_sha`: a caller-supplied `expectedHead` may only *restate* it, so no input
+  can rewrite `task.head_sha` to a commit that was never produced.
 - Publishing without an explicit `githubWrite` grant (`PUBLISH_UNAUTHORIZED`),
   without a publisher (`NO_PUBLISHER`), without a target repo
   (`REPO_UNKNOWN`/`BRANCH_UNKNOWN`) or when `git`/`gh` fails (`PUBLISH_FAILED`)
   is **BLOCKED**. There is no implicit grant, no default publisher, and no
   runtime repository push without it.
-- `GitGhPrPublisher` refuses to push when the git remote does **not** point at
-  the target repo, so a misconfigured checkout can never publish a Task's commit
-  into an unrelated repository.
+- `GitGhPrPublisher` **parses the git remote to `owner/name`** and requires
+  case-insensitive equality with the target repo (a substring test would accept
+  `relay-private`, `relay-fork` and `x81ueman/relay`); it refuses to push when
+  the remote does not point at the target repo, so a misconfigured checkout can
+  never publish a Task's commit into an unrelated repository. Its find-or-create
+  **skips cross-repository (fork) PRs** — a `gh pr list --head` lookup returns
+  them, and adopting one would bind the Task to a stranger's PR.
 - Nothing here merges, approves, deletes a branch, or writes Linear.
 - A new PR HEAD is review-invalidating: `reconcileTaskFromProvider`/`linkTask`
   re-open the review at a new attempt when the live PR head moves, so old
@@ -69,7 +79,8 @@ reviewer never runs. Unset, the Factory behaves exactly as before (read-only).
 ## Operator contract
 
 ```sh
-# Read-only (re-read + verify an already-recorded PR). Needs the gh reader:
+# Read-only (re-read + verify an already-recorded PR) at the Task's produced
+# commit (task.head_sha). Needs the gh reader:
 RELAY_PROVIDER_GITHUB=gh relay pr bind <task-id>
 RELAY_PROVIDER_GITHUB=gh relay pr bind <task-id> --json
 
@@ -86,8 +97,10 @@ wires; it is unset by default.
 
 `tests/pr-binding.test.ts` is the fixture suite: publish-then-verify, idempotent
 re-read, crash-retry adoption (no duplicate PR), moved-head / closed /
-other-repo / unreadable failures, the unauthorized and no-publisher refusals, the
-`GitGhPrPublisher` remote guard + find-or-create, and the HEAD-evidence
-invalidation through the existing provider reconcile. `tests/factory.test.ts`
-adds the Factory gate: a matching PR head reaches MergeReady, a moved one BLOCKS
-with the reviewer never running. No network is used.
+other-repo / fork / unreadable failures, the unauthorized and no-publisher
+refusals, the exact-full-SHA head fence (prefix and different-SHA refusals), the
+`GitGhPrPublisher` remote-URL parse + find-or-create (including skipping a fork
+PR), and the HEAD-evidence invalidation through the existing provider reconcile.
+`tests/factory.test.ts` adds the Factory gate: a matching PR head reaches
+MergeReady, a moved one BLOCKS with the reviewer never running. No network is
+used.
