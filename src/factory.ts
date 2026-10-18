@@ -661,7 +661,8 @@ export function verifyChecksReason(
 export function reviewBlockedReason(r: {
   verdict: ReviewerVerdict | null;
   evidenceRef: string | null;
-}): string {  const summary = r.verdict?.summary?.trim() ?? "";
+}): string {
+  const summary = r.verdict?.summary?.trim() ?? "";
   const findings = (r.verdict?.findings ?? []).map(
     (f) => `[${f.severity}] ${f.file ? `${f.file}${f.line ? `:${f.line}` : ""}: ` : ""}${f.message}`
   );

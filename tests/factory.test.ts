@@ -355,6 +355,20 @@ describe("ISH-830e: the reviewer runs under `auto`, never bypass/all-tools", () 
     expect(args).toContain("Read Grep Glob Bash");
     expect(args).not.toContain("--permission-mode");
   });
+
+  test("bypassPermissions can NEVER be emitted, even if a caller smuggles the removed field", () => {
+    // The field is gone from `ReviewerSpawnContext`; cast past the type to prove
+    // the ceiling is structural, not just documented.
+    const smuggle = { permissionMode: "bypassPermissions" } as unknown as Parameters<typeof buildReviewerArgs>[0];
+    expect(buildReviewerArgs(smuggle)).toEqual(["-p", "--output-format", "json", "--permission-mode", "auto"]);
+    expect(buildReviewerArgs(smuggle).join(" ")).not.toContain("bypassPermissions");
+    const withAllowlist = {
+      allowedTools: "Read Grep Glob Bash",
+      permissionMode: "bypassPermissions",
+    } as unknown as Parameters<typeof buildReviewerArgs>[0];
+    expect(buildReviewerArgs(withAllowlist).join(" ")).not.toContain("bypassPermissions");
+    expect(buildReviewerArgs(withAllowlist)).not.toContain("--permission-mode");
+  });
 });
 
 describe("reviewBlockedReason (ISH-830e: a blocked review is never an empty reason)", () => {

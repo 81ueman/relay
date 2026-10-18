@@ -269,7 +269,8 @@ export function ensureSandboxRelayExcluded(cli: SbxCli, name: string, workspace:
 }
 
 /** The in-clone HEAD (used as the Run's base/staleness fence). */
-export function sandboxHead(cli: SbxCli, name: string, workspace: string): string | null {  const r = cli.run(sbxExecArgv(name, ["git", "rev-parse", "HEAD"], { workdir: workspace }));
+export function sandboxHead(cli: SbxCli, name: string, workspace: string): string | null {
+  const r = cli.run(sbxExecArgv(name, ["git", "rev-parse", "HEAD"], { workdir: workspace }));
   const sha = r.ok ? r.out.trim().split(/\s+/)[0] : "";
   return /^[0-9a-f]{7,40}$/.test(sha) ? sha : null;
 }

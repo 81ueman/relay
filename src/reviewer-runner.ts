@@ -76,17 +76,16 @@ export const DEFAULT_REVIEW_COMMAND = "claude";
 /** ISH-883: the default reviewer model (an Opus-class reviewer), configurable. */
 export const DEFAULT_REVIEW_MODEL = "opus";
 
-/** A reviewer is a READ-ONLY principal: it may inspect, never write the work. */
-export const REVIEW_READONLY_TOOLS = "Read Grep Glob";
-
 /**
  * ISH-830e: the reviewer's permission ceiling. `auto` lets the CLI's own
  * classifier approve SAFE (read-mostly) actions — e.g. a read-only `git diff` to
  * see what changed — without pre-approving every tool. This is deliberately NOT
- * `bypassPermissions` and NOT an all-tools allowlist: the brief still instructs
- * the reviewer to treat the checkout as READ-ONLY, and Relay only ever reads the
- * structured verdict back. The ISH-883 native-PR path keeps its explicit
- * `allowedTools` allowlist (it must run `gh`), so it is unchanged.
+ * `bypassPermissions` and NOT an all-tools allowlist, and it is FIXED (there is
+ * no knob that could raise it). The brief still instructs the reviewer to treat
+ * the checkout as READ-ONLY; read-only is enforced by the disposable detached
+ * review checkout, the head-bound verdict, the post-review head guard, and this
+ * classifier. The ISH-883 native-PR path keeps its explicit `allowedTools`
+ * allowlist (it must run `gh`), so it is unchanged.
  */
 export const DEFAULT_REVIEW_PERMISSION_MODE = "auto";
 
@@ -136,14 +135,8 @@ export interface ReviewerSpawnContext {
   env: Record<string, string>;
   timeoutMs: number;
   model?: string;
-  /** ISH-883: the reviewer's tool allowlist (default: read-only inspection). */
+  /** ISH-883: the reviewer's tool allowlist (native-PR path only; must run `gh`). */
   allowedTools?: string;
-  /**
-   * ISH-830e: the CLI permission mode for a reviewer with no explicit
-   * `allowedTools` allowlist. Defaults to `DEFAULT_REVIEW_PERMISSION_MODE`
-   * (`auto`) — never `bypassPermissions`.
-   */
-  permissionMode?: string;
 }
 
 export interface ReviewerProcess {
@@ -458,19 +451,18 @@ export function extractReviewerVerdict(raw: string): ReviewerVerdict | null {
  * The real reviewer: `claude -p --output-format json` with the brief on stdin.
  * With no explicit `allowedTools` allowlist the reviewer runs under
  * `--permission-mode auto` (ISH-830e) — the CLI's own classifier approves safe,
- * read-mostly actions, and `bypassPermissions` is never used. The ISH-883
- * native-PR path still passes its explicit `allowedTools` allowlist (it must run
- * `gh`). Spawned in a NEW process group so a timeout can kill the whole tree (a
- * reviewer cannot stall the Factory).
+ * read-mostly actions. `auto` is a FIXED ceiling: this function never emits
+ * `bypassPermissions` (there is no knob). The ISH-883 native-PR path still passes
+ * its explicit `allowedTools` allowlist (it must run `gh`). Spawned in a NEW
+ * process group so a timeout can kill the whole tree (a reviewer cannot stall the
+ * Factory).
  */
-export function buildReviewerArgs(
-  ctx: Pick<ReviewerSpawnContext, "allowedTools" | "permissionMode" | "model">
-): string[] {
+export function buildReviewerArgs(ctx: Pick<ReviewerSpawnContext, "allowedTools" | "model">): string[] {
   const args = ["-p", "--output-format", "json"];
   if (ctx.allowedTools) {
     args.push("--allowedTools", ctx.allowedTools);
   } else {
-    args.push("--permission-mode", ctx.permissionMode ?? DEFAULT_REVIEW_PERMISSION_MODE);
+    args.push("--permission-mode", DEFAULT_REVIEW_PERMISSION_MODE);
   }
   if (ctx.model) args.push("--model", ctx.model);
   return args;
