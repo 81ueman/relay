@@ -35,6 +35,41 @@ and reuses**, the single worktree a Task owns:
 - **Base** — `--base`, else `task.pr_base`, else `origin/main` when present, else
   `HEAD`.
 
+### Self-contained workspace (ISH-904)
+
+The workspace is a **local clone** of the source repo
+(`git clone --local --no-checkout <source> <path>`), not a linked
+`git worktree add` checkout. A linked worktree keeps its git dir at
+`<source>/.git/worktrees/<T>` and its common dir at `<source>/.git` — both
+OUTSIDE the workspace — and a headless Run's default `workspace-write` sandbox
+writes only inside its cwd, so every git mutation (`index.lock`, `ORIG_HEAD`,
+refs) was denied and the Run could never commit. A local clone has `.git` *inside*
+the path, so:
+
+```sh
+git -C <path> rev-parse --path-format=absolute --git-dir        # <path>/.git
+git -C <path> rev-parse --path-format=absolute --git-common-dir # <path>/.git
+```
+
+`--local` hardlinks/copies objects (cheap, no network). If the source itself has
+`objects/info/alternates` (e.g. a `--shared` clone), the clone would inherit that
+escape and read objects outside the workspace, so the alternate objects are
+hardlinked into the clone and the alternates file is removed — the workspace is
+complete on its own.
+
+`origin` is re-pointed at the **source repo's `origin` URL**
+(`git -C <source> remote get-url origin`), so the pinned brief's
+`git push origin HEAD:refs/heads/<branch>` pushes to the real provider (a source
+with no origin keeps the clone's local origin; Relay never invents a remote).
+The base ref may only exist in the source's local refs; it is then fetched from
+the source PATH (`refs/relay-base/<name>`) — still no network. A `HEAD` base is
+imported from the source likewise.
+
+Consumers that read a produced head from the SOURCE repo (the ISH-829 detached
+review worktree) import it first: the source does not share the workspace's
+object store, so `importHeadIntoSource` does a local path fetch before
+`git worktree add --detach`.
+
 The chosen path + branch are written back to `tasks.worktree` / `tasks.branch`, so
 the Task **owns** its workspace. A second call on the same Task returns the
 existing binding (`worktree.selected`) instead of creating a new one — this is
@@ -128,6 +163,12 @@ guard passes:
 
 The `runs` rows and their output directories are **never** deleted by cleanup —
 they are the evidence. The Task row and its structured results survive too.
+
+A self-contained clone workspace is removed as a directory (`rm -rf`), so the
+SOURCE repo's `.git` is never touched (a linked `git worktree remove` would have
+mutated it). A legacy linked worktree recorded before ISH-904 is still reclaimed
+through `git worktree remove` in its own source. Cleanup is idempotent: a second
+`--apply` sees no recorded workspace and is a no-op.
 
 ## One-command fixture smoke
 

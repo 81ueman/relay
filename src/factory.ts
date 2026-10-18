@@ -30,7 +30,7 @@ import {
   type ReviewVerifyEvidence,
 } from "./reviewer-runner";
 import { checkMergeGate, type MergeGateDecision, type MergeGateDeps } from "./merge-gate";
-import { prepareReadOnlyReviewWorktree, removeReviewWorktree } from "./review-workspace";
+import { importHeadIntoSource, prepareReadOnlyReviewWorktree, removeReviewWorktree } from "./review-workspace";
 import type { NativeReviewDeps } from "./providers";
 import { bindTaskPr, type PrBindingDeps } from "./pr-binding";
 
@@ -854,8 +854,12 @@ export async function runFactoryTask(
         // at the fixed head (when configured), never the writer's live worktree.
         let reviewWorktree: string | undefined;
         if (deps.reviewWorktreeRoot && reviewHead) {
+          // ISH-904: the Task workspace is a self-contained clone whose `origin`
+          // is the GitHub remote, so the Run's produced HEAD is not in this
+          // source repo yet. Import it first (local path fetch, no network).
+          const reviewSource = importHeadIntoSource(deps.repo ?? projectRoot(), task.worktree, reviewHead);
           const ws = prepareReadOnlyReviewWorktree(
-            deps.repo ?? projectRoot(),
+            reviewSource,
             reviewHead,
             join(deps.reviewWorktreeRoot, `${taskId}-${task.attempt}-${reviewHead.slice(0, 10)}`)
           );

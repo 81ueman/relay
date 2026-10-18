@@ -1,6 +1,6 @@
 import type { Database } from "bun:sqlite";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve, sep } from "node:path";
 import { defaultDbPath, now, projectRoot } from "./db";
 import { logEvent } from "./events";
@@ -76,6 +76,53 @@ export function isGitWorktree(dir: string): boolean {
   return gitRun(dir, ["rev-parse", "--is-inside-work-tree"]).out === "true";
 }
 
+/** `git-dir` and `git-common-dir` of `dir`, absolute (resolved), or null. */
+export function gitDirs(dir: string): { gitDir: string; commonDir: string } | null {
+  const r = gitRun(dir, ["rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"]);
+  const [gitDir, commonDir] = r.ok ? r.out.split("\n") : [];
+  if (!gitDir || !commonDir) return null;
+  // realpath: git reports the physical path (/var -> /private/var on macOS) and
+  // `dir` may be the symlinked spelling, so compare in one space.
+  return { gitDir: realpathOf(gitDir), commonDir: realpathOf(commonDir) };
+}
+
+/** The checkout's (resolved) git COMMON dir — where `objects/` and `info/` live. */
+export function gitCommonDir(dir: string): string | null {
+  const r = gitRun(dir, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+  return r.ok && r.out ? realpathOf(r.out) : null;
+}
+
+function realpathOf(p: string): string {
+  try {
+    return realpathSync(p);
+  } catch {
+    return resolve(p);
+  }
+}
+
+/**
+ * ISH-904: every git dir the checkout needs lives INSIDE the checkout itself, so
+ * a `workspace-write` Run (writable set = the session cwd) can run every git
+ * mutation — commit, index.lock, ORIG_HEAD, refs — without escalating.
+ *
+ * A relay Task workspace is a LOCAL CLONE (`.git/` inside the path); a linked
+ * `git worktree add` checkout is NOT self-contained: its git dir is
+ * `<source>/.git/worktrees/<T>` and its common dir `<source>/.git`, both outside.
+ */
+export function isSelfContainedWorkspace(dir: string): boolean {
+  if (!isGitWorktree(dir)) return false;
+  const dirs = gitDirs(dir);
+  if (!dirs) return false;
+  const root = realpathOf(dir);
+  return isUnder(dirs.gitDir, root) && isUnder(dirs.commonDir, root);
+}
+
+/** The source repo's `origin` URL (what a Run push must target), or null. */
+export function gitOriginUrl(repo: string): string | null {
+  const r = gitRun(repo, ["remote", "get-url", "origin"]);
+  return r.ok && r.out ? r.out : null;
+}
+
 export function gitHeadOf(dir: string): string | null {
   const r = gitRun(dir, ["rev-parse", "HEAD"]);
   return r.ok && r.out ? r.out : null;
@@ -141,16 +188,16 @@ function isUnder(child: string, parent: string): boolean {
 }
 
 /**
- * Make the repo-local `.relay/` directory ignored so the PINNED run brief never
- * shows up as an uncommitted change (a clean `git status` is the cleanup
- * precondition). Uses `.git/info/exclude`, which is local and never committed —
- * the tracked `.gitignore` already carries `.relay/` in this repo, so this is a
- * no-op there and only helps a foreign fixture repo.
+ * Make the WORKSPACE-LOCAL `.relay/` directory ignored so the PINNED run brief
+ * never shows up as an uncommitted change (a clean `git status` is the cleanup
+ * precondition). Uses the checkout's own `.git/info/exclude` — local, never
+ * committed, and INSIDE the workspace (ISH-904 never writes `<source>/.git`).
+ * Tracked `.gitignore`s that already carry `.relay/` make this a no-op there.
  */
-function ensureRelayExcluded(repo: string): void {
-  const common = gitRun(repo, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
-  if (!common.ok || !common.out) return;
-  const exclude = join(common.out, "info", "exclude");
+function ensureRelayExcluded(workspace: string): void {
+  const dirs = gitDirs(workspace);
+  if (!dirs) return;
+  const exclude = join(dirs.commonDir, "info", "exclude");
   try {
     mkdirSync(dirname(exclude), { recursive: true });
     let body = "";
@@ -165,6 +212,121 @@ function ensureRelayExcluded(repo: string): void {
   } catch {
     /* best effort: the treed .gitignore still covers the real repo */
   }
+}
+
+/**
+ * Create the Task branch in the clone off `base`. The base ref may only live in
+ * the SOURCE repo's local refs (a branch or a sha this clone never fetched), so
+ * when the clone cannot resolve it the ref is fetched from the source PATH
+ * (objects are hardlinked, no network) — never from the Run's `origin`.
+ */
+function checkoutNewTaskBranch(path: string, source: string, branch: string, base: string): GitResult {
+  let ref = base;
+  const resolvedLocally = () => gitRun(path, ["rev-parse", "--verify", "--quiet", `${base}^{commit}`]);
+  if (!resolvedLocally().ok) {
+    // The base only exists in the SOURCE repo's local refs. Import it from the
+    // source PATH at the exact name (no ref namespace can collide with the clone's
+    // own refs): a local branch `base/x` lands at `refs/relay-base/base/x`. Never
+    // fetch the workspace's own path (that is served from its remote-tracking
+    // refs, not the source's local ones). No network, no new objects.
+    const name = base === "HEAD" ? null : base.replace(/^refs\/heads\//, "");
+    const local = `refs/relay-base/${name ?? "HEAD"}`;
+    const spec = name === null ? "+HEAD:refs/relay-base/HEAD" : `+refs/heads/${name}:${local}`;
+    const fetched =
+      gitRun(path, ["fetch", "-q", "--no-tags", realpathOf(source), spec]).ok ||
+      (name !== null && gitRun(path, ["fetch", "-q", "--no-tags", realpathOf(source), `+refs/tags/${name}:${local}`]).ok);
+    if (!fetched) {
+      return { ok: false, out: "", err: `base ref '${base}' is not in the source repo (${realpathOf(source)})` };
+    }
+    ref = local;
+  }
+  return gitRun(path, ["checkout", "-q", "-b", branch, ref]);
+}
+
+/**
+ * ISH-904 create path: a SELF-CONTAINED Task workspace = a LOCAL clone of the
+ * source repo (`--local --no-checkout`: hardlinked objects, cheap), whose
+ * `origin` is re-pointed at the SOURCE repo's `origin` URL so the Run pushes the
+ * Task branch to the real remote (never to the local source path). Then the Task
+ * branch is checked out from the requested base ref (or reused from `origin/`).
+ *
+ * `git worktree add` cannot help here: current git has no `--separate-git-dir`
+ * for it, and a linked worktree's git dir/common dir always live outside the
+ * workspace, which `workspace-write` denies.
+ */
+function createSelfContainedWorkspace(
+  repo: string,
+  path: string,
+  branch: string,
+  branchExists: boolean,
+  base: string,
+  taskId: string
+): void {
+  // Clone onto the PHYSICAL parent path: git records the canonical destination,
+  // so the clone's `origin` is the real source path (not a /var symlink alias).
+  const cloned = gitRun(realpathOf(dirname(path)), ["clone", "--local", "--no-checkout", realpathOf(repo), path]);
+  if (!cloned.ok || !existsSync(path)) {
+    throw new Error(`${WORKTREE_ERROR}: git clone failed for ${taskId}: ${(cloned.err || cloned.out).slice(0, 300)}`);
+  }
+  try {
+    // A local clone records `objects/info/alternates` back to the source's object
+    // dir instead of hardlinking when the source itself has alternates (common: a
+    // source checkout that is itself a `--shared` clone of `<main>/.git/objects`).
+    // Left in place, every git READ goes outside the workspace, and the deeper
+    // chain is not re-resolved from here (a `--shared` source's own commits go
+    // unreadable). Break it WITHOUT a transport: hardlink every alternate object
+    // (packed + loose) into the workspace's own store, then drop the file.
+    const alternates = join(gitCommonDir(path) ?? join(path, ".git"), "objects", "info", "alternates");
+    if (existsSync(alternates)) foldAlternatesInto(path, alternates);
+    const sourceOrigin = gitOriginUrl(repo);
+    if (sourceOrigin) {
+      const set = gitRun(path, ["remote", "set-url", "origin", sourceOrigin]);
+      if (!set.ok) throw new Error(`remote set-url origin failed: ${(set.err || set.out).slice(0, 200)}`);
+    }
+    const checkout = branchExists
+      ? gitRun(path, ["checkout", "-q", branch])
+      : checkoutNewTaskBranch(path, repo, branch, base);
+    if (!checkout.ok) throw new Error(`checkout ${branch} from ${base} failed: ${(checkout.err || checkout.out).slice(0, 300)}`);
+    // The self-mirror only existed to backfill objects; the branch now pins HEAD.
+    gitRun(path, ["update-ref", "-d", "refs/relay-self/heads/main"]);
+  } catch (e) {
+    // Fail closed: never leave a half-made workspace that a later call would
+    // SELECT as if it were live.
+    rmSync(path, { recursive: true, force: true });
+    throw new Error(`${WORKTREE_ERROR}: ${e instanceof Error ? e.message : String(e)} (task ${taskId})`);
+  }
+  ensureRelayExcluded(path);
+}
+
+/** Hardlink every object an `alternates` file points at into `path`'s own store. */
+function foldAlternatesInto(path: string, alternates: string): void {
+  const common = gitCommonDir(path) ?? join(path, ".git");
+  const objects = join(common, "objects");
+  const destPack = join(objects, "pack");
+  mkdirSync(join(destPack), { recursive: true });
+  mkdirSync(join(objects, "info"), { recursive: true });
+  for (const line of readFileSync(alternates, "utf8").split("\n")) {
+    const dir = resolve(common, line.trim());
+    if (!line.trim()) continue;
+    for (const name of readdirSync(dir)) {
+      if (name === "info" || name === "pack") continue;
+      const dst = join(objects, name);
+      mkdirSync(dst, { recursive: true });
+      for (const f of readdirSync(join(dir, name))) {
+        const to = join(dst, f);
+        if (!existsSync(to)) linkSync(join(dir, name, f), to);
+      }
+    }
+    const packDir = join(dir, "pack");
+    if (existsSync(packDir)) {
+      for (const f of readdirSync(packDir)) {
+        if (!/\.(pack|idx)$/.test(f)) continue; // rev/bitmap/mtimes are regenerated
+        const to = join(destPack, f);
+        if (!existsSync(to)) linkSync(join(packDir, f), to);
+      }
+    }
+  }
+  rmSync(alternates, { force: true });
 }
 
 function recordBinding(
@@ -192,11 +354,14 @@ function recordBinding(
 }
 
 /**
- * Create (or SELECT and reuse) the single worktree + branch a Task owns.
+ * Create (or SELECT and reuse) the single self-contained workspace + branch a
+ * Task owns.
  *
- * Idempotent: an already-recorded, live worktree is reused as-is (this is what
- * makes a FIX the SAME worktree + a NEW Run). Create path: `git worktree add`
- * from `repo` on the Task's branch, off `base` (or reuse the existing branch).
+ * Idempotent: an already-recorded, live workspace is reused as-is (this is what
+ * makes a FIX the SAME workspace + a NEW Run). Create path (ISH-904): a LOCAL
+ * CLONE of `repo` at the Task's path (see `createSelfContainedWorkspace`), on the
+ * Task's branch off `base` (or reuse the existing branch). Every git dir it needs
+ * is inside the path, so a `workspace-write` Run can commit and push.
  */
 export function ensureTaskWorktree(db: Database, taskId: string, opts: EnsureWorktreeOptions = {}): WorktreeBinding {
   const task = getTask(db, taskId);
@@ -206,10 +371,10 @@ export function ensureTaskWorktree(db: Database, taskId: string, opts: EnsureWor
   }
   const repo = resolve(opts.repo ?? projectRoot());
 
-  // SELECT: the Task already owns a live worktree -> reuse it unchanged.
-  if (task.worktree && existsSync(task.worktree) && isGitWorktree(task.worktree)) {
+  // SELECT: the Task already owns a live workspace -> reuse it unchanged.
+  if (task.worktree && existsSync(task.worktree) && isSelfContainedWorkspace(task.worktree)) {
     const branch = task.branch ?? gitCurrentBranch(task.worktree) ?? taskBranchName(task);
-    ensureRelayExcluded(repo);
+    ensureRelayExcluded(task.worktree);
     return recordBinding(db, task, resolve(task.worktree), branch, repo, false);
   }
 
@@ -217,23 +382,24 @@ export function ensureTaskWorktree(db: Database, taskId: string, opts: EnsureWor
   mkdirSync(wtRoot, { recursive: true });
   const path = resolve(opts.path ?? join(wtRoot, sanitizeId(task.id)));
   const branch = opts.branch ?? task.branch ?? taskBranchName(task);
-  if (existsSync(path) && !isGitWorktree(path)) {
-    throw new Error(`${WORKTREE_ERROR}: ${path} exists and is not a git worktree`);
+  if (existsSync(path) && !isSelfContainedWorkspace(path)) {
+    throw new Error(
+      `${WORKTREE_ERROR}: ${path} exists and is not a self-contained git clone (a linked \`git worktree add\` checkout keeps its git dir outside the workspace, so a workspace-write Run cannot commit in it)`
+    );
   }
 
-  const branchExists = gitRun(repo, ["rev-parse", "--verify", "--quiet", `refs/heads/${branch}`]).ok;
+  // The branch may already exist (a FIX, a re-run, or a pushed relay/<n>): in the
+  // source repo, or on the SOURCE repo's remote (so the clone's `origin/<branch>`
+  // will have it). Queried before cloning, so no fetch can answer it.
+  const branchExists =
+    gitRun(repo, ["rev-parse", "--verify", "--quiet", `refs/heads/${branch}`]).ok ||
+    (gitOriginUrl(repo) !== null && gitRun(repo, ["ls-remote", "--exit-code", "--heads", "origin", branch]).ok);
   const base =
     opts.base ??
     task.pr_base ??
-    (gitRun(repo, ["rev-parse", "--verify", "--quiet", "origin/main"]).ok ? "origin/main" : "HEAD");
-  const args = branchExists
-    ? ["worktree", "add", path, branch]
-    : ["worktree", "add", "-b", branch, path, base];
-  const added = gitRun(repo, args);
-  if (!added.ok) {
-    throw new Error(`${WORKTREE_ERROR}: git worktree add failed for ${task.id}: ${(added.err || added.out).slice(0, 300)}`);
-  }
-  ensureRelayExcluded(repo);
+    (gitOriginUrl(repo) !== null && gitRun(repo, ["ls-remote", "--exit-code", "--heads", "origin", "main"]).ok ? "origin/main" : "HEAD");
+  if (!existsSync(path)) createSelfContainedWorkspace(repo, path, branch, branchExists, base, taskId);
+  ensureRelayExcluded(path);
   return recordBinding(db, task, path, branch, repo, true);
 }
 
@@ -322,7 +488,8 @@ export function buildRunBrief(db: Database, task: Task, opts: BuildBriefOptions)
       "",
       "## Publish the Task branch as a GitHub PR (this is YOUR GitHub write)",
       "Relay is read-only: it never pushes, creates/updates a PR, or posts a review. You own the push and the PR.",
-      `- push your commit to the Task branch — NEVER the default branch: \`git push origin HEAD:refs/heads/${opts.branch}\``,
+      `- push your commit to the Task branch — NEVER the default branch: \`git push origin HEAD:refs/heads/${opts.branch}\`` +
+        " (`origin` is the source repo's origin URL; the workspace is a self-contained clone, so the whole push is writable under `workspace-write`)",
       `- if the branch has NO PR yet, create one: \`gh pr create --repo ${repo} --head ${opts.branch} --base ${base} --title <title> --body <body>\``,
       "- if a PR already exists for this branch (e.g. a FIX), just push the new commit to the SAME PR — do NOT open a duplicate",
       "- NEVER merge, and NEVER post a review (the independent reviewer posts reviews; Relay only reads them back)"
@@ -554,6 +721,55 @@ export function planWorkspaceCleanup(db: Database, taskId: string, opts: Cleanup
   return plan;
 }
 
+function isEmptyDir(path: string): boolean {
+  try {
+    return readdirSync(path).length === 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * ISH-904: remove a Task workspace from disk. A self-contained clone is just a
+ * directory (`rm -rf`), so the SOURCE repo's `.git` is never touched (a linked
+ * `git worktree remove` would have mutated it). A legacy linked worktree from
+ * before ISH-904 is still reclaimed through `git worktree remove` in its source.
+ * Idempotent: an already-absent path is success.
+ */
+function reclaimWorkspace(path: string, force: boolean): { ok: boolean; error: string } {
+  if (!existsSync(path)) return { ok: true, error: "" };
+  if (isSelfContainedWorkspace(path)) {
+    try {
+      rmSync(path, { recursive: true, force: true });
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+    return existsSync(path) ? { ok: false, error: `${path} still exists after removal` } : { ok: true, error: "" };
+  }
+  // A readable git checkout whose git dir lives elsewhere: a legacy linked
+  // worktree. Reclaim it via its OWN source repo so that repo's ledger is pruned.
+  if (isGitWorktree(path)) {
+    const dirs = gitDirs(path);
+    const source = dirs ? dirname(dirs.commonDir) : null;
+    if (source) {
+      const r = gitRun(source, ["worktree", "remove", ...(force ? ["--force"] : []), path]);
+      if (r.ok) gitRun(source, ["worktree", "prune"]);
+      if (r.ok || !existsSync(path)) return { ok: true, error: "" };
+      return { ok: false, error: `git worktree remove failed: ${(r.err || r.out).slice(0, 200)}` };
+    }
+  }
+  // Not a readable checkout (e.g. its `.git` was deleted, or it is a half-made
+  // clone). The ownership guard already held; a NON-empty directory that is not
+  // a checkout is not provably safe to delete without `--force`.
+  if (!force && !isEmptyDir(path)) return { ok: false, error: `${path} is not a readable git checkout` };
+  try {
+    rmSync(path, { recursive: true, force: true });
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+  return existsSync(path) ? { ok: false, error: `${path} still exists after removal` } : { ok: true, error: "" };
+}
+
 export function applyWorkspaceCleanup(db: Database, taskId: string, opts: CleanupOptions = {}): CleanupPlan {
   const plan = planWorkspaceCleanup(db, taskId, opts);
   if (!plan.apply || !plan.worktree) return plan;
@@ -567,14 +783,12 @@ export function applyWorkspaceCleanup(db: Database, taskId: string, opts: Cleanu
     return plan;
   }
   if (existsSync(plan.worktree)) {
-    const repo = opts.repo ?? projectRoot();
-    const r = gitRun(repo, ["worktree", "remove", ...(opts.force ? ["--force"] : []), plan.worktree]);
+    const r = reclaimWorkspace(plan.worktree, opts.force === true);
     if (!r.ok) {
-      plan.reasons.push(`git worktree remove failed: ${(r.err || r.out).slice(0, 200)}`);
+      plan.reasons.push(`workspace removal failed: ${r.error.slice(0, 200)}`);
       plan.remove = false;
       return plan;
     }
-    gitRun(repo, ["worktree", "prune"]);
   }
   db.query(`UPDATE tasks SET worktree = NULL, updated_at = ? WHERE id = ?`).run(now(), taskId);
   plan.removed = true;

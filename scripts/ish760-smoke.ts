@@ -24,6 +24,7 @@ import { registerWorker } from "../src/workers";
 import { intakeTask, recordReview, confirmMerged, runMechanicalVerification, taskChecks } from "../src/workflow";
 import { defaultRunner } from "../src/verify";
 import { acceptRunSubmission, getRun, listRuns, DUPLICATE_WRITER } from "../src/dsh-runner";
+import { PINNED_DSH_VERSION } from "../src/dsh-version";
 import {
   applyWorkspaceCleanup,
   ensureTaskWorktree,
@@ -79,7 +80,7 @@ try {
   );
   chmodSync(fast, 0o755);
   const slow = join(binDir, "dsh-slow");
-  writeFileSync(slow, "#!/bin/sh\nsleep 2\nexit 0\n");
+  writeFileSync(slow, `#!/bin/sh\nif [ "${"$"}1" = "--version" ]; then echo ${PINNED_DSH_VERSION}; exit 0; fi\nsleep 2\nexit 0\n`);
   chmodSync(slow, 0o755);
 
   process.env.RELAY_DB = join(dir, "state.db");
