@@ -156,11 +156,13 @@ function ensureLabctlInSandbox(sandbox: string, workspace: string): { ok: boolea
     "fi",
     "command -v labctl >/dev/null",
     "# The sandbox's own startup provisioning may hold the apt lock; retry until",
-    "# PyYAML is importable (labctl deploy fails closed without it).",
+    "# PyYAML is importable (labctl deploy fails closed without it). sshpass is",
+    "# best-effort (it enables the real SSH leg; missing it is recorded NOT_RUN).",
     "for i in $(seq 1 40); do",
-    "  python3 -c 'import yaml' >/dev/null 2>&1 && break",
+    "  python3 -c 'import yaml' >/dev/null 2>&1 && command -v sshpass >/dev/null 2>&1 && break",
     "  sudo apt-get update -qq >/dev/null 2>&1 || true",
-    "  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3-yaml >/dev/null 2>&1 || python3 -m pip install --quiet pyyaml >/dev/null 2>&1 || pip3 install --quiet pyyaml >/dev/null 2>&1 || true",
+    "  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3-yaml sshpass >/dev/null 2>&1 || true",
+    "  python3 -m pip install --quiet pyyaml >/dev/null 2>&1 || pip3 install --quiet pyyaml >/dev/null 2>&1 || true",
     "  sleep 3",
     "done",
     "python3 -c 'import yaml' >/dev/null 2>&1",
@@ -190,6 +192,13 @@ function stageEnv(): void {
   const dsh = sh("dsh", ["--version"]).out || "?";
   const claude = sh("claude", ["--version"]).out || "?";
   record("env", "PASS", `darwin/${uname} macOS ${sw}; sbx ${sbx}; dsh ${dsh}; claude ${claude}`);
+  // Time / disk / RAM (spec §Done-when asks for these to be recorded).
+  const when = new Date().toISOString();
+  const hostDisk = sh("df", ["-h", "/"]).out.split("\n").pop()?.trim() ?? "?";
+  const memBytes = Number(sh("sysctl", ["-n", "hw.memsize"]).out || "0");
+  record("env.host-resources", "PASS", `${when}; host disk(/) ${hostDisk}; host RAM ${memBytes ? (memBytes / 1024 ** 3).toFixed(1) + " GiB" : "?"}`);
+  const labRes = sh("sbx", ["exec", "ish824-lab", "--", "bash", "-lc", "echo cpus=$(nproc); free -h | awk 'NR==2{print \"mem=\"$2}'; df -h / | tail -1 | awk '{print \"disk=\"$2}'"]);
+  record("env.lab-resources", labRes.ok ? "PASS" : "NOT_RUN", labRes.ok ? `Shared Lab VM: ${labRes.out.replace(/\n/g, "; ")}` : `lab resources unreadable: ${labRes.err || labRes.out}`);
   // Shared Lab + image IDs (best effort; a down Lab is NOT_RUN, never a PASS).
   const labVm = sh("sbx", ["ls"]).out.split("\n").find((l) => l.startsWith("ish824-lab"))?.trim();
   record("env.labvm", labVm ? "PASS" : "NOT_RUN", labVm ? `Shared Lab VM: ${labVm}` : "Shared Lab VM ish824-lab not found");
@@ -249,7 +258,7 @@ function nosCheckScript(lab: string, ns: string, api: string, insecure: boolean)
   return [
     "set -e",
     "# ISH-830 NOS check: deploy a real SR Linux lab on the Shared Lab, read it",
-    "# back over SSH/sr_cli at the EXACT checked-out HEAD, then destroy it.",
+    "# back at the EXACT checked-out HEAD, then destroy it.",
     "# Credentials are provisioned into ~/.labctl.env by the harness (never logged).",
     '[ -f "$HOME/.labctl.env" ] && . "$HOME/.labctl.env"',
     `API="${api}"`,
@@ -258,12 +267,31 @@ function nosCheckScript(lab: string, ns: string, api: string, insecure: boolean)
     "cat /tmp/dep.json",
     `labctl inspect ${lab} --json --api "$API" ${ins} --reach-host host.docker.internal >/tmp/ins.json`,
     "cat /tmp/ins.json",
-    `echo '--- SSH read-back (sr_cli over the node SSH) ---'`,
+    "# (a) clab-api exec — this is the clab-api-server's docker exec, NOT SSH.",
+    `echo '--- clab-api exec (NOT SSH) ---'`,
     `labctl exec --json --api "$API" ${ins} ${lab}/srl1 -- sr_cli -c "show version"`,
-    `echo '--- gNMI read-back ---'`,
-    `if command -v gnmic >/dev/null; then`,
-    `  EP=$(python3 -c "import json;d=json.load(open('/tmp/ins.json'));print([e['reachable_at'] for n in d['nodes'] for e in n.get('mgmt_endpoints',[]) if e.get('container_port')==57400][0])")`,
-    `  gnmic -a "$EP" --insecure -e json_ietf get --path /system/name/host-name`,
+    "# (b) REAL SSH from the Sandbox to the node's published :22 (reachable_at).",
+    `echo '--- real SSH leg (published :22) ---'`,
+    `SSH_EP=$(python3 -c "import json;d=json.load(open('/tmp/ins.json'));print([e['reachable_at'] for n in d['nodes'] for e in n.get('mgmt_endpoints',[]) if e.get('container_port')==22][0])")`,
+    `if command -v sshpass >/dev/null 2>&1; then`,
+    `  SSH_HOST="\${SSH_EP%%:*}"; SSH_PORT="\${SSH_EP##*:}"`,
+    `  if sshpass -p "\${SRL_PASSWORD:-NokiaSrl1!}" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=15 -p "$SSH_PORT" admin@"$SSH_HOST" "show version" 2>&1; then`,
+    `    echo SSH_LEG_OK`,
+    `  else`,
+    `    echo SSH_LEG_FAIL`,
+    `  fi`,
+    `else`,
+    `  echo 'SSH_NOT_RUN: sshpass is not installed in the sandbox'`,
+    `fi`,
+    "# (c) REAL gNMI on the node's published :57400 (reachable_at), if gnmic exists.",
+    `echo '--- real gNMI leg (published :57400) ---'`,
+    `if command -v gnmic >/dev/null 2>&1; then`,
+    `  GNMI_EP=$(python3 -c "import json;d=json.load(open('/tmp/ins.json'));print([e['reachable_at'] for n in d['nodes'] for e in n.get('mgmt_endpoints',[]) if e.get('container_port')==57400][0])")`,
+    `  if gnmic -a "$GNMI_EP" --insecure -e json_ietf get --path /system/name/host-name 2>&1; then`,
+    `    echo GNMI_LEG_OK`,
+    `  else`,
+    `    echo GNMI_LEG_FAIL`,
+    `  fi`,
     `else`,
     `  echo 'GNMI_NOT_RUN: gnmic is not installed in the sandbox'`,
     `fi`,
@@ -359,16 +387,34 @@ async function stageNos(dir: string, api: string, insecure: boolean): Promise<vo
     // so a partial/timed-out deploy can never leak a lab.
     labDeployed = lab;
     const pass = await target.runner.run(checks[0], { cwd: target.cwd });
+    const out = `${pass.stdout ?? ""}\n${pass.output ?? ""}`;
     if (pass.outcome === "pass") {
-      const verLine = (pass.stdout ?? "").split("\n").find((l) => /SRLinux|Version|v2\d/i.test(l))?.trim() ?? "";
-      const gnmi = (pass.stdout ?? "").includes("GNMI_NOT_RUN") ? "gNMI NOT_RUN (no gnmic)" : "gNMI read-back present";
-      record("nos", "PASS", `real SR Linux VERIFY at the bound HEAD ${head.slice(0, 12)}: ${verLine}; ${gnmi}`, {
+      const verLine = out.split("\n").find((l) => /Software Version|SRLinux/i.test(l))?.trim() ?? "";
+      record("nos", "PASS", `real SR Linux VERIFY at the bound HEAD ${head.slice(0, 12)}: ${verLine}`, {
         command: "sandboxVerifyTarget.runner.run(nos-readback)",
-        raw: (pass.stdout ?? "").slice(-1200),
+        raw: out.slice(-1400),
       });
     } else {
-      record("nos", "FAIL", `real SR Linux VERIFY was '${pass.outcome}' (never a PASS)`, { raw: pass.output.slice(0, 800) });
+      record("nos", "FAIL", `real SR Linux VERIFY was '${pass.outcome}' (never a PASS)`, { raw: out.slice(0, 800) });
     }
+    // SSH / gNMI are recorded SEPARATELY and honestly: the `labctl exec` read-back
+    // above is clab-api-server docker exec, NOT SSH. A PASS requires REAL evidence
+    // (a version over the published :22, or a gNMI get on :57400); otherwise the
+    // leg is NOT_RUN — never claimed.
+    const sshLeg = out.split("--- real SSH leg (published :22) ---")[1]?.split("--- real gNMI")[0] ?? "";
+    const sshOk = out.includes("SSH_LEG_OK") && /Software Version|SRLinux/i.test(sshLeg);
+    record(
+      "nos.ssh",
+      sshOk ? "PASS" : "NOT_RUN",
+      sshOk ? "real SSH from the Sandbox to the node published :22 returned `show version`" : "SSH NOT_RUN (no SSH evidence obtained)",
+      sshOk ? {} : { raw: sshLeg.trim().slice(0, 300) || "sshpass unavailable" }
+    );
+    const gnmiOk = out.includes("GNMI_LEG_OK") && /host-name/i.test(out);
+    record(
+      "nos.gnmi",
+      gnmiOk ? "PASS" : "NOT_RUN",
+      gnmiOk ? "real gNMI from the Sandbox to the node published :57400 returned the host-name" : "gNMI NOT_RUN (gnmic not installed in the Sandbox)"
+    );
 
     // --- failure injections: none may become a PASS --------------------------
     const wrongHead = sandboxVerifyTarget(db, { ...getTask(db, task.id)!, head_sha: "0".repeat(40) }, checks);
@@ -379,15 +425,33 @@ async function stageNos(dir: string, api: string, insecure: boolean): Promise<vo
     record("nos.dirty-tree", dirty.outcome === "inconclusive" ? "PASS" : "FAIL", `a check that dirties the tree -> ${dirty.outcome}`);
     realSbxCli.run(sbxExecArgv(sandbox, bashLc("git checkout -q -- . && git clean -fdq"), { workdir: repo }));
 
-    const deadApi = `https://host.docker.internal:1`;
-    const deadTarget = sandboxVerifyTarget(db, getTask(db, task.id)!, [
-      { name: "api-down", command: `labctl inspect ${lab} --json --api ${deadApi} --insecure; true`, required: true },
-    ]);
-    const dead = await deadTarget!.runner.run(
-      { name: "api-down", command: `bash -c 'labctl inspect ${lab} --json --api ${deadApi} --insecure'`, required: true },
-      { cwd: deadTarget!.cwd }
+    // A REQUIRED check that exits non-zero must be `fail` (never a PASS).
+    const reqFail = await target.runner.run({ name: "required-fail", command: "exit 7", required: true }, { cwd: target.cwd });
+    record("nos.required-verify-fail", reqFail.outcome === "fail" ? "PASS" : "FAIL", `a required check that exits non-zero -> ${reqFail.outcome} (never a PASS)`);
+
+    // Lab port failure: an UNPUBLISHED node port must be refused, never a PASS.
+    const portFail = await target.runner.run(
+      { name: "port-fail", command: "curl -s --max-time 5 https://host.docker.internal:18099 >/dev/null", required: true },
+      { cwd: target.cwd }
     );
-    record("nos.api-unavailable", dead.outcome !== "pass" ? "PASS" : "FAIL", `Lab API unavailable -> VERIFY ${dead.outcome} (never a PASS)`);
+    record("nos.lab-port-failure", portFail.outcome === "fail" ? "PASS" : "FAIL", `an unpublished Lab port -> VERIFY ${portFail.outcome} (never a PASS)`);
+
+    // Lab API unavailable: SOURCE the creds (else labctl exits EXIT_USAGE=2 BEFORE
+    // any network I/O) and require a REAL transport failure (labctl exit 5/7, or a
+    // connection-refused/timeout line) — not merely any non-pass. A loopback dead
+    // port refuses the connection (a login failure is NOT an API-down signal).
+    const deadApi = "https://127.0.0.1:9";
+    const deadCmd = `bash -c '. "$HOME/.labctl.env" 2>/dev/null; labctl inspect ${lab} --json --api ${deadApi} --insecure; c=$?; echo LABCTL_EXIT=$c; exit $c'`;
+    const deadTarget = sandboxVerifyTarget(db, getTask(db, task.id)!, [{ name: "api-down", command: deadCmd, required: true }]);
+    const dead = await deadTarget!.runner.run({ name: "api-down", command: deadCmd, required: true }, { cwd: deadTarget!.cwd });
+    const deadOut = `${dead.stdout ?? ""}\n${dead.output ?? ""}`;
+    const networkish = /LABCTL_EXIT=(5|7)|refused|ECONNREFUSED|connection|Tunnel connection|timed out|Bad Gateway/i.test(deadOut);
+    record(
+      "nos.api-unavailable",
+      dead.outcome === "fail" && networkish ? "PASS" : "FAIL",
+      `Lab API unavailable -> VERIFY ${dead.outcome}${networkish ? "" : " (no transport-failure evidence)"} (never a PASS)`,
+      { raw: deadOut.slice(-500) }
+    );
 
     const foreign = await destroyTaskLab(sandboxLabctl({ sandbox, workspace: repo, exec: realSandboxExec }, labEnvFromProcess()), task as LabTask, {
       lab: "netlab-SOMEONE-ELSE",
@@ -426,11 +490,21 @@ async function stageNos(dir: string, api: string, insecure: boolean): Promise<vo
 // stage: parallel — two real Task labs do not collide
 // ---------------------------------------------------------------------------
 
+/**
+ * stage: parallel — two Task-named SR Linux labs coexist; destroying one leaves
+ * the other running, and the shared NOS image survives.
+ *
+ * SCOPE: this is a LAB-isolation proof only. The Tasks are not Relay Tasks with
+ * their own Coding Sandboxes/branches, so branch / review-HEAD isolation is NOT
+ * proven here (it is covered deterministically by `tests/factory.test.ts`:
+ * distinct worktrees run in parallel; one writer per worktree).
+ */
 async function stageParallel(dir: string, api: string, insecure: boolean): Promise<void> {
+  const runToken = Date.now().toString(36);
   const mk = (id: string, createdAt: number): LabTask => ({ id, created_at: createdAt });
-  const a = mk("ish830-par-a", 1_700_000_100_000);
-  const b = mk("ish830-par-b", 1_700_000_200_000);
-  const sandbox = `relay-ish830-par-${Date.now().toString(36)}`;
+  const a = mk(`ish830-par-a-${runToken}`, Date.now());
+  const b = mk(`ish830-par-b-${runToken}`, Date.now() + 1);
+  const sandbox = `relay-ish830-par-${runToken}`;
   const repo = join(dir, "par-repo");
   mkdirSync(repo, { recursive: true });
   git(repo, "init", "-q", "-b", "main");
@@ -476,39 +550,52 @@ async function stageParallel(dir: string, api: string, insecure: boolean): Promi
   const parLabctl = ensureLabctlInSandbox(sandbox, repo);
   if (!parLabctl.ok) return record("parallel", "FAIL", `labctl is not runnable inside the sandbox: ${parLabctl.detail}`);
   const labctl = sandboxLabctl({ sandbox, workspace: repo, exec: realSandboxExec }, labEnvFromProcess());
+
+  // Destroy a lab and record the verdict from the RESULT (never a discarded
+  // `.catch`): PASS only when destroy is `ok`, or a follow-up inspect exits 6.
+  async function destroyAndVerdict(t: LabTask, lab: string | null, label: string): Promise<void> {
+    if (!lab) return;
+    const del = await destroyTaskLab(labctl, t, { lab, api, insecure });
+    if (del.ok) return record(label, "PASS", `${lab} destroyed`);
+    const ins = await labctl.run(labctlInspectArgv({ lab, api, insecure }));
+    record(label, ins.code === 6 ? "PASS" : "FAIL", `destroy ${lab}: ${del.error ?? "failed"}; inspect exit ${ins.code}`, {
+      raw: del.error ?? "",
+    });
+  }
+
   let deployedA: string | null = null;
   let deployedB: string | null = null;
   try {
-    const da = await deployTaskLab(labctl, a, { topology: `labs/${labNameForTask(a)}/t.clab.yml`, namespace: labNamespaceForTask(a), api, insecure });
+    // Deploy BOTH labs concurrently (not one after the other).
+    const [da, db] = await Promise.all([
+      deployTaskLab(labctl, a, { topology: `labs/${labNameForTask(a)}/t.clab.yml`, namespace: labNamespaceForTask(a), api, insecure }),
+      deployTaskLab(labctl, b, { topology: `labs/${labNameForTask(b)}/t.clab.yml`, namespace: labNamespaceForTask(b), api, insecure }),
+    ]);
     if (da.lab) deployedA = da.lab;
-    const db = await deployTaskLab(labctl, b, { topology: `labs/${labNameForTask(b)}/t.clab.yml`, namespace: labNamespaceForTask(b), api, insecure });
     if (db.lab) deployedB = db.lab;
     if (!da.ok || !db.ok) {
       record("parallel", "FAIL", `two labs did not both come up: A=${da.error ?? "ok"} B=${db.error ?? "ok"}`);
       return;
     }
-    record("parallel", "PASS", `two Task labs deployed concurrently: ${da.lab} + ${db.lab} (distinct owners/ports)`);
+    record("parallel", "PASS", `two Task-named labs deployed concurrently: ${da.lab} + ${db.lab} (distinct owners/ports)`);
     // destroy A; B must survive
-    const delA = await destroyTaskLab(labctl, a, { lab: deployedA!, api, insecure });
+    await destroyAndVerdict(a, deployedA, "parallel.cleanup-a");
     deployedA = null;
     const insB = await inspectTaskLab(labctl, b, { lab: deployedB!, api, insecure, reachHost: "host.docker.internal" });
     record(
       "parallel.isolation",
-      delA.ok && insB.ok ? "PASS" : "FAIL",
-      `destroyed ${da.lab}; ${db.lab} still ${insB.ok ? "running" : `broken: ${insB.error}`}`
+      insB.ok ? "PASS" : "FAIL",
+      `${db.lab} still ${insB.ok ? "running after the other lab was destroyed" : `broken: ${insB.error}`}`
     );
     // the shared NOS image survives (destroy never purges images)
     const img = sh("sbx", ["exec", "ish824-lab", "--", "docker", "image", "inspect", "ghcr.io/nokia/srlinux:latest", "--format", "{{.Id}}"]);
     record("parallel.image-retained", img.ok ? "PASS" : "FAIL", `shared SR Linux image ${img.ok ? "retained" : "MISSING"}: ${img.out || img.err}`);
   } finally {
-    for (const [t, l] of [
-      [a, deployedA],
-      [b, deployedB],
-    ] as [LabTask, string | null][]) {
-      if (l) await destroyTaskLab(labctl, t, { lab: l, api, insecure }).catch(() => undefined);
-    }
+    await destroyAndVerdict(a, deployedA, "parallel.cleanup-a-final");
+    await destroyAndVerdict(b, deployedB, "parallel.cleanup-b");
     realSbxCli.run(["stop", sandbox]);
-    realSbxCli.run(["rm", "--force", sandbox]);
+    const rm = realSbxCli.run(["rm", "--force", sandbox]);
+    record("parallel.sandbox-cleanup", rm.ok ? "PASS" : "FAIL", rm.ok ? `sandbox ${sandbox} removed` : `sbx rm failed: ${rm.err || rm.out}`);
   }
 }
 
@@ -523,26 +610,73 @@ async function stageFactory(dir: string, api: string, insecure: boolean): Promis
   git(repo, "config", "user.email", "relay@test");
   git(repo, "config", "user.name", "relay-test");
   writeFileSync(join(repo, "README.md"), "base\n");
-  git(repo, "add", "-A");
-  git(repo, "commit", "-q", "-m", "base");
+  const labctlSrc = findLabctlSrc();
+  if (!labctlSrc) return record("factory", "BLOCKED", "no labctl.py (set LABCTL_SRC)");
+  mkdirSync(join(repo, "labs", "labctl"), { recursive: true });
+  writeFileSync(join(repo, "labs", "labctl", "labctl.py"), readFileSync(labctlSrc));
 
   const db = openDb(join(dir, "factory.db"));
   const task = intakeTask(db, {
     provider: "fixture",
     issueId: "ISH-830-FACTORY",
     codeChange: true,
-    title: "create the DONE marker",
-    description: "Create DONE.md at the repo root containing the single line: done. Commit it on the current branch.",
-    acceptance: "DONE.md exists and is committed",
-    checks: [{ name: "done-marker", command: "test -f DONE.md && grep -q done DONE.md" }],
+    title: "change the source and prove it against real SR Linux",
+    description:
+      "Create DONE.md at the repository root whose contents are the single line: done. Then commit it on the current branch. " +
+      "The REQUIRED check deploys a real SR Linux lab on the Shared Lab and reads it back at YOUR committed HEAD.",
+    acceptance: "DONE.md exists and is committed; the SR Linux NOS check passes at the committed HEAD",
+    // The REQUIRED check IS the real SR Linux NOS check (deploy/inspect/read-back/destroy).
+    checks: [{ name: "srl-nos-readback", command: "bash labs/ish830-smoke/nos-check.sh" }],
   });
+  const lab = labNameForTask(task as LabTask);
+  const ns = labNamespaceForTask(task as LabTask);
+  const topoDir = join(repo, "labs", "ish830-smoke");
+  mkdirSync(topoDir, { recursive: true });
+  writeFileSync(
+    join(topoDir, "smoke.clab.yml"),
+    [
+      `name: ${lab}`,
+      "topology:",
+      "  nodes:",
+      "    srl1:",
+      "      kind: nokia_srlinux",
+      "      type: ixrd3",
+      "      image: ghcr.io/nokia/srlinux:latest",
+      "      ports:",
+      '        - "18001:22"',
+      '        - "18002:57400"',
+      "",
+    ].join("\n")
+  );
+  writeFileSync(join(topoDir, "nos-check.sh"), nosCheckScript(lab, ns, api, insecure));
+  git(repo, "add", "-A");
+  git(repo, "commit", "-q", "-m", "base: labctl + a Task-named SR Linux topology + NOS check");
+
+  let sbName: string | null = null;
+  let sbWorkspace = repo;
   try {
-    ensureTaskSandbox(db, task.id, { source: repo, agent: "shell", cli: realSbxCli });
+    const binding = ensureTaskSandbox(db, task.id, { source: repo, agent: "shell", cli: realSbxCli });
+    sbName = binding.name;
+    // The clone mirrors the resolved MAIN-checkout path (e.g. /private/var/... on
+    // macOS), which may differ from the mkdtemp path — use the binding's.
+    sbWorkspace = binding.workspace;
   } catch (e) {
     record("factory", "BLOCKED", `could not create the Task Coding Sandbox: ${e instanceof Error ? e.message : String(e)}`.slice(0, 300));
     db.close();
     return;
   }
+  // Install labctl + lab creds + the published-port policy inside the Task
+  // sandbox (operator injection), so the REQUIRED NOS check can run at VERIFY.
+  const envFile = Object.entries(labEnvFromProcess())
+    .map(([k, v]) => `export ${k}=${v}`)
+    .join("\n");
+  realSbxCli.run(sbxExecArgv(sbName, bashLc(`mkdir -p "$HOME" && cat > "$HOME/.labctl.env" <<'EOF'\n${envFile}\nEOF\nchmod 600 "$HOME/.labctl.env"`)));
+  const u = new URL(api);
+  const apiPort = u.port || "443";
+  realSbxCli.run(["policy", "allow", "network", "--sandbox", sbName, `host.docker.internal:${apiPort},localhost:${apiPort},host.docker.internal:18001,localhost:18001,host.docker.internal:18002,localhost:18002`]);
+  const ready = ensureLabctlInSandbox(sbName, sbWorkspace);
+  if (!ready.ok) record("factory.labctl", "FAIL", `labctl is not runnable in the Task sandbox: ${ready.detail}`);
+
   const result = await runFactoryTask(db, task.id, {
     repo,
     dshBin: process.env.RELAY_DSH_BIN ?? "dsh",
@@ -564,8 +698,25 @@ async function stageFactory(dir: string, api: string, insecure: boolean): Promis
   }
   const raw = [result.reason ?? "", run?.error ?? "", ...rawBits].join("\n");
   const detail = `runFactoryTask(${task.id}) -> ${result.outcome} (head ${result.head?.slice(0, 12) ?? "none"}); run ${run?.id ?? "?"} ${run?.state ?? "?"} exit ${run?.exit_code ?? "?"}`;
-  if (result.outcome === "merge_ready") {
-    record("factory", "PASS", detail, { raw: JSON.stringify({ attempts: result.attempts, steps: result.steps }, null, 2).slice(0, 1500) });
+
+  // PASS is gated on the FULL chain, never a bare `merge_ready`: a FIX review
+  // followed by a LATER PASS, and the final attempt's produced HEAD equal to the
+  // MergeReady HEAD (verified HEAD == reviewer HEAD == MergeReady HEAD).
+  const attempts = result.attempts;
+  const fixIdx = attempts.findIndex((a) => a.reviewVerdict === "fix");
+  const passIdx = attempts.findIndex((a, i) => a.reviewVerdict === "pass" && fixIdx !== -1 && i > fixIdx);
+  const last = attempts[attempts.length - 1];
+  const headOk = !!result.head && !!last?.producedHead && last.producedHead === result.head;
+  const chainProven = fixIdx !== -1 && passIdx > fixIdx && headOk;
+  if (result.outcome === "merge_ready" && chainProven) {
+    record(
+      "factory",
+      "PASS",
+      `real chain: dsh IMPLEMENT -> SR Linux VERIFY -> Claude FIX -> fresh dsh -> re-VERIFY -> Claude PASS -> MergeReady @ ${result.head?.slice(0, 12)}`,
+      { raw: JSON.stringify({ attempts, steps: result.steps }, null, 2).slice(0, 1500) }
+    );
+  } else if (result.outcome === "merge_ready") {
+    record("factory", "FAIL", `merge_ready but the ISH-830 chain is NOT proven (fixIdx=${fixIdx} passIdx=${passIdx} head-equal=${headOk}): ${detail}`);
   } else if (/MISSING_CREDENTIAL|no credential|no API key/i.test(raw)) {
     const why = raw.split("\n").find((l) => /MISSING_CREDENTIAL|no credential|no API key/i.test(l))?.trim() ?? "";
     record("factory", "BLOCKED", `real factory fails CLOSED (no provider credential, no false PASS): ${detail}`, { raw: why });
@@ -582,7 +733,8 @@ async function stageFactory(dir: string, api: string, insecure: boolean): Promis
   db.close();
   if (sb) {
     realSbxCli.run(["stop", sb.name]);
-    realSbxCli.run(["rm", "--force", sb.name]);
+    const rm = realSbxCli.run(["rm", "--force", sb.name]);
+    record("factory.sandbox-cleanup", rm.ok ? "PASS" : "FAIL", rm.ok ? `sandbox ${sb.name} removed` : `sbx rm failed: ${rm.err || rm.out}`);
   }
 }
 
