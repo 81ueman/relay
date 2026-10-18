@@ -5,14 +5,23 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Database } from "bun:sqlite";
 import { openDb } from "../src/db";
-import { blockTask, claimNext, claimTask, getTask } from "../src/tasks";
-import { registerWorker } from "../src/workers";
+import { blockTask, claimNext, claimTask, addTask, getTask } from "../src/tasks";
+import { getWorker, registerWorker, HEADLESS_AGENT_KIND } from "../src/workers";
 import { inboxFor } from "../src/messages";
-import { intakeTask, linkTask, recordReview, runMechanicalVerification, submitPhase, taskChecks } from "../src/workflow";
-import { insertTaskResult } from "../src/results";
+import {
+  findPassingReview,
+  intakeTask,
+  linkTask,
+  recordReview,
+  runMechanicalVerification,
+  submitPhase,
+  taskChecks,
+} from "../src/workflow";
+import { getTaskResult, insertTaskResult, RESULT_WRITE_ERROR } from "../src/results";
 import { acceptRunSubmission, DUPLICATE_WRITER, listRuns, type DshProcess, type DshSpawner } from "../src/dsh-runner";
 import { PINNED_DSH_VERSION } from "../src/dsh-version";
-import { launchTaskRun, taskBranchName } from "../src/run-lifecycle";
+import { inheritFindings, launchTaskRun, taskBranchName } from "../src/run-lifecycle";
+import { buildDashboardView } from "../src/dashboard/model";
 import { defaultRunner, gitHead, type CommandRunner } from "../src/verify";
 import { sandboxNameForTask, upsertSandbox, type SbxCli, type SbxResult } from "../src/sandbox";
 import { ensureTaskSandbox, launchTaskSandboxRun, ensureSandboxRelayExcluded } from "../src/sandbox-lifecycle";
@@ -29,6 +38,7 @@ import {
   buildReviewerArgs,
   runHeadlessReview,
   extractReviewerVerdict,
+  extractReviewerVerdictDetailed,
   type ReviewerProcess,
   type ReviewerSpawnContext,
   type ReviewerSpawner,
@@ -481,6 +491,40 @@ describe("extractReviewerVerdict (fail-closed parsing)", () => {
     expect(extractReviewerVerdict("")).toBeNull();
     expect(extractReviewerVerdict('{"nope":1}')).toBeNull();
   });
+  test("ISH-904: parses the FIRST balanced verdict object even when wrapped in prose", () => {
+    // The real Opus output that was discarded: prose, then a well-formed verdict,
+    // then more prose. Braces inside a finding string must not truncate it.
+    const raw =
+      "Still reviewing: the diff is small, one finding.\n\n" +
+      '{"verdict":"fix","head":"abc","findings":[{"severity":"major","file":"a.ts","message":"a } brace in text"}],"summary":"needs work"}' +
+      "\n\nThanks for the context.";
+    const v = extractReviewerVerdict(raw);
+    expect(v?.verdict).toBe("fix");
+    expect(v?.head).toBe("abc");
+    expect(v?.findings[0].message).toBe("a } brace in text");
+
+    // An envelope whose result carries prose + a verdict is parsed too.
+    const envelope = JSON.stringify({
+      type: "result",
+      result: 'Still reviewing...\n{"verdict":"pass","head":"h","summary":"ok"}',
+    });
+    expect(extractReviewerVerdict(envelope)?.verdict).toBe("pass");
+    // The FIRST balanced verdict object wins, in document order.
+    expect(extractReviewerVerdict('{"verdict":"fix"}\n{"verdict":"pass"}')?.verdict).toBe("fix");
+  });
+  test("ISH-904: 'no JSON' and 'wrong JSON' are distinguishable in the extraction error", () => {
+    const none = extractReviewerVerdictDetailed("looks fine to me, no JSON here");
+    expect(none.verdict).toBeNull();
+    expect(none.error).toContain("no JSON object");
+
+    const wrong = extractReviewerVerdictDetailed('Still reviewing\n{"verdict":"fix",,}');
+    expect(wrong.verdict).toBeNull();
+    expect(wrong.error).toContain("JSON parse error");
+
+    const noVerdict = extractReviewerVerdictDetailed('{"type":"status","message":"working"}');
+    expect(noVerdict.verdict).toBeNull();
+    expect(noVerdict.error).toContain("no 'verdict' key");
+  });
 });
 
 describe("Factory E2E: real worktree, fake headless dsh + independent reviewer", () => {
@@ -814,6 +858,8 @@ describe("Factory E2E: real worktree, fake headless dsh + independent reviewer",
     const res = await runFactoryTask(db, id, factoryDeps(dsh, rev.spawner));
     expect(res.outcome).toBe("review_refused");
     expect(res.reason).toContain(REVIEW_NO_STRUCTURED_RESULT);
+    // ISH-904: the refusal carries the parse diagnostic ("no JSON" vs "wrong JSON").
+    expect(res.reason).toContain("no JSON object");
     expect(getTask(db, id)!.phase).toBe("review");
   });
 
@@ -894,6 +940,190 @@ describe("Factory E2E: real worktree, fake headless dsh + independent reviewer",
     );
     expect(() => recordReview(db, id, REVIEWER_WORKER, { verdict: "pass", headSha: bogus })).toThrow();
     expect(getTask(db, id)!.head_sha).toBe(reviewedHead);
+  });
+});
+
+describe("ISH-904: factory defects (phase-null, worker state, merge_ready rework, result writes)", () => {
+  test("a plain `relay task add` task is refused UP FRONT with the re-intake instruction and NO worktree", async () => {
+    const rev = reviewerHarness(["pass"]);
+    const plain = addTask(db, { title: "plain task" });
+    const res = await runFactoryTask(db, plain.id, factoryDeps(fakeDsh("dsh-commit", COMMITTING_DSH), rev.spawner));
+    expect(res.outcome).toBe("blocked");
+    expect(res.reason).toContain("not a code-change task");
+    expect(res.reason).toContain("relay task intake --code-change");
+    expect(res.attempts).toHaveLength(0);
+    const row = getTask(db, plain.id)!;
+    expect(row.worktree).toBeNull();
+    expect(listRuns(db, { taskId: plain.id })).toHaveLength(0);
+    expect(rev.calls).toHaveLength(0);
+  });
+
+  test("headless reviewer/integrator workers are idle (never starting) and raise no pane ATTENTION", async () => {
+    const dsh = fakeDsh("dsh-commit", COMMITTING_DSH);
+    const id = newTask();
+    // Simulate rows left `starting` with the OLD harness-style markers
+    // (`claude`/`relay`) by an older factory run: the headless path must repair
+    // them, not leave a permanent attach-stuck ATTENTION or a false "no visible
+    // runtime pane".
+    registerWorker(db, REVIEWER_WORKER, { role: "reviewer", agentKind: "claude" });
+    registerWorker(db, DEFAULT_INTEGRATOR_WORKER, { role: "integrator", agentKind: "relay" });
+    expect(getWorker(db, REVIEWER_WORKER)!.state).toBe("starting");
+    expect(getWorker(db, REVIEWER_WORKER)!.agent_kind).toBe("claude");
+    const res = await runFactoryTask(db, id, factoryDeps(dsh, reviewerHarness(["pass"]).spawner));
+    expect(res.outcome).toBe("merge_ready");
+    for (const wid of [REVIEWER_WORKER, DEFAULT_INTEGRATOR_WORKER]) {
+      expect(getWorker(db, wid)!.state).toBe("idle");
+    }
+    expect(getWorker(db, REVIEWER_WORKER)!.agent_kind).toBe(HEADLESS_AGENT_KIND);
+    expect(getWorker(db, DEFAULT_INTEGRATOR_WORKER)!.agent_kind).toBe(HEADLESS_AGENT_KIND);
+    const view = buildDashboardView(db, { root: dir, panes: new Map(), at: Date.now() });
+    const attention = view.attention.filter((a) => a.id === REVIEWER_WORKER || a.id === DEFAULT_INTEGRATOR_WORKER);
+    expect(attention).toHaveLength(0);
+    // The other surface (`relay status`) must agree: no headless stuck-attach row.
+    const status = Bun.spawnSync(["bun", join(import.meta.dir, "..", "src", "cli.ts"), "status"], {
+      env: { ...process.env, RELAY_DB: process.env.RELAY_DB! },
+    });
+    expect(status.exitCode).toBe(0);
+    const statusText = status.stdout.toString();
+    const statusAttention = statusText.split("Attention\n---------\n")[1]?.split("\nUnattached")[0] ?? "";
+    expect(statusAttention).toContain("(none)");
+    expect(statusText).not.toContain("starting for a while");
+    // A normal (pane-supervised) worker with no runtime is still actionable.
+    registerWorker(db, "pane-worker", { role: "worker" });
+    // A REAL pane-supervised Claude Code worker stuck in `starting` must still
+    // raise the attach-stuck ATTENTION: `claude` is a harness, not a headless
+    // marker (the regression this guards against).
+    registerWorker(db, "pane-claude", { role: "worker", agentKind: "claude", runtimeId: "w9:p1" });
+    db.query(`UPDATE workers SET state = 'starting', last_progress_at = ? WHERE id = ?`).run(
+      Date.now() - 130_000,
+      "pane-claude"
+    );
+    const view2 = buildDashboardView(db, { root: dir, panes: new Map(), at: Date.now() });
+    expect(
+      view2.attention.some((a) => a.id === "pane-worker" && a.text.includes("no visible runtime pane"))
+    ).toBe(true);
+    expect(
+      view2.attention.some((a) => a.id === "pane-claude" && a.text.includes("starting for a while (attach stuck?)"))
+    ).toBe(true);
+    expect(
+      view2.attention.some((a) => a.id === "pane-claude" && a.text.includes("no visible runtime pane"))
+    ).toBe(true);
+  });
+
+  test("a merge_ready task returns to implement at attempt+1 via a superseding --fail review", async () => {
+    const dsh = fakeDsh("dsh-commit", COMMITTING_DSH);
+    const id = newTask();
+    const res = await runFactoryTask(db, id, factoryDeps(dsh, reviewerHarness(["pass"]).spawner));
+    expect(res.outcome).toBe("merge_ready");
+    const before = getTask(db, id)!;
+    const pass = findPassingReview(db, id, before.attempt)!;
+    const reason = "origin/main moved: rebase and re-run";
+    const updated = recordReview(db, id, REVIEWER_WORKER, {
+      verdict: "fail",
+      headSha: before.head_sha!,
+      reason,
+      supersedesResultId: pass.id,
+    });
+    expect(updated.phase).toBe("implement");
+    expect(updated.state).toBe("queued");
+    expect(updated.attempt).toBe(before.attempt + 1);
+    expect(updated.head_sha).toBeNull();
+    // The replacement verdict is the SAME row (same attempt identity), now an NG.
+    const replaced = getTaskResult(db, pass.id)!;
+    expect(replaced.passed).toBe(0);
+    expect(replaced.reason).toBe(reason);
+    const rowCount = db
+      .query(
+        `SELECT COUNT(*) AS n FROM task_results WHERE task_id=? AND phase='review' AND attempt=? AND kind='ReviewResult'`
+      )
+      .get(id, before.attempt) as { n: number };
+    expect(rowCount.n).toBe(1);
+    // The reason is the FIX brief the next implement Run inherits.
+    expect(inheritFindings(db, updated).map((f) => f.reason).join("\n")).toContain(reason);
+  });
+
+  test("the same merge_ready route works without --supersedes (the current PASS is replaced)", async () => {
+    const dsh = fakeDsh("dsh-commit", COMMITTING_DSH);
+    const id = newTask();
+    await runFactoryTask(db, id, factoryDeps(dsh, reviewerHarness(["pass"]).spawner));
+    const before = getTask(db, id)!;
+    const updated = recordReview(db, id, REVIEWER_WORKER, {
+      verdict: "fail",
+      reason: "PR has conflicts, route back to implement",
+    });
+    expect(updated.phase).toBe("implement");
+    expect(updated.attempt).toBe(before.attempt + 1);
+    expect(updated.head_sha).toBeNull();
+  });
+
+  test("the supported CLI command `relay result review --fail --supersedes` routes merge_ready back", async () => {
+    const dsh = fakeDsh("dsh-commit", COMMITTING_DSH);
+    const id = newTask();
+    await runFactoryTask(db, id, factoryDeps(dsh, reviewerHarness(["pass"]).spawner));
+    const before = getTask(db, id)!;
+    const pass = findPassingReview(db, id, before.attempt)!;
+    const cli = join(import.meta.dir, "..", "src", "cli.ts");
+    const r = Bun.spawnSync(
+      [
+        "bun",
+        cli,
+        "result",
+        "review",
+        id,
+        "--fail",
+        "--head",
+        before.head_sha!,
+        "--reason",
+        "rebase needed after the trunk moved",
+        "--supersedes",
+        String(pass.id),
+        "--worker",
+        REVIEWER_WORKER,
+      ],
+      { env: { ...process.env, RELAY_DB: process.env.RELAY_DB! } }
+    );
+    expect(r.stderr.toString()).toBe("");
+    expect(r.exitCode).toBe(0);
+    const after = getTask(db, id)!;
+    expect(after.phase).toBe("implement");
+    expect(after.state).toBe("queued");
+    expect(after.attempt).toBe(before.attempt + 1);
+    expect(after.head_sha).toBeNull();
+  });
+
+  test("a result-write failure parks the task blocked_internal instead of a half-applied phase", async () => {
+    const dsh = fakeDsh("dsh-commit", COMMITTING_DSH);
+    const id = newTask();
+    db.exec(
+      `CREATE TRIGGER ish904_fail_results BEFORE INSERT ON task_results BEGIN SELECT RAISE(ABORT, 'task_results write boom'); END;`
+    );
+    try {
+      const res = await runFactoryTask(db, id, factoryDeps(dsh, reviewerHarness(["pass"]).spawner));
+      expect(res.outcome).toBe("blocked");
+      expect(res.reason).toContain(RESULT_WRITE_ERROR);
+      expect(res.reason).toContain("task_results write boom");
+      const task = getTask(db, id)!;
+      expect(task.state).toBe("blocked_internal");
+      // The implement phase never advanced (no half-applied phase/head).
+      expect(task.phase).toBe("implement");
+      expect(task.head_sha).toBeNull();
+    } finally {
+      db.exec(`DROP TRIGGER IF EXISTS ish904_fail_results`);
+    }
+  });
+
+  test("a transient launch failure is rethrown, not turned into a durable block", async () => {
+    const id = newTask();
+    // A missing dsh fails the pinned-version guard after the worktree was cut.
+    // That is an environment/launch error, not a result-write failure: it must
+    // surface to the caller and leave the Task runnable.
+    const missingDsh = join(binDir, "missing-dsh");
+    await expect(
+      runFactoryTask(db, id, { ...factoryDeps(missingDsh, reviewerHarness(["pass"]).spawner), maxAttempts: 1 })
+    ).rejects.toThrow(/DSH_VERSION_MISMATCH/);
+    const task = getTask(db, id)!;
+    expect(task.state).toBe("queued");
+    expect(task.phase).toBe("implement");
   });
 });
 

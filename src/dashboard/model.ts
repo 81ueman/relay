@@ -5,7 +5,7 @@ import { unreadCounts } from "../messages";
 import { findRuntime, listRuntimes } from "../runtimes";
 import { getNotes, listTasks, taskCounts, unclaimableRunnableTasks } from "../tasks";
 import { toolHardCapMs, toolMaxMs, toolNoOutputMs, toolWarnMs, unresponsiveWindowMs } from "../scheduler";
-import { listWorkers, quietActive, type WorkerRow } from "../workers";
+import { listWorkers, isHeadlessWorker, quietActive, type WorkerRow } from "../workers";
 import type { Task, WorkerRuntime } from "../schema";
 import { readPanes, relayWorkspaces, type PaneTelemetry } from "./herdr";
 import { buildAffinity, NO_AFFINITY, type WorkerAffinity, type WorkerCluster } from "./affinity";
@@ -56,6 +56,15 @@ export interface DashboardWorker {
   execution: { state: ExecutionState; paneId: string | null; agentStatus: string | null }; // nested for --json
   generation: number;
   paneId: string | null;
+  /**
+   * ISH-904: whether a visible Herdr runtime pane is EXPECTED for this worker.
+   * Headless principals (the Factory's `claude-review`/`factory-integrator`,
+   * marked by `agent_kind = headless`) have no pane, so "starting for a while" /
+   * "no visible runtime pane" would be a permanent false ATTENTION. Real
+   * pane-supervised harnesses (including `claude`) still raise it. The surface
+   * and `relay status` must agree.
+   */
+  paneSupervised: boolean;
   progressAgeMs: number | null;
   /**
    * In-flight tool telemetry (`tool.started`/`tool.execute.after`), surfaced for
@@ -191,6 +200,7 @@ export function buildDashboardView(db: Database, opts: BuildOptions): DashboardV
       execution: { state: execLabel, paneId: current?.pane_id ?? null, agentStatus: pane?.agentStatus ?? null },
       generation: w.generation,
       paneId: current?.pane_id ?? null,
+      paneSupervised: !isHeadlessWorker(w),
       progressAgeMs: w.last_progress_at ? Math.max(0, at - w.last_progress_at) : null,
       tool,
       quietRemainingMs,
@@ -359,12 +369,14 @@ function deriveAttention(
                    text: `tool ${w.tool.name} ${stale ? "stale" : "overdue"}${cmd}${budget}` });
       }
     }
-    if (w.state === "starting" && (w.progressAgeMs ?? 0) > 120_000) {
+    if (w.paneSupervised && w.state === "starting" && (w.progressAgeMs ?? 0) > 120_000) {
       out.push({ kind: "worker", id: w.id, ageMs: null, text: `starting for a while (attach stuck?)` });
     }
     // `unread messages` is STATUS, not attention: it lives on the WORKERS row
     // (`mail:N`), so a worker with queued mail does not pad ATTENTION.
-    if (!w.paneId) {
+    // ISH-904: a headless principal has no pane BY DESIGN; only a pane-supervised
+    // worker with no visible runtime is actionable.
+    if (w.paneSupervised && !w.paneId) {
       out.push({ kind: "worker", id: w.id, ageMs: null, text: "supervised worker has no visible runtime pane" });
     }
     for (const r of w.oldRuntimes) {

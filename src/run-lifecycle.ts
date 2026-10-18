@@ -58,9 +58,18 @@ export interface GitResult {
 }
 
 /** Run git in `cwd`, capturing stdout/stderr (never throws). */
-export function gitRun(cwd: string, args: string[]): GitResult {
+export function gitRun(
+  cwd: string,
+  args: string[],
+  opts: { timeoutMs?: number; env?: NodeJS.ProcessEnv } = {}
+): GitResult {
   try {
-    const out = execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+    const out = execFileSync("git", ["-C", cwd, ...args], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      ...(opts.timeoutMs !== undefined ? { timeout: opts.timeoutMs } : {}),
+      ...(opts.env !== undefined ? { env: opts.env } : {}),
+    });
     return { ok: true, out: out.trim(), err: "" };
   } catch (e) {
     const anyE = e as { stdout?: Buffer | string; stderr?: Buffer | string; message?: string };
@@ -172,6 +181,12 @@ export interface EnsureWorktreeOptions {
   base?: string;
   /** Root for Relay-created worktrees (default `taskWorktreesRoot()`). */
   worktreesRoot?: string;
+  /**
+   * ISH-904: receive non-fatal base-resolution warnings (a failed `origin`
+   * refresh, or a base that is behind `origin/main`). The binding always carries
+   * them too; this lets the CLI print them to stderr.
+   */
+  onWarning?: (message: string) => void;
 }
 
 export interface WorktreeBinding {
@@ -179,6 +194,12 @@ export interface WorktreeBinding {
   branch: string;
   repo: string;
   created: boolean;
+  /** The ref the Task branch was cut from (null when an existing branch was reused). */
+  base?: string | null;
+  /** The resolved base commit (null when an existing branch was reused). */
+  baseSha?: string | null;
+  /** Non-fatal base-resolution warnings (e.g. behind origin/main). */
+  warnings?: string[];
 }
 
 function isUnder(child: string, parent: string): boolean {
@@ -231,6 +252,58 @@ function resolveBaseCommit(repo: string, base: string, explicit: boolean): strin
   throw new Error(
     `${WORKTREE_ERROR}: base ref '${base}'${explicit ? "" : " (nor HEAD)"} resolves to no commit in the source repo (${realpathOf(repo)})`
   );
+}
+
+/**
+ * ISH-904: refresh the SOURCE repo's `origin/*` refs before cutting a Task
+ * branch. Without this the Factory based every lane on whatever `origin/main`
+ * happened to be at the last manual fetch — three merges stale in the overnight
+ * run. Best-effort: a checkout with no origin/network/credentials still cuts
+ * from the local refs it has, and the caller gets a warning instead of a failure.
+ */
+function fetchOriginForBase(repo: string): { ok: boolean; error: string | null } {
+  if (!gitOriginUrl(repo)) return { ok: true, error: null };
+  const r = gitRun(repo, ["fetch", "-q", "--no-tags", "origin"], {
+    timeoutMs: 20_000,
+    env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+  });
+  return r.ok ? { ok: true, error: null } : { ok: false, error: (r.err || r.out || "git fetch failed").slice(0, 300) };
+}
+
+/** True when `ancestor` is an ancestor of (or equal to) `descendant`. */
+function isAncestor(repo: string, ancestor: string, descendant: string): boolean {
+  return gitRun(repo, ["merge-base", "--is-ancestor", ancestor, descendant]).ok;
+}
+
+/** The commit a ref resolves to in the SOURCE repo, or null. */
+function resolveCommit(repo: string, ref: string): string | null {
+  const r = gitRun(repo, ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`]);
+  return r.ok && r.out ? r.out : null;
+}
+
+function shortSha(sha: string): string {
+  return sha.slice(0, 10);
+}
+
+/**
+ * ISH-904: choose the ref a NEW Task branch is cut from.
+ *
+ * `--base` is honoured exactly (an explicit local ref must keep working). A
+ * Task's recorded `pr_base` (normally a branch NAME such as `main`) prefers the
+ * SOURCE's fresh `origin/<base>` so a stale local `main` can never be the base;
+ * it falls back to the named local ref when the remote does not have it. The
+ * implicit default is `origin/main`, else `HEAD`.
+ */
+function resolveTaskBaseRef(repo: string, task: Task, opts: EnsureWorktreeOptions): { ref: string; explicit: boolean } {
+  if (opts.base !== undefined) return { ref: opts.base, explicit: true };
+  if (task.pr_base) {
+    const remote = `origin/${task.pr_base}`;
+    return { ref: resolveCommit(repo, `refs/remotes/${remote}`) ? remote : task.pr_base, explicit: true };
+  }
+  return {
+    ref: resolveCommit(repo, "refs/remotes/origin/main") ? "origin/main" : "HEAD",
+    explicit: false,
+  };
 }
 
 /**
@@ -412,7 +485,10 @@ function recordBinding(
   worktree: string,
   branch: string,
   repo: string,
-  created: boolean
+  created: boolean,
+  base: string | null = null,
+  baseSha: string | null = null,
+  warnings: string[] = []
 ): WorktreeBinding {
   // Own it durably: record the worktree and (if unset) the branch on the Task.
   db.query(`UPDATE tasks SET worktree = ?, branch = COALESCE(branch, ?), updated_at = ? WHERE id = ?`).run(
@@ -425,9 +501,9 @@ function recordBinding(
     source: "run-lifecycle",
     taskId: task.id,
     type: created ? "worktree.created" : "worktree.selected",
-    payload: { worktree, branch, repo },
+    payload: { worktree, branch, repo, base, baseSha, warnings },
   });
-  return { worktree, branch, repo, created };
+  return { worktree, branch, repo, created, base, baseSha, warnings };
 }
 
 /**
@@ -465,23 +541,61 @@ export function ensureTaskWorktree(db: Database, taskId: string, opts: EnsureWor
     );
   }
 
+  const warnings: string[] = [];
+  const willCreate = !existsSync(path);
+  // ISH-904: FETCH FIRST. The source's `origin/main` is whatever the last manual
+  // fetch made it; an overnight factory cut every lane from that stale commit.
+  // Best-effort: an offline/credential-less source still cuts from local refs and
+  // gets an explicit warning.
+  if (willCreate) {
+    const fetched = fetchOriginForBase(repo);
+    if (!fetched.ok) {
+      warnings.push(
+        `could not refresh origin before resolving the Task base: ${fetched.error}; using the source's existing refs`
+      );
+    }
+  }
   // The branch may already exist (a FIX, a re-run, or a pushed relay/<n>): in the
   // source repo, or on the SOURCE repo's remote (so the source's
-  // `refs/remotes/origin/<branch>` has it). LOCAL refs only — no `ls-remote`, so
-  // creating a workspace never needs the network (or credentials).
+  // `refs/remotes/origin/<branch>` has it). LOCAL refs only — no `ls-remote`.
   const branchExists =
     gitRun(repo, ["rev-parse", "--verify", "--quiet", `refs/heads/${branch}`]).ok ||
     gitRun(repo, ["rev-parse", "--verify", "--quiet", `refs/remotes/origin/${branch}`]).ok;
   // Resolved in the SOURCE, where `origin/main` really is the remote-tracking ref
   // (the clone's own `origin/*` would be copies of the source's LOCAL heads).
-  const baseExplicit = opts.base !== undefined || task.pr_base !== null;
-  const base =
-    opts.base ??
-    task.pr_base ??
-    (gitRun(repo, ["rev-parse", "--verify", "--quiet", "refs/remotes/origin/main^{commit}"]).ok ? "origin/main" : "HEAD");
-  if (!existsSync(path)) createSelfContainedWorkspace(repo, path, branch, branchExists, base, baseExplicit, taskId);
+  const { ref: base, explicit: baseExplicit } = resolveTaskBaseRef(repo, task, opts);
+  let baseSha: string | null = null;
+  if (willCreate && !branchExists) {
+    baseSha = resolveBaseCommit(repo, base, baseExplicit);
+    // Never silently cut a lane behind the freshly fetched trunk: warn with both
+    // SHAs. (An explicit `--base` that is intentionally older still proceeds —
+    // the operator named it — but is never silent.)
+    const remoteMain = resolveCommit(repo, "refs/remotes/origin/main");
+    if (remoteMain && baseSha !== remoteMain && isAncestor(repo, baseSha, remoteMain)) {
+      warnings.push(
+        `resolved base ${base}@${shortSha(baseSha)} is behind origin/main@${shortSha(remoteMain)}; ` +
+        `the Task workspace may start stale (rebase it, or re-intake with a fresh base)`
+      );
+    }
+  }
+  if (willCreate) createSelfContainedWorkspace(repo, path, branch, branchExists, base, baseExplicit, taskId);
   ensureRelayExcluded(path);
-  return recordBinding(db, task, path, branch, repo, true);
+  const binding = recordBinding(
+    db,
+    task,
+    path,
+    branch,
+    repo,
+    willCreate,
+    branchExists ? null : base,
+    baseSha,
+    warnings
+  );
+  for (const w of warnings) {
+    logEvent(db, { source: "run-lifecycle", taskId, type: "worktree.base_warning", payload: { warning: w } });
+    opts.onWarning?.(w);
+  }
+  return binding;
 }
 
 // ---------------------------------------------------------------------------
@@ -624,6 +738,8 @@ export interface LaunchedRun {
   branch: string;
   briefPath: string;
   findings: RunFinding[];
+  /** ISH-904: non-fatal base warnings (e.g. base behind origin/main). */
+  warnings: string[];
 }
 
 /**
@@ -681,7 +797,7 @@ export async function launchTaskRun(db: Database, taskId: string, opts: LaunchRu
       findings: findings.length,
     },
   });
-  return { handle, run, worktree: binding.worktree, branch: binding.branch, briefPath, findings };
+  return { handle, run, worktree: binding.worktree, branch: binding.branch, briefPath, findings, warnings: binding.warnings ?? [] };
 }
 
 // ---------------------------------------------------------------------------

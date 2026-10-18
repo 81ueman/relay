@@ -953,7 +953,10 @@ main repo's daemon automatically — no manual `.relay` symlink:
 
 A worker is not necessarily OpenCode. `workers.agent_kind` records the harness
 (`opencode` | `codex` | `claude`); it is set from the resolved Herdr agent kind
-at attach. The registry lives in `src/harness.ts` and pins two axes:
+at attach. The Factory's own reviewer/integrator principals are headless and
+store `agent_kind = 'headless'` instead: they never own a Herdr pane, so they
+are excluded from pane-attention checks (a real `claude` pane worker is not).
+The registry lives in `src/harness.ts` and pins two axes:
 
 | kind | idles via | Herdr `agent start --kind` |
 | --- | --- | --- |

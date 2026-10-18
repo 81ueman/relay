@@ -65,14 +65,19 @@ with no origin has no provider to push to, so the clone's local-path origin is
 checkout by accident).
 
 Everything else is answered from **local** refs — creating a workspace never
-runs `ls-remote`, so it needs no network or credentials:
+runs `ls-remote`. ISH-904 adds a best-effort `git -C <source> fetch origin`
+FIRST (no interactive credentials; a failure is a warning, not a create
+failure), so a lane is not cut from a `origin/main` that the last manual fetch
+left stale:
 
 - **Base** is resolved in the SOURCE (`git -C <source> rev-parse <base>^{commit}`)
-  and that commit is fetched from the source path. This matters because the
-  clone's own `refs/remotes/origin/*` are copies of the source's **local**
-  branches: left to itself, the default `origin/main` would mean the source's
-  local `main`, not the real `refs/remotes/origin/main`. So `origin/main` means
-  the same thing it did before ISH-904.
+  after that fetch, and that commit is fetched from the source path. This matters
+  because the clone's own `refs/remotes/origin/*` are copies of the source's
+  **local** branches: left to itself, the default `origin/main` would mean the
+  source's local `main`, not the real `refs/remotes/origin/main`. A Task's
+  recorded `pr_base` (e.g. `main`) also prefers `origin/<base>`; an explicit
+  `--base` is honoured exactly. A resolved base that is behind `origin/main` is
+  reported as a binding warning (and in the Factory `steps`), never silently cut.
 - **Existing branch** (a re-run/FIX of `relay/<n>`): the source's local branch if
   it has one, else its `refs/remotes/origin/<branch>` — a branch that was pushed
   to GitHub but has no local source branch, which a linked `git worktree add` used

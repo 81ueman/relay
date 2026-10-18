@@ -92,7 +92,7 @@ Usage:
   relay runtime list [--worker <id>] [--state <state>]
 
   relay task add "description" [--title T] [--acceptance A] [--priority N] [--role R] [--parent T1] [--plan <plan-id>] [--depends-on T1,T2]
-  relay task intake --provider P --issue ID [--slice S] [--title T] [--code-change] [--pr URL] [--branch B] [--head SHA] [--repo R] [--base REF] [--check name=cmd ...] [--worktree DIR]
+  relay task intake --provider P --issue ID [--slice S] [--title T] [--description D] [--code-change] [--pr URL] [--branch B] [--head SHA] [--repo R] [--base REF] [--check name=cmd ...] [--worktree DIR]
   relay task link <task-id> <plan-id>
   relay task unlink <task-id>
   relay task depend <task-id> <dep-id...> | --clear
@@ -121,7 +121,7 @@ Usage:
 
   relay run start <task-id> [--cwd DIR] [--prompt TEXT] [--permission MODE] [--timeout 30m] [--json]
   relay run launch <task-id> [--timeout 30m] [--permission MODE] [--json]   # ensure worktree + pin brief + ONE dsh Run
-  relay run factory <task-id> [--max-attempts N] [--dsh BIN] [--reviewer CMD] [--model M] [--json]  # dsh -> VERIFY -> Claude review -> MergeReady
+  relay run factory <task-id> [--max-attempts N] [--dsh BIN] [--reviewer CMD] [--model M] [--permission MODE] [--timeout 30m] [--json]  # code-change tasks only; dsh -> VERIFY -> Claude review -> MergeReady
   relay run worktree <task-id> [--branch B] [--base REF] [--path DIR] [--json]
   relay run sandbox create <task-id> [--agent K] [--source DIR] [--json]   # Task Coding Sandbox (sbx clone mode)
   relay run sandbox launch <task-id> [--timeout 30m] [--permission MODE] [--json]  # fresh dsh Run inside the sandbox
@@ -189,7 +189,7 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
     usage: [
       "relay run start <task-id> [--cwd DIR] [--prompt TEXT] [--permission MODE] [--timeout 30m] [--json]",
       "relay run launch <task-id> [--timeout 30m] [--permission MODE] [--json]",
-      "relay run factory <task-id> [--max-attempts N] [--dsh BIN] [--reviewer CMD] [--model M] [--json]",
+      "relay run factory <task-id> [--max-attempts N] [--dsh BIN] [--reviewer CMD] [--model M] [--permission MODE] [--timeout 30m] [--json]",
       "relay run worktree <task-id> [--branch B] [--base REF] [--path DIR] [--json]",
       "relay run sandbox create <task-id> [--agent K] [--source DIR] [--json]",
       "relay run sandbox launch <task-id> [--timeout 30m] [--permission MODE] [--agent K] [--json]",
@@ -205,6 +205,17 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
       "relay run logs <run-id> [--tail N]",
       "relay run cancel <run-id>",
       "relay run submit <run-id> [--evidence E] [--summary S] [--head SHA]",
+    ],
+  },
+  "run factory": {
+    about:
+      "Drive ONE code-change Task through the whole factory: headless dsh implement -> Relay mechanical VERIFY -> independent headless Claude review/FIX -> integration -> read-only MergeReady. It NEVER pushes, merges, accepts or writes to a provider. " +
+      "CODE-CHANGE TASKS ONLY: a task must have a workflow phase (created with `relay task intake --code-change`); a plain `relay task add` task is refused UP FRONT, before any worktree, with the re-intake instruction. " +
+      "VERIFY needs at least ONE REQUIRED mechanical check recorded at intake (`--check name=command`); with none (or only optional checks) the outcome is `no_checks` — an unrun gate is never a PASS. " +
+      "`--permission MODE` is forwarded to the headless dsh Run (default `workspace-write`). `--timeout` is the per-Run budget, `--max-attempts` the coding/review attempt cap. " +
+      "The task branch is cut from the SOURCE repo's freshly fetched `origin/main` (or the task's `pr_base`), and a resolved base behind `origin/main` is warned about, never silently accepted.",
+    usage: [
+      "relay run factory <task-id> [--max-attempts N] [--dsh BIN] [--reviewer CMD] [--model M] [--permission MODE] [--timeout 30m] [--repo DIR] [--review-worktrees DIR] [--json]",
     ],
   },
   db: {
@@ -304,14 +315,14 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
   },
   "task intake": {
     about:
-      "Idempotent code-change intake, keyed by (provider, issue ID, slice). Replaying the same intake returns the SAME task; a different --slice of the same issue is a DIFFERENT task. --code-change marks it as a code-change task, which enforces the mandatory phase gate (implement -> verify -> review -> integration -> merge_ready -> merged); `relay approve`/RELAY_AUTO_APPROVE can never complete it. --pr/--branch/--head/--repo/--base link the PR; a review PASS is invalid once the head moves. --check name=command (repeatable) makes verify MECHANICAL: Relay runs the command in --worktree and only passes when that checkout's `git rev-parse HEAD` equals --head (no LLM waits).",
+      "Idempotent code-change intake, keyed by (provider, issue ID, slice). Replaying the same intake returns the SAME task; a different --slice of the same issue is a DIFFERENT task. --code-change marks it as a code-change task, which enforces the mandatory phase gate (implement -> verify -> review -> integration -> merge_ready -> merged); `relay approve`/RELAY_AUTO_APPROVE can never complete it. --description records the Task description used in the coding/review briefs (distinct from --title). --pr/--branch/--head/--repo/--base link the PR; a review PASS is invalid once the head moves. --check name=command (repeatable) makes verify MECHANICAL: Relay runs the command in --worktree and only passes when that checkout's `git rev-parse HEAD` equals --head (no LLM waits).",
     usage: [
-      "relay task intake --provider P --issue ID [--slice S] [--title T] [--role R] [--priority N] [--parent T1] [--code-change] [--pr URL] [--branch B] [--head SHA] [--repo R] [--base REF] [--check name=cmd ...] [--worktree DIR]",
+      "relay task intake --provider P --issue ID [--slice S] [--title T] [--description D] [--role R] [--priority N] [--parent T1] [--code-change] [--pr URL] [--branch B] [--head SHA] [--repo R] [--base REF] [--check name=cmd ...] [--worktree DIR]",
     ],
   },
   result: {
     about:
-      "Record a STRUCTURED workflow result and advance the task's phase (the source of truth — `relay send` prose is never parsed for a verdict). submit advances implement/integration; verify and review record an outcome; review --blocked parks the task for a human; merged confirms a real GitHub merge (the only 'truly done' signal for a task with a PR); accept is the only way a code-change task becomes terminal internally (it must be at merge_ready). Duplicate/stale results are refused, and an unresolved NG at the same HEAD is never cleared by a later OK alone.",
+      "Record a STRUCTURED workflow result and advance the task's phase (the source of truth — `relay send` prose is never parsed for a verdict). submit advances implement/integration; verify and review record an outcome; review --blocked parks the task for a human; merged confirms a real GitHub merge (the only 'truly done' signal for a task with a PR); accept is the only way a code-change task becomes terminal internally (it must be at merge_ready). Duplicate/stale results are refused, and an unresolved NG at the same HEAD is never cleared by a later OK alone. A merge_ready task whose PR is NOT mergeable can return to implement at attempt+1 (with the reason as the FIX brief): `relay result review <id> --fail --reason \"<why>\"`, optionally naming the PASS being replaced with `--supersedes <result-id>`; the replacement verdict is recorded at the same attempt instead of hitting DUPLICATE_DISPATCH.",
     usage: [
       "relay result submit <task-id> [--evidence E] [--head SHA] [--lease N] [--worker <id>]",
       "relay result verify <task-id> --pass|--fail [--evidence E] [--head SHA] [--worker <id>]",
@@ -1057,7 +1068,7 @@ async function main(): Promise<void> {
           const provider = flag(rest, "--provider");
           const issueId = flag(rest, "--issue");
           if (!provider || !issueId) {
-            throw new Error("usage: relay task intake --provider P --issue ID [--slice S] [--title T] [--code-change] [--pr URL] [--branch B] [--head SHA]");
+            throw new Error("usage: relay task intake --provider P --issue ID [--slice S] [--title T] [--description D] [--code-change] [--pr URL] [--branch B] [--head SHA]");
           }
           const t = intakeTask(db, {
             provider,
@@ -1735,6 +1746,7 @@ async function main(): Promise<void> {
             branch: flag(rest, "--branch") ?? undefined,
             base: flag(rest, "--base") ?? undefined,
             path: flag(rest, "--path") ?? undefined,
+            onWarning: (m) => console.error(`relay: warning: ${m}`),
           });
           if (hasFlag(rest, "--json")) {
             console.log(JSON.stringify(b, null, 2));
@@ -1753,12 +1765,13 @@ async function main(): Promise<void> {
           const launched = await launchTaskRun(db, id, {
             timeoutMs: timeoutRaw ? parseDuration(timeoutRaw) : undefined,
             permissionMode: flag(rest, "--permission") ?? undefined,
+            onWarning: (m) => console.error(`relay: warning: ${m}`),
           });
           const r = await launched.handle.wait();
           if (hasFlag(rest, "--json")) {
             console.log(
               JSON.stringify(
-                { run: r, worktree: launched.worktree, branch: launched.branch, findings: launched.findings },
+                { run: r, worktree: launched.worktree, branch: launched.branch, findings: launched.findings, warnings: launched.warnings },
                 null,
                 2
               )
@@ -1783,7 +1796,7 @@ async function main(): Promise<void> {
           const id = positionals(rest)[0];
           if (!id) {
             throw new Error(
-              "usage: relay run factory <task-id> [--max-attempts N] [--dsh BIN] [--reviewer CMD] [--model M] [--timeout 30m] [--review-worktrees DIR] [--json]"
+              "usage: relay run factory <task-id> [--max-attempts N] [--dsh BIN] [--reviewer CMD] [--model M] [--permission MODE] [--timeout 30m] [--review-worktrees DIR] [--json]"
             );
           }
           const timeoutRaw = flag(rest, "--timeout");
@@ -1797,6 +1810,8 @@ async function main(): Promise<void> {
             timeoutMs: timeoutRaw ? parseDuration(timeoutRaw) : undefined,
             permissionMode: flag(rest, "--permission") ?? undefined,
             maxAttempts: maxRaw ? Number(maxRaw) : undefined,
+            // ISH-904: surface a stale/behind base and a failed origin refresh.
+            onWarning: (m) => console.error(`relay: warning: ${m}`),
             // ISH-829: the independent reviewer reads a detached read-only
             // worktree at the fixed head, outside the writer's checkout.
             reviewWorktreeRoot: flag(rest, "--review-worktrees") ?? join(repoRoot, STATE_DIR, "review-worktrees"),
