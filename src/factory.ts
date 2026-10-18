@@ -29,6 +29,7 @@ import {
 import { checkMergeGate, type MergeGateDecision, type MergeGateDeps } from "./merge-gate";
 import { prepareReadOnlyReviewWorktree, removeReviewWorktree } from "./review-workspace";
 import type { NativeReviewDeps } from "./providers";
+import { bindTaskPr, type PrBindingDeps } from "./pr-binding";
 
 /**
  * ISH-762 Factory driver.
@@ -120,6 +121,13 @@ export interface FactoryDeps {
    * path and Relay performs no external write (backward compatible).
    */
   nativeReview?: NativeReviewDeps;
+  /**
+   * ISH-880: bind the produced commit to a GitHub PR before the Task enters the
+   * review stage. Opt-in — unset keeps the read-only behaviour. When set, a Task
+   * with a recorded `pr_repo`/`pr_url` must have its PR's live remote head equal
+   * the produced commit before the reviewer runs; otherwise the Factory BLOCKS.
+   */
+  prBinding?: PrBindingDeps;
 }
 
 export interface FactoryAttempt {
@@ -734,9 +742,30 @@ export async function runFactoryTask(
         continue;
       }
       case "review": {
+        // ISH-880: BEFORE the review stage, bind the produced commit to a real
+        // GitHub PR and require the PR's CURRENT remote head to equal it. This is
+        // the only place a Sandbox-produced commit becomes a PR; if the PR cannot
+        // be read, is unreadable/moved/unauthorized, the Factory BLOCKS and the
+        // reviewer never runs (never a fake review_pass).
+        const reviewHead = task.head_sha;
+        if (deps.prBinding && reviewHead && (task.pr_repo || task.pr_url)) {
+          const bind = bindTaskPr(db, taskId, { ...deps.prBinding, expectedHead: reviewHead });
+          if (bind.status === "blocked") {
+            push(`review:pr-binding-blocked ${bind.reason ?? ""}`);
+            return {
+              taskId,
+              outcome: "blocked",
+              head: getTask(db, taskId)!.head_sha,
+              attempts,
+              gate: null,
+              reason: bind.reason ?? `${bind.identity}`,
+              steps,
+            };
+          }
+          push(`review:pr-${bind.status} ${bind.ref?.repo ?? "-"}#${bind.ref?.number ?? "-"}@${(bind.remoteHead ?? "none").slice(0, 10)}`);
+        }
         // ISH-829: the independent reviewer reads a DETACHED read-only checkout
         // at the fixed head (when configured), never the writer's live worktree.
-        const reviewHead = task.head_sha;
         let reviewWorktree: string | undefined;
         if (deps.reviewWorktreeRoot && reviewHead) {
           const ws = prepareReadOnlyReviewWorktree(

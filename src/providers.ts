@@ -62,6 +62,19 @@ export interface PrView {
   /** Derived display only — never a source of truth for a phase. */
   labels: string[];
   updatedAt: string;
+  /**
+   * ISH-880: true when the PR's HEAD branch lives in a DIFFERENT repository (a
+   * GitHub fork PR). A `gh pr list --head <branch>` lookup returns fork PRs, so
+   * the PR binding requires this to be explicitly false before it will adopt a
+   * PR by repo+branch. Absent (a fake/older view) is treated as unknown and the
+   * binding fails closed when a repo is known.
+   */
+  isCrossRepository?: boolean;
+  /**
+   * ISH-880: the head branch's repository `owner/name` when GitHub reports it
+   * (`headRepository.nameWithOwner`). Empty when unreported.
+   */
+  headRepo?: string;
 }
 
 export interface CommentView {

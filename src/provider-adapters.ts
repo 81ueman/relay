@@ -72,9 +72,13 @@ interface GhPrJson {
   labels?: { name?: string }[];
   updatedAt?: string;
   number?: number;
+  // ISH-880: fork detection — a `--head` lookup returns cross-repository PRs.
+  isCrossRepository?: boolean;
+  headRepository?: { nameWithOwner?: string } | null;
 }
 
-const PR_FIELDS = "url,state,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,mergeable,labels,updatedAt,number";
+const PR_FIELDS =
+  "url,state,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,mergeable,labels,updatedAt,number,isCrossRepository,headRepository";
 
 function toPrView(ref: PrRef, j: GhPrJson): PrView {
   return {
@@ -94,6 +98,8 @@ function toPrView(ref: PrRef, j: GhPrJson): PrView {
           : "unknown",
     labels: (j.labels ?? []).map((l) => l.name ?? "").filter(Boolean),
     updatedAt: j.updatedAt ?? "",
+    isCrossRepository: j.isCrossRepository === true,
+    headRepo: j.headRepository?.nameWithOwner ?? "",
   };
 }
 

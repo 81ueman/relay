@@ -405,6 +405,15 @@ an approval allowlist, **not** an OS sandbox — Relay does not claim process
 isolation from it. The reviewer model is configurable (`RELAY_REVIEW_MODEL` /
 `--model`, default `opus`).
 
+**PR binding (ISH-880):** a Sandbox-produced commit can be bridged to a real
+GitHub PR **before the review stage** (`FactoryDeps.prBinding`, opt-in). The
+Factory re-reads the PR and requires its live `headSha` to equal the produced
+commit; a moved/unreadable/other-repo PR — or an unauthorized publish — **blocks**
+before the reviewer runs. `relay pr bind <task-id>` re-reads/verifies a recorded
+PR, and `--publish` is the explicit point-of-use write grant that pushes the
+commit and find-or-creates the PR (normal `git`/`gh`; never merges). See
+[`docs/pr-binding.md`](docs/pr-binding.md).
+
 ### Headless dsh Runs (no Herdr)
 
 A coding attempt can run as **one `dsh --profile headless --json` process** — no
@@ -1610,6 +1619,7 @@ src/cli.ts  daemon.ts  db.ts  schema.ts  scheduler.ts  reconciler.ts
     runtimes.ts  mail-policy.ts  harness.ts  wake-outbox.ts  dsh-runner.ts
     run-lifecycle.ts  sandbox.ts  sandbox-lifecycle.ts
 docs/dsh-headless-runner.md  docs/run-lifecycle.md  docs/sandbox-lifecycle.md
+docs/factory-e2e.md  docs/pr-binding.md
     runtime/{runtime,herdr}.ts
     dashboard/{command,model,render,affinity,herdr,doctor}.ts
 .opencode/plugins/relay.ts  integrations/herdr/{herdr-plugin.toml,focus-pane.ts}
