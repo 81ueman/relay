@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { resolve as resolvePath } from "node:path";
 import type { Worker } from "../schema";
-import { harness, inferKind } from "../harness";
+import { AGENT_KINDS_HELP, harness, inferKind } from "../harness";
 import {
   MockRuntime,
   type AgentStatus,
@@ -430,8 +430,8 @@ export class HerdrRuntime implements Runtime {
     const { sessionId, hint } = input;
     const agents = listAgents();
     // Infer the expected agent kind from the session id (see src/harness.ts): a
-    // bare UUID is the historical non-`ses` codex default, `session-<uuid>` is
-    // dsh. An explicit hint always wins, so a claude UUID is resolved by
+    // bare UUID is the historical non-`ses` codex default, and `ses...` is
+    // opencode. An explicit hint always wins, so a claude UUID is resolved by
     // declaring `--kind claude`.
     const wantKind = hint?.agentKind ?? inferKind(sessionId);
 
@@ -504,14 +504,14 @@ export class HerdrRuntime implements Runtime {
         "no Herdr workspace configured: set RELAY_HERDR_WORKSPACE (or HERDR_WORKSPACE_ID); refusing to spawn into the focused workspace"
       );
     }
-    // Herdr can only start harnesses that register a real `--kind`. dsh is not
-    // one: it is started by hand and its relay plugin self-reports the pane, so
-    // an autonomous (re)spawn is refused with a clear message instead of a
-    // confusing `agent start` failure.
+    // Herdr can only start harnesses that register a real `--kind`. A worker
+    // whose `agent_kind` is no longer a registered harness (e.g. a legacy row on
+    // an upgraded DB) is refused with a clear message instead of a confusing
+    // `agent start` failure.
     const startKind = harness(w.agent_kind)?.herdrStartKind ?? null;
     if (!startKind) {
       throw new Error(
-        `cannot spawn ${w.agent_kind} worker ${w.id}: Herdr has no '${w.agent_kind}' agent kind; start it by hand (dsh --profile web) and attach with relay session attach --kind ${w.agent_kind}`
+        `cannot spawn worker ${w.id}: agent kind '${w.agent_kind}' is not a registered harness (${AGENT_KINDS_HELP}); retire or re-register the worker`
       );
     }
     const cwd = w.cwd ?? process.cwd();
