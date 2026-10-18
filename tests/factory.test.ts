@@ -519,6 +519,23 @@ describe("Factory E2E: real worktree, fake headless dsh + independent reviewer",
     expect(res.gate).not.toBeNull();
   });
 
+  test("ISH-830e: a resumed Factory (Task already in review) still carries the durable VERIFY evidence", async () => {
+    const dsh = fakeDsh("dsh-commit", COMMITTING_DSH);
+    const id = newTask();
+    // Drive the Task to `review` in a PRIOR process: launch -> submit -> verify.
+    // The VERIFY result is durable (a VerificationResult row); this new
+    // `runFactoryTask` call has NO in-process memory of the verify step.
+    const head = await driveToReview(id, dsh);
+    const rev = reviewerHarness(["pass"]);
+    const res = await runFactoryTask(db, id, factoryDeps(dsh, rev.spawner));
+    expect(res.outcome).toBe("merge_ready");
+    expect(rev.calls).toHaveLength(1);
+    expect(rev.calls[0].head).toBe(head);
+    // The brief still has the Mechanical VERIFY section, read from the row.
+    expect(rev.calls[0].brief).toContain("## Mechanical VERIFY — ALREADY RUN");
+    expect(rev.calls[0].brief).toContain("Outcome: `pass`");
+  });
+
   test("ISH-878: a Sandbox-backed Task IMPLEMENTs + FIXes INSIDE the Sandbox (never the host)", async () => {
     const dsh = fakeDsh("dsh-sbx", COMMITTING_DSH);
     const id = newTask();

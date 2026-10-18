@@ -10,6 +10,7 @@ import { isCanonicalToken, processPgid, spawnIdentityToken } from "./proc-identi
 import { defaultRunner, type CheckSpec, type CommandRunner } from "./verify";
 import { defaultVerifyTarget, type VerifyTarget } from "./sandbox-verify";
 import { runMechanicalVerification, submitPhase, taskChecks } from "./workflow";
+import { findTaskResult } from "./results";
 import { acceptRunSubmission, getRun, type DshSpawner } from "./dsh-runner";
 import { launchTaskRun, type LaunchRunOptions } from "./run-lifecycle";
 import { getSandbox, SANDBOX_ERROR, type SbxCli } from "./sandbox";
@@ -633,6 +634,47 @@ function reviewEvidenceBase(deps: FactoryDeps, taskId: string): string {
 }
 
 /**
+ * ISH-830e: the DURABLE mechanical VERIFY evidence for a review — read from the
+ * `VerificationResult` row (SQLite is the only source of truth), never from
+ * process memory, so a Factory resumed directly into `review` still hands the
+ * host reviewer the sandbox result. Only a PASSING verify at the EXACT reviewed
+ * head is used; anything else yields no VERIFY section (fail closed to the old
+ * behaviour: the reviewer sees only the declared checks).
+ */
+export function durableVerifyEvidence(
+  db: Database,
+  taskId: string,
+  attempt: number,
+  reviewHead: string | null
+): ReviewVerifyEvidence | null {
+  const row = findTaskResult(db, taskId, "verify", attempt, "VerificationResult");
+  if (!row || row.passed !== 1 || !reviewHead || row.head_sha !== reviewHead) return null;
+  let payload: unknown;
+  try {
+    payload = JSON.parse(row.payload_json);
+  } catch {
+    return null;
+  }
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
+  const p = payload as Record<string, unknown>;
+  const checksRaw = Array.isArray(p.checks) ? p.checks : [];
+  const checks = checksRaw
+    .filter((c): c is Record<string, unknown> => !!c && typeof c === "object" && !Array.isArray(c))
+    .map((c) => ({
+      name: String(c.name ?? ""),
+      required: c.required !== false,
+      outcome: String(c.outcome ?? ""),
+      exitCode: typeof c.exitCode === "number" ? c.exitCode : null,
+      ...(typeof c.output === "string" ? { output: c.output } : {}),
+    }));
+  return {
+    head: row.head_sha,
+    outcome: typeof p.outcome === "string" ? p.outcome : "",
+    checks,
+  };
+}
+
+/**
  * ISH-830e: a BLOCKED VERIFY must name the fence that failed. `verify not_run`
  * alone is opaque (it hid a dirty-tree fence failure in the ISH-830 harness); the
  * per-check outcome + a bounded output tail make the block diagnosable.
@@ -698,9 +740,6 @@ export async function runFactoryTask(
   const guardMax = maxAttempts * 6 + 12;
   let lastAttempt = -1;
   let current: FactoryAttempt | null = null;
-  // ISH-830e: the mechanical VERIFY result for the CURRENT attempt, captured at
-  // the (sandbox) verify step and handed to the host reviewer as context.
-  let lastVerify: (ReviewVerifyEvidence & { attempt: number }) | null = null;
 
   const push = (s: string) => {
     steps.push(s);
@@ -786,20 +825,6 @@ export async function runFactoryTask(
           continue;
         }
         push(`verify:pass@${task.attempt}`);
-        // ISH-830e: capture the sandbox VERIFY result (with the raw check output)
-        // for the review brief — the host reviewer never sees the sandbox.
-        lastVerify = {
-          attempt: task.attempt,
-          head: getTask(db, taskId)!.head_sha,
-          outcome: v.outcome,
-          checks: v.checks.map((c) => ({
-            name: c.name,
-            required: c.required,
-            outcome: c.outcome,
-            exitCode: c.exitCode,
-            output: c.output,
-          })),
-        };
         continue;
       }
       case "review": {
@@ -854,8 +879,13 @@ export async function runFactoryTask(
             evidenceBase: task.worktree ? undefined : reviewEvidenceBase(deps, taskId),
             nativeReview: deps.nativeReview,
             // ISH-830e: give the host reviewer the sandbox VERIFY evidence so it
-            // can judge the code without re-running the lab.
-            ...(lastVerify && lastVerify.attempt === task.attempt ? { verifyEvidence: lastVerify } : {}),
+            // can judge the code without re-running the lab. Sourced from the
+            // DURABLE VerificationResult row (not process memory), so a resumed
+            // Factory still carries it.
+            ...(() => {
+              const evidence = durableVerifyEvidence(db, taskId, task.attempt, reviewHead);
+              return evidence ? { verifyEvidence: evidence } : {};
+            })(),
           });
         } finally {
           if (reviewWorktree) removeReviewWorktree(deps.repo ?? projectRoot(), reviewWorktree);

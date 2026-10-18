@@ -78,14 +78,14 @@ export const DEFAULT_REVIEW_MODEL = "opus";
 
 /**
  * ISH-830e: the reviewer's permission ceiling. `auto` lets the CLI's own
- * classifier approve SAFE (read-mostly) actions — e.g. a read-only `git diff` to
- * see what changed — without pre-approving every tool. This is deliberately NOT
+ * classifier approve SAFE actions — e.g. a read-only `git diff` to see what
+ * changed — without pre-approving every tool. It is deliberately NOT
  * `bypassPermissions` and NOT an all-tools allowlist, and it is FIXED (there is
- * no knob that could raise it). The brief still instructs the reviewer to treat
- * the checkout as READ-ONLY; read-only is enforced by the disposable detached
- * review checkout, the head-bound verdict, the post-review head guard, and this
- * classifier. The ISH-883 native-PR path keeps its explicit `allowedTools`
- * allowlist (it must run `gh`), so it is unchanged.
+ * no knob). This is an APPROVAL mode, not an OS sandbox: Relay does NOT claim it
+ * prevents an uncommitted write. What actually holds for the reviewer is
+ * independence (`recordReview`), a HEAD-bound verdict, and a disposable detached
+ * review checkout where one is configured (`reviewWorktreeRoot`). The ISH-883
+ * native-PR path keeps its explicit `allowedTools` allowlist (it must run `gh`).
  */
 export const DEFAULT_REVIEW_PERMISSION_MODE = "auto";
 
