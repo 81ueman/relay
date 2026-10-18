@@ -67,8 +67,6 @@ export interface PrBindingResult {
   expectedHead: string | null;
   /** The PR's observed remote head (null when unreadable). */
   remoteHead: string | null;
-  /** Always false: Relay never creates a PR (Agent-owned GitHub writes). */
-  created: boolean;
   reason: string | null;
   /** Stable identity of this binding decision (task, head, status, ref). */
   identity: string;
@@ -182,7 +180,6 @@ export function bindTaskPr(db: Database, taskId: string, deps: PrBindingDeps = {
       ref,
       expectedHead,
       remoteHead,
-      created: false,
       reason: `${PR_BINDING_ERROR}: ${code}: ${message}`,
       identity,
     };
@@ -204,7 +201,7 @@ export function bindTaskPr(db: Database, taskId: string, deps: PrBindingDeps = {
       type: event,
       payload: { repo: ref.repo, number: ref.number, head: view.headSha, expectedHead },
     });
-    return { taskId, status, ref, expectedHead, remoteHead: view.headSha, created: false, reason: null, identity };
+    return { taskId, status, ref, expectedHead, remoteHead: view.headSha, reason: null, identity };
   };
 
   /**

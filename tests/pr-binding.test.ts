@@ -124,7 +124,6 @@ describe("bindTaskPr: re-read and bind the produced commit (read-only)", () => {
     const r = bindTaskPr(db, id, { github: gh });
 
     expect(r.status).toBe("bound");
-    expect(r.created).toBe(false); // Relay never creates a PR
     expect(r.remoteHead).toBe(A);
     const t = getTask(db, id)!;
     expect(t.pr_url).toBe(`https://github.com/${REPO}/pull/7`);
@@ -141,7 +140,6 @@ describe("bindTaskPr: re-read and bind the produced commit (read-only)", () => {
     const r = bindTaskPr(db, id, { github: gh });
 
     expect(r.status).toBe("adopted");
-    expect(r.created).toBe(false);
     expect(getTask(db, id)!.pr_url).toBe(`https://github.com/${REPO}/pull/7`);
   });
 
@@ -228,7 +226,6 @@ describe("ISH-885: a legitimate FIX is observed read-only (the Agent pushes B fi
     const r = bindTaskPr(db, id, { github: gh });
 
     expect(r.status).toBe("bound");
-    expect(r.created).toBe(false);
     expect(r.ref).toEqual({ repo: REPO, number: 7 }); // the SAME PR
     expect(r.remoteHead).toBe(B);
     expect(getTask(db, id)!.head_sha).toBe(B);

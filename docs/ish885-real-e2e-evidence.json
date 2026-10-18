@@ -2,85 +2,78 @@
   "task": "T16 / ISH-885",
   "architecture": "read-only Relay; Agent-owned GitHub writes",
   "repo": "81ueman/relay",
-  "branch": "relay/e2e-ish885-1792302585974",
-  "startedAt": "2026-10-18T05:49:45.974Z",
+  "branch": "relay/e2e-ish885-1792303409696",
+  "startedAt": "2026-10-18T06:03:29.696Z",
+  "codingAgentLeg": "NOT_RUN",
+  "githubWriter": "e2e-script stand-in (NOT dsh/DeepSeek)",
+  "independentClaudeJudgment": "NOT_RUN",
+  "reviewerIdentityIndependent": false,
   "steps": [
     {
-      "step": "agent-push-A-create-PR",
-      "sha": "ce8e168bcad545baf2609a1628e9bef2667b57a0",
-      "pr": "81ueman/relay#28",
-      "url": "https://github.com/81ueman/relay/pull/28",
-      "agent": "dsh/DeepSeek (script)",
-      "at": "2026-10-18T05:49:54.381Z"
+      "step": "standin-push-A-create-PR",
+      "sha": "f9f1e6fdd6d0bccb8352b6e81c3d13c03599c663",
+      "pr": "81ueman/relay#31",
+      "url": "https://github.com/81ueman/relay/pull/31",
+      "actor": "e2e-script stand-in (NOT dsh/DeepSeek)",
+      "at": "2026-10-18T06:03:37.326Z"
     },
     {
       "step": "relay-read-A-bound",
       "status": "bound",
-      "created": false,
-      "remoteHead": "ce8e168bcad545baf2609a1628e9bef2667b57a0",
-      "taskHead": "ce8e168bcad545baf2609a1628e9bef2667b57a0",
-      "at": "2026-10-18T05:49:55.053Z"
+      "remoteHead": "f9f1e6fdd6d0bccb8352b6e81c3d13c03599c663",
+      "taskHead": "f9f1e6fdd6d0bccb8352b6e81c3d13c03599c663",
+      "at": "2026-10-18T06:03:38.118Z"
     },
     {
-      "step": "claude-review-NG-at-A",
-      "reviewId": 5561642297,
+      "step": "relay-readback-NG-at-A",
+      "ok": true,
+      "reviewId": 5561682482,
       "author": "81ueman",
-      "headSha": "ce8e168bcad545baf2609a1628e9bef2667b57a0",
+      "headSha": "f9f1e6fdd6d0bccb8352b6e81c3d13c03599c663",
       "state": "COMMENTED",
-      "url": "https://github.com/81ueman/relay/pull/28#pullrequestreview-5561642297",
-      "at": "2026-10-18T05:50:07.041Z"
+      "url": "https://github.com/81ueman/relay/pull/31#pullrequestreview-5561682482",
+      "at": "2026-10-18T06:03:46.185Z"
     },
     {
-      "step": "agent-push-B-same-PR",
-      "sha": "ad58f2c3678f04b23cc663b9281af646ad1dab8a",
+      "step": "standin-push-B-same-PR",
+      "sha": "51c9466546a4eea83c18d6519ff5eb2d3092a238",
       "openPrs": 1,
-      "pr": "81ueman/relay#28",
-      "remoteHead": "ad58f2c3678f04b23cc663b9281af646ad1dab8a",
-      "at": "2026-10-18T05:50:11.933Z"
+      "pr": "81ueman/relay#31",
+      "remoteHead": "51c9466546a4eea83c18d6519ff5eb2d3092a238",
+      "actor": "e2e-script stand-in (NOT dsh/DeepSeek)",
+      "at": "2026-10-18T06:03:50.578Z"
     },
     {
       "step": "relay-read-B-bound",
       "status": "bound",
-      "created": false,
-      "remoteHead": "ad58f2c3678f04b23cc663b9281af646ad1dab8a",
-      "pr": "81ueman/relay#28",
-      "taskHead": "ad58f2c3678f04b23cc663b9281af646ad1dab8a",
+      "remoteHead": "51c9466546a4eea83c18d6519ff5eb2d3092a238",
+      "pr": "81ueman/relay#31",
+      "taskHead": "51c9466546a4eea83c18d6519ff5eb2d3092a238",
       "attempt": 1,
-      "at": "2026-10-18T05:50:12.663Z"
+      "at": "2026-10-18T06:03:51.032Z"
     },
     {
-      "step": "claude-review-OK-at-B",
-      "reviewId": 5561642936,
+      "step": "relay-readback-OK-at-B",
+      "ok": true,
+      "reviewId": 5561683045,
       "author": "81ueman",
-      "headSha": "ad58f2c3678f04b23cc663b9281af646ad1dab8a",
+      "headSha": "51c9466546a4eea83c18d6519ff5eb2d3092a238",
       "state": "COMMENTED",
-      "url": "https://github.com/81ueman/relay/pull/28#pullrequestreview-5561642936",
-      "at": "2026-10-18T05:50:22.446Z"
-    },
-    {
-      "step": "no-relay-writes",
-      "relayPublisher": "none (deleted)",
-      "reviewAuthors": [
-        "81ueman"
-      ],
-      "ghLogin": "81ueman",
-      "commits": {
-        "A": "ce8e168bcad545baf2609a1628e9bef2667b57a0",
-        "B": "ad58f2c3678f04b23cc663b9281af646ad1dab8a"
-      },
-      "at": "2026-10-18T05:50:22.778Z"
+      "url": "https://github.com/81ueman/relay/pull/31#pullrequestreview-5561683045",
+      "at": "2026-10-18T06:03:59.237Z"
     }
   ],
   "result": "PASS",
-  "prNumber": 28,
+  "prNumber": 31,
   "shas": {
-    "A": "ce8e168bcad545baf2609a1628e9bef2667b57a0",
-    "B": "ad58f2c3678f04b23cc663b9281af646ad1dab8a"
+    "A": "f9f1e6fdd6d0bccb8352b6e81c3d13c03599c663",
+    "B": "51c9466546a4eea83c18d6519ff5eb2d3092a238"
   },
   "reviewIds": {
-    "ngA": 5561642297,
-    "okB": 5561642936
+    "ngA": 5561682482,
+    "okB": 5561683045
   },
+  "zeroRelayWrites": "static: no write argv (git push / gh pr create|edit|merge|review|comment / gh api --method) in src/; Relay's gh calls are pr view / pr list / GET api only. This run shares ONE GitHub account (81ueman), so it does not independently prove that.",
   "mergeReadyDrive": "NOT_RUN (full dsh+factory MergeReady covered by tests; this script proves the GitHub write/read boundary)",
-  "finishedAt": "2026-10-18T05:50:22.779Z"
+  "finishedAt": "2026-10-18T06:03:59.240Z"
 }

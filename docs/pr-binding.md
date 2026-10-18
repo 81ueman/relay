@@ -118,11 +118,20 @@ the reviewer never running. No network is used.
 RELAY_ISH885_E2E=1 bun scripts/ish885-real-e2e.ts   # or: bun run smoke:pr-binding:real
 ```
 
-Against a real disposable PR on `81ueman/relay`, the script plays the **Coding
-Agent** (`git push` + `gh pr create`), has headless **Claude** post a native NG
-review at A and a PASS marker at B, and uses Relay's **read-only** `bindTaskPr` to
-observe A, then B (same PR, A invalidated). It asserts Relay made zero GitHub
-writes and cleans up the PR/branch after writing
-[`ish885-real-e2e-evidence.json`](ish885-real-e2e-evidence.json). The full
-Sandbox-dsh coding leg and the Factory MergeReady drive are covered separately
-(tests); this script isolates the GitHub write/read boundary.
+Against a real disposable PR on `81ueman/relay`, the script is a **stand-in for
+the Coding Agent** (it runs `git push` + `gh pr create` itself — NOT dsh/DeepSeek,
+`codingAgentLeg: NOT_RUN`), has headless **Claude** post a native NG review at A
+and a PASS marker at B (the prompt pre-fills the verdict, so this shows posting +
+Relay's readback, not an independent judgment — `independentClaudeJudgment:
+NOT_RUN`), and uses Relay's **read-only** `bindTaskPr` + `verifyNativeReview` to
+observe A then B (same PR) and bind each review to its exact HEAD. It cleans up
+the PR/branch after writing
+[`ish885-real-e2e-evidence.json`](ish885-real-e2e-evidence.json).
+
+Relay's zero-GitHub-write property is argued **statically**, not from this run:
+there is no write argv (`git push` / `gh pr create|edit|merge|review|comment` /
+`gh api --method`) anywhere in `src/`, and Relay's `gh` calls are `pr view`,
+`pr list` and GET `api` only. The run cannot prove it independently because the
+stand-in, the Claude reviewer and the `gh` login all share ONE GitHub account
+(`81ueman`). The full Sandbox-dsh coding leg and the Factory MergeReady drive are
+covered separately (tests); this script isolates the GitHub write/read boundary.
