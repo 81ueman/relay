@@ -20,6 +20,7 @@
     "smoke:factory": "bun scripts/ish762-smoke.ts",
     "smoke:factory:real": "RELAY_REAL_SMOKE=1 bun scripts/ish762-real-smoke.ts",
     "smoke:pr-binding:real": "RELAY_ISH885_E2E=1 bun scripts/ish885-real-e2e.ts",
+    "smoke:agent-pr-e2e": "RELAY_ISH885B_E2E=1 bun scripts/ish885b-real-agent-e2e.ts",
     "daemon": "bun src/cli.ts daemon",
     "formal": "formal/run-tlc.sh Relay",
     "formal:safety": "formal/run-tlc.sh RelaySafety",
