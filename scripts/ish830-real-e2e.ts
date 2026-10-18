@@ -16,8 +16,13 @@
  *               the raw `MISSING_CREDENTIAL` output — never a PASS.
  *   nos       — a REAL Coding Sandbox (`sbx create --clone`) VERIFYs the exact
  *               bound HEAD against a REAL Shared-Lab SR Linux via `labctl`
- *               (deploy -> inspect --json -> SSH/sr_cli read-back -> destroy),
- *               reusing ISH-829's `sandboxVerifyTarget` boundary. Failure
+ *               (deploy -> inspect --json -> read-back -> destroy), reusing
+ *               ISH-829's `sandboxVerifyTarget` boundary. The read-back is
+ *               recorded three ways: the clab-api `exec` channel (NOT SSH), a
+ *               REAL `ssh` to the node's published `:22` (with the egress
+ *               CONNECT-proxy `ProxyCommand` as a documented fallback), and a
+ *               REAL `gnmic` get on the node's published `:57400`. Each leg is
+ *               `PASS` only with real evidence, else `NOT_RUN`. Failure
  *               injections (HEAD mismatch, dirty tree, API unavailable, a
  *               foreign-lab destroy) must never produce a PASS.
  *   parallel  — TWO real Task labs (distinct owners + ports) deployed at once;
@@ -54,10 +59,8 @@ import {
   type LabTask,
 } from "../src/lab";
 
-if (process.env.RELAY_ISH830_E2E !== "1") {
-  console.log("ISH-830 real E2E is opt-in: set RELAY_ISH830_E2E=1 to run it (creates real sandboxes + labs).");
-  process.exit(0);
-}
+// The opt-in guard lives in the `import.meta.main` entry block at the bottom of
+// this file, so the module can be imported (e.g. by tests) without running.
 
 // ---------------------------------------------------------------------------
 // result bookkeeping (a JSON record is printed at the end)
@@ -120,6 +123,104 @@ function labEnvFromProcess(): Record<string, string> {
   }
   return env;
 }
+
+// ---------------------------------------------------------------------------
+// Shared-Lab reachability (the real SSH / gNMI legs)
+// ---------------------------------------------------------------------------
+
+/**
+ * The Lab HOST ports the node's SSH (:22) and gNMI (:57400) are published on.
+ *
+ * `labctl inspect --reach-host host.docker.internal` derives its endpoints as
+ * `<reach-host>:<host_port>`, where `<host_port>` is the port the lab published
+ * *on the Lab host*. That target is only reachable from a Coding Sandbox when
+ * the Shared Lab also publishes that port 1:1 on `0.0.0.0` (`sbx ports`), so the
+ * harness publishes exactly these and allows them for the Sandbox.
+ *
+ * `:18001` is deliberately NOT used: on this host an unrelated long-lived
+ * service (an OpenHands `uvicorn` automation server) squats `127.0.0.1:18001`,
+ * and the Sandbox egress proxy dials the published binding on `127.0.0.1` — so
+ * a `host.docker.internal:18001` tunnel reaches that foreign listener and is
+ * closed, never the Lab's published port. `:18021` is free and 1:1-published.
+ */
+const SRL_SSH_HOST_PORT = 18021;
+const SRL_GNMI_HOST_PORT = 18002;
+
+/**
+ * The cap for a leg's recorded raw output. It must exceed the SR Linux SSH
+ * banner + `show version` table (a 600-char cap cut the body off mid-banner, so
+ * the `Software Version` row never reached the evidence); 4000 is ~3x the whole
+ * SSH leg, so nothing is trimmed in practice.
+ */
+const LEG_RAW_CAP = 4000;
+
+/**
+ * The pinned gNMI client. The Coding Kit (`sandbox/coding-kit/spec.yaml`)
+ * installs the same release into a real Coding Sandbox; this harness installs it
+ * into its own throwaway `shell` Sandbox so the gNMI leg is real there too.
+ * `github.com` is on the global allowlist, so no new network host is needed.
+ */
+const GNMIC_VERSION = "0.49.0";
+const GNMIC_URL = `https://github.com/openconfig/gnmic/releases/download/v${GNMIC_VERSION}/gnmic_${GNMIC_VERSION}_Linux_aarch64.tar.gz`;
+
+/** `host.docker.internal:<p>,localhost:<p>` for each port (both aliases pinned). */
+function allowHostPorts(ports: (string | number)[]): string {
+  return ports.flatMap((p) => [`host.docker.internal:${p}`, `localhost:${p}`]).join(",");
+}
+
+/**
+ * Ensure the Shared Lab publishes each node HOST port 1:1 on `0.0.0.0`. `sbx
+ * ports --publish` exits non-zero with `409 … already published` once the
+ * binding exists, which is success here (idempotent). A real failure is `ok:false`.
+ */
+function ensureLabPorts(published: number[]): { ok: boolean; detail: string } {
+  const notes: string[] = [];
+  let ok = true;
+  for (const p of published) {
+    const r = realSbxCli.run(["ports", "ish824-lab", "--publish", `0.0.0.0:${p}:${p}`]);
+    if (r.ok) notes.push(`${p}: published`);
+    else if (/already published/i.test(r.err)) notes.push(`${p}: already published`);
+    else {
+      ok = false;
+      notes.push(`${p}: FAILED (${r.err || r.out || `exit ${r.code}`})`);
+    }
+  }
+  return { ok, detail: notes.join("; ") };
+}
+
+export interface SshAttempt {
+  /** The exit marker of the attempt that produced the PASS (e.g. `SSH_EXIT=0`). */
+  exit: string;
+  /** The exact command of that attempt (credentials are already redacted by the script). */
+  command: string;
+  /** True when the PASS came from the CONNECT-proxy fallback attempt. */
+  viaFallback: boolean;
+}
+
+/**
+ * Pick the SSH attempt that produced the PASS out of the leg's echoed output.
+ *
+ * The direct attempt always echoes `SSH_EXIT=<rc>`. The CONNECT-proxy fallback
+ * runs ONLY after the direct path failed (`SSH_LEG_RAW_FAIL`) and echoes
+ * `--- SSH CONNECT-proxy fallback ---`, `SSH fallback command:` and
+ * `SSH_FALLBACK_EXIT=<rc>`. So on the fallback path the FIRST
+ * `SSH(_FALLBACK)?_EXIT=` line is the FAILED direct attempt, and a PASS must
+ * report the LAST successful one (with the fallback command) — never the failed
+ * attempt's exit code or command.
+ */
+export function selectSshAttempt(sshLeg: string): SshAttempt {
+  const lines = sshLeg.split("\n").map((l) => l.trim());
+  const exits = lines.filter((l) => /^SSH(_FALLBACK)?_EXIT=/.test(l));
+  // The attempt that emitted `=0` is the one that passed (the script only emits
+  // `SSH_LEG_OK` after a 0 exit); otherwise the last marker is the latest try.
+  const selected = [...exits].reverse().find((l) => l.endsWith("=0")) ?? exits[exits.length - 1] ?? "";
+  const viaFallback = selected.startsWith("SSH_FALLBACK_EXIT=");
+  const command =
+    lines.find((l) => l.startsWith(viaFallback ? "SSH fallback command:" : "SSH command:")) ??
+    lines.find((l) => l.startsWith("SSH command:")) ??
+    "";
+  return { exit: selected, command, viaFallback };
+}
 /** Start the Shared Lab VM and wait until clab-api-server answers (cold start is ~2s). */
 function warmLab(): void {
   const r = sh(
@@ -167,6 +268,15 @@ function ensureLabctlInSandbox(sandbox: string, workspace: string): { ok: boolea
     "  sleep 3",
     "done",
     "python3 -c 'import yaml' >/dev/null 2>&1",
+    "# gnmic (the pinned gNMI client; the same release the Coding Kit installs).",
+    "# Best-effort: without it the gNMI leg is NOT_RUN, never a PASS.",
+    `for i in 1 2 3; do`,
+    `  command -v gnmic >/dev/null 2>&1 && break`,
+    `  curl -sSLf -o /tmp/gnmic.tgz ${GNMIC_URL} 2>/dev/null &&`,
+    `    sudo tar -xzf /tmp/gnmic.tgz -C /usr/local/bin gnmic 2>/dev/null &&`,
+    `    sudo chmod 0755 /usr/local/bin/gnmic || true`,
+    `  sleep 2`,
+    "done",
     "labctl --help >/dev/null",
   ].join("\n");
   const r = realSbxCli.run(sbxExecArgv(sandbox, bashLc(script), { workdir: workspace }));
@@ -279,6 +389,7 @@ function nosCheckScript(lab: string, ns: string, api: string, insecure: boolean)
     "# Credentials are provisioned into ~/.labctl.env by the harness (never logged).",
     '[ -f "$HOME/.labctl.env" ] && . "$HOME/.labctl.env"',
     `API="${api}"`,
+    'SRL_PASSWORD="${SRL_PASSWORD:-NokiaSrl1!}"',
     "# Fail-closed teardown: EVERY exit of this check destroys its own lab, so a",
     "# failure after `deploy` (inspect/exec/ssh index) can never leak it. A later",
     "# explicit destroy is a no-op (the trap then sees EXIT_NOTFOUND).",
@@ -292,30 +403,53 @@ function nosCheckScript(lab: string, ns: string, api: string, insecure: boolean)
     `echo '--- clab-api exec (NOT SSH) ---'`,
     `labctl exec --json --api "$API" ${ins} ${lab}/srl1 -- sr_cli -c "show version"`,
     "# (b) REAL SSH from the Sandbox to the node's published :22 (reachable_at).",
+    "# The exact command is echoed (password redacted) with its raw output + exit.",
     `echo '--- real SSH leg (published :22) ---'`,
     `SSH_EP=$(python3 -c "import json;d=json.load(open('/tmp/ins.json'));print([e['reachable_at'] for n in d['nodes'] for e in n.get('mgmt_endpoints',[]) if e.get('container_port')==22][0])")`,
-    `if command -v sshpass >/dev/null 2>&1; then`,
-    `  SSH_HOST="\${SSH_EP%%:*}"; SSH_PORT="\${SSH_EP##*:}"`,
-    `  if sshpass -p "\${SRL_PASSWORD:-NokiaSrl1!}" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=15 -p "$SSH_PORT" admin@"$SSH_HOST" "show version" 2>&1; then`,
-    `    echo SSH_LEG_OK`,
-    `  else`,
-    `    echo SSH_LEG_FAIL`,
-    `  fi`,
-    `else`,
-    `  echo 'SSH_NOT_RUN: sshpass is not installed in the sandbox'`,
-    `fi`,
-    "# (c) REAL gNMI on the node's published :57400 (reachable_at), if gnmic exists.",
+    `SSH_HOST="\${SSH_EP%%:*}"; SSH_PORT="\${SSH_EP##*:}"`,
+    `SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=15"`,
+    `echo "SSH command: sshpass -p <redacted> ssh $SSH_OPTS -p $SSH_PORT admin@$SSH_HOST 'show version'"`,
+    "if command -v sshpass >/dev/null 2>&1; then",
+    `  sshpass -p "$SRL_PASSWORD" ssh $SSH_OPTS -p "$SSH_PORT" admin@"$SSH_HOST" "show version" > /tmp/ssh.out 2>&1 && SSH_RC=0 || SSH_RC=$?`,
+    "  cat /tmp/ssh.out",
+    `  echo "SSH_EXIT=$SSH_RC"`,
+    `  if [ "$SSH_RC" = 0 ] && grep -qE 'Software Version|SRLinux' /tmp/ssh.out; then`,
+    "    echo SSH_LEG_OK",
+    "  else",
+    "    echo SSH_LEG_RAW_FAIL",
+    "    # Documented fallback: the Sandbox egress CONNECT proxy (HTTP CONNECT at",
+    "    # gateway.docker.internal:3128) can carry the same TCP stream when the",
+    "    # transparent raw path is refused.",
+    "    if command -v socat >/dev/null 2>&1; then",
+    `      echo '--- SSH CONNECT-proxy fallback ---'`,
+    `      echo "SSH fallback command: sshpass -p <redacted> ssh $SSH_OPTS -o ProxyCommand='socat - PROXY:gateway.docker.internal:%h:%p,proxyport=3128' -p $SSH_PORT admin@$SSH_HOST 'show version'"`,
+    `      echo 'ProxyCommand: socat - PROXY:gateway.docker.internal:%h:%p,proxyport=3128'`,
+    `      sshpass -p "$SRL_PASSWORD" ssh $SSH_OPTS -o ProxyCommand='socat - PROXY:gateway.docker.internal:%h:%p,proxyport=3128' -p "$SSH_PORT" admin@"$SSH_HOST" "show version" > /tmp/ssh2.out 2>&1 && SSH2_RC=0 || SSH2_RC=$?`,
+    "      cat /tmp/ssh2.out",
+    `      echo "SSH_FALLBACK_EXIT=$SSH2_RC"`,
+    `      if [ "$SSH2_RC" = 0 ] && grep -qE 'Software Version|SRLinux' /tmp/ssh2.out; then echo SSH_LEG_OK; fi`,
+    "    else",
+    "      echo 'SSH_FALLBACK_NOT_RUN: socat is not installed in the sandbox'",
+    "    fi",
+    "  fi",
+    "else",
+    "  echo 'SSH_NOT_RUN: sshpass is not installed in the sandbox'",
+    "fi",
+    "# (c) REAL gNMI on the node's published :57400 (reachable_at) via gnmic.",
+    "# SR Linux serves gNMI over TLS with a self-signed cert, so the client needs",
+    "# `--skip-verify` (TLS, verification skipped) — NOT `--insecure`, which would",
+    "# speak plaintext gRPC to a TLS port and always fail.",
     `echo '--- real gNMI leg (published :57400) ---'`,
-    `if command -v gnmic >/dev/null 2>&1; then`,
+    "if command -v gnmic >/dev/null 2>&1; then",
     `  GNMI_EP=$(python3 -c "import json;d=json.load(open('/tmp/ins.json'));print([e['reachable_at'] for n in d['nodes'] for e in n.get('mgmt_endpoints',[]) if e.get('container_port')==57400][0])")`,
-    `  if gnmic -a "$GNMI_EP" --insecure -e json_ietf get --path /system/name/host-name 2>&1; then`,
-    `    echo GNMI_LEG_OK`,
-    `  else`,
-    `    echo GNMI_LEG_FAIL`,
-    `  fi`,
-    `else`,
-    `  echo 'GNMI_NOT_RUN: gnmic is not installed in the sandbox'`,
-    `fi`,
+    `  echo "gNMI command: gnmic -a $GNMI_EP -u admin -p <redacted> --skip-verify -e json_ietf get --path /system/name/host-name"`,
+    `  gnmic -a "$GNMI_EP" -u admin -p "$SRL_PASSWORD" --skip-verify -e json_ietf get --path /system/name/host-name > /tmp/gnmi.out 2>&1 && GNMI_RC=0 || GNMI_RC=$?`,
+    "  cat /tmp/gnmi.out",
+    `  echo "GNMI_EXIT=$GNMI_RC"`,
+    `  if [ "$GNMI_RC" = 0 ] && grep -q 'host-name' /tmp/gnmi.out; then echo GNMI_LEG_OK; else echo GNMI_LEG_FAIL; fi`,
+    "else",
+    "  echo 'GNMI_NOT_RUN: gnmic is not installed in the sandbox'",
+    "fi",
     `labctl destroy --name ${lab} --json --api "$API" ${ins} >/tmp/del.json`,
     "cat /tmp/del.json",
     "echo NOS_CHECK_DONE",
@@ -369,13 +503,13 @@ async function stageNos(dir: string, api: string, insecure: boolean): Promise<vo
       "      type: ixrd3",
       "      image: ghcr.io/nokia/srlinux:latest",
       "      ports:",
-      '        - "18001:22"',
-      '        - "18002:57400"',
+      `        - "${SRL_SSH_HOST_PORT}:22"`,
+      `        - "${SRL_GNMI_HOST_PORT}:57400"`,
       "",
     ].join("\n")
   );
   writeFileSync(join(topoDir, "nos-check.sh"), nosCheckScript(lab, ns, api, insecure));
-  // The port-collision topology: same published host port 18001 as `smoke.clab.yml`.
+  // The port-collision topology: same published host port as `smoke.clab.yml`.
   const portDir = join(repo, "labs", portLab);
   mkdirSync(portDir, { recursive: true });
   writeFileSync(
@@ -389,7 +523,7 @@ async function stageNos(dir: string, api: string, insecure: boolean): Promise<vo
       "      type: ixrd3",
       "      image: ghcr.io/nokia/srlinux:latest",
       "      ports:",
-      '        - "18001:22"',
+      `        - "${SRL_SSH_HOST_PORT}:22"`,
       "",
     ].join("\n")
   );
@@ -412,7 +546,16 @@ async function stageNos(dir: string, api: string, insecure: boolean): Promise<vo
     realSbxCli.run(sbxExecArgv(sandbox, bashLc(`mkdir -p "$HOME" && cat > "$HOME/.labctl.env" <<'EOF'\n${envFile}\nEOF\nchmod 600 "$HOME/.labctl.env"`)));
     const u = new URL(api);
     const apiPort = u.port || (u.protocol === "https:" ? "443" : "80");
-    realSbxCli.run(["policy", "allow", "network", "--sandbox", sandbox, `host.docker.internal:${apiPort},localhost:${apiPort},host.docker.internal:18001,localhost:18001,host.docker.internal:18002,localhost:18002`]);
+    const published = ensureLabPorts([SRL_GNMI_HOST_PORT, SRL_SSH_HOST_PORT]);
+    record("nos.lab-ports", published.ok ? "PASS" : "FAIL", `Shared Lab node ports published 1:1 on 0.0.0.0: ${published.detail}`);
+    realSbxCli.run([
+      "policy",
+      "allow",
+      "network",
+      "--sandbox",
+      sandbox,
+      allowHostPorts([apiPort, SRL_SSH_HOST_PORT, SRL_GNMI_HOST_PORT]),
+    ]);
     const labctlReady = ensureLabctlInSandbox(sandbox, repo);
     if (!labctlReady.ok) {
       record("nos", "FAIL", `labctl is not runnable inside the sandbox: ${labctlReady.detail}`);
@@ -434,32 +577,64 @@ async function stageNos(dir: string, api: string, insecure: boolean): Promise<vo
     const pass = await target.runner.run(checks[0], { cwd: target.cwd });
     const out = `${pass.stdout ?? ""}\n${pass.output ?? ""}`;
     if (pass.outcome === "pass") {
+      // `out` is already bounded by the runner (each stream is tail-capped at
+      // `STREAM_TAIL`); record it WHOLE so the SSH `show version` body survives.
       const verLine = out.split("\n").find((l) => /Software Version|SRLinux/i.test(l))?.trim() ?? "";
       record("nos", "PASS", `real SR Linux VERIFY at the bound HEAD ${head.slice(0, 12)}: ${verLine}`, {
         command: "sandboxVerifyTarget.runner.run(nos-readback)",
-        raw: out.slice(-1400),
+        raw: out,
       });
     } else {
-      record("nos", "FAIL", `real SR Linux VERIFY was '${pass.outcome}' (never a PASS)`, { raw: out.slice(0, 800) });
+      record("nos", "FAIL", `real SR Linux VERIFY was '${pass.outcome}' (never a PASS)`, { raw: out });
     }
     // SSH / gNMI are recorded SEPARATELY and honestly: the `labctl exec` read-back
     // above is clab-api-server docker exec, NOT SSH. A PASS requires REAL evidence
     // (a version over the published :22, or a gNMI get on :57400); otherwise the
-    // leg is NOT_RUN — never claimed.
+    // leg is NOT_RUN — never claimed. A non-PASS leg still keeps its WHOLE output,
+    // with the cause distinguished, so a real failure (e.g. the TLS mismatch this
+    // change fixes) is never misreported as a missing tool with its output dropped.
     const sshLeg = out.split("--- real SSH leg (published :22) ---")[1]?.split("--- real gNMI")[0] ?? "";
     const sshOk = out.includes("SSH_LEG_OK") && /Software Version|SRLinux/i.test(sshLeg);
-    record(
-      "nos.ssh",
-      sshOk ? "PASS" : "NOT_RUN",
-      sshOk ? "real SSH from the Sandbox to the node published :22 returned `show version`" : "SSH NOT_RUN (no SSH evidence obtained)",
-      sshOk ? {} : { raw: sshLeg.trim().slice(0, 300) || "sshpass unavailable" }
-    );
-    const gnmiOk = out.includes("GNMI_LEG_OK") && /host-name/i.test(out);
-    record(
-      "nos.gnmi",
-      gnmiOk ? "PASS" : "NOT_RUN",
-      gnmiOk ? "real gNMI from the Sandbox to the node published :57400 returned the host-name" : "gNMI NOT_RUN (gnmic not installed in the Sandbox)"
-    );
+    // Report the attempt that PASSED: on the fallback path the FIRST exit marker
+    // is the FAILED direct attempt, so a PASS must not report its exit/command.
+    const ssh = selectSshAttempt(sshLeg);
+    const sshDetail = sshOk
+      ? `real SSH from the Sandbox to host.docker.internal:${SRL_SSH_HOST_PORT} (node :22) returned \`show version\`${ssh.viaFallback ? " via the CONNECT-proxy fallback" : ""} [${ssh.exit}] ${ssh.command}`
+      : out.includes("SSH_NOT_RUN:")
+        ? "SSH NOT_RUN (sshpass is not installed in the Sandbox)"
+        : sshLeg.includes("SSH_LEG_RAW_FAIL")
+          ? `SSH NOT_RUN (ssh ran and FAILED${ssh.exit ? ` [${ssh.exit}]` : ""} — see raw)`
+          : "SSH NOT_RUN (no SSH evidence obtained)";
+    record("nos.ssh", sshOk ? "PASS" : "NOT_RUN", sshDetail, {
+      // The WHOLE leg — echoed command + banner + `Hostname`..`Software Version`
+      // body + `SSH_EXIT=` — so the body is recorded verbatim, never cut off.
+      raw: (sshLeg.trim() || "sshpass unavailable").slice(0, LEG_RAW_CAP),
+    });
+    // gnmic's OWN output: the section minus the harness's echoed command line,
+    // which itself contains `host-name` and must not satisfy the gate. The
+    // section ends at `GNMI_LEG_OK`/`GNMI_LEG_FAIL` (not the destroy JSON).
+    const gnmiLines = (out.split("--- real gNMI leg (published :57400) ---")[1] ?? "").split("\n");
+    const gnmiEnd = gnmiLines.findIndex((l) => /^GNMI_LEG_(OK|FAIL)$/.test(l.trim()));
+    const gnmiSection = (gnmiEnd === -1 ? gnmiLines : gnmiLines.slice(0, gnmiEnd + 1)).join("\n").trim();
+    const gnmiOutput = gnmiSection
+      .split("\n")
+      .filter((l) => !l.startsWith("gNMI command:"))
+      .join("\n")
+      .trim();
+    const gnmiOk = out.includes("GNMI_LEG_OK") && gnmiOutput.includes("host-name") && gnmiOutput.includes('"values"');
+    const gnmiExit = out.split("\n").find((l) => /^GNMI_EXIT=/.test(l))?.trim() ?? "";
+    const gnmiDetail = gnmiOk
+      ? `real gNMI from the Sandbox to host.docker.internal:${SRL_GNMI_HOST_PORT} (node :57400) returned the host-name [${gnmiExit}]`
+      : out.includes("GNMI_NOT_RUN:")
+        ? "gNMI NOT_RUN (gnmic is not installed in the Sandbox — tool absent)"
+        : gnmiSection.includes("GNMI_LEG_FAIL")
+          ? `gNMI NOT_RUN (gnmic ran against host.docker.internal:${SRL_GNMI_HOST_PORT}:57400 and FAILED${gnmiExit ? ` [${gnmiExit}]` : ""} — see raw)`
+          : "gNMI NOT_RUN (no gNMI evidence obtained)";
+    record("nos.gnmi", gnmiOk ? "PASS" : "NOT_RUN", gnmiDetail, {
+      // gnmic's output is kept on PASS **and** on failure (the verdict stays
+      // NOT_RUN); only a genuinely absent tool has no output to keep.
+      raw: (gnmiSection || "no gnmic output").slice(0, LEG_RAW_CAP),
+    });
 
     // --- failure injections: none may become a PASS --------------------------
     const wrongHead = sandboxVerifyTarget(db, { ...getTask(db, task.id)!, head_sha: "0".repeat(40) }, checks);
@@ -496,7 +671,7 @@ async function stageNos(dir: string, api: string, insecure: boolean): Promise<vo
     record(
       "nos.lab-port-failure",
       holdLab.ok && !collide.ok ? "PASS" : "FAIL",
-      `a second Task lab on the already-published host port 18001 -> deploy ok=${collide.ok} (never a PASS)`,
+      `a second Task lab on the already-published host port ${SRL_SSH_HOST_PORT} -> deploy ok=${collide.ok} (never a PASS)`,
       { raw: collide.error ?? "" }
     );
     if (holdLab.lab) {
@@ -590,7 +765,10 @@ async function stageParallel(dir: string, api: string, insecure: boolean): Promi
   git(repo, "config", "user.email", "relay@test");
   git(repo, "config", "user.name", "relay-test");
   const labctlSrc = findLabctlSrc();
-  if (!labctlSrc) return record("parallel", "BLOCKED", "no labctl.py (set LABCTL_SRC)");
+  if (!labctlSrc) {
+    record("parallel", "BLOCKED", "no labctl.py (set LABCTL_SRC)");
+    return;
+  }
   mkdirSync(join(repo, "labs", "labctl"), { recursive: true });
   writeFileSync(join(repo, "labs", "labctl", "labctl.py"), readFileSync(labctlSrc));
   for (const [t, ssh, gnmi] of [
@@ -620,7 +798,10 @@ async function stageParallel(dir: string, api: string, insecure: boolean): Promi
   git(repo, "commit", "-q", "-m", "ish830: two Task-named SR Linux topologies");
 
   const created = realSbxCli.run(sbxCreateArgv({ name: sandbox, agent: "shell", source: repo }));
-  if (!created.ok) return record("parallel", "BLOCKED", `sbx create failed: ${created.err || created.out}`.slice(0, 300));
+  if (!created.ok) {
+    record("parallel", "BLOCKED", `sbx create failed: ${created.err || created.out}`.slice(0, 300));
+    return;
+  }
 
   // Everything from here runs INSIDE the try/finally: the env-file write, the
   // `new URL(api)` parse, the policy and `ensureLabctlInSandbox` can all fail, and
@@ -632,7 +813,10 @@ async function stageParallel(dir: string, api: string, insecure: boolean): Promi
   async function destroyAndVerdict(t: LabTask, lab: string | null, label: string): Promise<void> {
     if (!lab) return;
     const del = await destroyTaskLab(labctl, t, { lab, api, insecure });
-    if (del.ok) return record(label, "PASS", `${lab} destroyed`);
+    if (del.ok) {
+      record(label, "PASS", `${lab} destroyed`);
+      return;
+    }
     const ins = await labctl.run(labctlInspectArgv({ lab, api, insecure }));
     record(label, ins.code === 6 ? "PASS" : "FAIL", `destroy ${lab}: ${del.error ?? "failed"}; inspect exit ${ins.code}`, {
       raw: del.error ?? "",
@@ -646,7 +830,14 @@ async function stageParallel(dir: string, api: string, insecure: boolean): Promi
     realSbxCli.run(sbxExecArgv(sandbox, bashLc(`mkdir -p "$HOME" && cat > "$HOME/.labctl.env" <<'EOF'\n${envFile}\nEOF\nchmod 600 "$HOME/.labctl.env"`)));
     const u = new URL(api);
     const apiPort = u.port || "443";
-    realSbxCli.run(["policy", "allow", "network", "--sandbox", sandbox, `host.docker.internal:${apiPort},localhost:${apiPort},host.docker.internal:18001,localhost:18001,host.docker.internal:18002,localhost:18002,host.docker.internal:18011,localhost:18011,host.docker.internal:18012,localhost:18012`]);
+    realSbxCli.run([
+      "policy",
+      "allow",
+      "network",
+      "--sandbox",
+      sandbox,
+      allowHostPorts([apiPort, 18001, 18002, 18011, 18012]),
+    ]);
     const parLabctl = ensureLabctlInSandbox(sandbox, repo);
     if (!parLabctl.ok) {
       // Record FAIL and fall through to the `finally`, which removes the sandbox.
@@ -703,7 +894,10 @@ async function stageFactory(dir: string, api: string, insecure: boolean): Promis
   git(repo, "config", "user.name", "relay-test");
   writeFileSync(join(repo, "README.md"), "base\n");
   const labctlSrc = findLabctlSrc();
-  if (!labctlSrc) return record("factory", "BLOCKED", "no labctl.py (set LABCTL_SRC)");
+  if (!labctlSrc) {
+    record("factory", "BLOCKED", "no labctl.py (set LABCTL_SRC)");
+    return;
+  }
   mkdirSync(join(repo, "labs", "labctl"), { recursive: true });
   writeFileSync(join(repo, "labs", "labctl", "labctl.py"), readFileSync(labctlSrc));
 
@@ -735,8 +929,8 @@ async function stageFactory(dir: string, api: string, insecure: boolean): Promis
       "      type: ixrd3",
       "      image: ghcr.io/nokia/srlinux:latest",
       "      ports:",
-      '        - "18001:22"',
-      '        - "18002:57400"',
+      `        - "${SRL_SSH_HOST_PORT}:22"`,
+      `        - "${SRL_GNMI_HOST_PORT}:57400"`,
       "",
     ].join("\n")
   );
@@ -764,7 +958,16 @@ async function stageFactory(dir: string, api: string, insecure: boolean): Promis
     realSbxCli.run(sbxExecArgv(sbName, bashLc(`mkdir -p "$HOME" && cat > "$HOME/.labctl.env" <<'EOF'\n${envFile}\nEOF\nchmod 600 "$HOME/.labctl.env"`)));
     const u = new URL(api);
     const apiPort = u.port || "443";
-    realSbxCli.run(["policy", "allow", "network", "--sandbox", sbName, `host.docker.internal:${apiPort},localhost:${apiPort},host.docker.internal:18001,localhost:18001,host.docker.internal:18002,localhost:18002`]);
+    const published = ensureLabPorts([SRL_GNMI_HOST_PORT, SRL_SSH_HOST_PORT]);
+    record("factory.lab-ports", published.ok ? "PASS" : "FAIL", `Shared Lab node ports published 1:1 on 0.0.0.0: ${published.detail}`);
+    realSbxCli.run([
+      "policy",
+      "allow",
+      "network",
+      "--sandbox",
+      sbName,
+      allowHostPorts([apiPort, SRL_SSH_HOST_PORT, SRL_GNMI_HOST_PORT]),
+    ]);
     const ready = ensureLabctlInSandbox(sbName, sbWorkspace);
     if (!ready.ok) record("factory.labctl", "FAIL", `labctl is not runnable in the Task sandbox: ${ready.detail}`);
 
@@ -885,9 +1088,15 @@ async function main(): Promise<void> {
   rmSync(dir, { recursive: true, force: true });
 }
 
-try {
-  await main();
-} catch (e) {
-  console.error(`ISH-830 E2E crashed: ${e instanceof Error ? e.stack ?? e.message : String(e)}`);
-  process.exitCode = 1;
+if (import.meta.main) {
+  if (process.env.RELAY_ISH830_E2E !== "1") {
+    console.log("ISH-830 real E2E is opt-in: set RELAY_ISH830_E2E=1 to run it (creates real sandboxes + labs).");
+    process.exit(0);
+  }
+  try {
+    await main();
+  } catch (e) {
+    console.error(`ISH-830 E2E crashed: ${e instanceof Error ? e.stack ?? e.message : String(e)}`);
+    process.exitCode = 1;
+  }
 }
