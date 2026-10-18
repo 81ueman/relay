@@ -36,7 +36,7 @@ import {
 const HEAD = "a".repeat(40);
 const MOVED = "b".repeat(40);
 const BASE = "0".repeat(40);
-const GRANT: ProviderAuthority = { githubWrite: false, linearWrite: false, merge: true };
+const GRANT: ProviderAuthority = { linearWrite: false, merge: true };
 
 function view(over: Partial<PrView> = {}): PrView {
   return {
@@ -183,7 +183,7 @@ describe("merge gate: the READY / BLOCKED decision table (pure)", () => {
   });
 
   test("lack of point-of-use permission -> BLOCKED NO_PERMISSION (never merge-ready by mistake)", () => {
-    const d = evaluateMergeGate(base({ authority: { githubWrite: false, linearWrite: false, merge: false } }));
+    const d = evaluateMergeGate(base({ authority: { linearWrite: false, merge: false } }));
     expect(d.status).toBe("BLOCKED");
     expect(d.reasons.map((r) => r.code)).toContain("NO_PERMISSION");
   });

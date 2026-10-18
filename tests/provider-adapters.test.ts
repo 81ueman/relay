@@ -152,7 +152,7 @@ describe("providerDepsFromEnv (opt-in, deny-by-default)", () => {
     const deps = providerDepsFromEnv({});
     expect(deps.github).toBeUndefined();
     expect(deps.linear).toBeUndefined();
-    expect(deps.authority).toEqual({ githubWrite: false, linearWrite: false, merge: false });
+    expect(deps.authority).toEqual({ linearWrite: false, merge: false });
     expect(deps.authorizedReviewers).toEqual(["claude"]);
   });
 
@@ -172,7 +172,6 @@ describe("providerDepsFromEnv (opt-in, deny-by-default)", () => {
     expect(deps.authorizedReviewers).toEqual(["claude", "second-reviewer"]);
     // Enabling a reader never grants a write or a merge.
     expect(deps.authority.merge).toBe(false);
-    expect(deps.authority.githubWrite).toBe(false);
     expect(deps.authority.linearWrite).toBe(false);
   });
 

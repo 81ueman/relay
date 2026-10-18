@@ -65,17 +65,18 @@ not in a host worktree:
   is confirmed gone — so the single-writer fence is never released under a live
   writer.
 
-## PR binding before review (ISH-880)
+## PR check before review (ISH-880/885, read-only)
 
 A Sandbox-produced commit is bridged to a real GitHub PR **before the review
 stage**, so a review PASS is bound to the PR's *real current remote HEAD*. When
 `FactoryDeps.prBinding` is configured and the Task records a `pr_repo`/`pr_url`,
 the Factory re-reads the PR and requires its live `headSha` to equal the produced
-commit; a moved/unreadable/other-repo PR — or an unauthorized publish — returns
+commit; a moved/unreadable/other-repo PR — or no identity/adoptable PR — returns
 the Factory outcome `blocked` and the reviewer **never runs** (never a fake
-`review_pass`). Publishing (push + find-or-create `gh pr create`) needs an
-explicit point-of-use `githubWrite` grant and is opt-in per invocation. See
-[`pr-binding.md`](pr-binding.md). Unset, the Factory is unchanged and read-only.
+`review_pass`). The **Coding Agent** (dsh/DeepSeek) owns the GitHub write
+(`git push` + `gh pr create`/update) and the Claude reviewer posts the native
+review; **Relay never writes to GitHub**. See [`pr-binding.md`](pr-binding.md).
+Unset, the Factory is unchanged and read-only.
 
 ## Commands
 

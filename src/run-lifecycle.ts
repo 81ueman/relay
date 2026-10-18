@@ -311,6 +311,23 @@ export function buildRunBrief(db: Database, task: Task, opts: BuildBriefOptions)
       lines.push(`- [${f.kind}] ${f.reason ?? "(no reason recorded)"}${ev}`);
     }
   }
+  // ISH-885: a PR-bound Task's GitHub write is the Coding Agent's job — Relay is
+  // read-only and only OBSERVES the PR afterwards. Without this instruction the
+  // Factory's read-only Task↔PR gate would block every real Run (NO_PR_IDENTITY
+  // on the first attempt, HEAD_MOVED on a FIX).
+  if (task.pr_repo || task.pr_url) {
+    const repo = task.pr_repo ?? "(the PR's repository)";
+    const base = task.pr_base ?? "<the PR's base branch>";
+    lines.push(
+      "",
+      "## Publish the Task branch as a GitHub PR (this is YOUR GitHub write)",
+      "Relay is read-only: it never pushes, creates/updates a PR, or posts a review. You own the push and the PR.",
+      `- push your commit to the Task branch — NEVER the default branch: \`git push origin HEAD:refs/heads/${opts.branch}\``,
+      `- if the branch has NO PR yet, create one: \`gh pr create --repo ${repo} --head ${opts.branch} --base ${base} --title <title> --body <body>\``,
+      "- if a PR already exists for this branch (e.g. a FIX), just push the new commit to the SAME PR — do NOT open a duplicate",
+      "- NEVER merge, and NEVER post a review (the independent reviewer posts reviews; Relay only reads them back)"
+    );
+  }
   lines.push(
     "",
     "## Do NOT run `relay` mutations",

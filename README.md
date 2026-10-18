@@ -405,13 +405,14 @@ an approval allowlist, **not** an OS sandbox — Relay does not claim process
 isolation from it. The reviewer model is configurable (`RELAY_REVIEW_MODEL` /
 `--model`, default `opus`).
 
-**PR binding (ISH-880):** a Sandbox-produced commit can be bridged to a real
-GitHub PR **before the review stage** (`FactoryDeps.prBinding`, opt-in). The
+**PR check (ISH-880/885, read-only):** a Sandbox-produced commit can be bridged to
+a real GitHub PR **before the review stage** (`FactoryDeps.prBinding`, opt-in). The
 Factory re-reads the PR and requires its live `headSha` to equal the produced
-commit; a moved/unreadable/other-repo PR — or an unauthorized publish — **blocks**
+commit; a moved/unreadable/other-repo PR — or no identity/adoptable PR — **blocks**
 before the reviewer runs. `relay pr bind <task-id>` re-reads/verifies a recorded
-PR, and `--publish` is the explicit point-of-use write grant that pushes the
-commit and find-or-creates the PR (normal `git`/`gh`; never merges). See
+PR. The **Coding Agent** owns the GitHub write (`git push` + `gh pr create`/update)
+and the Claude reviewer posts the native review; **Relay never writes to GitHub**
+(the ISH-880 `--publish`/`githubWrite` write path was removed). See
 [`docs/pr-binding.md`](docs/pr-binding.md).
 
 ### Headless dsh Runs (no Herdr)
