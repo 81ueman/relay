@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { selectSshAttempt } from "../scripts/ish830-real-e2e";
 
 // ISH-830 follow-up: the opt-in real E2E harness must run a REAL SSH leg and a
 // REAL gNMI leg (PRE-20 ran a `labctl exec` read-back and claimed neither), and
@@ -73,5 +74,56 @@ describe("ISH-830 real E2E — the legs are real", () => {
     // The published node ports are the ones the legs dial.
     expect(harness).toContain("const SRL_SSH_HOST_PORT = 18021");
     expect(harness).toContain("const SRL_GNMI_HOST_PORT = 18002");
+  });
+});
+
+// Round-3 finding: on the CONNECT-proxy fallback path the FIRST `SSH_EXIT=` line
+// is the FAILED direct attempt, so a PASS must report the fallback's exit code
+// and command. This is a BEHAVIOURAL test of the real selector the harness uses.
+describe("ISH-830 real E2E — SSH attempt selection (round-3)", () => {
+  const directOk = [
+    "SSH command: sshpass -p <redacted> ssh -p 18021 admin@host.docker.internal 'show version'",
+    "Software Version     : v26.7.2",
+    "SSH_EXIT=0",
+    "SSH_LEG_OK",
+  ].join("\n");
+
+  const fallbackOk = [
+    "SSH command: sshpass -p <redacted> ssh -p 18021 admin@host.docker.internal 'show version'",
+    "Connection closed by 169.254.1.1 port 18021",
+    "SSH_EXIT=255",
+    "SSH_LEG_RAW_FAIL",
+    "--- SSH CONNECT-proxy fallback ---",
+    "SSH fallback command: sshpass -p <redacted> ssh -o ProxyCommand='socat - PROXY:gateway.docker.internal:%h:%p,proxyport=3128' -p 18021 admin@host.docker.internal 'show version'",
+    "ProxyCommand: socat - PROXY:gateway.docker.internal:%h:%p,proxyport=3128",
+    "Software Version     : v26.7.2",
+    "SSH_FALLBACK_EXIT=0",
+    "SSH_LEG_OK",
+  ].join("\n");
+
+  test("the direct path reports SSH_EXIT and the direct command", () => {
+    const a = selectSshAttempt(directOk);
+    expect(a.exit).toBe("SSH_EXIT=0");
+    expect(a.viaFallback).toBe(false);
+    expect(a.command.startsWith("SSH command:")).toBe(true);
+  });
+
+  test("the fallback path reports the successful fallback, not the failed direct attempt", () => {
+    const a = selectSshAttempt(fallbackOk);
+    expect(a.exit).toBe("SSH_FALLBACK_EXIT=0");
+    expect(a.exit).not.toBe("SSH_EXIT=255");
+    expect(a.viaFallback).toBe(true);
+    expect(a.command.startsWith("SSH fallback command:")).toBe(true);
+    expect(a.command).toContain("ProxyCommand=");
+  });
+
+  test("a leg where every attempt failed reports the last attempt's exit", () => {
+    const failed = ["SSH_EXIT=255", "SSH_LEG_RAW_FAIL", "--- SSH CONNECT-proxy fallback ---", "SSH_FALLBACK_EXIT=1"].join("\n");
+    expect(selectSshAttempt(failed).exit).toBe("SSH_FALLBACK_EXIT=1");
+  });
+
+  test("the harness reports the fallback in the PASS detail", () => {
+    expect(harness).toContain("via the CONNECT-proxy fallback");
+    expect(harness).toContain("selectSshAttempt(sshLeg)");
   });
 });

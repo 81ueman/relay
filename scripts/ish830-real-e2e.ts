@@ -59,10 +59,8 @@ import {
   type LabTask,
 } from "../src/lab";
 
-if (process.env.RELAY_ISH830_E2E !== "1") {
-  console.log("ISH-830 real E2E is opt-in: set RELAY_ISH830_E2E=1 to run it (creates real sandboxes + labs).");
-  process.exit(0);
-}
+// The opt-in guard lives in the `import.meta.main` entry block at the bottom of
+// this file, so the module can be imported (e.g. by tests) without running.
 
 // ---------------------------------------------------------------------------
 // result bookkeeping (a JSON record is printed at the end)
@@ -188,6 +186,40 @@ function ensureLabPorts(published: number[]): { ok: boolean; detail: string } {
     }
   }
   return { ok, detail: notes.join("; ") };
+}
+
+export interface SshAttempt {
+  /** The exit marker of the attempt that produced the PASS (e.g. `SSH_EXIT=0`). */
+  exit: string;
+  /** The exact command of that attempt (credentials are already redacted by the script). */
+  command: string;
+  /** True when the PASS came from the CONNECT-proxy fallback attempt. */
+  viaFallback: boolean;
+}
+
+/**
+ * Pick the SSH attempt that produced the PASS out of the leg's echoed output.
+ *
+ * The direct attempt always echoes `SSH_EXIT=<rc>`. The CONNECT-proxy fallback
+ * runs ONLY after the direct path failed (`SSH_LEG_RAW_FAIL`) and echoes
+ * `--- SSH CONNECT-proxy fallback ---`, `SSH fallback command:` and
+ * `SSH_FALLBACK_EXIT=<rc>`. So on the fallback path the FIRST
+ * `SSH(_FALLBACK)?_EXIT=` line is the FAILED direct attempt, and a PASS must
+ * report the LAST successful one (with the fallback command) — never the failed
+ * attempt's exit code or command.
+ */
+export function selectSshAttempt(sshLeg: string): SshAttempt {
+  const lines = sshLeg.split("\n").map((l) => l.trim());
+  const exits = lines.filter((l) => /^SSH(_FALLBACK)?_EXIT=/.test(l));
+  // The attempt that emitted `=0` is the one that passed (the script only emits
+  // `SSH_LEG_OK` after a 0 exit); otherwise the last marker is the latest try.
+  const selected = [...exits].reverse().find((l) => l.endsWith("=0")) ?? exits[exits.length - 1] ?? "";
+  const viaFallback = selected.startsWith("SSH_FALLBACK_EXIT=");
+  const command =
+    lines.find((l) => l.startsWith(viaFallback ? "SSH fallback command:" : "SSH command:")) ??
+    lines.find((l) => l.startsWith("SSH command:")) ??
+    "";
+  return { exit: selected, command, viaFallback };
 }
 /** Start the Shared Lab VM and wait until clab-api-server answers (cold start is ~2s). */
 function warmLab(): void {
@@ -390,6 +422,7 @@ function nosCheckScript(lab: string, ns: string, api: string, insecure: boolean)
     "    # transparent raw path is refused.",
     "    if command -v socat >/dev/null 2>&1; then",
     `      echo '--- SSH CONNECT-proxy fallback ---'`,
+    `      echo "SSH fallback command: sshpass -p <redacted> ssh $SSH_OPTS -o ProxyCommand='socat - PROXY:gateway.docker.internal:%h:%p,proxyport=3128' -p $SSH_PORT admin@$SSH_HOST 'show version'"`,
     `      echo 'ProxyCommand: socat - PROXY:gateway.docker.internal:%h:%p,proxyport=3128'`,
     `      sshpass -p "$SRL_PASSWORD" ssh $SSH_OPTS -o ProxyCommand='socat - PROXY:gateway.docker.internal:%h:%p,proxyport=3128' -p "$SSH_PORT" admin@"$SSH_HOST" "show version" > /tmp/ssh2.out 2>&1 && SSH2_RC=0 || SSH2_RC=$?`,
     "      cat /tmp/ssh2.out",
@@ -562,14 +595,15 @@ async function stageNos(dir: string, api: string, insecure: boolean): Promise<vo
     // change fixes) is never misreported as a missing tool with its output dropped.
     const sshLeg = out.split("--- real SSH leg (published :22) ---")[1]?.split("--- real gNMI")[0] ?? "";
     const sshOk = out.includes("SSH_LEG_OK") && /Software Version|SRLinux/i.test(sshLeg);
-    const sshExit = sshLeg.split("\n").find((l) => /^SSH(_FALLBACK)?_EXIT=/.test(l))?.trim() ?? "";
-    const sshCmd = sshLeg.split("\n").find((l) => l.startsWith("SSH command:"))?.trim() ?? "";
+    // Report the attempt that PASSED: on the fallback path the FIRST exit marker
+    // is the FAILED direct attempt, so a PASS must not report its exit/command.
+    const ssh = selectSshAttempt(sshLeg);
     const sshDetail = sshOk
-      ? `real SSH from the Sandbox to host.docker.internal:${SRL_SSH_HOST_PORT} (node :22) returned \`show version\` [${sshExit}] ${sshCmd}`
+      ? `real SSH from the Sandbox to host.docker.internal:${SRL_SSH_HOST_PORT} (node :22) returned \`show version\`${ssh.viaFallback ? " via the CONNECT-proxy fallback" : ""} [${ssh.exit}] ${ssh.command}`
       : out.includes("SSH_NOT_RUN:")
         ? "SSH NOT_RUN (sshpass is not installed in the Sandbox)"
         : sshLeg.includes("SSH_LEG_RAW_FAIL")
-          ? `SSH NOT_RUN (ssh ran and FAILED${sshExit ? ` [${sshExit}]` : ""} — see raw)`
+          ? `SSH NOT_RUN (ssh ran and FAILED${ssh.exit ? ` [${ssh.exit}]` : ""} — see raw)`
           : "SSH NOT_RUN (no SSH evidence obtained)";
     record("nos.ssh", sshOk ? "PASS" : "NOT_RUN", sshDetail, {
       // The WHOLE leg — echoed command + banner + `Hostname`..`Software Version`
@@ -731,7 +765,10 @@ async function stageParallel(dir: string, api: string, insecure: boolean): Promi
   git(repo, "config", "user.email", "relay@test");
   git(repo, "config", "user.name", "relay-test");
   const labctlSrc = findLabctlSrc();
-  if (!labctlSrc) return record("parallel", "BLOCKED", "no labctl.py (set LABCTL_SRC)");
+  if (!labctlSrc) {
+    record("parallel", "BLOCKED", "no labctl.py (set LABCTL_SRC)");
+    return;
+  }
   mkdirSync(join(repo, "labs", "labctl"), { recursive: true });
   writeFileSync(join(repo, "labs", "labctl", "labctl.py"), readFileSync(labctlSrc));
   for (const [t, ssh, gnmi] of [
@@ -761,7 +798,10 @@ async function stageParallel(dir: string, api: string, insecure: boolean): Promi
   git(repo, "commit", "-q", "-m", "ish830: two Task-named SR Linux topologies");
 
   const created = realSbxCli.run(sbxCreateArgv({ name: sandbox, agent: "shell", source: repo }));
-  if (!created.ok) return record("parallel", "BLOCKED", `sbx create failed: ${created.err || created.out}`.slice(0, 300));
+  if (!created.ok) {
+    record("parallel", "BLOCKED", `sbx create failed: ${created.err || created.out}`.slice(0, 300));
+    return;
+  }
 
   // Everything from here runs INSIDE the try/finally: the env-file write, the
   // `new URL(api)` parse, the policy and `ensureLabctlInSandbox` can all fail, and
@@ -773,7 +813,10 @@ async function stageParallel(dir: string, api: string, insecure: boolean): Promi
   async function destroyAndVerdict(t: LabTask, lab: string | null, label: string): Promise<void> {
     if (!lab) return;
     const del = await destroyTaskLab(labctl, t, { lab, api, insecure });
-    if (del.ok) return record(label, "PASS", `${lab} destroyed`);
+    if (del.ok) {
+      record(label, "PASS", `${lab} destroyed`);
+      return;
+    }
     const ins = await labctl.run(labctlInspectArgv({ lab, api, insecure }));
     record(label, ins.code === 6 ? "PASS" : "FAIL", `destroy ${lab}: ${del.error ?? "failed"}; inspect exit ${ins.code}`, {
       raw: del.error ?? "",
@@ -851,7 +894,10 @@ async function stageFactory(dir: string, api: string, insecure: boolean): Promis
   git(repo, "config", "user.name", "relay-test");
   writeFileSync(join(repo, "README.md"), "base\n");
   const labctlSrc = findLabctlSrc();
-  if (!labctlSrc) return record("factory", "BLOCKED", "no labctl.py (set LABCTL_SRC)");
+  if (!labctlSrc) {
+    record("factory", "BLOCKED", "no labctl.py (set LABCTL_SRC)");
+    return;
+  }
   mkdirSync(join(repo, "labs", "labctl"), { recursive: true });
   writeFileSync(join(repo, "labs", "labctl", "labctl.py"), readFileSync(labctlSrc));
 
@@ -1042,9 +1088,15 @@ async function main(): Promise<void> {
   rmSync(dir, { recursive: true, force: true });
 }
 
-try {
-  await main();
-} catch (e) {
-  console.error(`ISH-830 E2E crashed: ${e instanceof Error ? e.stack ?? e.message : String(e)}`);
-  process.exitCode = 1;
+if (import.meta.main) {
+  if (process.env.RELAY_ISH830_E2E !== "1") {
+    console.log("ISH-830 real E2E is opt-in: set RELAY_ISH830_E2E=1 to run it (creates real sandboxes + labs).");
+    process.exit(0);
+  }
+  try {
+    await main();
+  } catch (e) {
+    console.error(`ISH-830 E2E crashed: ${e instanceof Error ? e.stack ?? e.message : String(e)}`);
+    process.exitCode = 1;
+  }
 }
