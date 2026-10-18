@@ -43,6 +43,7 @@ import { runFactoryTask } from "../src/factory";
 import { realSbxCli, sbxCreateArgv, sbxExecArgv, bashLc, upsertSandbox, getSandbox } from "../src/sandbox";
 import { ensureTaskSandbox } from "../src/sandbox-lifecycle";
 import { sandboxVerifyTarget, realSandboxExec, sandboxLabctl } from "../src/sandbox-verify";
+import { isPinnedDsh, readDshVersion, PINNED_DSH_VERSION } from "../src/dsh-version";
 import {
   deployTaskLab,
   destroyTaskLab,
@@ -186,12 +187,17 @@ function findLabctlSrc(): string | null {
 // ---------------------------------------------------------------------------
 
 function stageEnv(): void {
-  const uname = sh("uname", ["-m"]).out || "?";
-  const sw = sh("sw_vers", ["-productVersion"]).out || "?";
-  const sbx = sh("sbx", ["version"]).out.replace(/\n/g, " ") || "?";
-  const dsh = sh("dsh", ["--version"]).out || "?";
-  const claude = sh("claude", ["--version"]).out || "?";
-  record("env", "PASS", `darwin/${uname} macOS ${sw}; sbx ${sbx}; dsh ${dsh}; claude ${claude}`);
+  const uname = sh("uname", ["-m"]).out;
+  const sw = sh("sw_vers", ["-productVersion"]).out;
+  const sbx = sh("sbx", ["version"]).out.replace(/\n/g, " ");
+  const dsh = readDshVersion("dsh") ?? sh("dsh", ["--version"]).out;
+  const claude = sh("claude", ["--version"]).out;
+  const missing = [!uname && "uname", !sw && "sw_vers", !sbx && "sbx", !dsh && "dsh", !claude && "claude"].filter(Boolean) as string[];
+  const summary = `darwin/${uname || "?"} macOS ${sw || "?"}; sbx ${sbx || "?"}; dsh ${dsh || "?"}; claude ${claude || "?"}`;
+  // env is PASS only with every tool present AND the pinned dsh build (ISH-869).
+  if (missing.length > 0) record("env", "NOT_RUN", `missing tool(s): ${missing.join(", ")}; ${summary}`);
+  else if (!isPinnedDsh(dsh)) record("env", "FAIL", `dsh is not the pin ${PINNED_DSH_VERSION}: ${summary}`);
+  else record("env", "PASS", summary);
   // Time / disk / RAM (spec §Done-when asks for these to be recorded).
   const when = new Date().toISOString();
   const hostDisk = sh("df", ["-h", "/"]).out.split("\n").pop()?.trim() ?? "?";
@@ -230,6 +236,17 @@ function stageEnv(): void {
 
 function stageProvider(): void {
   const cmd = `dsh --profile headless --json "reply with the single token PING"`;
+  // The leg MUST be the pinned build (ISH-869); an unpinned/old dsh is refused,
+  // never credited as a provider PASS.
+  const version = readDshVersion("dsh");
+  if (!version) {
+    record("provider", "BLOCKED", "dsh is not on PATH / `--version` failed", { command: cmd });
+    return;
+  }
+  if (!isPinnedDsh(version)) {
+    record("provider", "FAIL", `DSH_VERSION_MISMATCH: dsh reports ${version}, Relay pins ${PINNED_DSH_VERSION}`, { command: cmd });
+    return;
+  }
   const r = sh("dsh", ["--profile", "headless", "--json", "reply with the single token PING"], { timeoutMs: 180_000 });
   const blob = `${r.out}\n${r.err}`;
   const finalText = (r.out.split("\n").find((l) => l.includes('"type":"final"')) ?? "").trim();
@@ -262,6 +279,10 @@ function nosCheckScript(lab: string, ns: string, api: string, insecure: boolean)
     "# Credentials are provisioned into ~/.labctl.env by the harness (never logged).",
     '[ -f "$HOME/.labctl.env" ] && . "$HOME/.labctl.env"',
     `API="${api}"`,
+    "# Fail-closed teardown: EVERY exit of this check destroys its own lab, so a",
+    "# failure after `deploy` (inspect/exec/ssh index) can never leak it. A later",
+    "# explicit destroy is a no-op (the trap then sees EXIT_NOTFOUND).",
+    `trap 'labctl destroy --name ${lab} --json --api "$API" ${ins} >/dev/null 2>&1 || true' EXIT`,
     "command -v labctl >/dev/null || { echo 'labctl missing'; exit 3; }",
     `labctl deploy -t labs/ish830-smoke/smoke.clab.yml --namespace ${ns} --json --api "$API" ${ins} >/tmp/dep.json`,
     "cat /tmp/dep.json",
@@ -330,6 +351,11 @@ async function stageNos(dir: string, api: string, insecure: boolean): Promise<vo
   });
   const lab = labNameForTask(task as LabTask);
   const ns = labNamespaceForTask(task as LabTask);
+  // A SECOND Task identity for the real lab-port-failure injection (its lab maps
+  // the SAME published host port 18001).
+  const portTask: LabTask = { id: `${task.id}-port`, created_at: task.created_at + 1 };
+  const portLab = labNameForTask(portTask);
+  const portNs = labNamespaceForTask(portTask);
   const topoDir = join(repo, "labs", "ish830-smoke");
   mkdirSync(topoDir, { recursive: true });
   writeFileSync(
@@ -349,6 +375,24 @@ async function stageNos(dir: string, api: string, insecure: boolean): Promise<vo
     ].join("\n")
   );
   writeFileSync(join(topoDir, "nos-check.sh"), nosCheckScript(lab, ns, api, insecure));
+  // The port-collision topology: same published host port 18001 as `smoke.clab.yml`.
+  const portDir = join(repo, "labs", portLab);
+  mkdirSync(portDir, { recursive: true });
+  writeFileSync(
+    join(portDir, "port.clab.yml"),
+    [
+      `name: ${portLab}`,
+      "topology:",
+      "  nodes:",
+      "    srl1:",
+      "      kind: nokia_srlinux",
+      "      type: ixrd3",
+      "      image: ghcr.io/nokia/srlinux:latest",
+      "      ports:",
+      '        - "18001:22"',
+      "",
+    ].join("\n")
+  );
   git(repo, "add", "-A");
   git(repo, "commit", "-q", "-m", "ish830: labctl + a Task-named SR Linux topology + NOS check");
   const head = git(repo, "rev-parse", "HEAD");
@@ -359,6 +403,7 @@ async function stageNos(dir: string, api: string, insecure: boolean): Promise<vo
     return;
   }
   let labDeployed: string | null = null;
+  let portLabDeployed: string | null = null;
   try {
     // provision lab creds + policy inside the sandbox (operator injection)
     const envFile = Object.entries(labEnvFromProcess())
@@ -429,12 +474,35 @@ async function stageNos(dir: string, api: string, insecure: boolean): Promise<vo
     const reqFail = await target.runner.run({ name: "required-fail", command: "exit 7", required: true }, { cwd: target.cwd });
     record("nos.required-verify-fail", reqFail.outcome === "fail" ? "PASS" : "FAIL", `a required check that exits non-zero -> ${reqFail.outcome} (never a PASS)`);
 
-    // Lab port failure: an UNPUBLISHED node port must be refused, never a PASS.
-    const portFail = await target.runner.run(
-      { name: "port-fail", command: "curl -s --max-time 5 https://host.docker.internal:18099 >/dev/null", required: true },
-      { cwd: target.cwd }
+    // Real Lab port failure: hold published host port 18001 with a first Task lab,
+    // then a SECOND Task lab on the SAME port must FAIL to deploy (never a PASS).
+    const nosLabctl = sandboxLabctl({ sandbox, workspace: repo, exec: realSandboxExec }, labEnvFromProcess());
+    const holdLab = await deployTaskLab(nosLabctl, task as LabTask, {
+      topology: "labs/ish830-smoke/smoke.clab.yml",
+      namespace: ns,
+      api,
+      insecure,
+    });
+    // A port-conflict deploy can PARTIALLY create the node container even on an
+    // API error (labctl exit 5) where `deployTaskLab` returns `lab:null`, so record
+    // the DETERMINISTIC name before deploying — `finally` always destroys it.
+    portLabDeployed = portLab;
+    const collide = await deployTaskLab(nosLabctl, portTask, {
+      topology: `labs/${portLab}/port.clab.yml`,
+      namespace: portNs,
+      api,
+      insecure,
+    });
+    record(
+      "nos.lab-port-failure",
+      holdLab.ok && !collide.ok ? "PASS" : "FAIL",
+      `a second Task lab on the already-published host port 18001 -> deploy ok=${collide.ok} (never a PASS)`,
+      { raw: collide.error ?? "" }
     );
-    record("nos.lab-port-failure", portFail.outcome === "fail" ? "PASS" : "FAIL", `an unpublished Lab port -> VERIFY ${portFail.outcome} (never a PASS)`);
+    if (holdLab.lab) {
+      const holdDel = await destroyTaskLab(nosLabctl, task as LabTask, { lab: holdLab.lab, api, insecure });
+      record("nos.lab-port-holder-cleanup", holdDel.ok ? "PASS" : "FAIL", `${holdLab.lab}: ${holdDel.error ?? "destroyed"}`);
+    }
 
     // Lab API unavailable: SOURCE the creds (else labctl exits EXIT_USAGE=2 BEFORE
     // any network I/O) and require a REAL transport failure (labctl exit 5/7, or a
@@ -477,6 +545,17 @@ async function stageNos(dir: string, api: string, insecure: boolean): Promise<vo
           labctlInspectArgv({ lab: labDeployed, api, insecure })
         );
         record("nos.cleanup", ins.code === 6 ? "PASS" : "FAIL", `destroy: ${del.error}; inspect exit ${ins.code}`);
+      }
+    }
+    // The port-collision lab can partially create a container even on exit 5:
+    // destroy the deterministic name and record the verdict (never a silent leak).
+    if (portLabDeployed) {
+      const labctl = sandboxLabctl({ sandbox, workspace: repo, exec: realSandboxExec }, labEnvFromProcess());
+      const del = await destroyTaskLab(labctl, portTask, { lab: portLabDeployed, api, insecure });
+      if (del.ok) record("nos.lab-port-cleanup", "PASS", `${portLabDeployed} destroyed`);
+      else {
+        const ins = await labctl.run(labctlInspectArgv({ lab: portLabDeployed, api, insecure }));
+        record("nos.lab-port-cleanup", ins.code === 6 ? "PASS" : "FAIL", `destroy ${portLabDeployed}: ${del.error ?? "failed"}; inspect exit ${ins.code}`);
       }
     }
     realSbxCli.run(["stop", sandbox]);
@@ -654,87 +733,111 @@ async function stageFactory(dir: string, api: string, insecure: boolean): Promis
 
   let sbName: string | null = null;
   let sbWorkspace = repo;
+  const taskLab = task as LabTask;
+  const factoryLab = labNameForTask(taskLab);
+  let factoryLabDeployed: string | null = null;
   try {
     const binding = ensureTaskSandbox(db, task.id, { source: repo, agent: "shell", cli: realSbxCli });
     sbName = binding.name;
     // The clone mirrors the resolved MAIN-checkout path (e.g. /private/var/... on
     // macOS), which may differ from the mkdtemp path — use the binding's.
     sbWorkspace = binding.workspace;
-  } catch (e) {
-    record("factory", "BLOCKED", `could not create the Task Coding Sandbox: ${e instanceof Error ? e.message : String(e)}`.slice(0, 300));
-    db.close();
-    return;
-  }
-  // Install labctl + lab creds + the published-port policy inside the Task
-  // sandbox (operator injection), so the REQUIRED NOS check can run at VERIFY.
-  const envFile = Object.entries(labEnvFromProcess())
-    .map(([k, v]) => `export ${k}=${v}`)
-    .join("\n");
-  realSbxCli.run(sbxExecArgv(sbName, bashLc(`mkdir -p "$HOME" && cat > "$HOME/.labctl.env" <<'EOF'\n${envFile}\nEOF\nchmod 600 "$HOME/.labctl.env"`)));
-  const u = new URL(api);
-  const apiPort = u.port || "443";
-  realSbxCli.run(["policy", "allow", "network", "--sandbox", sbName, `host.docker.internal:${apiPort},localhost:${apiPort},host.docker.internal:18001,localhost:18001,host.docker.internal:18002,localhost:18002`]);
-  const ready = ensureLabctlInSandbox(sbName, sbWorkspace);
-  if (!ready.ok) record("factory.labctl", "FAIL", `labctl is not runnable in the Task sandbox: ${ready.detail}`);
 
-  const result = await runFactoryTask(db, task.id, {
-    repo,
-    dshBin: process.env.RELAY_DSH_BIN ?? "dsh",
-    permissionMode: "workspace-write",
-    timeoutMs: 15 * 60_000,
-    maxAttempts: 2,
-    sandboxCli: realSbxCli,
-    reviewWorktreeRoot: join(dir, "review-wt"),
-  });
-  const t = getTask(db, task.id)!;
-  // Find the real dsh Run and read its raw failure evidence, so a missing
-  // provider credential is recorded BLOCKED (not a generic failure).
-  const run = db
-    .query("SELECT * FROM runs WHERE task_id = ? ORDER BY created_at DESC LIMIT 1")
-    .get(task.id) as { id: string; state: string; exit_code: number | null; error: string | null; stderr_path: string | null; dsh_events_path: string | null } | null;
-  const rawBits: string[] = [];
-  for (const p of [run?.stderr_path, run?.dsh_events_path]) {
-    if (p && existsSync(p)) rawBits.push(readFileSync(p, "utf-8").slice(-1500));
-  }
-  const raw = [result.reason ?? "", run?.error ?? "", ...rawBits].join("\n");
-  const detail = `runFactoryTask(${task.id}) -> ${result.outcome} (head ${result.head?.slice(0, 12) ?? "none"}); run ${run?.id ?? "?"} ${run?.state ?? "?"} exit ${run?.exit_code ?? "?"}`;
+    // Install labctl + lab creds + the published-port policy inside the Task
+    // sandbox (operator injection), so the REQUIRED NOS check can run at VERIFY.
+    const envFile = Object.entries(labEnvFromProcess())
+      .map(([k, v]) => `export ${k}=${v}`)
+      .join("\n");
+    realSbxCli.run(sbxExecArgv(sbName, bashLc(`mkdir -p "$HOME" && cat > "$HOME/.labctl.env" <<'EOF'\n${envFile}\nEOF\nchmod 600 "$HOME/.labctl.env"`)));
+    const u = new URL(api);
+    const apiPort = u.port || "443";
+    realSbxCli.run(["policy", "allow", "network", "--sandbox", sbName, `host.docker.internal:${apiPort},localhost:${apiPort},host.docker.internal:18001,localhost:18001,host.docker.internal:18002,localhost:18002`]);
+    const ready = ensureLabctlInSandbox(sbName, sbWorkspace);
+    if (!ready.ok) record("factory.labctl", "FAIL", `labctl is not runnable in the Task sandbox: ${ready.detail}`);
 
-  // PASS is gated on the FULL chain, never a bare `merge_ready`: a FIX review
-  // followed by a LATER PASS, and the final attempt's produced HEAD equal to the
-  // MergeReady HEAD (verified HEAD == reviewer HEAD == MergeReady HEAD).
-  const attempts = result.attempts;
-  const fixIdx = attempts.findIndex((a) => a.reviewVerdict === "fix");
-  const passIdx = attempts.findIndex((a, i) => a.reviewVerdict === "pass" && fixIdx !== -1 && i > fixIdx);
-  const last = attempts[attempts.length - 1];
-  const headOk = !!result.head && !!last?.producedHead && last.producedHead === result.head;
-  const chainProven = fixIdx !== -1 && passIdx > fixIdx && headOk;
-  if (result.outcome === "merge_ready" && chainProven) {
+    // The Task's lab name is DETERMINISTIC: record it BEFORE the run so a VERIFY
+    // that fails after `deploy` (and leaves the lab up) is torn down in `finally`.
+    factoryLabDeployed = factoryLab;
+    // ISH-869: the in-Sandbox dsh route (`deepseek-official`) reads
+    // `DEEPSEEK_API_KEY` from the Run env; forward it when the operator exports it.
+    const dshEnv = process.env.DEEPSEEK_API_KEY ? { DEEPSEEK_API_KEY: process.env.DEEPSEEK_API_KEY } : undefined;
+    const result = await runFactoryTask(db, task.id, {
+      repo,
+      dshBin: process.env.RELAY_DSH_BIN ?? "dsh",
+      permissionMode: "workspace-write",
+      timeoutMs: 15 * 60_000,
+      maxAttempts: 2,
+      sandboxCli: realSbxCli,
+      reviewWorktreeRoot: join(dir, "review-wt"),
+      ...(dshEnv ? { dshEnv } : {}),
+    });
+    const t = getTask(db, task.id)!;
+    // Find the real dsh Run and read its raw failure evidence, so a missing
+    // provider credential is recorded BLOCKED (not a generic failure).
+    const run = db
+      .query("SELECT * FROM runs WHERE task_id = ? ORDER BY created_at DESC LIMIT 1")
+      .get(task.id) as { id: string; state: string; exit_code: number | null; error: string | null; stderr_path: string | null; dsh_events_path: string | null } | null;
+    const rawBits: string[] = [];
+    for (const p of [run?.stderr_path, run?.dsh_events_path]) {
+      if (p && existsSync(p)) rawBits.push(readFileSync(p, "utf-8").slice(-1500));
+    }
+    const raw = [result.reason ?? "", run?.error ?? "", ...rawBits].join("\n");
+    const detail = `runFactoryTask(${task.id}) -> ${result.outcome} (head ${result.head?.slice(0, 12) ?? "none"}); run ${run?.id ?? "?"} ${run?.state ?? "?"} exit ${run?.exit_code ?? "?"}`;
+
+    // PASS is gated on the FULL chain, never a bare `merge_ready`: a FIX review
+    // followed by a LATER PASS, and the final attempt's produced HEAD equal to the
+    // MergeReady HEAD (verified HEAD == reviewer HEAD == MergeReady HEAD).
+    const attempts = result.attempts;
+    const fixIdx = attempts.findIndex((a) => a.reviewVerdict === "fix");
+    const passIdx = attempts.findIndex((a, i) => a.reviewVerdict === "pass" && fixIdx !== -1 && i > fixIdx);
+    const last = attempts[attempts.length - 1];
+    const headOk = !!result.head && !!last?.producedHead && last.producedHead === result.head;
+    const chainProven = fixIdx !== -1 && passIdx > fixIdx && headOk;
+    if (result.outcome === "merge_ready" && chainProven) {
+      record(
+        "factory",
+        "PASS",
+        `real chain: dsh IMPLEMENT -> SR Linux VERIFY -> Claude FIX -> fresh dsh -> re-VERIFY -> Claude PASS -> MergeReady @ ${result.head?.slice(0, 12)}`,
+        { raw: JSON.stringify({ attempts, steps: result.steps }, null, 2).slice(0, 1500) }
+      );
+    } else if (result.outcome === "merge_ready") {
+      record("factory", "FAIL", `merge_ready but the ISH-830 chain is NOT proven (fixIdx=${fixIdx} passIdx=${passIdx} head-equal=${headOk}): ${detail}`);
+    } else if (/MISSING_CREDENTIAL|no credential|no API key/i.test(raw)) {
+      const why = raw.split("\n").find((l) => /MISSING_CREDENTIAL|no credential|no API key/i.test(l))?.trim() ?? "";
+      record("factory", "BLOCKED", `real factory fails CLOSED (no provider credential, no false PASS): ${detail}`, { raw: why });
+    } else {
+      record("factory", "FAIL", detail, { raw: raw.slice(-800) });
+    }
+    // No merge/PR/Linear side effect.
     record(
-      "factory",
-      "PASS",
-      `real chain: dsh IMPLEMENT -> SR Linux VERIFY -> Claude FIX -> fresh dsh -> re-VERIFY -> Claude PASS -> MergeReady @ ${result.head?.slice(0, 12)}`,
-      { raw: JSON.stringify({ attempts, steps: result.steps }, null, 2).slice(0, 1500) }
+      "factory.read-only",
+      t.merged_at === null && t.accepted_at === null && t.pr_url === null ? "PASS" : "FAIL",
+      `merged_at=${t.merged_at} accepted_at=${t.accepted_at} pr_url=${t.pr_url} (MergeReady is read-only)`
     );
-  } else if (result.outcome === "merge_ready") {
-    record("factory", "FAIL", `merge_ready but the ISH-830 chain is NOT proven (fixIdx=${fixIdx} passIdx=${passIdx} head-equal=${headOk}): ${detail}`);
-  } else if (/MISSING_CREDENTIAL|no credential|no API key/i.test(raw)) {
-    const why = raw.split("\n").find((l) => /MISSING_CREDENTIAL|no credential|no API key/i.test(l))?.trim() ?? "";
-    record("factory", "BLOCKED", `real factory fails CLOSED (no provider credential, no false PASS): ${detail}`, { raw: why });
-  } else {
-    record("factory", "FAIL", detail, { raw: raw.slice(-800) });
-  }
-  // No merge/PR/Linear side effect.
-  record(
-    "factory.read-only",
-    t.merged_at === null && t.accepted_at === null && t.pr_url === null ? "PASS" : "FAIL",
-    `merged_at=${t.merged_at} accepted_at=${t.accepted_at} pr_url=${t.pr_url} (MergeReady is read-only)`
-  );
-  const sb = getSandbox(db, task.id);
-  db.close();
-  if (sb) {
-    realSbxCli.run(["stop", sb.name]);
-    const rm = realSbxCli.run(["rm", "--force", sb.name]);
-    record("factory.sandbox-cleanup", rm.ok ? "PASS" : "FAIL", rm.ok ? `sandbox ${sb.name} removed` : `sbx rm failed: ${rm.err || rm.out}`);
+  } catch (e) {
+    // Fail-closed: never swallow a factory-stage error (a throw is a FAIL, and the
+    // `finally` still tears down the Task lab + sandbox).
+    record("factory", "FAIL", `factory stage error: ${e instanceof Error ? e.message : String(e)}`.slice(0, 400));
+  } finally {
+    // FAIL-CLOSED teardown: destroy the Task's own lab (same exit-6 verdict as
+    // `stageNos`), then remove the Coding Sandbox — a leaked lab/sandbox is a FAIL.
+    if (factoryLabDeployed && sbName) {
+      const labctl = sandboxLabctl({ sandbox: sbName, workspace: sbWorkspace, exec: realSandboxExec }, labEnvFromProcess());
+      const del = await destroyTaskLab(labctl, taskLab, { lab: factoryLabDeployed, api, insecure });
+      if (del.ok) {
+        record("factory.lab-cleanup", "PASS", `${factoryLabDeployed} destroyed`);
+      } else {
+        const ins = await labctl.run(labctlInspectArgv({ lab: factoryLabDeployed, api, insecure }));
+        record("factory.lab-cleanup", ins.code === 6 ? "PASS" : "FAIL", `destroy ${factoryLabDeployed}: ${del.error ?? "failed"}; inspect exit ${ins.code}`);
+      }
+    }
+    const sb = getSandbox(db, task.id);
+    db.close();
+    if (sb) {
+      realSbxCli.run(["stop", sb.name]);
+      const rm = realSbxCli.run(["rm", "--force", sb.name]);
+      record("factory.sandbox-cleanup", rm.ok ? "PASS" : "FAIL", rm.ok ? `sandbox ${sb.name} removed` : `sbx rm failed: ${rm.err || rm.out}`);
+    }
   }
 }
 
@@ -750,12 +853,14 @@ async function main(): Promise<void> {
   if (stages.has("env")) stageEnv();
   if (stages.has("provider")) stageProvider();
   if (!api && (stages.has("nos") || stages.has("parallel") || stages.has("factory"))) {
-    record("lab", "BLOCKED", "LABCTL_API is unset; the Shared-Lab legs are skipped", { command: "LABCTL_API=<url> LABCTL_USER=<u> LABCTL_PASSWORD=<pw> ..." });
+    record("lab", "BLOCKED", "LABCTL_API is unset; the Shared-Lab legs (nos/parallel/factory) are skipped", { command: "LABCTL_API=<url> LABCTL_USER=<u> LABCTL_PASSWORD=<pw> ..." });
   }
-  if ((stages.has("nos") || stages.has("parallel")) && api) warmLab();
+  // Any stage that talks to the Lab needs the VM awake (an idle Shared Lab VM is
+  // stopped; the factory VERIFY would otherwise hit a stopped API).
+  if (api && (stages.has("nos") || stages.has("parallel") || stages.has("factory"))) warmLab();
   if (stages.has("nos") && api) await stageNos(dir, api, insecure);
   if (stages.has("parallel") && api) await stageParallel(dir, api, insecure);
-  if (stages.has("factory")) await stageFactory(dir, api, insecure);
+  if (stages.has("factory") && api) await stageFactory(dir, api, insecure);
 
   console.log("\n=== ISH-830 E2E summary ===");
   const counts = results.reduce<Record<string, number>>((m, r) => ((m[r.verdict] = (m[r.verdict] ?? 0) + 1), m), {});

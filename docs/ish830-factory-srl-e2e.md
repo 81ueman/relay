@@ -52,31 +52,43 @@ host disk/RAM + timestamp: recorded by `env.host-resources` (`df -h /`, `hw.mems
 ## Result summary (raw)
 
 ```
-ok   [env]            darwin/arm64 … sbx v0.48.0 … dsh 0.2.1-rc.2; claude 2.1.292
-ok   [env.host-resources]  <time>; host disk(/) …; host RAM …
-ok   [env.lab-resources]   Shared Lab VM: cpus=…; mem=…; disk=…
-ok   [env.srl-image]  sha256:0096fe3e… (ghcr.io/nokia/srlinux@sha256:0096fe3e…)
-ok   [env.clab-api]   clab-api-server: …:latest running
-BLOCKED [provider]    real dsh/DeepSeek leg cannot run (no provider credential)
-ok   [lab.warm]       Shared Lab clab-api-server is ready
-ok   [lab.keepalive]  keep-alive exec session started on the Shared Lab VM
-ok   [nos]            real SR Linux VERIFY at the bound HEAD <sha>: v26.7.2 (clab-api exec)
-NOT_RUN [nos.ssh]     SSH NOT_RUN (no SSH evidence obtained)
-NOT_RUN [nos.gnmi]    gNMI NOT_RUN (gnmic not installed in the Sandbox)
-ok   [nos.head-mismatch]         HEAD mismatch -> not_run (never a PASS)
-ok   [nos.dirty-tree]            a check that dirties the tree -> inconclusive
-ok   [nos.required-verify-fail]  a required check that exits non-zero -> fail
-ok   [nos.lab-port-failure]      an unpublished Lab port -> VERIFY fail
-ok   [nos.api-unavailable]       Lab API unavailable -> VERIFY fail (transport failure)
-ok   [nos.foreign-lab]           a foreign-lab destroy is refused (LAB_FOREIGN)
-ok   [nos.cleanup]               lab destroyed (NOS image retained)
-ok   [parallel]                  two Task-named labs deployed concurrently (distinct owners/ports)
-ok   [parallel.cleanup-a]        lab A destroyed (verdict from the destroy result)
-ok   [parallel.isolation]        lab B still running after A was destroyed
-ok   [parallel.image-retained]   shared SR Linux image retained: sha256:0096fe3e…
-ok   [parallel.cleanup-b]        lab B destroyed
-BLOCKED [factory]     real factory fails CLOSED (no provider credential, no false PASS)
-ok   [factory.read-only]         merged_at=null accepted_at=null pr_url=null
+=== ISH-830 E2E summary ===
+  PASS     env: darwin/arm64 macOS 26.2; sbx sbx version v0.48.0 5caf923e0587d376848f6f388eca3e0f5ca00e2d; dsh 0.2.1-rc.2; claude 2.1.292 (Claude Code)
+  PASS     env.host-resources: 2026-10-18T02:47:30.015Z; host disk(/) /dev/disk3s1s1   926Gi    11Gi   186Gi     6%    453k  2.0G    0%   /; host RAM 32.0 GiB
+  PASS     env.lab-resources: Shared Lab VM: cpus=10; mem=15Gi; disk=20G
+  PASS     env.labvm: Shared Lab VM: ish824-lab             shell           ● running   127.0.0.1:49161->8090/tcp, ::1:49161->8090/tcp, 0.0.0.0:49170->8090/tcp4, 127.0.0.1:49305->8090/tcp4, 0.0.0.0:18001->18001/tcp4, 0.0.0.0:18002->18002/tcp4, 0.0.0.0:18011->18011/tcp4, 0.0.0.0:18012->18012/tcp4, 0.0.0.0:18021->18021/tcp4   -                                                                                             1d
+  PASS     env.srl-image: SR Linux image: sha256:0096fe3ebcafabb7253492e2060425fe027a168e0e066766d1e85efbb0b48be8 ghcr.io/nokia/srlinux@sha256:0096fe3ebcafabb7253492e2060425fe027a168e0e066766d1e85efbb0b48be8
+  PASS     env.clab-api: clab-api-server: ghcr.io/srl-labs/clab-api-server/clab-api-server:latest running
+  BLOCKED  provider: real dsh/DeepSeek leg cannot run (no provider credential)
+  PASS     lab.warm: Shared Lab clab-api-server is ready
+  PASS     lab.keepalive: started a keep-alive exec session on the Shared Lab VM
+  PASS     nos: real SR Linux VERIFY at the bound HEAD 97c00db62443: "image": "ghcr.io/nokia/srlinux:latest",
+  NOT_RUN  nos.ssh: SSH NOT_RUN (no SSH evidence obtained)
+  NOT_RUN  nos.gnmi: gNMI NOT_RUN (gnmic not installed in the Sandbox)
+  PASS     nos.head-mismatch: HEAD mismatch -> not_run (never a PASS)
+  PASS     nos.dirty-tree: a check that dirties the tree -> inconclusive
+  PASS     nos.required-verify-fail: a required check that exits non-zero -> fail (never a PASS)
+  PASS     nos.lab-port-failure: a second Task lab on the already-published host port 18001 -> deploy ok=false (never a PASS)
+  PASS     nos.lab-port-holder-cleanup: netlab-T1-1792291652678: destroyed
+  PASS     nos.api-unavailable: Lab API unavailable -> VERIFY fail (never a PASS)
+  PASS     nos.foreign-lab: a foreign-lab destroy is refused: LAB_FOREIGN: lab 'netlab-SOMEONE-ELSE' is not owned by task T1 (expected netlab-T1-1792291652678)
+  PASS     nos.cleanup: destroy: destroy failed (exit 6): labctl: not found: DELETE /api/v1/labs/netlab-T1-1792291652678: lab 'netlab-T1-1792291652678' not found; inspect exit 6
+  PASS     nos.lab-port-cleanup: netlab-T1-port-1792291652679 destroyed
+  PASS     nos.sandbox-cleanup: sandbox relay-ish830-nos-mvd86a0d removed
+  PASS     parallel: two Task-named labs deployed concurrently: netlab-ish830-par-a-mvd88vtj-1792291774231 + netlab-ish830-par-b-mvd88vtj-1792291774232 (distinct owners/ports)
+  PASS     parallel.cleanup-a: netlab-ish830-par-a-mvd88vtj-1792291774231 destroyed
+  PASS     parallel.isolation: netlab-ish830-par-b-mvd88vtj-1792291774232 still running after the other lab was destroyed
+  PASS     parallel.image-retained: shared SR Linux image retained: sha256:0096fe3ebcafabb7253492e2060425fe027a168e0e066766d1e85efbb0b48be8
+  PASS     parallel.cleanup-b: netlab-ish830-par-b-mvd88vtj-1792291774232 destroyed
+  PASS     parallel.sandbox-cleanup: sandbox relay-ish830-par-mvd88vtj removed
+  BLOCKED  factory: real factory fails CLOSED (no provider credential, no false PASS): runFactoryTask(T1) -> coding_failed (head none); run run-92c4f197 failed exit 1
+  PASS     factory.read-only: merged_at=null accepted_at=null pr_url=null (MergeReady is read-only)
+  PASS     factory.lab-cleanup: destroy netlab-T1-1792291872959: destroy failed (exit 6): labctl: not found: DELETE /api/v1/labs/netlab-T1-1792291872959: lab 'netlab-T1-1792291872959' not found; inspect exit 6
+  PASS     factory.sandbox-cleanup: sandbox relay-ish-830-factory-1f93603d removed
+
+counts: {"PASS":28,"BLOCKED":2,"NOT_RUN":2}
+evidence-json: [{"stage":"env","verdict":"PASS","detail":"darwin/arm64 macOS 26.2; sbx sbx version v0.48.0 5caf923e0587d376848f6f388eca3e0f5ca00e2d; dsh 0.2.1-rc.2; claude 2.1.292 (Claude Code)"},{"stage":"env.host-resources","verdict":"PASS","detail":"2026-10-18T02:47:30.015Z; host disk(/) /dev/disk3s1s1   926Gi    11Gi   186Gi     6%    453k  2.0G    0%   /; host RAM 32.0 GiB"},{"stage":"env.lab-resources","verdict":"PASS","detail":"Shared Lab VM: cpus=10; mem=15Gi; disk=20G"},{"stage":"env.labvm","verdict":"PASS","detail":"Shared Lab VM: ish824-lab             shell           ● running   127.0.0.1:49161->8090/tcp, ::1:49161->8090/tcp, 0.0.0.0:49170->8090/tcp4, 127.0.0.1:49305->8090/tcp4, 0.0.0.0:18001->18001/tcp4, 0.0.0.0:18002->18002/tcp4, 0.0.0.0:18011->18011/tcp4, 0.0.0.0:18012->18012/tcp4, 0.0.0.0:18021->18021/tcp4   -                                                                                             1d"},{"stage":"env.srl-image","verdict":"PASS","detail":"SR Linux image: sha256:0096fe3ebcafabb7253492e2060425fe027a168e0e066766d1e85efbb0b48be8 ghcr.io/nokia/srlinux@sha256:0096fe3ebcafabb7253492e2060425fe027a168e0e066766d1e85efbb0b48be8"},{"stage":"env.clab-api","verdict":"PASS","detail":"clab-api-server: ghcr.io/srl-labs/clab-api-server/clab-api-server:latest running"},{"stage":"provider","verdict":"BLOCKED","detail":"real dsh/DeepSeek leg cannot run (no provider credential)","command":"dsh --profile headless --json \"reply with the single token PING\"","raw":"{\"type\":\"status\",\"phase\":\"turn_end\",\"turn\":1,\"reason\":{\"kind\":\"error\",\"error\":{\"message\":\"llm-pi-ai: no credential for provider route \\\"ollama-cloud-v41\\\"; its profile resolves OLLAMA_CLOUD_V41_API_KEY, which is not set — store OLLAMA_CLOUD_V41_API_KEY through the credentials service (the web Models page writes it) or export it, and remove apiKeyEnv only if this provider should authenticate from pi-ai's own environment discovery\",\"code\":\"MISSING_CREDENTIAL\"}}}\n{\"type\":\"final\",\"text\":\"\"}"},{"stage":"lab.warm","verdict":"PASS","detail":"Shared Lab clab-api-server is ready"},{"stage":"lab.keepalive","verdict":"PASS","detail":"started a keep-alive exec session on the Shared Lab VM"},{"stage":"nos","verdict":"PASS","detail":"real SR Linux VERIFY at the bound HEAD 97c00db62443: \"image\": \"ghcr.io/nokia/srlinux:latest\",","command":"sandboxVerifyTarget.runner.run(nos-readback)","raw":".\nSerial Number        : Sim Serial No.\nSystem HW MAC Address: 1A:4F:00:FF:00:00\nOS                   : SR Linux\nSoftware Version     : v26.7.2\nBuild Number         : 519-g94fbd638fa8\nArchitecture         : aarch64\nLast Booted          : 2026-10-18T02:48:04.613Z\nTotal Memory         : 16593984 kB\nFree Memory          : 13769392 kB\n--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------\n--- real SSH leg (published :22) ---\nConnection closed by 169.254.1.1 port 18001\r\nSSH_LEG_FAIL\n--- real gNMI leg (published :57400) ---\nGNMI_NOT_RUN: gnmic is not installed in the sandbox\n{\n  \"destroyed\": true,\n  \"lab\": \"netlab-T1-1792291652678\",\n  \"response\": {\n    \"message\": \"Lab 'netlab-T1-1792291652678' destroyed successfully\"\n  }\n}\nNOS_CHECK_DONE\n\nParsing error: Unknown token 'commit'. Options are ['!', '#', '..', '/', 'acl', 'back', 'bash', 'bfd', 'cls', 'date', 'diff', 'echo', 'enter', 'environment', 'exit', 'file', 'help', 'history', 'info', 'interface', 'list', 'monitor', 'network-instance', 'passwd', 'ping', 'ping6', 'platform', 'pwc', 'qos', 'quit', 'references', 'routing-policy', 'save', 'show', 'source', 'ssh', 'system', 'tcptraceroute', 'tech-support', 'tools', 'traceroute', 'traceroute6', 'tree', 'tunnel', 'tunnel-interface', 'watch', '{']"},{"stage":"nos.ssh","verdict":"NOT_RUN","detail":"SSH NOT_RUN (no SSH evidence obtained)","raw":"Connection closed by 169.254.1.1 port 18001\r\nSSH_LEG_FAIL"},{"stage":"nos.gnmi","verdict":"NOT_RUN","detail":"gNMI NOT_RUN (gnmic not installed in the Sandbox)"},{"stage":"nos.head-mismatch","verdict":"PASS","detail":"HEAD mismatch -> not_run (never a PASS)"},{"stage":"nos.dirty-tree","verdict":"PASS","detail":"a check that dirties the tree -> inconclusive"},{"stage":"nos.required-verify-fail","verdict":"PASS","detail":"a required check that exits non-zero -> fail (never a PASS)"},{"stage":"nos.lab-port-failure","verdict":"PASS","detail":"a second Task lab on the already-published host port 18001 -> deploy ok=false (never a PASS)","raw":"LAB_ERROR: labctl deploy failed (exit 5): labctl: API error 500 for POST /api/v1/labs/netlab-T1-port-1792291652679/deploy: Failed to deploy lab 'netlab-T1-port-1792291652679': deployment failed: deployment failed for one or more nodes: node \"srl1\" deploy: Error response from daemon: failed to set up container networking: driver failed programming external connectivity on endpoint clab-netlab-T1-port-1792291652679-srl1 (b1c22db037637ca626f"},{"stage":"nos.lab-port-holder-cleanup","verdict":"PASS","detail":"netlab-T1-1792291652678: destroyed"},{"stage":"nos.api-unavailable","verdict":"PASS","detail":"Lab API unavailable -> VERIFY fail (never a PASS)","raw":"LABCTL_EXIT=5\n\nLABCTL_EXIT=5\n\nlabctl: cannot reach API server at https://127.0.0.1:9: [Errno 111] Connection refused"},{"stage":"nos.foreign-lab","verdict":"PASS","detail":"a foreign-lab destroy is refused: LAB_FOREIGN: lab 'netlab-SOMEONE-ELSE' is not owned by task T1 (expected netlab-T1-1792291652678)"},{"stage":"nos.cleanup","verdict":"PASS","detail":"destroy: destroy failed (exit 6): labctl: not found: DELETE /api/v1/labs/netlab-T1-1792291652678: lab 'netlab-T1-1792291652678' not found; inspect exit 6"},{"stage":"nos.lab-port-cleanup","verdict":"PASS","detail":"netlab-T1-port-1792291652679 destroyed"},{"stage":"nos.sandbox-cleanup","verdict":"PASS","detail":"sandbox relay-ish830-nos-mvd86a0d removed"},{"stage":"parallel","verdict":"PASS","detail":"two Task-named labs deployed concurrently: netlab-ish830-par-a-mvd88vtj-1792291774231 + netlab-ish830-par-b-mvd88vtj-1792291774232 (distinct owners/ports)"},{"stage":"parallel.cleanup-a","verdict":"PASS","detail":"netlab-ish830-par-a-mvd88vtj-1792291774231 destroyed"},{"stage":"parallel.isolation","verdict":"PASS","detail":"netlab-ish830-par-b-mvd88vtj-1792291774232 still running after the other lab was destroyed"},{"stage":"parallel.image-retained","verdict":"PASS","detail":"shared SR Linux image retained: sha256:0096fe3ebcafabb7253492e2060425fe027a168e0e066766d1e85efbb0b48be8"},{"stage":"parallel.cleanup-b","verdict":"PASS","detail":"netlab-ish830-par-b-mvd88vtj-1792291774232 destroyed"},{"stage":"parallel.sandbox-cleanup","verdict":"PASS","detail":"sandbox relay-ish830-par-mvd88vtj removed"},{"stage":"factory","verdict":"BLOCKED","detail":"real factory fails CLOSED (no provider credential, no false PASS): runFactoryTask(T1) -> coding_failed (head none); run run-92c4f197 failed exit 1","raw":"dsh: MISSING_CREDENTIAL: llm-deepseek: no API key for provider route \"deepseek-official\"; store DEEPSEEK_API_KEY through the credentials service (the web Models page writes it), or export DEEPSEEK_API_KEY in the launching environment"},{"stage":"factory.read-only","verdict":"PASS","detail":"merged_at=null accepted_at=null pr_url=null (MergeReady is read-only)"},{"stage":"factory.lab-cleanup","verdict":"PASS","detail":"destroy netlab-T1-1792291872959: destroy failed (exit 6): labctl: not found: DELETE /api/v1/labs/netlab-T1-1792291872959: lab 'netlab-T1-1792291872959' not found; inspect exit 6"},{"stage":"factory.sandbox-cleanup","verdict":"PASS","detail":"sandbox relay-ish-830-factory-1f93603d removed"}]
+
 ```
 
 ### A. Real SR Linux VERIFY at the bound HEAD — **measured**
@@ -97,10 +109,11 @@ Software Version     : v26.7.2
 Build Number         : 519-g94fbd638fa8
 Architecture         : aarch64
 --- real SSH leg (published :22) ---
-Connection closed by 169.254.1.1 port 18001   # SSH_NOT_RUN
+Connection closed by 169.254.1.1 port 18001
+SSH_LEG_FAIL
 --- real gNMI leg (published :57400) ---
 GNMI_NOT_RUN: gnmic is not installed in the sandbox
-{ "destroyed": true, "lab": "netlab-<owner>", "response": { "message": "Lab '…' destroyed successfully" } }
+{ "destroyed": true, "lab": "netlab-T1-1792291652678", "response": { "message": "Lab 'netlab-T1-1792291652678' destroyed successfully" } }
 NOS_CHECK_DONE
 ```
 
@@ -120,8 +133,8 @@ NOS and to the checked-out HEAD.
 | clone HEAD ≠ the bound head | `not_run` (the command never ran) | never a PASS |
 | a check that dirties the tree | `inconclusive` | never a PASS |
 | a REQUIRED check that exits non-zero | `fail` | never a PASS |
-| an unpublished Lab port | `fail` | never a PASS |
-| Lab API unavailable (`--api https://127.0.0.1:9`, creds sourced) | `fail`, with a transport failure (`LABCTL_EXIT=5/7` / connection refused) | never a PASS |
+| a second Task lab on an already-published Lab port (18001) | `deployTaskLab` `ok=false` (API 500, container networking) — and the partial container is torn down (`nos.lab-port-cleanup`) | never a PASS |
+| Lab API unavailable (`--api https://127.0.0.1:9`, creds sourced) | `fail`, `LABCTL_EXIT=5` + `[Errno 111] Connection refused` | never a PASS |
 | `destroyTaskLab` on a foreign lab (`netlab-SOMEONE-ELSE`) | refused `LAB_FOREIGN` before `labctl` | never a PASS |
 
 ### C. Two Task-named labs coexist (LAB isolation) — **measured**
@@ -130,7 +143,8 @@ Two Task-named labs (`netlab-ish830-par-a-<run>-…` on host ports 18001/18002 a
 `…-b-…` on 18011/18012, **unique per run**) were deployed **concurrently**
 (`Promise.all`); destroying `…-a-…` left `…-b-…` running, and the shared SR Linux
 image (`sha256:0096fe3e…`) survived. Each destroy's verdict is recorded from its
-**result** (`parallel.cleanup-a` / `parallel.cleanup-b`), not discarded.
+**result** (`parallel.cleanup-a` / `parallel.cleanup-b`) and the sandbox removal is
+recorded (`parallel.sandbox-cleanup`), never discarded.
 
 **Scope of this proof:** it is a **lab** isolation proof only. The Tasks are not
 Relay Tasks with their own Coding Sandboxes/branches, so **branch / review-HEAD
@@ -159,6 +173,19 @@ proven — a `FIX` review followed by a **later** `PASS`, with the final attempt
 produced HEAD equal to the MergeReady HEAD (verified HEAD == reviewer HEAD ==
 MergeReady HEAD). A bare `merge_ready` without that chain is recorded `FAIL`.
 
+**Fail-closed teardown (factory).** Everything after `ensureTaskSandbox` runs in a
+`try/finally`: the Task's own lab is destroyed (same exit-6 verdict as `nos`, row
+`factory.lab-cleanup`) and the Coding Sandbox is removed (`factory.sandbox-cleanup`).
+A leaked lab/sandbox is a recorded `FAIL`, and a stage error is a `FAIL` — never a
+silent leak. When `LABCTL_API` is unset the `factory` stage is skipped as `BLOCKED`
+(no sandbox is created). `nos-check.sh` also carries a
+`trap 'labctl destroy …' EXIT`, so **every** VERIFY attempt tears down its own lab
+even if it fails after `deploy`.
+
+**Provider credential.** The stage forwards `DEEPSEEK_API_KEY` into the Sandbox Run
+when the operator exports it (`dshEnv`), and runs `warmLab()` whenever a Lab stage
+runs, so the factory VERIFY cannot hit a stopped Shared Lab API.
+
 ## BLOCKED / NOT_RUN (do not treat as PASS)
 
 - **BLOCKED — the real DeepSeek/provider leg.** No provider credential is
@@ -182,8 +209,9 @@ MergeReady HEAD). A bare `merge_ready` without that chain is recorded `FAIL`.
 - **NOT_RUN — spec §6 cases not injected here** (each has deterministic unit
   coverage; the real chain is BLOCKED anyway):
   - *lab destroy fail* → `tests/lab.test.ts` (`destroy` failure is `ok:false`);
-  - *VM restart / stale generation / orphan* → `tests/factory.test.ts` (adoption,
-    orphan sweep, generation fence);
+  - *VM restart / orphan* → `tests/factory.test.ts` (adoption, orphan sweep);
+  - *stale generation* → `tests/run-lifecycle.test.ts:389` (a superseded Run is
+    refused) and `tests/workflow.test.ts:238` (a review of a moved HEAD is refused);
   - *dsh timeout / early exit* → `tests/dsh-runner.test.ts` (timeout → `not_run`/
     `failed`; `exit 0` with no commit → `NO_IMPLEMENTATION`);
   - *duplicate writer* → `tests/factory.test.ts` (same worktree → `DUPLICATE_WRITER`);
@@ -211,10 +239,12 @@ no TLC run is required (AGENTS.md).
 ## Not verified / follow-ups
 
 - The **real model chain** (DeepSeek IMPLEMENT → Claude FIX → PASS → MergeReady):
-  BLOCKED on a provider credential. Once `DEEPSEEK_API_KEY` is available to the
-  host Run (or the operator credential proxy to the Sandbox), re-run the
-  `factory` stage — it credits `PASS` only when the FIX→fresh-Run→PASS chain and
-  the HEAD equality hold.
+  BLOCKED on a provider credential. Export `DEEPSEEK_API_KEY` and re-run the
+  `factory` stage (`RELAY_ISH830_E2E=1 LABCTL_API=… … ISH830_STAGES=factory bun
+  scripts/ish830-real-e2e.ts`): the harness forwards `DEEPSEEK_API_KEY` into the
+  Sandbox Run (`dshEnv`) and runs `warmLab()`, so the Run can reach the provider;
+  `PASS` is credited only when the FIX→fresh-Run→PASS chain and the HEAD equality
+  hold.
 - Real SSH and real gNMI read-backs (a Sandbox egress path that permits SSH, and
   `gnmic` installed in the Coding Kit).
 - No GitHub push/PR/Linear write is performed by the harness (MergeReady is
