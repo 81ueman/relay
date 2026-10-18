@@ -106,6 +106,13 @@ export interface HeadlessReviewDeps {
    * edits. Omitted -> the existing `task.worktree` path (old Herdr Reviewer).
    */
   reviewWorktree?: string;
+  /**
+   * ISH-878: the DURABLE directory the raw reviewer output is written under,
+   * overriding the default (`task.worktree`, else the review worktree). A
+   * Sandbox-backed Task has no host worktree, so the Factory passes a durable
+   * per-Task directory — the read-only review worktree is removed afterwards.
+   */
+  evidenceBase?: string;
 }
 
 export interface HeadlessReviewResult {
@@ -440,7 +447,7 @@ export async function runHeadlessReview(
   // DURABLE base — the Task's own worktree — never inside a temporary
   // `reviewWorktree` that the caller removes, so a recorded `evidence_ref` never
   // dangles.
-  const evidenceBase = task.worktree ?? worktree;
+  const evidenceBase = deps.evidenceBase ?? task.worktree ?? worktree;
   const evidencePath = reviewEvidencePath(evidenceBase, task.attempt, head);
   try {
     mkdirSync(dirname(evidencePath), { recursive: true });
