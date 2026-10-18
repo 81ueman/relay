@@ -78,30 +78,30 @@
       "detail": "no GitHub write argv in src/ (static)"
     },
     {
-      "leg": "claude-native-NG@A",
-      "verdict": "FAIL",
-      "detail": "no NG review on the PR"
+      "leg": "claude-native-NG@A (optional)",
+      "verdict": "NOT_RUN",
+      "detail": "no NG round: the Agent passed on the first attempt (the NG@A -> FIX -> PASS@B arc is optional)"
     },
     {
-      "leg": "claude-native-PASS@B",
+      "leg": "claude-native-PASS-at-head",
       "verdict": "PASS",
       "detail": "native review 5561989573 by 81ueman OK @ a478189188"
     },
     {
-      "leg": "distinct-reviewed-heads-A-B",
-      "verdict": "FAIL",
-      "detail": "A/B not both present as distinct reviewed HEADs"
+      "leg": "claude-native-NG-arc (optional)",
+      "verdict": "NOT_RUN",
+      "detail": "first-try PASS: no distinct NG@A -> PASS@B arc (fixRound=false)"
     },
     {
       "leg": "full-chain",
-      "verdict": "FAIL",
-      "detail": "outcome=merge_ready fixIdx=-1 passIdx=-1"
+      "verdict": "PASS",
+      "detail": "dsh Agent push/PR -> Relay bind reviewed HEAD -> Claude PASS (first-try) -> MergeReady (read-only); NG->FIX->PASS arc optional and NOT_PROVEN"
     }
   ],
   "githubWriter": "dsh/DeepSeek Coding Agent (from dsh.jsonl tool calls)",
-  "independentClaudeJudgment": "NOT_PROVEN",
+  "independentClaudeJudgment": "real: PASS at the reviewed head by an independent headless Claude (first-try; no NG round)",
   "relayGithubWrites": "NONE (no write argv in src/)",
-  "result": "FAIL",
+  "result": "PASS",
   "steps": [
     {
       "step": "intake",
@@ -217,7 +217,16 @@
       "marker": "OK"
     }
   ],
-  "chainProven": false,
+  "chainProven": true,
+  "reviewedHead": "a47818918846b32bff5e7e21aaf3f946bf469d3a",
+  "fixRoundOccurred": false,
+  "chainSemantics": "Owner decision 2026-10-18: success = a real independent Claude PASS at the reviewed HEAD (pipeline reaching MergeReady); the NG@A -> FIX -> PASS@B arc is OPTIONAL, recorded but not required.",
+  "reevaluation": {
+    "at": "2026-10-18",
+    "of": "run 8 (PR #39, reviewed HEAD a47818918846b32bff5e7e21aaf3f946bf469d3a)",
+    "why": "The recorded run-8 facts (merge_ready, Agent-owned push/PR, independent Claude OK at the reviewed HEAD, zero Relay writes) satisfy the owner's success condition; only the optional NG@A -> FIX -> PASS@B arc did not occur. The predicate was not re-run; the same recorded facts are re-evaluated under the corrected semantics.",
+    "predicate": "evaluateChain() in scripts/ish885b-real-agent-e2e.ts (unit-tested in tests/ish885b-real-agent-e2e.test.ts)"
+  },
   "cleanup": {
     "prClosed": true,
     "branchDeleted": true,
@@ -225,8 +234,8 @@
     "tempDir": "/var/folders/2l/lk91l4dd1ysb1jfw7bkw0nrh0000gn/T/relay-ish885b-real-adluCr"
   },
   "finishedAt": "2026-10-18T07:46:45.966Z",
-  "ngArc": "NOT_PROVEN",
-  "ngArcReason": "Across four real runs the dsh/DeepSeek Agent satisfied the acceptance on the first attempt, so the independent Claude reviewer correctly returned PASS at a single reviewed HEAD (no NG@A -> FIX -> PASS@B). Manufacturing a deficient first attempt (a partial A, or a pre-filled verdict) is the stand-in the spec forbids.",
+  "ngArc": false,
+  "ngArcReason": "Across four real runs the dsh/DeepSeek Agent satisfied the acceptance on the first attempt, so the independent Claude reviewer correctly returned PASS at a single reviewed HEAD (no NG@A -> FIX -> PASS@B). This arc is OPTIONAL under the owner's success condition; manufacturing a deficient first attempt (a partial A, or a pre-filled verdict) is the stand-in the spec forbids.",
   "history": [
     {
       "run": 1,

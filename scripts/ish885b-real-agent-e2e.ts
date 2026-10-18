@@ -10,12 +10,15 @@
  *     (`sandbox/coding-kit`) and performs the GitHub writes itself: `git commit`
  *     + `git push` (SSH agent forwarding) + `gh pr create`/update (the sbx GitHub
  *     credential proxy). Relay has NO publisher and makes ZERO GitHub writes.
- *   - an **independent headless Claude** (`claude -p`) posts a native
- *     `gh pr review` NG at A and, after a FRESH dsh FIX pushes B to the SAME PR,
- *     a PASS at B — from its own judgment (the verdict is NOT pre-filled).
- *   - Relay OBSERVES: `bindTaskPr` (read-only) binds A then B and `verifyNativeReview`
- *     reads both reviews back bound to the exact HEADs; a FAIL reaches the read-only
- *     merge gate. Nothing is merged and the default branch is never pushed.
+ *   - an **independent headless Claude** (`claude -p`) posts a native `gh pr review`
+ *     PASS at the reviewed HEAD — from its own judgment (the verdict is NOT
+ *     pre-filled). The `NG@A -> fresh dsh FIX -> PASS@B` arc is **OPTIONAL**: it is
+ *     recorded when it occurs, but a genuine first-try PASS is a valid success
+ *     (owner decision 2026-10-18). Either way the arc is never fabricated.
+ *   - Relay OBSERVES: `bindTaskPr` (read-only) binds the HEAD(s) and
+ *     `verifyNativeReview` reads the review(s) back bound to the exact HEADs; a FAIL
+ *     reaches the read-only merge gate. Nothing is merged and the default branch is
+ *     never pushed.
  *
  * The disposable PR + branch + sandbox are cleaned up ONLY after the durable
  * evidence file is written. This script NEVER merges and NEVER pushes to the
@@ -173,6 +176,58 @@ export function extractAgentGithubWrites(dbDir: string, rows: { id: string; stat
     return { runId: r.id, state: r.state, exitCode: r.exit_code, headSha: r.head_sha, baseHeadSha: r.base_head_sha, dshJsonl: r.dsh_events_path };
   });
   return { agentGithubWrites: writes, agentGithubWriteDetails: details, runs };
+}
+
+export interface ChainOutcome {
+  /** The pipeline reached the read-only merge gate with a real review PASS at the reviewed HEAD. */
+  chainOk: boolean;
+  /** An independent `verdict=OK` native review exists at the FINAL reviewed HEAD. */
+  passHeadMatches: boolean;
+  /** A `verdict=NG` review exists at a DIFFERENT HEAD than the PASS (the optional arc occurred). */
+  ngArc: boolean;
+  /** The factory ran a FIX attempt (the arc's fix leg happened). */
+  fixRoundOccurred: boolean;
+  /** Honest description of the independent judgment, or `NOT_PROVEN`. */
+  independentClaudeJudgment: string;
+}
+
+/**
+ * The success predicate, kept pure so it is unit-testable without a real PR.
+ *
+ * Owner decision 2026-10-18: the success condition is a **real review PASS at the
+ * reviewed HEAD** (pipeline reaching MergeReady with an independent Claude verdict).
+ * The `NG@A -> FIX -> PASS@B` arc is OPTIONAL — a first-try PASS is a valid PASS, and
+ * `fixRoundOccurred` records which happened. A missing/incongruent review is still
+ * `NOT_PROVEN` (never a fabricated PASS).
+ */
+export function evaluateChain(input: {
+  outcome: string | null;
+  pushedByAgent: boolean;
+  prNumber: number | null;
+  finalHead: string | null;
+  lastProducedHead: string | null;
+  attemptVerdicts: (string | null | undefined)[];
+  reviews: { body?: string | null; commit_id?: string | null }[];
+}): ChainOutcome {
+  const { outcome, pushedByAgent, prNumber, finalHead, lastProducedHead, attemptVerdicts, reviews } = input;
+  const ngReview = reviews.find((r) => /verdict=NG/.test(r.body ?? ""));
+  const okReview = reviews.find((r) => /verdict=OK/.test(r.body ?? ""));
+  const passHeadMatches = !!okReview && !!finalHead && okReview.commit_id === finalHead;
+  const fixRoundOccurred = attemptVerdicts.some((v) => v === "fix");
+  const ngArc = !!ngReview && !!okReview && ngReview.commit_id !== okReview.commit_id;
+  const chainOk =
+    outcome === "merge_ready" &&
+    pushedByAgent &&
+    prNumber != null &&
+    passHeadMatches &&
+    !!finalHead &&
+    lastProducedHead === finalHead;
+  const independentClaudeJudgment = passHeadMatches
+    ? ngArc
+      ? "real: NG@A then OK@B by an independent headless Claude"
+      : "real: PASS at the reviewed head by an independent headless Claude (first-try; no NG round)"
+    : "NOT_PROVEN";
+  return { chainOk, passHeadMatches, ngArc, fixRoundOccurred, independentClaudeJudgment };
 }
 
 async function main(): Promise<void> {
@@ -398,28 +453,42 @@ async function main(): Promise<void> {
       }
     }
     const ngA = reviews.find((r) => /verdict=NG/.test(r.body ?? ""));
-    const okB = reviews.find((r) => /verdict=OK/.test(r.body ?? ""));
+    const okReview = reviews.find((r) => /verdict=OK/.test(r.body ?? ""));
     evidence.reviews = reviews.map((r) => ({ id: r.id, author: r.user?.login, state: r.state, headSha: r.commit_id, marker: /verdict=(NG|OK|HOLD)/.exec(r.body ?? "")?.[1] ?? null }));
-    leg("claude-native-NG@A", ngA ? "PASS" : "FAIL", ngA ? `native review ${ngA.id} by ${ngA.user?.login} NG @ ${(ngA.commit_id ?? "").slice(0, 10)}` : "no NG review on the PR");
-    leg("claude-native-PASS@B", okB ? "PASS" : "FAIL", okB ? `native review ${okB.id} by ${okB.user?.login} OK @ ${(okB.commit_id ?? "").slice(0, 10)}` : "no OK review on the PR");
-    const distinctHeads = !!ngA && !!okB && ngA.commit_id !== okB.commit_id;
-    evidence.independentClaudeJudgment = ngA && okB && distinctHeads ? "real: NG@A then OK@B by an independent headless Claude" : "NOT_PROVEN";
-    leg("distinct-reviewed-heads-A-B", distinctHeads ? "PASS" : "FAIL", distinctHeads ? `A=${(ngA!.commit_id ?? "").slice(0, 10)} B=${(okB!.commit_id ?? "").slice(0, 10)} on PR #${prNumber}` : "A/B not both present as distinct reviewed HEADs");
+    // The NG@A leg is OPTIONAL (owner decision 2026-10-18): absent means the Agent
+    // passed on the FIRST try and the independent reviewer had nothing to reject —
+    // not a failure. It is recorded as NOT_RUN, never as a fabricated PASS.
+    leg("claude-native-NG@A (optional)", ngA ? "PASS" : "NOT_RUN", ngA ? `native review ${ngA.id} by ${ngA.user?.login} NG @ ${(ngA.commit_id ?? "").slice(0, 10)}` : "no NG round: the Agent passed on the first attempt (the NG@A -> FIX -> PASS@B arc is optional)");
 
-    // The whole chain: dsh writes + independent NG->FIX->PASS + MergeReady.
-    const fixIdx = result.attempts.findIndex((a) => a.reviewVerdict === "fix");
-    const passIdx = result.attempts.findIndex((a, i) => a.reviewVerdict === "pass" && fixIdx !== -1 && i > fixIdx);
-    const chainOk =
-      result.outcome === "merge_ready" &&
-      pushedByAgent &&
-      !!prNumber &&
-      distinctHeads &&
-      fixIdx !== -1 &&
-      passIdx > fixIdx &&
-      !!(result.head && result.attempts[result.attempts.length - 1]?.producedHead === result.head);
-    evidence.chainProven = chainOk;
-    leg("full-chain", chainOk ? "PASS" : "FAIL", chainOk ? "dsh Agent push/PR -> Relay bind A -> Claude NG@A -> dsh FIX B -> Relay bind B -> Claude PASS@B -> MergeReady (read-only)" : `outcome=${result.outcome} fixIdx=${fixIdx} passIdx=${passIdx}`);
-    evidence.result = chainOk ? "PASS" : "FAIL";
+    // The success predicate: dsh Agent push/PR + a REAL independent Claude PASS at
+    // the reviewed HEAD + MergeReady. The FIX arc is optional; evaluateChain (pure,
+    // unit-tested) records whether it occurred and never fabricates a verdict.
+    const chain = evaluateChain({
+      outcome: result.outcome ?? null,
+      pushedByAgent,
+      prNumber,
+      finalHead: result.head ?? null,
+      lastProducedHead: result.attempts[result.attempts.length - 1]?.producedHead ?? null,
+      attemptVerdicts: result.attempts.map((a) => a.reviewVerdict),
+      reviews,
+    });
+    evidence.fixRoundOccurred = chain.fixRoundOccurred;
+    evidence.ngArc = chain.ngArc;
+    evidence.reviewedHead = result.head ?? null;
+    evidence.independentClaudeJudgment = chain.independentClaudeJudgment;
+    leg("claude-native-PASS-at-head", chain.passHeadMatches ? "PASS" : "FAIL", okReview ? `native review ${okReview.id} by ${okReview.user?.login} OK @ ${(okReview.commit_id ?? "").slice(0, 10)}` : "no OK review on the PR at the reviewed HEAD");
+    leg("claude-native-NG-arc (optional)", chain.ngArc ? "PASS" : "NOT_RUN", chain.ngArc ? `NG@${(ngA!.commit_id ?? "").slice(0, 10)} -> PASS@reviewed HEAD (a real FIX round occurred)` : `first-try PASS: no distinct NG@A -> PASS@B arc (fixRound=${chain.fixRoundOccurred})`);
+    evidence.chainProven = chain.chainOk;
+    leg(
+      "full-chain",
+      chain.chainOk ? "PASS" : "FAIL",
+      chain.chainOk
+        ? chain.ngArc
+          ? "dsh Agent push/PR -> Relay bind A -> Claude NG@A -> dsh FIX B -> Relay bind B -> Claude PASS@B -> MergeReady (read-only)"
+          : "dsh Agent push/PR -> Relay bind reviewed HEAD -> Claude PASS (first-try) -> MergeReady (read-only); NG->FIX->PASS arc optional and NOT_PROVEN"
+        : `outcome=${result.outcome} pushedByAgent=${pushedByAgent} pr=${prNumber} passHeadMatches=${chain.passHeadMatches} fixRound=${chain.fixRoundOccurred}`
+    );
+    evidence.result = chain.chainOk ? "PASS" : "FAIL";
   } catch (e) {
     evidence.error = e instanceof Error ? e.stack ?? e.message : String(e);
     evidence.result = "FAIL";

@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { extractAgentGithubWrites, fixtureCheck, resolveGithubPlaceholder, REPO, BASE } from "../scripts/ish885b-real-agent-e2e";
+import { evaluateChain, extractAgentGithubWrites, fixtureCheck, resolveGithubPlaceholder, REPO, BASE } from "../scripts/ish885b-real-agent-e2e";
 
 /**
  * ISH-885 item 1: the harness must attribute the GitHub writes to the dsh AGENT
@@ -106,5 +106,78 @@ describe("ISH-885b harness: agent GitHub-write attribution", () => {
     ]);
     expect(ev.agentGithubWrites).toEqual([]);
     expect(ev.runs[0]!.dshJsonl).toBeNull();
+  });
+});
+
+/**
+ * Owner decision 2026-10-18: the success condition is a REAL independent Claude PASS
+ * at the reviewed HEAD; the NG@A -> FIX -> PASS@B arc is OPTIONAL. These tests pin
+ * that a first-try PASS is a PASS, that the arc is recorded when it happens, and
+ * that a missing review is still NOT_PROVEN (never a fabricated PASS).
+ */
+describe("ISH-885b harness: success predicate (arc optional)", () => {
+  const base = {
+    outcome: "merge_ready",
+    pushedByAgent: true,
+    prNumber: 40,
+    finalHead: "b".repeat(40),
+    lastProducedHead: "b".repeat(40),
+  };
+
+  test("a genuine first-try PASS at the reviewed head is PASS", () => {
+    const r = evaluateChain({
+      ...base,
+      attemptVerdicts: ["pass"],
+      reviews: [{ body: "second-opinion: verdict=OK", commit_id: base.finalHead }],
+    });
+    expect(r.chainOk).toBe(true);
+    expect(r.passHeadMatches).toBe(true);
+    expect(r.ngArc).toBe(false);
+    expect(r.fixRoundOccurred).toBe(false);
+    expect(r.independentClaudeJudgment).toContain("first-try");
+  });
+
+  test("the NG@A -> FIX -> PASS@B arc counts when it really occurs", () => {
+    const a = "a".repeat(40);
+    const r = evaluateChain({
+      ...base,
+      attemptVerdicts: ["fix", "pass"],
+      reviews: [
+        { body: "verdict=NG", commit_id: a },
+        { body: "verdict=OK", commit_id: base.finalHead },
+      ],
+    });
+    expect(r.chainOk).toBe(true);
+    expect(r.ngArc).toBe(true);
+    expect(r.fixRoundOccurred).toBe(true);
+    expect(r.independentClaudeJudgment).toContain("NG@A then OK@B");
+  });
+
+  test("an OK review at a DIFFERENT head than the produced head is NOT proven", () => {
+    const r = evaluateChain({
+      ...base,
+      attemptVerdicts: ["pass"],
+      reviews: [{ body: "verdict=OK", commit_id: "c".repeat(40) }],
+    });
+    expect(r.passHeadMatches).toBe(false);
+    expect(r.chainOk).toBe(false);
+    expect(r.independentClaudeJudgment).toBe("NOT_PROVEN");
+  });
+
+  test("no independent review -> NOT_PROVEN, never PASS", () => {
+    const r = evaluateChain({ ...base, attemptVerdicts: ["pass"], reviews: [] });
+    expect(r.chainOk).toBe(false);
+    expect(r.independentClaudeJudgment).toBe("NOT_PROVEN");
+  });
+
+  test("a moved head after the last attempt is not the reviewed head", () => {
+    const r = evaluateChain({
+      ...base,
+      finalHead: "d".repeat(40),
+      lastProducedHead: "b".repeat(40),
+      attemptVerdicts: ["pass"],
+      reviews: [{ body: "verdict=OK", commit_id: "d".repeat(40) }],
+    });
+    expect(r.chainOk).toBe(false);
   });
 });

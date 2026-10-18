@@ -10,13 +10,25 @@ disposable PR on `81ueman/relay`. It is not the ISH-885 stand-in
 | Actor | Does | Relay |
 | --- | --- | --- |
 | **dsh / DeepSeek Coding Agent** (inside a real Coding Sandbox from `sandbox/coding-kit`) | `git commit` + `git push` (SSH agent forwarding) + `gh pr create`/update (the sbx GitHub credential proxy) on a feature branch | reads GitHub only |
-| **independent headless Claude** (`claude -p`, resolves to `claude-opus-5-5`) | posts a native `gh pr review` **NG** at A, then **PASS** at B — its own judgment, posted after a fresh dsh FIX pushes B to the SAME PR | reads both reviews back via `verifyNativeReview`, bound to the exact HEADs |
-| **Relay** | observes: `bindTaskPr` (A then B), re-VERIFY at B, read-only merge gate | **zero GitHub writes** (no push, no create/update, no review) |
+| **independent headless Claude** (`claude -p`, resolves to `claude-opus-5-5`) | posts a native `gh pr review` **PASS** at the reviewed HEAD — its own judgment (the verdict is never pre-filled). If a FIX round happens it also posts the **NG** at A and the **PASS** at B | reads the review(s) back via `verifyNativeReview`, bound to the exact HEAD(s) |
+| **Relay** | observes: `bindTaskPr`, re-VERIFY at the reviewed HEAD, read-only merge gate | **zero GitHub writes** (no push, no create/update, no review) |
 
 The evidence attributes the push/PR writes to the Agent by parsing the per-Run
-`dsh.jsonl` tool calls (`git push …`, `gh pr create …`) — not to the script. A
-partial first attempt reaches REVIEW, so the NG@A comes from the reviewer, never
-from the harness.
+`dsh.jsonl` tool calls (`git push …`, `gh pr create …`) — not to the script. The
+NG@A leg, when it occurs, comes from the independent reviewer and never from the
+harness.
+
+## Success condition: first-try PASS counts (owner decision 2026-10-18)
+
+The `NG@A → fresh dsh FIX → PASS@B` arc is **OPTIONAL, not required**. The success
+condition is a **real review PASS at the reviewed HEAD** — the dsh Agent owns the
+push/PR, an **independent** Claude posts its own verdict, and Relay reaches
+read-only MergeReady. A genuine first-try PASS is a PASS.
+
+The harness records which happened (`fixRoundOccurred`, `ngArc`) and never
+fabricates a verdict: a missing or incongruent review is still `NOT_PROVEN`. The
+predicate lives in the pure, unit-tested `evaluateChain()` in
+`scripts/ish885b-real-agent-e2e.ts`.
 
 ## Owner prerequisite: a GitHub credential the sandbox `gh` can use
 
@@ -77,11 +89,17 @@ a real, Agent-owned PR (`#36`, `#37`, `#38`, `#39` on `81ueman/relay`), each wit
 - the disposable PR, branch and sandbox cleaned up, and **no merge / no
   default-branch push**.
 
-**Not proven: the `NG@A → fresh dsh FIX → PASS@B` arc.** In every run the real Agent
-satisfied the acceptance on the FIRST attempt (even with a strict 6-item checklist,
-a description↔acceptance rounding conflict, and a many-edge-case parser contract),
-so the independent reviewer had no defect to return `NG` on and correctly returned
-`PASS` at A — one reviewed HEAD, not two. Producing an `NG@A` would require the
-first attempt to be genuinely deficient; engineering that deficiency (scripting a
-partial A, or pre-filling the reviewer's verdict) is exactly the stand-in the spec
-forbids. This is recorded as `NOT_PROVEN`, never a fabricated PASS.
+Under the owner's success condition (a real independent Claude PASS at the reviewed
+HEAD) **these runs are PASS**: each reached read-only MergeReady with the Agent's own
+push/PR, an independent verdict read back at the exact reviewed HEAD, and zero Relay
+GitHub writes.
+
+**The `NG@A → fresh dsh FIX → PASS@B` arc is OPTIONAL and remains NOT_PROVEN.** In
+every run the real Agent satisfied the acceptance on the FIRST attempt (even with a
+strict 6-item checklist, a description↔acceptance rounding conflict, and a
+many-edge-case parser contract), so the independent reviewer had no defect to return
+`NG` on and correctly returned `PASS` at the single reviewed HEAD. Producing an
+`NG@A` would require the first attempt to be genuinely deficient; engineering that
+deficiency (scripting a partial A, or pre-filling the reviewer's verdict) is exactly
+the stand-in the spec forbids. The harness records `fixRoundOccurred=false` /
+`ngArc=false` for these runs — never a fabricated arc.

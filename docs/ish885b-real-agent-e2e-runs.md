@@ -33,13 +33,22 @@ Relay made no GitHub writes. Nothing was merged.
    authenticates, and the egress proxy substitutes the real token on the wire —
    the real token never enters the sandbox or any argv.
 
-## Why the `NG@A → FIX → PASS@B` arc is NOT_PROVEN
+## Success condition: first-try PASS counts (owner decision 2026-10-18)
+
+Runs 5–8 each reached read-only MergeReady with the Agent's own push/PR and an
+**independent Claude PASS at the reviewed HEAD**. Under the owner's success
+condition that is a **PASS** — the `NG@A → FIX → PASS@B` arc is **OPTIONAL, not
+required**. The harness records whether a FIX round occurred
+(`fixRoundOccurred`/`ngArc`) and never fabricates a verdict.
+
+## Why the `NG@A → FIX → PASS@B` arc is NOT_PROVEN (optional leg)
 
 Runs 5–8 exercised the whole pipeline except a review `NG`: in each one the real
 Agent satisfied the acceptance on the first attempt, so the independent reviewer
-correctly returned `PASS` at A (a single reviewed HEAD). A strict 6-item checklist,
-a description/acceptance rounding conflict and a many-edge-case parser contract
+correctly returned `PASS` at a single reviewed HEAD. A strict 6-item checklist, a
+description/acceptance rounding conflict and a many-edge-case parser contract
 (run 8's parser handled BigInt precision, case-insensitive units and repeated-unit
 rejection) all passed first try. A real `NG@A` therefore needs a genuinely
 deficient first attempt; manufacturing one — a partial A, or a pre-filled reviewer
-verdict — is the stand-in the spec forbids. Recorded as `NOT_PROVEN`, never PASS.
+verdict — is the stand-in the spec forbids. Recorded as `NOT_PROVEN` (arc not
+exercised), never a fabricated arc.
