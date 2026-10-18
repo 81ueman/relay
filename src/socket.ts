@@ -11,7 +11,6 @@ import { attachSession, detachSession, gateEvent, getSession, managedWorkerForSe
 import type { DaemonIdentity } from "./singleton";
 import { reviveWorkerRestoringTasks } from "./tasks";
 import { recordSessionCompaction, recordSessionUsage, type CompactionStatus, type UsageReading } from "./usage";
-import { awaitWake } from "./wake-outbox";
 import { getWorker, setWorkerState, setWorkerTool, clearWorkerTool, setWorkerContext, touchSeen } from "./workers";
 
 // JSON Lines over a Unix domain socket. Small protocol:
@@ -50,21 +49,15 @@ export interface SocketMessage {
   /** Per-spawn attach secret (relay-spawned generations only). */
   token?: string;
   /**
-   * Agent harness kind (`opencode|codex|claude|dsh`). OpenCode (`ses...`) and
-   * dsh (`session-<uuid>`) sessions are recognized by shape and need no
-   * declaration; a bare UUID is ambiguous (codex vs claude) and MUST pass
-   * `kind` so the `ses...` guard is not weakened.
+   * Agent harness kind (`opencode|codex|claude`). OpenCode (`ses...`) sessions
+   * are recognized by shape and need no declaration; a bare UUID is ambiguous
+   * (codex vs claude) and MUST pass `kind` so the `ses...` guard is not weakened.
    */
   kind?: string;
   /** Herdr identity hints (manual attach): directory is authoritative when no pane is given. */
   pane_id?: string;
   tab_id?: string;
   workspace_id?: string;
-  /**
-   * `worker.wake.await` long-poll window in ms (clamped to 30s). A plugin-woken
-   * harness with no session/worker binding yet gets `{ok:true,wake:null}`.
-   */
-  wait_ms?: number;
 }
 
 export interface SocketContext {
@@ -143,34 +136,13 @@ export async function handleSocketMessage(msg: SocketMessage, ctx: SocketContext
     return { ok: true, pong: true, ...(ctx.identity ? { identity: ctx.identity } : {}) };
   }
 
-  // Plugin-woken harnesses (dsh) PULL their next nudge here instead of receiving
-  // a keystroke in a Herdr pane. Resolve the worker from `worker_id`, else from a
-  // managed `session_id`; an unknown/unattached target is not an error — the
-  // caller simply keeps polling. `takeWake` clears the row, so a nudge is
-  // delivered exactly once.
-  if (type === "worker.wake.await") {
-    const waitMs = Math.max(0, Math.min(Number(msg.wait_ms ?? 25000) || 0, 30000));
-    const workerId = msg.worker_id ?? (msg.session_id ? getSession(db, msg.session_id)?.worker_id : null) ?? null;
-    const worker = workerId ? getWorker(db, workerId) : undefined;
-    if (!worker) {
-      // Nothing can be delivered for a session relay has not attached (yet).
-      // Still hold the poll window: this IS a long-poll, and returning instantly
-      // would let a client that re-polls in a loop spin at full speed (the dsh
-      // plugin does exactly this, including while the daemon is down).
-      if (waitMs > 0) await Bun.sleep(waitMs);
-      return { ok: true, wake: null };
-    }
-    const wake = await awaitWake(db, workerId!, waitMs);
-    return { ok: true, wake };
-  }
-
   if (type === "session.attach") {
     if (!msg.session_id) return { ok: false, reason: "no-session" };
     // Defense in depth: only a session id its harness could have minted is
-    // accepted. OpenCode (`ses...`) and dsh (`session-<uuid>`) are recognized by
-    // shape; a bare UUID is ambiguous (codex vs claude) and is accepted ONLY
-    // when the client declares `kind` — the opencode guard is never weakened (an
-    // undeclared non-`ses` id is refused). See `src/harness.ts`.
+    // accepted. OpenCode (`ses...`) is recognized by shape; a bare UUID is
+    // ambiguous (codex vs claude) and is accepted ONLY when the client declares
+    // `kind` — the opencode guard is never weakened (an undeclared non-`ses` id
+    // is refused). See `src/harness.ts`.
     const kind = resolveKind(msg.session_id, msg.kind);
     if (!kind) return { ok: false, reason: "not-a-session-id" };
 

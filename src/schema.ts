@@ -202,7 +202,7 @@ export interface Worker {
   role: string;
   /**
    * Which agent harness this worker is, from the registry in `src/harness.ts`
-   * ("opencode" | "codex" | "claude" | "dsh"). Event-driven harnesses stream
+   * ("opencode" | "codex" | "claude"). Event-driven harnesses stream
    * session.idle/tool/permission; polled harnesses (codex, claude) have no event
    * stream and their liveness/idle/blocked are POLLED from Herdr agent status.
    * Set at attach time from the resolved Herdr agent kind; defaults to
@@ -735,19 +735,6 @@ CREATE TABLE IF NOT EXISTS worker_runtimes (
 );
 CREATE INDEX IF NOT EXISTS idx_worker_runtimes_worker ON worker_runtimes(worker_id, generation);
 CREATE INDEX IF NOT EXISTS idx_worker_runtimes_cleanup ON worker_runtimes(state, cleanup_after);
-
--- Durable wake outbox for PLUGIN-woken harnesses (src/harness.ts wakeVia).
--- A server harness like dsh has no Herdr input pane, so a nudge is queued here
--- and PULLED by that harness's relay plugin over the unix socket
--- (worker.wake.await). One row per worker: the newest nudge replaces the old
--- one — a stale instruction is worse than none, and the supervisor recomputes it
--- from current DB state on the next pass. relay's wake cooldown bounds the rate.
-CREATE TABLE IF NOT EXISTS worker_wakes (
-  worker_id TEXT PRIMARY KEY,
-  reason TEXT NOT NULL DEFAULT 'wake',
-  text TEXT NOT NULL,
-  created_at INTEGER NOT NULL
-);
 
 -- Standing reminders: the daemon-owned recurring nudge (see Reminder). The
 -- daemon enqueues the reminder message to its worker when every_ms has elapsed

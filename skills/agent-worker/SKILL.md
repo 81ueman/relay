@@ -14,8 +14,6 @@ alike; only the attach call differs (declare it with `--kind`):
   from context), or `relay session attach --session ses_...`.
 - **Claude Code / Codex** — `relay session attach --session <uuid> --kind claude`
   (or `--kind codex`). A bare UUID is ambiguous, so `--kind` is required.
-- **dsh (DeepSeek Harness)** — its relay plugin self-reports the pane to Herdr;
-  attach with `relay session attach --session session-<uuid> --kind dsh --worker <w>`.
 
 In a shared checkout, where several agents run in the same directory, the daemon
 cannot tell which pane is yours unless you say so — name your Herdr pane:

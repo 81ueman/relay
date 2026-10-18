@@ -7,15 +7,13 @@ import { openDb } from "../src/db";
 import { pollWorker } from "../src/reconciler";
 import { MockRuntime, type HerdrIdentity } from "../src/runtime/runtime";
 import { handleSocketMessage, type SocketContext } from "../src/socket";
-import { attachSession, getSession } from "../src/sessions";
+import { attachSession } from "../src/sessions";
 import { getWorker, registerWorker } from "../src/workers";
 
-// T-HARNESS: claude and dsh are the two harnesses added on top of the registry.
-// Claude Code is POLLED via Herdr (like codex); dsh is EVENT-driven and is
-// recognized by its `session-<uuid>` id shape without a declared kind.
+// T-HARNESS: Claude Code is POLLED via Herdr (like codex) and its session id is
+// a bare UUID, so it must be attached with an explicit `--kind claude`.
 
 const CLAUDE_UUID = "9030b285-ce54-4dbb-9b71-1719916a80d3";
-const DSH_SESSION = "session-23274032-a2fc-4be5-9803-07cfeea34058";
 
 let dir = "";
 let db: Database;
@@ -40,9 +38,6 @@ afterEach(() => {
 
 const claudeIdentity: HerdrIdentity = {
   agent: "claude-1", tabId: "w6D:t5", paneId: "w6D:p8", workspaceId: "w6D", agentKind: "claude",
-};
-const dshIdentity: HerdrIdentity = {
-  agent: "dsh", tabId: "w6D:t9", paneId: "w6D:p9", workspaceId: "w6D", agentKind: "dsh",
 };
 
 describe("claude is a polled harness", () => {
@@ -71,27 +66,5 @@ describe("claude is a polled harness", () => {
     rt.setAgentStatus("claude-1", "dead");
     expect(await pollWorker(db, rt, "claude-1")).toBe("dead");
     expect(getWorker(db, "claude-1")!.state).toBe("dead");
-  });
-});
-
-describe("dsh is an event-driven harness recognized by id shape", () => {
-  test("socket attach: a `session-<uuid>` id is accepted without a declared kind", async () => {
-    rt.setIdentity(DSH_SESSION, dshIdentity);
-    const res = await handleSocketMessage(
-      { type: "session.attach", session_id: DSH_SESSION, worker_id: "dsh-1", role: "worker" },
-      ctx
-    );
-    expect(res).toMatchObject({ ok: true, worker_id: "dsh-1", managed: true });
-    const w = getWorker(db, "dsh-1")!;
-    expect(w.agent_kind).toBe("dsh");
-    expect(w.opencode_session_id).toBe(DSH_SESSION);
-    expect(getSession(db, DSH_SESSION)!.managed).toBe(1);
-  });
-
-  test("a dsh worker is never polled (event stream drives it)", async () => {
-    registerWorker(db, "dsh-1", { role: "worker", agentKind: "dsh", runtimeId: "w6D:p9" });
-    attachSession(db, DSH_SESSION, { role: "worker", workerId: "dsh-1", agentKind: "dsh", identity: dshIdentity });
-    rt.setAgentStatus("dsh-1", "working");
-    expect(await pollWorker(db, rt, "dsh-1")).toBe("not-polled");
   });
 });
