@@ -47,6 +47,25 @@ describe("ISH-830 real E2E — the legs are real", () => {
     expect(harness).toContain("ProxyCommand='socat - PROXY:gateway.docker.internal:%h:%p,proxyport=3128'");
   });
 
+  test("the SSH leg records its whole output (the show-version body is never cut off)", () => {
+    // Round-2 finding 1: a 600-char cap consumed by the command + banner cut the
+    // `Software Version` body out of the recorded evidence.
+    expect(harness).not.toContain("sshLeg.trim().slice(0, 600)");
+    expect(harness).toMatch(/const LEG_RAW_CAP = \d{4,}/);
+    expect(harness).toContain("raw: (sshLeg.trim()");
+  });
+
+  test("a failed gnmic get is reported as a failed get with its output, not a missing tool", () => {
+    // Round-2 finding 2: every non-PASS gNMI case used a fixed "gnmic not
+    // installed" detail with no raw, so a real TLS failure looked like an absent tool.
+    expect(harness).toContain('out.includes("GNMI_NOT_RUN:")');
+    expect(harness).toContain('gnmiSection.includes("GNMI_LEG_FAIL")');
+    expect(harness).toContain("raw: (gnmiSection");
+    // The host-name conjunct must be scoped to gnmic's own output, not all of `out`.
+    expect(harness).not.toContain("/host-name/i.test(out)");
+    expect(harness).toContain('gnmiOutput.includes("host-name")');
+  });
+
   test("the Sandbox allow list is only exact host:port entries (both pinned aliases)", () => {
     // The one place the allow list is built maps each port to both aliases.
     expect(harness).toMatch(/host\.docker\.internal:\$\{p\}/);

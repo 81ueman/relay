@@ -149,6 +149,14 @@ const SRL_SSH_HOST_PORT = 18021;
 const SRL_GNMI_HOST_PORT = 18002;
 
 /**
+ * The cap for a leg's recorded raw output. It must exceed the SR Linux SSH
+ * banner + `show version` table (a 600-char cap cut the body off mid-banner, so
+ * the `Software Version` row never reached the evidence); 4000 is ~3x the whole
+ * SSH leg, so nothing is trimmed in practice.
+ */
+const LEG_RAW_CAP = 4000;
+
+/**
  * The pinned gNMI client. The Coding Kit (`sandbox/coding-kit/spec.yaml`)
  * installs the same release into a real Coding Sandbox; this harness installs it
  * into its own throwaway `shell` Sandbox so the gNMI leg is real there too.
@@ -536,41 +544,60 @@ async function stageNos(dir: string, api: string, insecure: boolean): Promise<vo
     const pass = await target.runner.run(checks[0], { cwd: target.cwd });
     const out = `${pass.stdout ?? ""}\n${pass.output ?? ""}`;
     if (pass.outcome === "pass") {
+      // `out` is already bounded by the runner (each stream is tail-capped at
+      // `STREAM_TAIL`); record it WHOLE so the SSH `show version` body survives.
       const verLine = out.split("\n").find((l) => /Software Version|SRLinux/i.test(l))?.trim() ?? "";
       record("nos", "PASS", `real SR Linux VERIFY at the bound HEAD ${head.slice(0, 12)}: ${verLine}`, {
         command: "sandboxVerifyTarget.runner.run(nos-readback)",
-        raw: out.slice(-1400),
+        raw: out,
       });
     } else {
-      record("nos", "FAIL", `real SR Linux VERIFY was '${pass.outcome}' (never a PASS)`, { raw: out.slice(0, 800) });
+      record("nos", "FAIL", `real SR Linux VERIFY was '${pass.outcome}' (never a PASS)`, { raw: out });
     }
     // SSH / gNMI are recorded SEPARATELY and honestly: the `labctl exec` read-back
     // above is clab-api-server docker exec, NOT SSH. A PASS requires REAL evidence
     // (a version over the published :22, or a gNMI get on :57400); otherwise the
-    // leg is NOT_RUN — never claimed.
+    // leg is NOT_RUN — never claimed. A non-PASS leg still keeps its WHOLE output,
+    // with the cause distinguished, so a real failure (e.g. the TLS mismatch this
+    // change fixes) is never misreported as a missing tool with its output dropped.
     const sshLeg = out.split("--- real SSH leg (published :22) ---")[1]?.split("--- real gNMI")[0] ?? "";
     const sshOk = out.includes("SSH_LEG_OK") && /Software Version|SRLinux/i.test(sshLeg);
     const sshExit = sshLeg.split("\n").find((l) => /^SSH(_FALLBACK)?_EXIT=/.test(l))?.trim() ?? "";
     const sshCmd = sshLeg.split("\n").find((l) => l.startsWith("SSH command:"))?.trim() ?? "";
-    record(
-      "nos.ssh",
-      sshOk ? "PASS" : "NOT_RUN",
-      sshOk
-        ? `real SSH from the Sandbox to host.docker.internal:${SRL_SSH_HOST_PORT} (node :22) returned \`show version\` [${sshExit}] ${sshCmd}`
-        : "SSH NOT_RUN (no SSH evidence obtained)",
-      sshOk ? { raw: sshLeg.trim().slice(0, 600) } : { raw: sshLeg.trim().slice(0, 400) || "sshpass unavailable" }
-    );
-    const gnmiOk = out.includes("GNMI_LEG_OK") && /host-name/i.test(out);
+    const sshDetail = sshOk
+      ? `real SSH from the Sandbox to host.docker.internal:${SRL_SSH_HOST_PORT} (node :22) returned \`show version\` [${sshExit}] ${sshCmd}`
+      : out.includes("SSH_NOT_RUN:")
+        ? "SSH NOT_RUN (sshpass is not installed in the Sandbox)"
+        : sshLeg.includes("SSH_LEG_RAW_FAIL")
+          ? `SSH NOT_RUN (ssh ran and FAILED${sshExit ? ` [${sshExit}]` : ""} — see raw)`
+          : "SSH NOT_RUN (no SSH evidence obtained)";
+    record("nos.ssh", sshOk ? "PASS" : "NOT_RUN", sshDetail, {
+      // The WHOLE leg — echoed command + banner + `Hostname`..`Software Version`
+      // body + `SSH_EXIT=` — so the body is recorded verbatim, never cut off.
+      raw: (sshLeg.trim() || "sshpass unavailable").slice(0, LEG_RAW_CAP),
+    });
+    // gnmic's OWN output: the section minus the harness's echoed command line,
+    // which itself contains `host-name` and must not satisfy the gate.
+    const gnmiSection = (out.split("--- real gNMI leg (published :57400) ---")[1] ?? "").split("NOS_CHECK_DONE")[0].trim();
+    const gnmiOutput = gnmiSection
+      .split("\n")
+      .filter((l) => !l.startsWith("gNMI command:"))
+      .join("\n")
+      .trim();
+    const gnmiOk = out.includes("GNMI_LEG_OK") && gnmiOutput.includes("host-name") && gnmiOutput.includes('"values"');
     const gnmiExit = out.split("\n").find((l) => /^GNMI_EXIT=/.test(l))?.trim() ?? "";
-    const gnmiRaw = out.split("--- real gNMI leg (published :57400) ---")[1]?.trim() ?? "";
-    record(
-      "nos.gnmi",
-      gnmiOk ? "PASS" : "NOT_RUN",
-      gnmiOk
-        ? `real gNMI from the Sandbox to host.docker.internal:${SRL_GNMI_HOST_PORT} (node :57400) returned the host-name [${gnmiExit}]`
-        : "gNMI NOT_RUN (gnmic not installed in the Sandbox)",
-      gnmiOk ? { raw: gnmiRaw.slice(0, 600) } : {}
-    );
+    const gnmiDetail = gnmiOk
+      ? `real gNMI from the Sandbox to host.docker.internal:${SRL_GNMI_HOST_PORT} (node :57400) returned the host-name [${gnmiExit}]`
+      : out.includes("GNMI_NOT_RUN:")
+        ? "gNMI NOT_RUN (gnmic is not installed in the Sandbox — tool absent)"
+        : gnmiSection.includes("GNMI_LEG_FAIL")
+          ? `gNMI NOT_RUN (gnmic ran against host.docker.internal:${SRL_GNMI_HOST_PORT}:57400 and FAILED${gnmiExit ? ` [${gnmiExit}]` : ""} — see raw)`
+          : "gNMI NOT_RUN (no gNMI evidence obtained)";
+    record("nos.gnmi", gnmiOk ? "PASS" : "NOT_RUN", gnmiDetail, {
+      // gnmic's output is kept on PASS **and** on failure (the verdict stays
+      // NOT_RUN); only a genuinely absent tool has no output to keep.
+      raw: (gnmiSection || "no gnmic output").slice(0, LEG_RAW_CAP),
+    });
 
     // --- failure injections: none may become a PASS --------------------------
     const wrongHead = sandboxVerifyTarget(db, { ...getTask(db, task.id)!, head_sha: "0".repeat(40) }, checks);
