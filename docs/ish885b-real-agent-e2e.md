@@ -18,12 +18,26 @@ The evidence attributes the push/PR writes to the Agent by parsing the per-Run
 NG@A leg, when it occurs, comes from the independent reviewer and never from the
 harness.
 
+**Independence is process-level, not identity-level.** The Agent's sandbox `gh`
+and the `claude -p` reviewer both post as the operator's GitHub identity
+(`81ueman`), so GitHub itself cannot separate them. The harness therefore
+attributes *every* Agent write — including `gh pr review|comment|merge|close` and
+`gh api` mutations (`POST`/`PATCH`/`PUT`/`DELETE`) — from `dsh.jsonl`, and records
+the judgment `NOT_PROVEN` if an Agent tool call wrote a review or comment, rather
+than crediting it to the reviewer.
+
 ## Success condition: first-try PASS counts (owner decision 2026-10-18)
 
 The `NG@A → fresh dsh FIX → PASS@B` arc is **OPTIONAL, not required**. The success
 condition is a **real review PASS at the reviewed HEAD** — the dsh Agent owns the
-push/PR, an **independent** Claude posts its own verdict, and Relay reaches
-read-only MergeReady. A genuine first-try PASS is a PASS.
+push/PR, an **independent** Claude posts its own verdict, and the factory reaches
+**phase `merge_ready`**. A genuine first-try PASS is a PASS.
+
+This is the *phase*, not the read-only **gate decision**: the gate is wired to
+GitHub (`mergeGateDeps: { github, checks: github }`) and its `status` + `reasons`
+are recorded in the evidence. In the recorded runs the gate decision was
+`BLOCKED` (nothing granted a merge authority), and the docs/evidence say so
+instead of claiming MergeReady.
 
 The harness records which happened (`fixRoundOccurred`, `ngArc`) and never
 fabricates a verdict: a missing or incongruent review is still `NOT_PROVEN`. The
@@ -64,9 +78,10 @@ RELAY_ISH885B_E2E=1 bun scripts/ish885b-real-agent-e2e.ts
 ```
 
 The harness writes durable evidence to
-`docs/ish885b-real-agent-e2e-evidence.json`, then closes the disposable PR,
-deletes its branch, and removes the sandbox. It **never merges** and **never
-pushes to the default branch**.
+`docs/ish885b-real-agent-e2e-evidence.json` **before** any cleanup, then closes the
+disposable PR, deletes its branch, and removes the sandbox, and finally rewrites the
+file with the cleanup outcomes. It **never merges** and **never pushes to the
+default branch**.
 
 ## Gates
 
@@ -78,8 +93,9 @@ pushes to the default branch**.
 See `docs/ish885b-real-agent-e2e-evidence.json` (`result`, `legs`, `steps`) and
 `docs/ish885b-real-agent-e2e-runs.md` (the full run history).
 
-**Honest state (2026-10-18).** Four full real runs reached read-only MergeReady on
-a real, Agent-owned PR (`#36`, `#37`, `#38`, `#39` on `81ueman/relay`), each with:
+**Honest state (2026-10-18).** Four full real runs reached factory phase
+`merge_ready` on a real, Agent-owned PR (`#36`, `#37`, `#38`, `#39` on
+`81ueman/relay`), each with:
 
 - the **dsh/DeepSeek Agent** doing `git push` + `gh pr create` inside the Coding
   Sandbox (attributed from `dsh.jsonl` tool calls, not the script);
@@ -90,9 +106,10 @@ a real, Agent-owned PR (`#36`, `#37`, `#38`, `#39` on `81ueman/relay`), each wit
   default-branch push**.
 
 Under the owner's success condition (a real independent Claude PASS at the reviewed
-HEAD) **these runs are PASS**: each reached read-only MergeReady with the Agent's own
-push/PR, an independent verdict read back at the exact reviewed HEAD, and zero Relay
-GitHub writes.
+HEAD) **these runs are PASS**: each reached factory phase `merge_ready` with the
+Agent's own push/PR, an independent verdict read back at the exact reviewed HEAD, and
+zero Relay GitHub writes. Their read-only gate decision was `BLOCKED` because those
+runs predate wiring `mergeGateDeps` — that is recorded, not hidden.
 
 **The `NG@A → fresh dsh FIX → PASS@B` arc is OPTIONAL and remains NOT_PROVEN.** In
 every run the real Agent satisfied the acceptance on the FIRST attempt (even with a

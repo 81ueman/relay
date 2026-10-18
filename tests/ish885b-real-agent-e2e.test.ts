@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { evaluateChain, extractAgentGithubWrites, fixtureCheck, resolveGithubPlaceholder, REPO, BASE } from "../scripts/ish885b-real-agent-e2e";
+import { evaluateChain, extractAgentGithubWrites, fixtureCheck, isAgentGithubWrite, isAgentReviewWrite, resolveGithubPlaceholder, REPO, BASE } from "../scripts/ish885b-real-agent-e2e";
 
 /**
  * ISH-885 item 1: the harness must attribute the GitHub writes to the dsh AGENT
@@ -107,6 +107,42 @@ describe("ISH-885b harness: agent GitHub-write attribution", () => {
     expect(ev.agentGithubWrites).toEqual([]);
     expect(ev.runs[0]!.dshJsonl).toBeNull();
   });
+
+  /**
+   * Finding 5: an Agent review/comment write must be attributed (it shares the
+   * operator's GitHub identity with the independent reviewer), so the harness can
+   * no longer silently credit the Agent's own review to the reviewer.
+   */
+  test("attributes Agent review/comment/merge writes and gh api mutations", () => {
+    const dir = mkdtempSync(join(tmpdir(), "ish885b-attrib3-"));
+    const dsh = join(dir, "dsh.jsonl");
+    writeFileSync(
+      dsh,
+      jsonl([
+        { type: "tool_call", callId: "r1", tool: "bash", input: { command: "git push origin HEAD:refs/heads/relay/ish885b-e2e-y" } },
+        { type: "tool_call", callId: "r2", tool: "bash", input: { command: "gh pr create --repo 81ueman/relay --head relay/ish885b-e2e-y --base main --title t --body b" } },
+        { type: "tool_call", callId: "r3", tool: "bash", input: { command: "gh pr review 40 --comment --body '<!-- ishiul-review head=deadbeef verdict=OK -->'" } },
+        { type: "tool_call", callId: "r4", tool: "bash", input: { command: "gh api -X POST repos/81ueman/relay/pulls/40/reviews -f body=x -f event=APPROVE" } },
+        { type: "tool_call", callId: "r5", tool: "bash", input: { command: "git push origin --delete relay/ish885b-e2e-y" } },
+        // reads must NOT be attributed
+        { type: "tool_call", callId: "r6", tool: "bash", input: { command: "gh pr view 40 --json headRefOid" } },
+        { type: "tool_call", callId: "r7", tool: "bash", input: { command: "gh api repos/81ueman/relay/pulls/40/reviews" } },
+      ])
+    );
+    const ev = extractAgentGithubWrites(dir, [
+      { id: "run-5", state: "exited", exit_code: 0, head_sha: "a".repeat(40), base_head_sha: "b".repeat(40), dsh_events_path: dsh },
+    ]);
+    const reviewWrites = ev.agentGithubWrites.filter((c) => isAgentReviewWrite(c));
+    expect(reviewWrites.some((c) => /gh\s+pr\s+review/.test(c))).toBe(true);
+    expect(reviewWrites.some((c) => /\bgh\s+api\b/.test(c))).toBe(true);
+    expect(ev.agentGithubWrites.some((c) => c.includes("--delete"))).toBe(true);
+    // the two READ calls are not attributed
+    expect(ev.agentGithubWrites.some((c) => /gh\s+pr\s+view/.test(c))).toBe(false);
+    expect(ev.agentGithubWrites.some((c) => c === "gh api repos/81ueman/relay/pulls/40/reviews")).toBe(false);
+    expect(isAgentGithubWrite("gh pr comment 40 --body hi")).toBe(true);
+    expect(isAgentGithubWrite("gh pr close 40")).toBe(true);
+    expect(isAgentGithubWrite("gh pr view 40")).toBe(false);
+  });
 });
 
 /**
@@ -179,5 +215,18 @@ describe("ISH-885b harness: success predicate (arc optional)", () => {
       reviews: [{ body: "verdict=OK", commit_id: "d".repeat(40) }],
     });
     expect(r.chainOk).toBe(false);
+  });
+
+  test("an Agent review write makes the judgment NOT_PROVEN (shared operator identity)", () => {
+    const r = evaluateChain({
+      ...base,
+      attemptVerdicts: ["pass"],
+      reviews: [{ body: "verdict=OK", commit_id: base.finalHead }],
+      agentWroteReview: true,
+    });
+    expect(r.chainOk).toBe(false);
+    expect(r.agentWroteReview).toBe(true);
+    expect(r.passHeadMatches).toBe(true); // the review exists, but its authorship is not provable
+    expect(r.independentClaudeJudgment).toContain("NOT_PROVEN");
   });
 });

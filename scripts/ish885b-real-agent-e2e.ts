@@ -128,10 +128,30 @@ export function resolveGithubPlaceholder(listOut: string): string | null {
  * The write signatures that must be attributed to the AGENT, never to Relay.
  * Quoted segments are stripped first so a `grep 'gh pr create' log` (a READ of a
  * string that mentions the command) is never mis-attributed as the write itself.
+ *
+ * Finding 5: this deliberately covers the REVIEW-bearing writes too (`gh pr
+ * review|comment|merge|close`, `gh api --method/-X POST|PATCH|PUT|DELETE`), not
+ * just push/create — otherwise an Agent-posted review is invisible and the
+ * harness could credit the Agent's own review to the independent reviewer.
  */
 export function isAgentGithubWrite(cmd: string): boolean {
   const c = cmd.replace(/'[^']*'/g, "''").replace(/"[^"]*"/g, '""');
-  return /\bgit\s+push\b/.test(c) || /\bgh\s+pr\s+(create|edit)\b/.test(c);
+  return isAgentReviewWrite(c) || /\bgit\s+push\b/.test(c) || /\bgh\s+pr\s+(create|edit)\b/.test(c);
+}
+
+/**
+ * A GitHub write that mutates a REVIEW / COMMENT / MERGE (not a push, not the PR
+ * creation). Attribution of these is what keeps the "independent review" claim
+ * honest: the Agent and the reviewer share the operator's GitHub identity
+ * (process-level independence), so an Agent-posted review at the reviewed HEAD
+ * would otherwise be indistinguishable from the reviewer's own.
+ */
+export function isAgentReviewWrite(cmd: string): boolean {
+  const c = cmd.replace(/'[^']*'/g, "''").replace(/"[^"]*"/g, '""');
+  if (/\bgh\s+pr\s+(review|comment|merge|close)\b/.test(c)) return true;
+  // `gh api -X POST …/reviews` (or PATCH/PUT/DELETE on a review/comment/merge path)
+  if (/\bgh\s+api\b/.test(c) && (/\s(?:-X|--method)\s+(?:POST|PATCH|PUT|DELETE)\b/.test(c) || /\s(?:-f|--field|--raw-field)\b/.test(c))) return true;
+  return false;
 }
 
 /**
@@ -179,7 +199,12 @@ export function extractAgentGithubWrites(dbDir: string, rows: { id: string; stat
 }
 
 export interface ChainOutcome {
-  /** The pipeline reached the read-only merge gate with a real review PASS at the reviewed HEAD. */
+  /**
+   * The pipeline reached phase `merge_ready` with a real review PASS at the
+   * reviewed HEAD. NOTE (finding 1): this is the factory PHASE, not the read-only
+   * gate decision — `result.gate.status` is recorded separately in the evidence
+   * and is NOT claimed to be READY.
+   */
   chainOk: boolean;
   /** An independent `verdict=OK` native review exists at the FINAL reviewed HEAD. */
   passHeadMatches: boolean;
@@ -187,6 +212,8 @@ export interface ChainOutcome {
   ngArc: boolean;
   /** The factory ran a FIX attempt (the arc's fix leg happened). */
   fixRoundOccurred: boolean;
+  /** An Agent dsh tool call wrote a review/comment/merge (identity-independence broken). */
+  agentWroteReview: boolean;
   /** Honest description of the independent judgment, or `NOT_PROVEN`. */
   independentClaudeJudgment: string;
 }
@@ -195,10 +222,15 @@ export interface ChainOutcome {
  * The success predicate, kept pure so it is unit-testable without a real PR.
  *
  * Owner decision 2026-10-18: the success condition is a **real review PASS at the
- * reviewed HEAD** (pipeline reaching MergeReady with an independent Claude verdict).
- * The `NG@A -> FIX -> PASS@B` arc is OPTIONAL — a first-try PASS is a valid PASS, and
- * `fixRoundOccurred` records which happened. A missing/incongruent review is still
- * `NOT_PROVEN` (never a fabricated PASS).
+ * reviewed HEAD** (the factory reaching phase `merge_ready` with an independent
+ * Claude verdict). The `NG@A -> FIX -> PASS@B` arc is OPTIONAL — a first-try PASS
+ * is a valid PASS, and `fixRoundOccurred` records which happened. A
+ * missing/incongruent review is still `NOT_PROVEN` (never a fabricated PASS).
+ *
+ * Finding 5: the Agent and the reviewer share the operator's GitHub identity, so
+ * independence is process-level. If an Agent dsh tool call wrote a review/comment
+ * (`agentWroteReview`), the judgment is `NOT_PROVEN` — the harness cannot tell the
+ * Agent's review from the independent reviewer's.
  */
 export function evaluateChain(input: {
   outcome: string | null;
@@ -208,8 +240,11 @@ export function evaluateChain(input: {
   lastProducedHead: string | null;
   attemptVerdicts: (string | null | undefined)[];
   reviews: { body?: string | null; commit_id?: string | null }[];
+  /** True when an Agent dsh tool call wrote a review/comment/merge (finding 5). */
+  agentWroteReview?: boolean;
 }): ChainOutcome {
   const { outcome, pushedByAgent, prNumber, finalHead, lastProducedHead, attemptVerdicts, reviews } = input;
+  const agentWroteReview = input.agentWroteReview === true;
   const ngReview = reviews.find((r) => /verdict=NG/.test(r.body ?? ""));
   const okReview = reviews.find((r) => /verdict=OK/.test(r.body ?? ""));
   const passHeadMatches = !!okReview && !!finalHead && okReview.commit_id === finalHead;
@@ -221,13 +256,16 @@ export function evaluateChain(input: {
     prNumber != null &&
     passHeadMatches &&
     !!finalHead &&
-    lastProducedHead === finalHead;
-  const independentClaudeJudgment = passHeadMatches
-    ? ngArc
-      ? "real: NG@A then OK@B by an independent headless Claude"
-      : "real: PASS at the reviewed head by an independent headless Claude (first-try; no NG round)"
-    : "NOT_PROVEN";
-  return { chainOk, passHeadMatches, ngArc, fixRoundOccurred, independentClaudeJudgment };
+    lastProducedHead === finalHead &&
+    !agentWroteReview;
+  const independentClaudeJudgment = agentWroteReview
+    ? "NOT_PROVEN: an Agent dsh tool call wrote a review/comment; the Agent and the reviewer share the operator's GitHub identity, so the verdict is not provably independent"
+    : passHeadMatches
+      ? ngArc
+        ? "real: NG@A then OK@B by an independent headless Claude"
+        : "real: PASS at the reviewed head by an independent headless Claude (first-try; no NG round)"
+      : "NOT_PROVEN";
+  return { chainOk, passHeadMatches, ngArc, fixRoundOccurred, agentWroteReview, independentClaudeJudgment };
 }
 
 async function main(): Promise<void> {
@@ -329,16 +367,34 @@ async function main(): Promise<void> {
     sandboxName = binding.name;
     step("sandbox-created", { name: binding.name, agent: CODING_KIT, workspace: binding.workspace, branch: binding.branch, created: binding.created });
     leg("coding-sandbox", "PASS", `dsh Agent runs inside Coding Sandbox ${binding.name} (kit ${CODING_KIT})`);
-    // Operator provisioning: pin GitHub's `ssh.github.com:443` host key (the kit
-    // routes github.com there because the egress policy has no :22 rule) so the
-    // Agent's `git push` does not fail on first-connection host verification. The
+    // Operator provisioning: verify GitHub's `ssh.github.com:443` host key against
+    // GitHub's PUBLISHED ed25519 fingerprint (the kit routes github.com to :443
+    // because the egress policy has no :22 rule) so the Agent's `git push` does
+    // not fail on first-connection host verification. Finding 4: a bare
+    // `ssh-keyscan > known_hosts` is trust-on-first-use and must NOT be reported as
+    // "pinned"; verify with `ssh-keygen -lf` and fail closed on a mismatch. The
     // Agent still performs the push/PR write itself.
+    const GITHUB_ED25519_FP = "SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU";
     const kh = realSbxCli.run(
-      sbxExecArgv(binding.name, bashLc("mkdir -p ~/.ssh && ssh-keyscan -p 443 ssh.github.com 2>/dev/null > ~/.ssh/known_hosts && chmod 600 ~/.ssh/known_hosts && wc -l < ~/.ssh/known_hosts"), {
-        workdir: binding.workspace,
-      })
+      sbxExecArgv(
+        binding.name,
+        bashLc(
+          "mkdir -p ~/.ssh && ssh-keyscan -p 443 ssh.github.com 2>/dev/null > ~/.ssh/known_hosts.scan && " +
+            `fp=$(ssh-keygen -lf ~/.ssh/known_hosts.scan 2>/dev/null | awk '{print $2}' | sort -u | tr '\\n' ' ') && ` +
+            `case "$fp" in *${GITHUB_ED25519_FP}*) mv ~/.ssh/known_hosts.scan ~/.ssh/known_hosts && chmod 600 ~/.ssh/known_hosts && echo "VERIFIED $fp";; *) rm -f ~/.ssh/known_hosts.scan; echo "MISMATCH $fp"; exit 3;; esac`
+        ),
+        { workdir: binding.workspace }
+      )
     );
-    leg("sandbox-known-hosts", kh.ok ? "PASS" : "NOT_RUN", kh.ok ? `pinned ssh.github.com host key (${kh.out.trim()} line(s))` : `could not pin host key: ${kh.err || kh.out}`);
+    const hostKeyVerified = kh.ok && kh.out.includes("VERIFIED") && kh.out.includes(GITHUB_ED25519_FP);
+    leg(
+      "sandbox-known-hosts",
+      hostKeyVerified ? "PASS" : "FAIL",
+      hostKeyVerified
+        ? `ssh.github.com host key verified against GitHub's published ed25519 fingerprint ${GITHUB_ED25519_FP}`
+        : `host key NOT verified against ${GITHUB_ED25519_FP}: ${kh.err || kh.out || "ssh-keyscan/ssh-keygen failed"}`
+    );
+    if (!hostKeyVerified) throw new Error(`the ssh.github.com host key did not match GitHub's published ed25519 fingerprint ${GITHUB_ED25519_FP}`);
     // The dsh Agent's bash tool runs with a SANITIZED env (no GH_TOKEN/GITHUB_TOKEN
     // reaches it), so an env-injected credential is invisible to the Agent. Give
     // `gh` a config file instead: `~/.config/gh/hosts.yml` carries the PROXY
@@ -360,12 +416,19 @@ async function main(): Promise<void> {
     const ghPre = realSbxCli.run(
       sbxExecArgv(binding.name, bashLc("env -u GH_TOKEN -u GITHUB_TOKEN gh api user -q .login"), { workdir: binding.workspace })
     );
+    // Finding 3: fail closed. An EXACT login match (not `includes`, which would
+    // accept a login that merely contains the expected one as a substring), and
+    // abort BEFORE the 20-minute factory so a known-bad credential never runs the
+    // Agent or performs avoidable remote writes.
+    const ghPreOk = !!ghUser.out.trim() && ghPre.ok && ghPre.out.trim() === ghUser.out.trim();
     leg(
       "sandbox-gh-api",
-      ghPre.ok && ghPre.out.includes(ghUser.out) ? "PASS" : "BLOCKED",
+      ghPreOk ? "PASS" : "BLOCKED",
       ghPre.ok ? `sandbox gh authenticated as ${ghPre.out.trim()} (hosts.yml proxy placeholder, GH_TOKEN unset)` : `sandbox gh failed: ${(ghPre.err || ghPre.out).slice(0, 300)}`
     );
-    if (!ghConfigWrote) throw new Error("the sandbox gh credential config could not be written");
+    if (!ghConfigWrote || !ghPreOk) {
+      throw new Error(`sandbox gh preflight failed: configWrote=${ghConfigWrote} ghPre.ok=${ghPre.ok} ghPre.login=${JSON.stringify(ghPre.out.trim())} host.login=${JSON.stringify(ghUser.out.trim())}`);
+    }
 
     const result = await runFactoryTask(db, task.id, {
       repo,
@@ -383,9 +446,27 @@ async function main(): Promise<void> {
       reviewWorktreeRoot: join(dir, "review-wt"),
       nativeReview: { reader: github, github, author: ghUser.out || "81ueman", allowedTools: "Read Grep Glob Bash" },
       prBinding: { github },
+      // Finding 1: wire the read-only merge gate to GitHub (read-only) so
+      // `checkMergeGate` actually reads the PR + HEAD-pinned checks instead of
+      // leaving `prRead="unbound"`. This is observation only — nothing merges.
+      mergeGateDeps: { github, checks: github },
     });
-    evidence.factoryResult = { outcome: result.outcome, head: result.head, reason: result.reason, attempts: result.attempts, gate: result.gate?.status ?? null };
+    // Finding 1: record the gate DECISION (status + reasons), not just the phase.
+    // `outcome: "merge_ready"` is the factory phase; the gate decision is separate
+    // and is not claimed to be READY.
+    const gateDetail = result.gate
+      ? { status: result.gate.status, action: result.gate.action, reasons: result.gate.reasons.map((r) => ({ code: r.code, message: r.message })) }
+      : null;
+    evidence.factoryResult = { outcome: result.outcome, head: result.head, reason: result.reason, attempts: result.attempts, gate: gateDetail };
     step("factory-result", evidence.factoryResult as Record<string, unknown>);
+    step("merge-gate", { decision: gateDetail });
+    leg(
+      "read-only-merge-gate",
+      result.gate ? "PASS" : "FAIL",
+      result.gate
+        ? `phase ${result.outcome}; read-only gate decision was ${result.gate.status}${result.gate.reasons.length ? ` (${result.gate.reasons.map((r) => r.code).join(",")})` : ""}`
+        : "no gate decision recorded"
+    );
 
     // ---- actor evidence: did the dsh AGENT do the GitHub writes? -------------
     const runRows = db
@@ -395,12 +476,21 @@ async function main(): Promise<void> {
     evidence.actorEvidence = actor;
     const pushedByAgent = actor.agentGithubWrites.some((c) => /\bgit\s+push\b/.test(c));
     const prCreateAttempted = actor.agentGithubWrites.some((c) => /\bgh\s+pr\s+(create|edit)\b/.test(c));
+    // Finding 5: an Agent review/comment write would make the "independent review"
+    // claim unverifiable (shared operator identity), so detect and report it.
+    const agentWroteReview = actor.agentGithubWrites.some((c) => isAgentReviewWrite(c));
     leg(
       "dsh-agent-push",
       pushedByAgent ? "PASS" : "FAIL",
       pushedByAgent ? `dsh Agent ran git push in the Coding Sandbox (${actor.agentGithubWrites.length} GitHub-write tool call(s))` : "no dsh `git push` tool call found in dsh.jsonl"
     );
     leg("dsh-agent-pr-write", prCreateAttempted ? "PASS" : "FAIL", prCreateAttempted ? "dsh Agent ran `gh pr create`/`gh pr edit` in the Coding Sandbox" : "no dsh `gh pr create` tool call found");
+    leg(
+      "dsh-agent-review-write",
+      agentWroteReview ? "FAIL" : "PASS",
+      agentWroteReview ? `dsh Agent wrote a review/comment/merge: ${actor.agentGithubWrites.filter((c) => isAgentReviewWrite(c)).join(" | ").slice(0, 300)}` : "no Agent review/comment/merge write in dsh.jsonl (the native review is the reviewer's)"
+    );
+    evidence.agentReviewWrites = actor.agentGithubWrites.filter((c) => isAgentReviewWrite(c));
     evidence.githubWriter = pushedByAgent && prCreateAttempted ? "dsh/DeepSeek Coding Agent (from dsh.jsonl tool calls)" : "NOT the dsh Agent";
     if (prCreateAttempted) {
       const createDetail = actor.agentGithubWriteDetails.find((d) => /\bgh\s+pr\s+(create|edit)\b/.test(d.command));
@@ -461,8 +551,10 @@ async function main(): Promise<void> {
     leg("claude-native-NG@A (optional)", ngA ? "PASS" : "NOT_RUN", ngA ? `native review ${ngA.id} by ${ngA.user?.login} NG @ ${(ngA.commit_id ?? "").slice(0, 10)}` : "no NG round: the Agent passed on the first attempt (the NG@A -> FIX -> PASS@B arc is optional)");
 
     // The success predicate: dsh Agent push/PR + a REAL independent Claude PASS at
-    // the reviewed HEAD + MergeReady. The FIX arc is optional; evaluateChain (pure,
-    // unit-tested) records whether it occurred and never fabricates a verdict.
+    // the reviewed HEAD, reaching factory PHASE `merge_ready` (the read-only gate's
+    // decision is recorded above and is NOT claimed to be READY). The FIX arc is
+    // optional; evaluateChain (pure, unit-tested) records whether it occurred and
+    // never fabricates a verdict.
     const chain = evaluateChain({
       outcome: result.outcome ?? null,
       pushedByAgent,
@@ -471,6 +563,7 @@ async function main(): Promise<void> {
       lastProducedHead: result.attempts[result.attempts.length - 1]?.producedHead ?? null,
       attemptVerdicts: result.attempts.map((a) => a.reviewVerdict),
       reviews,
+      agentWroteReview,
     });
     evidence.fixRoundOccurred = chain.fixRoundOccurred;
     evidence.ngArc = chain.ngArc;
@@ -479,14 +572,15 @@ async function main(): Promise<void> {
     leg("claude-native-PASS-at-head", chain.passHeadMatches ? "PASS" : "FAIL", okReview ? `native review ${okReview.id} by ${okReview.user?.login} OK @ ${(okReview.commit_id ?? "").slice(0, 10)}` : "no OK review on the PR at the reviewed HEAD");
     leg("claude-native-NG-arc (optional)", chain.ngArc ? "PASS" : "NOT_RUN", chain.ngArc ? `NG@${(ngA!.commit_id ?? "").slice(0, 10)} -> PASS@reviewed HEAD (a real FIX round occurred)` : `first-try PASS: no distinct NG@A -> PASS@B arc (fixRound=${chain.fixRoundOccurred})`);
     evidence.chainProven = chain.chainOk;
+    const gateSuffix = result.gate ? `; read-only gate decision ${result.gate.status}${result.gate.reasons.length ? ` (${result.gate.reasons.map((r) => r.code).join(",")})` : ""}` : "; no gate decision";
     leg(
       "full-chain",
       chain.chainOk ? "PASS" : "FAIL",
       chain.chainOk
         ? chain.ngArc
-          ? "dsh Agent push/PR -> Relay bind A -> Claude NG@A -> dsh FIX B -> Relay bind B -> Claude PASS@B -> MergeReady (read-only)"
-          : "dsh Agent push/PR -> Relay bind reviewed HEAD -> Claude PASS (first-try) -> MergeReady (read-only); NG->FIX->PASS arc optional and NOT_PROVEN"
-        : `outcome=${result.outcome} pushedByAgent=${pushedByAgent} pr=${prNumber} passHeadMatches=${chain.passHeadMatches} fixRound=${chain.fixRoundOccurred}`
+          ? `dsh Agent push/PR -> Relay bind A -> Claude NG@A -> dsh FIX B -> Relay bind B -> Claude PASS@B -> phase merge_ready${gateSuffix}`
+          : `dsh Agent push/PR -> Relay bind reviewed HEAD -> Claude PASS (first-try) -> phase merge_ready${gateSuffix}; NG->FIX->PASS arc optional and NOT_PROVEN`
+        : `outcome=${result.outcome} pushedByAgent=${pushedByAgent} pr=${prNumber} passHeadMatches=${chain.passHeadMatches} fixRound=${chain.fixRoundOccurred} agentWroteReview=${chain.agentWroteReview}`
     );
     evidence.result = chain.chainOk ? "PASS" : "FAIL";
   } catch (e) {
@@ -494,6 +588,22 @@ async function main(): Promise<void> {
     evidence.result = "FAIL";
     console.error(`ISH-885b run error: ${evidence.error}`);
   } finally {
+    // Finding 2: persist the durable evidence file FIRST (final result + legs),
+    // BEFORE any destructive cleanup. `cleanup only after the evidence is written`
+    // was the stated guarantee; a hang/interrupt during `gh pr close` /
+    // `git push --delete` / `sbx rm` must not lose the run's evidence or leave a
+    // stale file from an earlier run looking current.
+    const persistEvidence = (): boolean => {
+      try {
+        mkdirSync(join(process.cwd(), "docs"), { recursive: true });
+        writeFileSync(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    evidence.evidenceWrittenBeforeCleanup = persistEvidence();
+
     // ---- cleanup AFTER evidence is retained ---------------------------------
     const sb = (() => {
       try {
@@ -521,12 +631,8 @@ async function main(): Promise<void> {
     cleanup.tempDir = dir;
     evidence.cleanup = cleanup;
     evidence.finishedAt = new Date().toISOString();
-    try {
-      mkdirSync(join(process.cwd(), "docs"), { recursive: true });
-      writeFileSync(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`);
-    } catch {
-      /* best effort */
-    }
+    // Rewrite with the cleanup outcomes; the pre-cleanup copy above is already durable.
+    persistEvidence();
     db.close();
     rmSync(dir, { recursive: true, force: true });
     console.log(`\nresult=${evidence.result}  evidence: ${evidencePath}`);

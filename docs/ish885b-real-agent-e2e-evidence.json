@@ -95,7 +95,7 @@
     {
       "leg": "full-chain",
       "verdict": "PASS",
-      "detail": "dsh Agent push/PR -> Relay bind reviewed HEAD -> Claude PASS (first-try) -> MergeReady (read-only); NG->FIX->PASS arc optional and NOT_PROVEN"
+      "detail": "dsh Agent push/PR -> Relay bind reviewed HEAD -> Claude PASS (first-try) -> factory phase merge_ready; read-only gate decision BLOCKED; NG->FIX->PASS arc optional and NOT_PROVEN"
     }
   ],
   "githubWriter": "dsh/DeepSeek Coding Agent (from dsh.jsonl tool calls)",
@@ -141,7 +141,7 @@
           "phase": "implement"
         }
       ],
-      "gate": "BLOCKED",
+      "gate": { "status": "BLOCKED", "action": "none", "reasons": [], "note": "run 8: the gate ran WITHOUT mergeGateDeps (prRead=unbound) and its reasons were not recorded. The harness now wires mergeGateDeps {github, checks} and records status+action+reasons." },
       "at": "2026-10-18T07:46:40.582Z"
     },
     {
@@ -180,7 +180,7 @@
         "phase": "implement"
       }
     ],
-    "gate": "BLOCKED"
+    "gate": { "status": "BLOCKED", "action": "none", "reasons": [], "note": "run 8: the gate ran WITHOUT mergeGateDeps (prRead=unbound) and its reasons were not recorded. The harness now wires mergeGateDeps {github, checks} and records status+action+reasons." }
   },
   "actorEvidence": {
     "agentGithubWrites": [
@@ -220,7 +220,15 @@
   "chainProven": true,
   "reviewedHead": "a47818918846b32bff5e7e21aaf3f946bf469d3a",
   "fixRoundOccurred": false,
-  "chainSemantics": "Owner decision 2026-10-18: success = a real independent Claude PASS at the reviewed HEAD (pipeline reaching MergeReady); the NG@A -> FIX -> PASS@B arc is OPTIONAL, recorded but not required.",
+  "chainSemantics": "Owner decision 2026-10-18: success = a real independent Claude PASS at the reviewed HEAD (the factory reaching PHASE merge_ready; the read-only gate decision is recorded separately and is NOT claimed to be READY); the NG@A -> FIX -> PASS@B arc is OPTIONAL, recorded but not required.",
+  "harnessFixes": {
+    "round": "PR #40 review NG at d4b7784 (5 findings) — all harness accuracy in scripts/ish885b-real-agent-e2e.ts",
+    "1_merge_gate_wired": "runFactoryTask now passes mergeGateDeps {github, checks: github}; evidence.factoryResult.gate records status+action+reasons. Earlier runs (incl. run 8) ran the gate unbound (prRead=unbound) and recorded BLOCKED.",
+    "2_evidence_before_cleanup": "the evidence file is written BEFORE any cleanup and rewritten with cleanup outcomes afterwards (evidenceWrittenBeforeCleanup).",
+    "3_gh_preflight_abort": "the run aborts if the sandbox gh preflight does not EXACTLY match the host login (no factory run under a known-bad credential).",
+    "4_host_key_pinned": "the ssh.github.com host key is verified against GitHub's published ed25519 fingerprint SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU via ssh-keygen -lf, and the run fails closed on a mismatch (run 8 used trust-on-first-use).",
+    "5_agent_review_attribution": "isAgentGithubWrite now also detects gh pr review|comment|merge|close and gh api -X/--method POST|PATCH|PUT|DELETE; evaluateChain returns NOT_PROVEN when an Agent tool call wrote a review/comment (the Agent and reviewer share the operator GitHub identity; independence is process-level)."
+  },
   "reevaluation": {
     "at": "2026-10-18",
     "of": "run 8 (PR #39, reviewed HEAD a47818918846b32bff5e7e21aaf3f946bf469d3a)",

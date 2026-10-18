@@ -35,11 +35,17 @@ Relay made no GitHub writes. Nothing was merged.
 
 ## Success condition: first-try PASS counts (owner decision 2026-10-18)
 
-Runs 5–8 each reached read-only MergeReady with the Agent's own push/PR and an
-**independent Claude PASS at the reviewed HEAD**. Under the owner's success
+Runs 5–8 each reached factory phase `merge_ready` with the Agent's own push/PR and
+an **independent Claude PASS at the reviewed HEAD**. Under the owner's success
 condition that is a **PASS** — the `NG@A → FIX → PASS@B` arc is **OPTIONAL, not
 required**. The harness records whether a FIX round occurred
 (`fixRoundOccurred`/`ngArc`) and never fabricates a verdict.
+
+The read-only **gate** decision is recorded separately from the phase. Runs 5–8
+predate wiring `mergeGateDeps`, so their recorded gate decision was `BLOCKED`
+(`NO_PR`/`NOT_RUN` — nothing granted a merge authority); the later harness wires
+`mergeGateDeps: { github, checks: github }` and records `gate.status` + `reasons`.
+Neither the harness nor Relay ever merges.
 
 ## Why the `NG@A → FIX → PASS@B` arc is NOT_PROVEN (optional leg)
 
