@@ -11,6 +11,7 @@ import { registerWorker } from "../src/workers";
 import { intakeTask, recordVerification, submitPhase } from "../src/workflow";
 import { gitHead } from "../src/verify";
 import {
+  REVIEW_NATIVE_CONTRADICTED,
   REVIEW_NATIVE_MISSING,
   REVIEW_NATIVE_NO_PR,
   REVIEW_NATIVE_UNVERIFIED,
@@ -257,7 +258,7 @@ describe("runHeadlessReview verifies the reviewer's native GitHub review (ISH-88
     const gh = new FakeNativeGitHub(prView(head));
     const r = await runHeadlessReview(db, id, { spawner: reviewer(gh, { post: "nomarker" }).spawner, nativeReview: nativeDeps(gh) });
     expect(r.outcome).toBe("refused");
-    expect(r.error).toContain(REVIEW_NATIVE_MISSING);
+    expect(r.error).toContain(REVIEW_NATIVE_CONTRADICTED);
   });
 
   test("refuses a review authored by a foreign identity", async () => {
@@ -329,6 +330,34 @@ describe("runHeadlessReview verifies the reviewer's native GitHub review (ISH-88
     expect(r.outcome).toBe("pass");
     expect(r.nativeReview?.id).toBe(newer.id);
     expect(r.nativeReview?.id).not.toBe(older.id);
+  });
+
+  test("refuses when the NEWEST review contradicts the structured pass (older OK, newer NG)", async () => {
+    const head = HEAD();
+    const id = driveToReview(head);
+    const gh = new FakeNativeGitHub(prView(head));
+    const ok = `<!-- ishiul-review head=${head} verdict=OK reviewer=${gh.author} -->`;
+    const ng = `<!-- ishiul-review head=${head} verdict=NG reviewer=${gh.author} -->`;
+    gh.record({ headSha: head, body: ok, createdAt: "2026-01-01T00:00:00Z" });
+    gh.record({ headSha: head, body: ng, createdAt: "2026-02-01T00:00:00Z" });
+    // Structured verdict says pass, but the reviewer's newest word is NG.
+    const r = await runHeadlessReview(db, id, { spawner: reviewer(gh, { post: "missing" }).spawner, nativeReview: nativeDeps(gh) });
+    expect(r.outcome).toBe("refused");
+    expect(r.error).toContain(REVIEW_NATIVE_CONTRADICTED);
+    expect(getTask(db, id)!.phase).toBe("review");
+  });
+
+  test("accepts the NEWEST when it agrees (older NG, newer OK, structured pass)", async () => {
+    const head = HEAD();
+    const id = driveToReview(head);
+    const gh = new FakeNativeGitHub(prView(head));
+    const ok = `<!-- ishiul-review head=${head} verdict=OK reviewer=${gh.author} -->`;
+    const ng = `<!-- ishiul-review head=${head} verdict=NG reviewer=${gh.author} -->`;
+    gh.record({ headSha: head, body: ng, createdAt: "2026-01-01T00:00:00Z" });
+    const newerOk = gh.record({ headSha: head, body: ok, createdAt: "2026-02-01T00:00:00Z" });
+    const r = await runHeadlessReview(db, id, { spawner: reviewer(gh, { post: "missing" }).spawner, nativeReview: nativeDeps(gh) });
+    expect(r.outcome).toBe("pass");
+    expect(r.nativeReview?.id).toBe(newerOk.id);
   });
 
   test("refuses when the PR has moved off the reviewed HEAD", async () => {

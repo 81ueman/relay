@@ -62,6 +62,8 @@ export const REVIEW_PROCESS_FAILED = "REVIEW_PROCESS_FAILED";
 export const REVIEW_NATIVE_NO_PR = "REVIEW_NATIVE_NO_PR";
 /** ISH-883: the reviewer posted no matching native review at the reviewed HEAD. */
 export const REVIEW_NATIVE_MISSING = "REVIEW_NATIVE_MISSING";
+/** ISH-883: the reviewer's NEWEST review at the HEAD contradicts the structured verdict. */
+export const REVIEW_NATIVE_CONTRADICTED = "REVIEW_NATIVE_CONTRADICTED";
 /** ISH-883: a native review could not be read back, or did not match the reviewed HEAD. */
 export const REVIEW_NATIVE_UNVERIFIED = "REVIEW_NATIVE_UNVERIFIED";
 
@@ -457,12 +459,13 @@ export interface NativeReviewOutcome {
 
 /**
  * Read the reviewer's native PR review BACK from GitHub and accept it only when
- * it is a submitted `COMMENTED` review authored by the expected GitHub identity,
- * pinned to the EXACT reviewed HEAD, carrying the head-pinned verdict marker,
- * posted AFTER any base-changed invalidation at that HEAD, and the PR's CURRENT
- * head is still that commit. A missing/foreign/PENDING/DISMISSED/mismatched/
- * stale/moved-HEAD review or a failed read is `ok:false` — the caller records
- * NOTHING. Relay never trusts the reviewer's own URL/JSON, and never posts here.
+ * the reviewer's CURRENT word at the HEAD — the newest fresh `COMMENTED` review
+ * authored by the expected GitHub identity, pinned to the EXACT reviewed HEAD,
+ * posted AFTER any base-changed invalidation — carries the marker matching the
+ * structured verdict, and the PR's CURRENT head is still that commit. A
+ * missing/foreign/PENDING/DISMISSED/stale/moved-HEAD review, a newer review whose
+ * verdict contradicts the structured one, or a failed read is `ok:false` — the
+ * caller records NOTHING. Relay never trusts the reviewer's own URL/JSON.
  */
 export function verifyNativeReview(
   db: Database,
@@ -484,32 +487,42 @@ export function verifyNativeReview(
   // review posted before that invalidation judged the OLD base's diff, so it must
   // not be re-accepted (the same rule the marker path uses).
   const invalidatedAt = latestReviewInvalidationAt(db, task.id, head);
-  // Accept ONLY a submitted COMMENT review by the expected author at the exact
-  // HEAD whose body carries the matching verdict marker and that is fresh enough.
-  // A PENDING (never submitted) or DISMISSED/APPROVED/CHANGES_REQUESTED review is
-  // never a valid Relay verdict; the brief allows a COMMENT only.
+  // The reviewer's CURRENT word at this HEAD: the NEWEST fresh `COMMENTED` review
+  // by the expected author, whatever its verdict. Only then is its marker checked
+  // against the structured verdict — so a newer contradicting review is never
+  // shadowed by an older matching one. A PENDING (never submitted) or
+  // DISMISSED/APPROVED/CHANGES_REQUESTED review is never a valid verdict; the
+  // brief allows a COMMENT only.
   const candidates = reviews.filter(
     (r) =>
       (r.author ?? "").toLowerCase() === native.author.toLowerCase() &&
       (r.state ?? "").toUpperCase() === "COMMENTED" &&
       headsMatch(r.headSha, head) &&
-      reviewBodyHasMarker(r.body, head, marker) &&
       markerAfterInvalidation({ createdAt: r.createdAt } as ReviewMarker, invalidatedAt)
   );
-  // Prefer the NEWEST match: an older same-HEAD review must not win over a newer
-  // one (an older OK never beats a newer NG). Unparseable timestamps sort last.
+  // Prefer the NEWEST review. Unparseable timestamps sort last.
   const timeOf = (r: ReviewView): number => {
     const t = Date.parse(r.createdAt);
     return Number.isFinite(t) ? t : Number.NEGATIVE_INFINITY;
   };
   candidates.sort((a, b) => timeOf(b) - timeOf(a));
-  const found = candidates[0] ?? null;
-  if (!found) {
+  const newest = candidates[0] ?? null;
+  if (!newest) {
     return fail(
-      `${REVIEW_NATIVE_MISSING}: no fresh COMMENTED '${native.author}' review at HEAD ${head} with verdict ${marker} on ${ref.repo}#${ref.number}` +
+      `${REVIEW_NATIVE_MISSING}: no fresh COMMENTED '${native.author}' review at HEAD ${head} on ${ref.repo}#${ref.number}` +
         (invalidatedAt > 0 ? ` (reviews before the base-changed invalidation do not count)` : "")
     );
   }
+  // The newest review IS the reviewer's current verdict at this HEAD. If it does
+  // not carry the marker matching the structured verdict (a different verdict, or
+  // no marker at all), the run is contradicted — refuse, never fall back to an
+  // older review that happens to agree.
+  if (!reviewBodyHasMarker(newest.body, head, marker)) {
+    return fail(
+      `${REVIEW_NATIVE_CONTRADICTED}: the newest '${native.author}' review at HEAD ${head} (id ${newest.id}) does not carry a ${marker} marker on ${ref.repo}#${ref.number}; refusing to accept an older review`
+    );
+  }
+  const found = newest;
   // A moved PR HEAD invalidates the review even when the read-back review is
   // pinned: GitHub's CURRENT head must still be the reviewed commit.
   if (native.github) {
