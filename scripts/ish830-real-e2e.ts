@@ -621,13 +621,10 @@ async function stageParallel(dir: string, api: string, insecure: boolean): Promi
 
   const created = realSbxCli.run(sbxCreateArgv({ name: sandbox, agent: "shell", source: repo }));
   if (!created.ok) return record("parallel", "BLOCKED", `sbx create failed: ${created.err || created.out}`.slice(0, 300));
-  const envFile = Object.entries(labEnvFromProcess()).map(([k, v]) => `export ${k}=${v}`).join("\n");
-  realSbxCli.run(sbxExecArgv(sandbox, bashLc(`mkdir -p "$HOME" && cat > "$HOME/.labctl.env" <<'EOF'\n${envFile}\nEOF\nchmod 600 "$HOME/.labctl.env"`)));
-  const u = new URL(api);
-  const apiPort = u.port || "443";
-  realSbxCli.run(["policy", "allow", "network", "--sandbox", sandbox, `host.docker.internal:${apiPort},localhost:${apiPort},host.docker.internal:18001,localhost:18001,host.docker.internal:18002,localhost:18002,host.docker.internal:18011,localhost:18011,host.docker.internal:18012,localhost:18012`]);
-  const parLabctl = ensureLabctlInSandbox(sandbox, repo);
-  if (!parLabctl.ok) return record("parallel", "FAIL", `labctl is not runnable inside the sandbox: ${parLabctl.detail}`);
+
+  // Everything from here runs INSIDE the try/finally: the env-file write, the
+  // `new URL(api)` parse, the policy and `ensureLabctlInSandbox` can all fail, and
+  // the `finally` must ALWAYS stop/remove the sandbox (a leak is a FAIL).
   const labctl = sandboxLabctl({ sandbox, workspace: repo, exec: realSandboxExec }, labEnvFromProcess());
 
   // Destroy a lab and record the verdict from the RESULT (never a discarded
@@ -645,6 +642,18 @@ async function stageParallel(dir: string, api: string, insecure: boolean): Promi
   let deployedA: string | null = null;
   let deployedB: string | null = null;
   try {
+    const envFile = Object.entries(labEnvFromProcess()).map(([k, v]) => `export ${k}=${v}`).join("\n");
+    realSbxCli.run(sbxExecArgv(sandbox, bashLc(`mkdir -p "$HOME" && cat > "$HOME/.labctl.env" <<'EOF'\n${envFile}\nEOF\nchmod 600 "$HOME/.labctl.env"`)));
+    const u = new URL(api);
+    const apiPort = u.port || "443";
+    realSbxCli.run(["policy", "allow", "network", "--sandbox", sandbox, `host.docker.internal:${apiPort},localhost:${apiPort},host.docker.internal:18001,localhost:18001,host.docker.internal:18002,localhost:18002,host.docker.internal:18011,localhost:18011,host.docker.internal:18012,localhost:18012`]);
+    const parLabctl = ensureLabctlInSandbox(sandbox, repo);
+    if (!parLabctl.ok) {
+      // Record FAIL and fall through to the `finally`, which removes the sandbox.
+      record("parallel", "FAIL", `labctl is not runnable inside the sandbox: ${parLabctl.detail}`);
+      return;
+    }
+
     // Deploy BOTH labs concurrently (not one after the other).
     const [da, db] = await Promise.all([
       deployTaskLab(labctl, a, { topology: `labs/${labNameForTask(a)}/t.clab.yml`, namespace: labNamespaceForTask(a), api, insecure }),
@@ -669,6 +678,10 @@ async function stageParallel(dir: string, api: string, insecure: boolean): Promi
     // the shared NOS image survives (destroy never purges images)
     const img = sh("sbx", ["exec", "ish824-lab", "--", "docker", "image", "inspect", "ghcr.io/nokia/srlinux:latest", "--format", "{{.Id}}"]);
     record("parallel.image-retained", img.ok ? "PASS" : "FAIL", `shared SR Linux image ${img.ok ? "retained" : "MISSING"}: ${img.out || img.err}`);
+  } catch (e) {
+    // Fail-closed: a throw (e.g. a malformed LABCTL_API in `new URL`) is a FAIL, and
+    // the `finally` still stops/removes the sandbox.
+    record("parallel", "FAIL", `parallel stage error: ${e instanceof Error ? e.message : String(e)}`.slice(0, 400));
   } finally {
     await destroyAndVerdict(a, deployedA, "parallel.cleanup-a-final");
     await destroyAndVerdict(b, deployedB, "parallel.cleanup-b");
