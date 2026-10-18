@@ -77,7 +77,6 @@ import {
 } from "./workers";
 import { RELAY_TAG, sendMessage } from "./messages";
 import { immediateKindSql, mailNudgeMs, ordinaryStarvationCapMs, starvationCapMs } from "./mail-policy";
-import { wakeWorker } from "./wake-outbox";
 
 // Deterministic reconciler. No LLM: pure DB state + runtime transport.
 // Callers pass full Worker rows; only the Runtime adapter maps to targets.
@@ -407,7 +406,7 @@ async function tryWake(
 ): Promise<boolean> {
   if (recentlyWoken(db, w.id, at)) return false;
   try {
-    await wakeWorker(rt, db, w, text, reason);
+    await rt.wake(w, text);
     logEvent(db, { source: "supervisor", workerId: w.id, type: "worker.woken", payload: { reason } });
     return true;
   } catch (e) {
@@ -785,12 +784,9 @@ async function deliverBootstrap(
   const worker = getWorker(db, workerId);
   if (!worker) return false;
   try {
-    await wakeWorker(
-      rt,
-      db,
+    await rt.wake(
       { ...worker, runtime_id: row.runtime_id ?? worker.runtime_id },
-      BOOTSTRAP_PROMPT(workerId, generation, row.attach_token, handoff),
-      "bootstrap"
+      BOOTSTRAP_PROMPT(workerId, generation, row.attach_token, handoff)
     );
     markBootstrapSent(db, row.id, at);
     return true;
@@ -1238,7 +1234,7 @@ async function nudgeUnreadMail(
       ? `${RELAY_TAG}URGENT: you have ${n} unread durable message(s) needing attention now — run \`relay inbox --claim\`.`
       : `${RELAY_TAG}You have ${n} unread durable message(s). Not urgent — finish your current step, then run \`relay inbox --claim\` at a stopping point. Relay keeps reminding you until you read it.`;
     try {
-      await wakeWorker(rt, db, w, body, "unread-mail");
+      await rt.wake(w, body);
       logEvent(db, { source: "supervisor", workerId: recipient, type: "worker.mail_nudged", payload: { recipient, count: n, starvation: busy && stale, urgent: urgent.n > 0 } });
       actions.push(`mail-nudged:${recipient}`);
     } catch (e) {
@@ -1279,7 +1275,7 @@ async function processQuietLeases(
     const task = taskId ? getTask(db, taskId) : null;
     if (task && task.state === "running" && task.assignee === w.id) {
       try {
-        await wakeWorker(rt, db, w, `${RELAY_TAG}Quiet wait expired for ${taskId}. Resume the task now, check the background result, then continue, submit, or explicitly block.`, "quiet-expired");
+        await rt.wake(w, `${RELAY_TAG}Quiet wait expired for ${taskId}. Resume the task now, check the background result, then continue, submit, or explicitly block.`);
       } catch { /* best effort; the task is still owned by a live worker */ }
     }
   }

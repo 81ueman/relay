@@ -949,18 +949,17 @@ main repo's daemon automatically — no manual `.relay` symlink:
   (`directory` / `worktree`); the control plane itself stays centralized in the
   main checkout, so one ledger serves every lane.
 
-### Codex, Claude Code, and dsh agents
+### Codex and Claude Code agents
 
 A worker is not necessarily OpenCode. `workers.agent_kind` records the harness
-(`opencode` | `codex` | `claude` | `dsh`); it is set from the resolved Herdr agent
-kind at attach. The registry lives in `src/harness.ts` and pins two axes:
+(`opencode` | `codex` | `claude`); it is set from the resolved Herdr agent kind
+at attach. The registry lives in `src/harness.ts` and pins two axes:
 
-| kind | idles via | wake via | Herdr `agent start --kind` |
-| --- | --- | --- | --- |
-| `opencode` | plugin **events** | `agent prompt` | `opencode` |
-| `codex` | Herdr **poll** | `agent prompt` | `codex` |
-| `claude` | Herdr **poll** | `agent prompt` | `claude` |
-| `dsh` | plugin **events** | **wake outbox** | *(none — start by hand)* |
+| kind | idles via | Herdr `agent start --kind` |
+| --- | --- | --- |
+| `opencode` | plugin **events** | `opencode` |
+| `codex` | Herdr **poll** | `codex` |
+| `claude` | Herdr **poll** | `claude` |
 
 **Claude Code** is polled exactly like Codex (Herdr `agent_status`, no plugin):
 
@@ -968,26 +967,22 @@ kind at attach. The registry lives in `src/harness.ts` and pins two axes:
 relay session attach --session <uuid> --kind claude --worker claude-1 --role design-v4
 ```
 
-**dsh** is event-driven and started by hand (Herdr has no `dsh` kind); its relay
-plugin self-reports the pane and pulls wakes from the outbox. See
-[`integrations/dsh-relay/`](integrations/dsh-relay/README.md) for install and the
-smoke test.
+**Headless dsh Runs** are a separate, non-session path — a disposable
+`dsh --profile headless --json` process with no Herdr pane, plugin or wake; see
+[Headless dsh Runs (no Herdr)](#headless-dsh-runs-no-herdr).
 
 - A **codex/claude session id is a UUID**, not `ses...`. The socket/CLI attach
   accepts it ONLY when `kind` is declared (and it matches the UUID shape), so the
   OpenCode `ses...` guard is not weakened: an undeclared non-`ses` id is still
-  refused. A **dsh** id is `session-<uuid>`, recognized by shape without a
-  declaration.
+  refused.
 - A **polled** harness (codex, claude) has **no plugin event stream**, so relay
   does not wait for `session.idle`. The reconciler polls Herdr `agent_status`
   each pass and maps it onto the same state machine an idle event runs: `working`
   = progress (never stall a busy agent), `blocked` = `waiting_input`, unreachable
   = `dead`, and `idle`/`done` runs the idle transition (nudge to the next task, or
   continue a running one). Each poll logs `worker.status_polled`.
-- An **event-driven** harness that is not OpenCode (dsh) forwards its own
-  `session.idle`/`tool.*` events through its plugin.
-- Wake/detach/retire/recovery go through the harness's wake path (Herdr pane, or
-  the durable outbox for dsh) and the same worker/runtime rows.
+- Wake/detach/retire/recovery go through the harness's Herdr-pane wake path and
+  the same worker/runtime rows.
 - Existing workers default to `agent_kind = 'opencode'` (idempotent migration).
 
 ## Managed sessions: plain `opencode` stays untouched
@@ -1619,14 +1614,13 @@ The alt-screen + pause/scroll behaviour is verified in a real tmux emulator
 ```text
 src/cli.ts  daemon.ts  db.ts  schema.ts  scheduler.ts  reconciler.ts
     sessions.ts  socket.ts  messages.ts  tasks.ts  workers.ts  events.ts
-    runtimes.ts  mail-policy.ts  harness.ts  wake-outbox.ts  dsh-runner.ts
+    runtimes.ts  mail-policy.ts  harness.ts  dsh-runner.ts
     run-lifecycle.ts  sandbox.ts  sandbox-lifecycle.ts
 docs/dsh-headless-runner.md  docs/run-lifecycle.md  docs/sandbox-lifecycle.md
 docs/factory-e2e.md  docs/pr-binding.md
     runtime/{runtime,herdr}.ts
     dashboard/{command,model,render,affinity,herdr,doctor}.ts
 .opencode/plugins/relay.ts  integrations/herdr/{herdr-plugin.toml,focus-pane.ts}
-integrations/dsh-relay/{lib/{index,core.mjs},cordis.patch.yml,package.json}
 skills/agent-worker/SKILL.md  skills/parallel-worktrees/SKILL.md
 tests/{integration,contract,lifecycle,herdr,release,dashboard,dashboard-affinity}.test.ts
 tests/{dsh-runner,dsh-smoke,run-lifecycle}.test.ts

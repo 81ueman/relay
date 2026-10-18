@@ -61,7 +61,6 @@ import { attachPrompt, createLane, realHerdrRunner, reapLane } from "./spawn";
 import { runDashboard } from "./dashboard/command";
 import { runWeb } from "./web";
 import { runGc } from "./gc";
-import { wakeWorker } from "./wake-outbox";
 import { addReminder, disableReminder, listReminders } from "./reminders";
 
 // A role is "known" if it matches a registered worker or a built-in special role.
@@ -961,8 +960,7 @@ async function main(): Promise<void> {
               workspaceId: flag(rest, "--workspace") ?? (noEnv ? undefined : process.env.HERDR_WORKSPACE_ID),
               directory: dir,
               // A bare-UUID session (codex/claude) is declared with `--kind`;
-              // `ses...` (opencode) and `session-<uuid>` (dsh) are inferred. See
-              // src/harness.ts.
+              // `ses...` (opencode) is inferred. See src/harness.ts.
               agentKind: declaredKind ?? inferKind(sessionId),
             },
           });
@@ -1494,7 +1492,7 @@ async function main(): Promise<void> {
         }
         try {
           const rt = new HerdrRuntime();
-          await wakeWorker(rt, db, targetRow, `${RELAY_TAG}A durable message arrived (id ${id}). Not urgent — finish what you are doing, then run \`relay inbox --claim\` when you reach a stopping point. It is stored and will not be lost.`, "mail");
+          await rt.wake(targetRow, `${RELAY_TAG}A durable message arrived (id ${id}). Not urgent — finish what you are doing, then run \`relay inbox --claim\` when you reach a stopping point. It is stored and will not be lost.`);
           console.log(`sent msg=${id} (wake delivered)`);
         } catch (e) {
           console.log(`sent msg=${id} (wake failed, message remains queued: ${String(e).slice(0, 120)})`);

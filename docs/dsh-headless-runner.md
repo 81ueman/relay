@@ -20,9 +20,8 @@ relay run cancel <run-id>
 relay run submit <run-id> [--evidence E] [--summary S]
 ```
 
-The older `integrations/dsh-relay/` bridge is for the **long-lived** `dsh
-web`/SDK (`worker.wake.await -> followup()`); a one-shot headless attempt is
-launched directly instead — the bridge is not extended and not used here.
+A one-shot headless attempt is launched directly by `src/dsh-runner.ts`; there
+is no long-lived `dsh web` bridge.
 
 ## Pinned CLI contract (dsh 0.2.1-rc.2)
 

@@ -22,20 +22,11 @@
 // session-id validation; the poll path and spawn path read this table too.
 
 export type IdlesVia = "events" | "poll";
-/** How relay delivers a nudge to the harness. */
-export type WakeVia = "herdr" | "plugin";
 
 export interface Harness {
   /** Value stored in `workers.agent_kind` (and sent as `kind` on attach). */
   readonly id: string;
   readonly idlesVia: IdlesVia;
-  /**
-   * How a nudge reaches the harness:
-   *   "herdr"  — typed into its Herdr pane (`herdr agent prompt`).
-   *   "plugin" — written to the durable wake outbox and pulled by the harness's
-   *              relay plugin (a server harness like dsh has no input pane).
-   */
-  readonly wakeVia: WakeVia;
   /** Herdr agent kind / report label used by identity resolution. */
   readonly herdrKind: string;
   /** Does `sessionId` look like an id this harness could have minted? */
@@ -51,15 +42,11 @@ const UUID_RE = new RegExp(`^${UUID}$`, "i");
 // OpenCode session ids start with `ses` (`ses_...`). Shell ids (`sh_...`) and
 // any other prefix are deliberately NOT sessions.
 const OPENCODE_RE = /^ses/;
-// dsh session ids are `session-<uuid>`; an agent id may prefix it
-// (`main-session-<uuid>`), so allow an optional `[a-z0-9_-]+-` before `session-`.
-const DSH_RE = new RegExp(`^(?:[a-z0-9_-]+-)?session-${UUID}$`, "i");
 
 export const HARNESSES: readonly Harness[] = [
   {
     id: "opencode",
     idlesVia: "events",
-    wakeVia: "herdr",
     herdrKind: "opencode",
     matchesSessionId: (s) => OPENCODE_RE.test(s),
     herdrStartKind: "opencode",
@@ -68,7 +55,6 @@ export const HARNESSES: readonly Harness[] = [
   {
     id: "codex",
     idlesVia: "poll",
-    wakeVia: "herdr",
     herdrKind: "codex",
     matchesSessionId: (s) => UUID_RE.test(s),
     herdrStartKind: "codex",
@@ -77,38 +63,25 @@ export const HARNESSES: readonly Harness[] = [
   {
     id: "claude",
     idlesVia: "poll",
-    wakeVia: "herdr",
     herdrKind: "claude",
     matchesSessionId: (s) => UUID_RE.test(s),
     herdrStartKind: "claude",
     note: "Claude Code (polled over Herdr)",
   },
-  {
-    id: "dsh",
-    idlesVia: "events",
-    wakeVia: "plugin",
-    herdrKind: "dsh",
-    matchesSessionId: (s) => DSH_RE.test(s),
-    // Herdr has no `dsh` agent kind: a dsh worker is started by hand and its
-    // relay plugin self-reports the pane via `herdr pane report-agent`.
-    herdrStartKind: null,
-    note: "DeepSeek Harness (relay dsh plugin event stream)",
-  },
 ];
 
 export const AGENT_KINDS: readonly string[] = HARNESSES.map((h) => h.id);
 
-/** The `opencode|codex|claude|dsh` list used throughout CLI help. */
+/** The `opencode|codex|claude` list used throughout CLI help. */
 export const AGENT_KINDS_HELP: string = AGENT_KINDS.join("|");
 
 // Kinds whose session-id shape is unambiguous: a shell id or a bare UUID can
 // never collide with them, so an UNDECLARED attach can be accepted by pattern
 // alone. A bare UUID is ambiguous (codex vs claude), so it needs `kind`.
 //
-// ORDER MATTERS: dsh's `session-<uuid>` ALSO matches the opencode `^ses` prefix,
-// so the more specific dsh pattern must be tested first. `harness()` is a hoisted
-// function declaration, so these initializers may call it.
-const UNAMBIGUOUS: readonly Harness[] = [harness("dsh")!, harness("opencode")!];
+// `harness()` is a hoisted function declaration, so these initializers may call
+// it.
+const UNAMBIGUOUS: readonly Harness[] = [harness("opencode")!];
 // Preference order for `inferKind`: the unambiguous shapes first, then the
 // historical `codex` fallback for anything else (a bare UUID).
 const INFER_ORDER: readonly Harness[] = [...UNAMBIGUOUS];
@@ -133,23 +106,14 @@ export function herdrKindOf(kind: string | null | undefined): string | null {
 }
 
 /**
- * True when a nudge must be queued in the durable wake outbox for the harness's
- * relay plugin to pull, rather than typed into a Herdr pane (a server harness
- * like dsh has no input pane). Unknown kinds default to the Herdr path.
- */
-export function wakeViaPlugin(kind: string | null | undefined): boolean {
-  return harness(kind)?.wakeVia === "plugin";
-}
-
-/**
  * Resolve the harness kind for an ATTACH, fail closed.
  *
  * - A declared kind must exist AND match the session id. A mismatch (e.g.
  *   `kind:"codex"` on a `sh_...` id) is refused.
  * - With no declaration, only unambiguous session-id shapes are accepted:
- *   opencode (`ses...`) and dsh (`session-<uuid>`). A bare UUID is refused
- *   unless declared — the existing "an undeclared non-`ses` id is refused"
- *   guard, now covering claude as well as codex.
+ *   opencode (`ses...`). A bare UUID is refused unless declared — the existing
+ *   "an undeclared non-`ses` id is refused" guard, now covering claude as well
+ *   as codex.
  *
  * Returns the resolved kind, or null when it cannot be proven.
  */

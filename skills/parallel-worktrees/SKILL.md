@@ -33,8 +33,8 @@ Human
 
 - relay（`.relay/state.db` が source of truth）が稼働していること
 - herdr（`HERDR_ENV=1`）内で動いていること
-- worker は **OpenCode が既定**。`claude`（Herdr poll）や `dsh`（手動起動 + plugin）は
-  operator が明示したときだけ。理由なく別 harness を使わない
+- worker は **OpenCode が既定**。`claude`（Herdr poll）は operator が明示したときだけ。
+  理由なく別 harness を使わない
 - 1 repo / 1 canonical relay DB / **active daemon は 1 つだけ**
 
 ## 不変条件（壊すと壊れる）
@@ -101,10 +101,6 @@ relay worker status <worker-name>   # opencode_session_id が入り state が動
 - **Claude Code** — `herdr agent start <name> --kind claude ...` で起動し、
   `relay session attach --session <uuid> --kind claude --worker <name>`。
   以後の liveness/idle は Herdr の agent status を **poll** して取る（plugin 不要）。
-- **dsh (DeepSeek Harness)** — Herdr に `dsh` kind が無いので `worker spawn` は不可。
-  pane 内で `dsh --profile web` を**手動起動** → その relay plugin が pane を Herdr に
-  self-report → `relay session attach --session session-<uuid> --kind dsh --worker <name>`。
-  wake は pane でなく plugin（wake outbox）経由。
 
 ### 3. ルートタスクを作り、統合エージェントに委任する
 
@@ -118,7 +114,7 @@ relay task add "<program の目的・acceptance・hard constraint>" \
 - **責任範囲**: 自分の subtree 全体（decomposition / dependency / child worktree / child 統合 / acceptance / evidence）
 - **merge 分担**: 自分の subtree の merge は自分。**main への merge は上位**（merge-ready な branch + 統合証拠を渡す）
 - **並列化の指示**: 「並列化できる仕事は並列化せよ。子 task を早期に並列投入し、`--depends-on` で DAG を表現せよ」
-- **runtime**: 既定 OpenCode（`claude`/`dsh` は operator の明示時のみ）
+- **runtime**: 既定 OpenCode（`claude` は operator の明示時のみ）
 - **失敗時**: block/note して具体論点を返す
 
 ```sh
@@ -195,7 +191,7 @@ done になった他の task の commit が「ブランチ全体をマージで�
 herdr worktree create --branch <b> --base main --label <L> --no-focus
 herdr worktree list
 herdr pane list --workspace <w>
-herdr agent start <name> --kind opencode --pane <p> --timeout 90000   # --kind claude/codex も可; dsh は手動起動
+herdr agent start <name> --kind opencode --pane <p> --timeout 90000   # --kind claude/codex も可
 herdr agent prompt <name> '<text>' --wait --timeout 120000
 herdr agent get <name>
 herdr pane move <pane> --new-workspace --label <L> --no-focus   # 狭い workspace から退避
@@ -221,7 +217,7 @@ relay status
 - 統合エージェントを飛ばして Top-Level が個別最適化タスクを直接管理する
 - 同じ file を複数 worker に同時編集させる
 - `git add -A` / `git add .` / `git reset --hard` / destructive checkout
-- 理由なく OpenCode 以外の harness を使う（Claude Code / dsh は operator の明示があるときだけ）
+- 理由なく OpenCode 以外の harness を使う（Claude Code は operator の明示があるときだけ）
 - merge を統合エージェントに任せず、各 worker が main を直接いじる
 
 ## チェックリスト
