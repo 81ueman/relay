@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { evaluateChain, extractAgentGithubWrites, fixtureCheck, isAgentGithubWrite, isAgentReviewWrite, resolveGithubPlaceholder, REPO, BASE } from "../scripts/ish885b-real-agent-e2e";
+import { evaluateChain, extractAgentGithubWrites, fixtureCheck, GITHUB_ED25519_FP, hostKeyVerifyCommand, isAgentGithubWrite, isAgentReviewWrite, resolveGithubPlaceholder, REPO, BASE } from "../scripts/ish885b-real-agent-e2e";
 
 /**
  * ISH-885 item 1: the harness must attribute the GitHub writes to the dsh AGENT
@@ -28,6 +28,24 @@ describe("ISH-885b harness: fixture", () => {
   test("the fixture targets the relay repo on main", () => {
     expect(REPO).toBe("81ueman/relay");
     expect(BASE).toBe("main");
+  });
+});
+
+/**
+ * Round-2 finding 1: the host key must be scanned ed25519-only, verified, and
+ * installed ALONE — never the whole multi-algorithm scan (RSA/ECDSA would then be
+ * trusted-on-first-use).
+ */
+describe("ISH-885b harness: verified host key install", () => {
+  test("scans ed25519 only, requires exactly one line, and never installs a bare scan", () => {
+    const cmd = hostKeyVerifyCommand();
+    expect(cmd).toContain("ssh-keyscan -t ed25519 -p 443 ssh.github.com");
+    expect(cmd).not.toMatch(/ssh-keyscan -p 443/);
+    expect(cmd).toContain("n=$(grep -c 'ssh-ed25519'");
+    expect(cmd).toContain('[ "$n" = "1" ]');
+    expect(cmd).toContain(GITHUB_ED25519_FP);
+    expect(cmd).toContain("mv ~/.ssh/known_hosts.scan ~/.ssh/known_hosts");
+    expect(cmd).toContain("exit 3");
   });
 });
 
@@ -142,6 +160,37 @@ describe("ISH-885b harness: agent GitHub-write attribution", () => {
     expect(isAgentGithubWrite("gh pr comment 40 --body hi")).toBe(true);
     expect(isAgentGithubWrite("gh pr close 40")).toBe(true);
     expect(isAgentGithubWrite("gh pr view 40")).toBe(false);
+  });
+
+  /**
+   * Round-2 finding 2: every common gh write form must be classified, including
+   * `-F`/`--input`/`--method=POST`/`-XPOST`, and a wrapped `bash -lc "…"` whose
+   * inner command quote-stripping would otherwise delete.
+   */
+  test("classifies gh api write flags and wrapped shell forms (fail-closed)", () => {
+    const reviewWrites = [
+      "gh api repos/81ueman/relay/pulls/39/reviews -F event=COMMENT -F body=@/tmp/r.md",
+      "gh api repos/81ueman/relay/pulls/39/reviews --input /tmp/review.json",
+      "gh api --method=POST repos/81ueman/relay/pulls/39/reviews",
+      "gh api -XPOST repos/81ueman/relay/pulls/39/reviews",
+      "gh api --method PATCH repos/81ueman/relay/pulls/39/reviews/1",
+      'bash -lc "gh pr review 39 --comment --body ok"',
+      "sh -c 'gh pr comment 39 --body hi'",
+    ];
+    for (const cmd of reviewWrites) {
+      expect({ cmd, review: isAgentReviewWrite(cmd) }).toEqual({ cmd, review: true });
+      expect({ cmd, write: isAgentGithubWrite(cmd) }).toEqual({ cmd, write: true });
+    }
+    const reads = [
+      "gh api repos/81ueman/relay/pulls/39/reviews",
+      "gh api repos/81ueman/relay/pulls/39 --jq .head.sha",
+      "gh pr view 39 --json headRefOid",
+      "git commit -qm x",
+    ];
+    for (const cmd of reads) {
+      expect({ cmd, review: isAgentReviewWrite(cmd) }).toEqual({ cmd, review: false });
+      expect({ cmd, write: isAgentGithubWrite(cmd) }).toEqual({ cmd, write: false });
+    }
   });
 });
 

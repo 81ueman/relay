@@ -221,6 +221,11 @@
   "reviewedHead": "a47818918846b32bff5e7e21aaf3f946bf469d3a",
   "fixRoundOccurred": false,
   "chainSemantics": "Owner decision 2026-10-18: success = a real independent Claude PASS at the reviewed HEAD (the factory reaching PHASE merge_ready; the read-only gate decision is recorded separately and is NOT claimed to be READY); the NG@A -> FIX -> PASS@B arc is OPTIONAL, recorded but not required.",
+  "harnessFixesRound2": {
+    "round": "PR #40 review NG round 2 at fa23684 (2 findings) — both in scripts/ish885b-real-agent-e2e.ts",
+    "1_install_only_verified_key": "the sandbox now scans ed25519 ONLY (ssh-keyscan -t ed25519 -p 443 ssh.github.com), requires exactly one ssh-ed25519 line, verifies it against GitHub's published ed25519 fingerprint SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU, and installs ONLY that key (the whole multi-algorithm scan is no longer moved into known_hosts).",
+    "2_agent_review_write_raw_and_widened": "isAgentReviewWrite now matches the RAW command (a wrapped bash -lc \"gh pr review …\" is caught; a false positive only yields NOT_PROVEN) and accepts -X/-XPOST/--method=/--method POST|PATCH|PUT|DELETE plus -f/-F/--field/--raw-field/--input. Attribution is argv-level best effort (a write from an unseen script file is not classifiable)."
+  },
   "harnessFixes": {
     "round": "PR #40 review NG at d4b7784 (5 findings) — all harness accuracy in scripts/ish885b-real-agent-e2e.ts",
     "1_merge_gate_wired": "runFactoryTask now passes mergeGateDeps {github, checks: github}; evidence.factoryResult.gate records status+action+reasons. Earlier runs (incl. run 8) ran the gate unbound (prRead=unbound) and recorded BLOCKED.",

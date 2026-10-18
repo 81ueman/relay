@@ -135,8 +135,11 @@ export function resolveGithubPlaceholder(listOut: string): string | null {
  * harness could credit the Agent's own review to the independent reviewer.
  */
 export function isAgentGithubWrite(cmd: string): boolean {
+  // The review predicate matches the RAW command (see isAgentReviewWrite); the
+  // push/create predicate keeps quote-stripping so a `grep 'gh pr create' log`
+  // READ is not attributed as the write itself.
   const c = cmd.replace(/'[^']*'/g, "''").replace(/"[^"]*"/g, '""');
-  return isAgentReviewWrite(c) || /\bgit\s+push\b/.test(c) || /\bgh\s+pr\s+(create|edit)\b/.test(c);
+  return isAgentReviewWrite(cmd) || /\bgit\s+push\b/.test(c) || /\bgh\s+pr\s+(create|edit)\b/.test(c);
 }
 
 /**
@@ -145,13 +148,42 @@ export function isAgentGithubWrite(cmd: string): boolean {
  * honest: the Agent and the reviewer share the operator's GitHub identity
  * (process-level independence), so an Agent-posted review at the reviewed HEAD
  * would otherwise be indistinguishable from the reviewer's own.
+ *
+ * Round-2 finding 2: this matches the RAW command on purpose. Quote-stripping
+ * would delete a wrapped `bash -lc "gh pr review …"` / `sh -c 'gh pr comment …'`
+ * command and let the NOT_PROVEN guard be bypassed; a false positive here only
+ * ever yields NOT_PROVEN (the fail-closed direction), never a fabricated PASS.
+ * Coverage is **argv-level best effort**: a write performed from an unseen script
+ * file (`bash post.sh`) cannot be classified from the dsh argv.
  */
+export const GITHUB_ED25519_FP = "SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU";
+
+/**
+ * The in-sandbox command that installs ONLY GitHub's verified ed25519 host key.
+ *
+ * Round-2 finding 1: scan ed25519 only (`-t ed25519`), require EXACTLY one
+ * `ssh-ed25519` line, verify its fingerprint with `ssh-keygen -lf`, and install
+ * that single key — never the whole multi-algorithm scan (which would leave
+ * RSA/ECDSA trusted-on-first-use). Any deviation exits non-zero (fail closed).
+ */
+export function hostKeyVerifyCommand(fp: string = GITHUB_ED25519_FP): string {
+  return (
+    "mkdir -p ~/.ssh && ssh-keyscan -t ed25519 -p 443 ssh.github.com 2>/dev/null > ~/.ssh/known_hosts.scan && " +
+    "n=$(grep -c 'ssh-ed25519' ~/.ssh/known_hosts.scan) && " +
+    `fp=$(ssh-keygen -lf ~/.ssh/known_hosts.scan 2>/dev/null | awk '{print $2}' | sort -u | tr '\\n' ' ') && ` +
+    `{ [ "$n" = "1" ] && printf '%s' "$fp" | grep -qF '${fp}'; } && ` +
+    `mv ~/.ssh/known_hosts.scan ~/.ssh/known_hosts && chmod 600 ~/.ssh/known_hosts && echo "VERIFIED n=$n $fp" || ` +
+    `{ rm -f ~/.ssh/known_hosts.scan; echo "MISMATCH n=$n fp=$fp"; exit 3; }`
+  );
+}
+
 export function isAgentReviewWrite(cmd: string): boolean {
-  const c = cmd.replace(/'[^']*'/g, "''").replace(/"[^"]*"/g, '""');
-  if (/\bgh\s+pr\s+(review|comment|merge|close)\b/.test(c)) return true;
-  // `gh api -X POST …/reviews` (or PATCH/PUT/DELETE on a review/comment/merge path)
-  if (/\bgh\s+api\b/.test(c) && (/\s(?:-X|--method)\s+(?:POST|PATCH|PUT|DELETE)\b/.test(c) || /\s(?:-f|--field|--raw-field)\b/.test(c))) return true;
-  return false;
+  if (/\bgh\s+pr\s+(review|comment|merge|close)\b/.test(cmd)) return true;
+  if (!/\bgh\s+api\b/.test(cmd)) return false;
+  // `gh api` switches to POST when given any parameter, and honours an explicit
+  // method flag with either `=` or a bare `-XPOST` form.
+  if (/\s(?:-X\s*|--method[=\s]+)(?:POST|PATCH|PUT|DELETE)\b/i.test(cmd)) return true;
+  return /\s(?:-f|-F|--field|--raw-field|--input)\b/.test(cmd);
 }
 
 /**
@@ -370,28 +402,20 @@ async function main(): Promise<void> {
     // Operator provisioning: verify GitHub's `ssh.github.com:443` host key against
     // GitHub's PUBLISHED ed25519 fingerprint (the kit routes github.com to :443
     // because the egress policy has no :22 rule) so the Agent's `git push` does
-    // not fail on first-connection host verification. Finding 4: a bare
-    // `ssh-keyscan > known_hosts` is trust-on-first-use and must NOT be reported as
-    // "pinned"; verify with `ssh-keygen -lf` and fail closed on a mismatch. The
-    // Agent still performs the push/PR write itself.
-    const GITHUB_ED25519_FP = "SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU";
-    const kh = realSbxCli.run(
-      sbxExecArgv(
-        binding.name,
-        bashLc(
-          "mkdir -p ~/.ssh && ssh-keyscan -p 443 ssh.github.com 2>/dev/null > ~/.ssh/known_hosts.scan && " +
-            `fp=$(ssh-keygen -lf ~/.ssh/known_hosts.scan 2>/dev/null | awk '{print $2}' | sort -u | tr '\\n' ' ') && ` +
-            `case "$fp" in *${GITHUB_ED25519_FP}*) mv ~/.ssh/known_hosts.scan ~/.ssh/known_hosts && chmod 600 ~/.ssh/known_hosts && echo "VERIFIED $fp";; *) rm -f ~/.ssh/known_hosts.scan; echo "MISMATCH $fp"; exit 3;; esac`
-        ),
-        { workdir: binding.workspace }
-      )
-    );
+    // not fail on first-connection host verification. Finding 4 / round-2 finding 1:
+    // a bare `ssh-keyscan > known_hosts` is trust-on-first-use, and even a check
+    // that only validates the ed25519 line while installing the WHOLE scan leaves
+    // RSA/ECDSA unverified. So: scan ONLY ed25519 (`-t ed25519`), require EXACTLY
+    // one ed25519 line, verify its fingerprint with `ssh-keygen -lf`, and install
+    // only that single verified key. Fail closed otherwise. The Agent still
+    // performs the push/PR write itself.
+    const kh = realSbxCli.run(sbxExecArgv(binding.name, bashLc(hostKeyVerifyCommand()), { workdir: binding.workspace }));
     const hostKeyVerified = kh.ok && kh.out.includes("VERIFIED") && kh.out.includes(GITHUB_ED25519_FP);
     leg(
       "sandbox-known-hosts",
       hostKeyVerified ? "PASS" : "FAIL",
       hostKeyVerified
-        ? `ssh.github.com host key verified against GitHub's published ed25519 fingerprint ${GITHUB_ED25519_FP}`
+        ? `verified GitHub's published ed25519 fingerprint ${GITHUB_ED25519_FP} and installed ONLY that ed25519 key (1 line)`
         : `host key NOT verified against ${GITHUB_ED25519_FP}: ${kh.err || kh.out || "ssh-keyscan/ssh-keygen failed"}`
     );
     if (!hostKeyVerified) throw new Error(`the ssh.github.com host key did not match GitHub's published ed25519 fingerprint ${GITHUB_ED25519_FP}`);

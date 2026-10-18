@@ -22,9 +22,15 @@ harness.
 and the `claude -p` reviewer both post as the operator's GitHub identity
 (`81ueman`), so GitHub itself cannot separate them. The harness therefore
 attributes *every* Agent write — including `gh pr review|comment|merge|close` and
-`gh api` mutations (`POST`/`PATCH`/`PUT`/`DELETE`) — from `dsh.jsonl`, and records
+`gh api` mutations (`-X`/`--method` `POST|PATCH|PUT|DELETE`, and the implicit-POST
+`-f`/`-F`/`--field`/`--raw-field`/`--input` forms) — from `dsh.jsonl`, and records
 the judgment `NOT_PROVEN` if an Agent tool call wrote a review or comment, rather
 than crediting it to the reviewer.
+
+This attribution is **argv-level best effort**: it matches the raw dsh tool-call
+argv (so a wrapped `bash -lc "gh pr review …"` is still caught, at the cost of a
+possible false positive that only ever yields `NOT_PROVEN`). It cannot classify a
+write performed from an unseen script file (`bash post.sh`).
 
 ## Success condition: first-try PASS counts (owner decision 2026-10-18)
 
