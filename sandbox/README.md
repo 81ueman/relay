@@ -19,6 +19,8 @@ agent (`extends: shell`) and adds only the Ishiul development tools:
 - `/usr/local/bin/labctl`, installed from the checked-out Ishiul workspace
   ([`ishiul labs/labctl/labctl.py`](https://github.com/81ueman/ishiul/blob/main/labs/labctl/README.md)
   — no second copy);
+- the pinned `gnmic` `0.49.0` gNMI client (`/usr/local/bin/gnmic`, Linux aarch64),
+  for real gNMI read-backs against a Shared-Lab node's published `:57400`;
 - the `network-lab` agent skill (ISH-845), installed at the dsh **user skill**
   path `~/.agents/skills/network-lab/SKILL.md` (`files/home/.agents/skills/`).
   This is the path the pinned `dsh 0.2.1-rc.2` actually scans
