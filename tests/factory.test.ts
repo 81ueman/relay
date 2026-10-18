@@ -8,7 +8,7 @@ import { openDb } from "../src/db";
 import { blockTask, claimNext, claimTask, getTask } from "../src/tasks";
 import { registerWorker } from "../src/workers";
 import { inboxFor } from "../src/messages";
-import { intakeTask, recordReview, runMechanicalVerification, submitPhase, taskChecks } from "../src/workflow";
+import { intakeTask, linkTask, recordReview, runMechanicalVerification, submitPhase, taskChecks } from "../src/workflow";
 import { insertTaskResult } from "../src/results";
 import { acceptRunSubmission, DUPLICATE_WRITER, listRuns, type DshProcess, type DshSpawner } from "../src/dsh-runner";
 import { PINNED_DSH_VERSION } from "../src/dsh-version";
@@ -19,6 +19,7 @@ import { ensureTaskSandbox, launchTaskSandboxRun } from "../src/sandbox-lifecycl
 import { sandboxVerifyTarget, type SandboxExec } from "../src/sandbox-verify";
 import { processPgid, spawnIdentityToken } from "../src/proc-identity";
 import { DEFAULT_INTEGRATOR_WORKER, pidAlive, runFactoryTask } from "../src/factory";
+import type { GitHubReadOnly } from "../src/providers";
 import {
   DEFAULT_REVIEWER_WORKER as REVIEWER_WORKER,
   REVIEW_NOT_INDEPENDENT,
@@ -1150,6 +1151,72 @@ echo DONE
     expect(res.outcome).toBe("merge_ready");
     const log = readFileSync(join(dir, "worktrees", id, ".relay", "attempt.log"), "utf-8");
     expect(log).toContain("RUN_OWNED");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ISH-880: bind a produced commit to a real PR before the review stage.
+// ---------------------------------------------------------------------------
+
+/** A read-only GitHub whose PR head is read LAZILY from the task (H_0 = produced). */
+function dynamicGithub(head: () => string | null): GitHubReadOnly {
+  return {
+    name: "dynamic-github",
+    readOnly: true as const,
+    getPullRequest(ref) {
+      const sha = head();
+      if (!sha) return null;
+      return {
+        ref,
+        url: `https://github.com/81ueman/relay/pull/7`,
+        state: "open",
+        isDraft: false,
+        headRefName: "relay/ish-880",
+        headSha: sha,
+        baseRef: "main",
+        baseSha: "0".repeat(40),
+        mergeable: "mergeable",
+        labels: [],
+        updatedAt: "2026-01-01T00:00:00Z",
+      };
+    },
+    findPullRequestForBranch: () => null,
+    listComments: () => [],
+  };
+}
+
+describe("ISH-880: the produced commit is bound to its PR before review", () => {
+  test("a matching PR head is bound and the Task reaches MergeReady", async () => {
+    const dsh = fakeDsh("dsh-pr", COMMITTING_DSH);
+    const id = newTask();
+    linkTask(db, id, { prUrl: "81ueman/relay#7", prRepo: "81ueman/relay" });
+    const rev = reviewerHarness(["pass"]);
+    const res = await runFactoryTask(db, id, {
+      ...factoryDeps(dsh, rev.spawner),
+      prBinding: { github: dynamicGithub(() => getTask(db, id)!.head_sha) },
+    });
+
+    expect(res.outcome).toBe("merge_ready");
+    expect(rev.calls).toHaveLength(1);
+    const t = getTask(db, id)!;
+    expect(t.pr_repo).toBe("81ueman/relay");
+    expect(t.head_sha).toBe(res.head);
+    expect(res.steps.some((s) => s.startsWith("review:pr-bound"))).toBe(true);
+  });
+
+  test("a PR whose head != the produced commit BLOCKS before the reviewer runs", async () => {
+    const dsh = fakeDsh("dsh-pr2", COMMITTING_DSH);
+    const id = newTask();
+    linkTask(db, id, { prUrl: "81ueman/relay#7", prRepo: "81ueman/relay" });
+    const rev = reviewerHarness(["pass"]);
+    const res = await runFactoryTask(db, id, {
+      ...factoryDeps(dsh, rev.spawner),
+      prBinding: { github: dynamicGithub(() => "0".repeat(40)) },
+    });
+
+    expect(res.outcome).toBe("blocked");
+    expect(res.reason).toContain("HEAD_MOVED");
+    expect(rev.calls).toHaveLength(0); // never a fake review_pass
   });
 });
 

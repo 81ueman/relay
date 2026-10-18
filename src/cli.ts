@@ -46,10 +46,11 @@ import {
 } from "./sandbox-lifecycle";
 import { getSandbox as getTaskSandbox, listSandboxes } from "./sandbox";
 import { applyLabCleanup, planLabCleanup, type LabCleanupPlan } from "./lab-cleanup";
-import { providerDepsFromEnv, nativeReviewDepsFromEnv } from "./provider-adapters";
+import { providerDepsFromEnv, nativeReviewDepsFromEnv, defaultExec } from "./provider-adapters";
 import { checkMergeGate, formatMergeGateDecision } from "./merge-gate";
 import { runFactoryTask } from "./factory";
 import { DEFAULT_REVIEW_MODEL } from "./reviewer-runner";
+import { bindTaskPr, formatPrBindingResult, GitGhPrPublisher } from "./pr-binding";
 import {
   bindSession, findWorkerBySession, getWorker, listWorkers,
   quietActive, registerWorker, retireWorker, setWorkerState, touchSeen, unretireWorker,
@@ -106,6 +107,7 @@ Usage:
   relay result accept <task-id> [--worker <id>]
   relay verify <task-id> [--cwd <dir>] [--head SHA]   # mechanical verify (Relay runs the commands)
   relay merge-check <task-id> [--json] [--authority merge]   # read-only HEAD-bound merge readiness (dry-run)
+  relay pr bind <task-id> [--publish] [--head SHA] [--json]   # bind the produced commit to a real PR (re-read/verify; --publish is an authorized write)
 
   relay next [--worker <id>] [--role <r>] [--any-role]
   relay claim <task-id> [--worker <id>] [--role <r>] [--any-role]
@@ -328,6 +330,11 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
     about:
       "READ-ONLY, HEAD-bound merge readiness (dry-run by default). Judges the GitHub PR (OPEN, non-draft, head/base/diff, mergeability, re-fetched `merged`), a trusted independent review at the CURRENT head, an unresolved NG, an owner HOLD, required check results and dependent change order, and prints READY / BLOCKED with concrete reasons. It NEVER pushes, rebases or merges: a real merge needs a point-of-use authority (ISH-288), so without one the verdict is BLOCKED/NO_PERMISSION. --authority merge only assumes the permission for the DRY-RUN verdict; it performs nothing. A conflict raises IntegrationRequired for a Gateway routing decision. --json emits the structured decision.",
     usage: ["relay merge-check <task-id> [--json] [--authority merge]"],
+  },
+  pr: {
+    about:
+      "ISH-880 Task↔PR binding. Bridges a Sandbox-produced commit to a real GitHub PR and binds the PR's CURRENT remote HEAD to the SAME Task/attempt. By default it is READ-ONLY: it re-reads an already-recorded PR (owner/repo#n) and requires its live head to equal the produced commit; a moved/unreadable PR, a different repo, or no recorded identity is BLOCKED (never a fake pass). With `--publish` it may push the produced commit and find-or-create the PR through normal `git`/`gh` — an EXPLICIT point-of-use write grant, opt-in per invocation; it never merges, approves, deletes a branch or writes Linear. Requires RELAY_PROVIDER_GITHUB=gh for the read-only reader.",
+    usage: ["relay pr bind <task-id> [--publish] [--head SHA] [--repo R] [--base REF] [--json]"],
   },
   "task list": { about: "List tasks (id, state, priority, role, assignee, plan, depends, title).", usage: ["relay task list [--state <state>]"] },
   "task show": { about: "Print one task as JSON (includes depends_on). Notes go to stderr so stdout stays parseable; --json emits ONE document with the task, its dependencies and its notes.", usage: ["relay task show <id> [--json]"] },
@@ -1353,6 +1360,33 @@ async function main(): Promise<void> {
         const decision = checkMergeGate(db, id, { ...base, authority });
         if (!decision) throw new Error(`unknown task: ${id}`);
         console.log(hasFlag(rest, "--json") ? JSON.stringify(decision, null, 2) : formatMergeGateDecision(decision));
+        break;
+      }
+
+      case "pr": {
+        // ISH-880: bind a Task's produced commit to a real PR and its current
+        // remote HEAD. Read-only by default; `--publish` is an explicit
+        // point-of-use write grant (push + find-or-create) — never implicit.
+        const rest = argv.slice(1);
+        const sub = rest[0];
+        if (sub !== "bind") throw new Error("usage: relay pr bind <task-id> [--publish] [--head SHA] [--repo R] [--base REF] [--json]");
+        const args = rest.slice(1);
+        const id = positionals(args)[0];
+        if (!id) throw new Error("usage: relay pr bind <task-id> [--publish] [--head SHA] [--repo R] [--base REF] [--json]");
+        if (!getTask(db, id)) throw new Error(`unknown task: ${id}`);
+        const publish = hasFlag(args, "--publish");
+        const base = providerDepsFromEnv();
+        const authority = publish ? { ...base.authority, githubWrite: true } : base.authority;
+        const result = bindTaskPr(db, id, {
+          github: base.github,
+          publisher: publish ? new GitGhPrPublisher(projectRoot(), defaultExec) : undefined,
+          authority,
+          expectedHead: flag(args, "--head") ?? undefined,
+          repo: flag(args, "--repo") ?? undefined,
+          base: flag(args, "--base") ?? undefined,
+        });
+        console.log(hasFlag(args, "--json") ? JSON.stringify(result, null, 2) : formatPrBindingResult(result));
+        if (result.status === "blocked") process.exitCode = 1;
         break;
       }
 
