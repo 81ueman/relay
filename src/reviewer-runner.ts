@@ -29,12 +29,13 @@ import {
  * ISH-762: the independent HEADLESS reviewer.
  *
  * The Factory's reviewer is a SEPARATE principal from the coding worker: a real
- * Claude process (`claude -p --output-format json`) invoked with READ-ONLY
- * access, given a brief pinned to the Task's worktree, that prints ONE
- * structured verdict. Relay parses ONLY that structured verdict and records it
- * through the ordinary `recordReview` path — so the existing authority,
- * independence, HEAD-binding and duplicate/unresolved-NG rules all apply
- * unchanged. Nothing here is a second review state machine.
+ * Claude process (`claude -p --output-format json`) invoked with
+ * `--permission-mode auto` (an approval mode, not an OS sandbox) and a brief that
+ * instructs it to treat the checkout as READ-ONLY, given a brief pinned to the
+ * Task's worktree, that prints ONE structured verdict. Relay parses ONLY that
+ * structured verdict and records it through the ordinary `recordReview` path — so
+ * the existing authority, independence, HEAD-binding and duplicate/unresolved-NG
+ * rules all apply unchanged. Nothing here is a second review state machine.
  *
  * Fail-closed rules (a reviewer can never manufacture an advance):
  *   - no structured result / malformed output / unknown verdict  -> REFUSED;
@@ -76,8 +77,18 @@ export const DEFAULT_REVIEW_COMMAND = "claude";
 /** ISH-883: the default reviewer model (an Opus-class reviewer), configurable. */
 export const DEFAULT_REVIEW_MODEL = "opus";
 
-/** A reviewer is a READ-ONLY principal: it may inspect, never write the work. */
-export const REVIEW_READONLY_TOOLS = "Read Grep Glob";
+/**
+ * ISH-830e: the reviewer's permission ceiling. `auto` lets the CLI's own
+ * classifier approve SAFE actions — e.g. a read-only `git diff` to see what
+ * changed — without pre-approving every tool. It is deliberately NOT
+ * `bypassPermissions` and NOT an all-tools allowlist, and it is FIXED (there is
+ * no knob). This is an APPROVAL mode, not an OS sandbox: Relay does NOT claim it
+ * prevents an uncommitted write. What actually holds for the reviewer is
+ * independence (`recordReview`), a HEAD-bound verdict, and a disposable detached
+ * review checkout where one is configured (`reviewWorktreeRoot`). The ISH-883
+ * native-PR path keeps its explicit `allowedTools` allowlist (it must run `gh`).
+ */
+export const DEFAULT_REVIEW_PERMISSION_MODE = "auto";
 
 export type ReviewSeverity = "blocker" | "major" | "minor" | "nit";
 
@@ -97,6 +108,27 @@ export interface ReviewerVerdict {
   summary: string;
 }
 
+/**
+ * ISH-830e: the mechanical VERIFY result Relay ALREADY produced for the reviewed
+ * HEAD — inside the Task's Coding Sandbox, where the Shared-Lab NOS check runs.
+ * It is passed to the host reviewer as CONTEXT (with the raw check output tail)
+ * so the reviewer can judge the change WITHOUT re-running the lab, and without
+ * having to take the check's own word for it.
+ */
+export interface ReviewVerifyEvidence {
+  head: string | null;
+  outcome: string;
+  checks: {
+    name: string;
+    command?: string;
+    required?: boolean;
+    outcome: string;
+    exitCode: number | null;
+    /** The command output (the brief includes a bounded tail). */
+    output?: string;
+  }[];
+}
+
 export interface ReviewerSpawnContext {
   cwd: string;
   /** The full review brief (also pinned at `.relay/review-brief.md`). */
@@ -104,7 +136,7 @@ export interface ReviewerSpawnContext {
   env: Record<string, string>;
   timeoutMs: number;
   model?: string;
-  /** ISH-883: the reviewer's tool allowlist (default: read-only inspection). */
+  /** ISH-883: the reviewer's tool allowlist (native-PR path only; must run `gh`). */
   allowedTools?: string;
 }
 
@@ -145,6 +177,13 @@ export interface HeadlessReviewDeps {
    * per-Task directory — the read-only review worktree is removed afterwards.
    */
   evidenceBase?: string;
+  /**
+   * ISH-830e: the mechanical VERIFY result for this attempt's HEAD (produced in
+   * the Task's sandbox). Rendered into the brief as context so the host reviewer
+   * can judge the change without re-running the lab. Omitted -> no VERIFY section
+   * (the old behaviour; the reviewer sees only the declared checks).
+   */
+  verifyEvidence?: ReviewVerifyEvidence;
   /**
    * ISH-883: post a NATIVE GitHub Pull Request Review and read it back. When
    * omitted (the default), the reviewer keeps the local structured-verdict path
@@ -192,7 +231,7 @@ export function reviewEvidencePath(worktree: string, attempt: number, head: stri
 export function buildReviewBrief(
   db: Database,
   task: Task,
-  opts: { head: string; worktree: string; native?: { ref: PrRef; author: string } }
+  opts: { head: string; worktree: string; native?: { ref: PrRef; author: string }; verify?: ReviewVerifyEvidence }
 ): string {
   const checks = taskChecks(task);
   const findings = inheritFindingsForBrief(db, task);
@@ -217,6 +256,33 @@ export function buildReviewBrief(
   if (checks.length > 0) {
     lines.push("", "## Mechanical checks Relay runs after the coding Run (`pass` requires these to pass)");
     for (const c of checks) lines.push(`- ${c.name}: \`${c.command}\`${c.required === false ? " (optional)" : ""}`);
+  }
+  if (opts.verify) {
+    const v = opts.verify;
+    lines.push(
+      "",
+      `## Mechanical VERIFY — ALREADY RUN at \`${v.head ?? opts.head}\` (context; do NOT re-run)`,
+      "",
+      "Relay ran the REQUIRED checks above at this exact HEAD in the Task's own Coding",
+      "Sandbox (that is where the Shared-Lab lab lives). This is the RESULT, recorded",
+      "before the review:",
+      "",
+      `Outcome: \`${v.outcome}\``
+    );
+    for (const c of v.checks) {
+      const cmd = checks.find((k) => k.name === c.name)?.command;
+      lines.push(
+        `- ${c.name}${cmd ? ` (\`${cmd}\`)` : ""}: ${c.outcome}${c.exitCode === null ? "" : ` (exit ${c.exitCode})`}`
+      );
+      const tail = tailLines(c.output ?? "", 20);
+      if (tail) lines.push(...tail.split("\n").map((l) => `    ${l}`));
+    }
+    lines.push(
+      "",
+      "Use this as EVIDENCE that the mechanical check passed at the reviewed HEAD; you",
+      "are NOT asked to (and should not) re-run the lab yourself. Judge the CODE and",
+      "the acceptance against the diff."
+    );
   }
   if (findings.length > 0) {
     lines.push("", `## Prior findings @ attempt ${token(task)} (context — verify they are actually fixed)`);
@@ -260,6 +326,14 @@ export function buildReviewBrief(
 
 function token(task: Task): number {
   return Math.max(0, task.attempt - 1);
+}
+
+/** The last `n` lines of a check output, bounded (for the review brief). */
+function tailLines(s: string, n: number): string {
+  const t = s.replace(/\r/g, "").trimEnd();
+  if (!t) return "";
+  const all = t.split("\n");
+  return all.slice(Math.max(0, all.length - n)).join("\n").slice(-4_000);
 }
 
 function inheritFindingsForBrief(db: Database, task: Task): string[] {
@@ -375,21 +449,30 @@ export function extractReviewerVerdict(raw: string): ReviewerVerdict | null {
 // ---------------------------------------------------------------------------
 
 /**
- * The real reviewer: `claude -p --output-format json --allowedTools "Read Grep
- * Glob"` with the brief on stdin. Spawned in a NEW process group so a timeout
- * can kill the whole tree (a reviewer cannot stall the Factory).
+ * The real reviewer: `claude -p --output-format json` with the brief on stdin.
+ * With no explicit `allowedTools` allowlist the reviewer runs under
+ * `--permission-mode auto` (ISH-830e) — the CLI's own classifier approves safe,
+ * read-mostly actions. `auto` is a FIXED ceiling: this function never emits
+ * `bypassPermissions` (there is no knob). The ISH-883 native-PR path still passes
+ * its explicit `allowedTools` allowlist (it must run `gh`). Spawned in a NEW
+ * process group so a timeout can kill the whole tree (a reviewer cannot stall the
+ * Factory).
  */
+export function buildReviewerArgs(ctx: Pick<ReviewerSpawnContext, "allowedTools" | "model">): string[] {
+  const args = ["-p", "--output-format", "json"];
+  if (ctx.allowedTools) {
+    args.push("--allowedTools", ctx.allowedTools);
+  } else {
+    args.push("--permission-mode", DEFAULT_REVIEW_PERMISSION_MODE);
+  }
+  if (ctx.model) args.push("--model", ctx.model);
+  return args;
+}
+
 export function bunReviewerSpawner(command = DEFAULT_REVIEW_COMMAND): ReviewerSpawner {
   return {
     async run(ctx) {
-      const args = [
-        "-p",
-        "--output-format",
-        "json",
-        "--allowedTools",
-        ctx.allowedTools ?? REVIEW_READONLY_TOOLS,
-      ];
-      if (ctx.model) args.push("--model", ctx.model);
+      const args = buildReviewerArgs(ctx);
       const proc = Bun.spawn([command, ...args], {
         cwd: ctx.cwd,
         env: { ...process.env, ...ctx.env },
@@ -611,6 +694,7 @@ export async function runHeadlessReview(
     head,
     worktree,
     ...(native && nativeRef ? { native: { ref: nativeRef, author: native.author } } : {}),
+    ...(deps.verifyEvidence ? { verify: deps.verifyEvidence } : {}),
   });
   pinReviewBrief(worktree, brief);
   logEvent(db, {

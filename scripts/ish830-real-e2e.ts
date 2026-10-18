@@ -38,13 +38,13 @@
  */
 import { execFileSync } from "node:child_process";
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { openDb } from "../src/db";
 import { getTask } from "../src/tasks";
 import { intakeTask } from "../src/workflow";
-import { runFactoryTask } from "../src/factory";
+import { runFactoryTask, type FactoryResult } from "../src/factory";
 import { realSbxCli, sbxCreateArgv, sbxExecArgv, bashLc, upsertSandbox, getSandbox } from "../src/sandbox";
 import { ensureTaskSandbox } from "../src/sandbox-lifecycle";
 import { sandboxVerifyTarget, realSandboxExec, sandboxLabctl } from "../src/sandbox-verify";
@@ -71,6 +71,19 @@ const CODING_KIT = join(import.meta.dir, "..", "sandbox", "coding-kit");
 // A missing Shared-Lab API credential is an owner/operator prerequisite, not a
 // product failure: the factory stage records it BLOCKED (never a false PASS).
 const MISSING_LAB_CREDS = /no LABCTL_TOKEN|no LABCTL_USER|LABCTL_PASSWORD credentials|labctl\.env is empty/i;
+
+/**
+ * ISH-830e: when the factory's review leg reaches NO verdict (the reviewer was
+ * blocked or refused), that is an owner prerequisite — "the reviewer could not
+ * judge" — not a code failure. Classify it BLOCKED (with the precise
+ * `runFactoryTask` reason) instead of a generic FAIL, so the harness never
+ * conflates an unavailable reviewer with a broken change. A reviewer that DID
+ * judge (`fix`/`pass`) is never matched here.
+ */
+function reviewLegBlocked(result: FactoryResult): boolean {
+  if (result.outcome === "review_refused") return true;
+  return result.outcome === "blocked" && result.attempts.some((a) => a.reviewVerdict === "blocked");
+}
 
 // ---------------------------------------------------------------------------
 // result bookkeeping (a JSON record is printed at the end)
@@ -1002,6 +1015,28 @@ async function stageFactory(dir: string, api: string, insecure: boolean): Promis
       reviewWorktreeRoot: join(dir, "review-wt"),
     });
     const t = getTask(db, task.id)!;
+    // ISH-830e: DURABLE dump of the reviewer evidence. The harness removes its
+    // temp dir below, so read the recorded `evidence_ref` off the (still-open)
+    // factory DB and copy it somewhere durable BEFORE teardown. This is the raw
+    // reviewer stdout/stderr + structured verdict, whatever the verdict.
+    const reviewRow = db
+      .query(`SELECT evidence_ref FROM task_results WHERE task_id = ? AND kind = 'ReviewResult' ORDER BY id DESC LIMIT 1`)
+      .get(task.id) as { evidence_ref: string | null } | null;
+    if (reviewRow?.evidence_ref) {
+      const src = reviewRow.evidence_ref;
+      const dst = join(process.cwd(), ".relay", "ish830-evidence", basename(src));
+      const readable = existsSync(src);
+      if (readable) {
+        mkdirSync(dirname(dst), { recursive: true });
+        copyFileSync(src, dst);
+      }
+      record(
+        "factory.review-evidence",
+        readable ? "PASS" : "BLOCKED",
+        `reviewer evidence_ref ${src}${readable ? ` (copied to ${dst})` : " is not readable on the host"}`,
+        readable ? { raw: readFileSync(src, "utf-8").slice(0, 1500) } : undefined
+      );
+    }
     // Find the real dsh Run and read its raw failure evidence, so a missing
     // provider credential is recorded BLOCKED (not a generic failure).
     const run = db
@@ -1012,7 +1047,7 @@ async function stageFactory(dir: string, api: string, insecure: boolean): Promis
       if (p && existsSync(p)) rawBits.push(readFileSync(p, "utf-8").slice(-1500));
     }
     const raw = [result.reason ?? "", run?.error ?? "", ...rawBits].join("\n");
-    const detail = `runFactoryTask(${task.id}) -> ${result.outcome} (head ${result.head?.slice(0, 12) ?? "none"}); run ${run?.id ?? "?"} ${run?.state ?? "?"} exit ${run?.exit_code ?? "?"}`;
+    const detail = `runFactoryTask(${task.id}) -> ${result.outcome} (head ${result.head?.slice(0, 12) ?? "none"}); run ${run?.id ?? "?"} ${run?.state ?? "?"} exit ${run?.exit_code ?? "?"}; reason=${result.reason ?? "(none)"}; steps=${result.steps.join(",")}`;
 
     // PASS is gated on the FULL chain, never a bare `merge_ready`: a FIX review
     // followed by a LATER PASS, and the final attempt's produced HEAD equal to the
@@ -1042,6 +1077,16 @@ async function stageFactory(dir: string, api: string, insecure: boolean): Promis
       // provider route. Record it precisely (never a PASS, never a generic FAIL).
       const why = raw.split("\n").find((l) => MISSING_LAB_CREDS.test(l))?.trim() ?? "";
       record("factory", "BLOCKED", `real factory is BLOCKED on Shared-Lab credentials (owner prerequisite), not on the provider route: ${detail}`, { raw: why });
+    } else if (reviewLegBlocked(result)) {
+      // ISH-830e: the review leg reached NO verdict (reviewer blocked/refused).
+      // The reason is now guaranteed non-empty by `runFactoryTask`; record it
+      // precisely as an owner prerequisite, never a generic FAIL.
+      record(
+        "factory",
+        "BLOCKED",
+        `real factory review leg reached no verdict (owner prerequisite: reviewer unavailable/blocked, NOT a code failure): ${detail}`,
+        { raw: (result.reason ?? "(no reason)").slice(-800) }
+      );
     } else {
       record("factory", "FAIL", detail, { raw: raw.slice(-800) });
     }

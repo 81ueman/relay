@@ -15,16 +15,18 @@ import { PINNED_DSH_VERSION } from "../src/dsh-version";
 import { launchTaskRun, taskBranchName } from "../src/run-lifecycle";
 import { defaultRunner, gitHead, type CommandRunner } from "../src/verify";
 import { sandboxNameForTask, upsertSandbox, type SbxCli, type SbxResult } from "../src/sandbox";
-import { ensureTaskSandbox, launchTaskSandboxRun } from "../src/sandbox-lifecycle";
+import { ensureTaskSandbox, launchTaskSandboxRun, ensureSandboxRelayExcluded } from "../src/sandbox-lifecycle";
 import { sandboxVerifyTarget, type SandboxExec } from "../src/sandbox-verify";
 import { processPgid, spawnIdentityToken } from "../src/proc-identity";
-import { DEFAULT_INTEGRATOR_WORKER, pidAlive, runFactoryTask } from "../src/factory";
+import { DEFAULT_INTEGRATOR_WORKER, pidAlive, reviewBlockedReason, runFactoryTask, verifyChecksReason } from "../src/factory";
 import type { GitHubReadOnly } from "../src/providers";
 import {
   DEFAULT_REVIEWER_WORKER as REVIEWER_WORKER,
   REVIEW_NOT_INDEPENDENT,
   REVIEW_NO_STRUCTURED_RESULT,
   REVIEW_PROCESS_FAILED,
+  buildReviewBrief,
+  buildReviewerArgs,
   runHeadlessReview,
   extractReviewerVerdict,
   type ReviewerProcess,
@@ -194,6 +196,7 @@ type ReviewPlan =
   | "pass"
   | "fix"
   | "blocked"
+  | "blockedempty"
   | "garbage"
   | "wronghead"
   | "envelope"
@@ -226,6 +229,11 @@ function reviewerHarness(plan: ReviewPlan[]): ReviewerHarness {
           break;
         case "blocked":
           stdout = JSON.stringify({ verdict: "blocked", head, summary: "cannot judge" });
+          break;
+        case "blockedempty":
+          // ISH-830e: the real reviewer can exit 0 with a structured `blocked`
+          // verdict and an EMPTY summary (the observed ISH-830 symptom).
+          stdout = JSON.stringify({ verdict: "blocked", head, findings: [], summary: "" });
           break;
         case "wronghead":
           stdout = JSON.stringify({ verdict: "pass", head: "0".repeat(40), summary: "x" });
@@ -332,6 +340,124 @@ afterEach(() => {
   delete process.env.RELAY_HUMAN;
 });
 
+describe("ISH-830e: the reviewer runs under `auto`, never bypass/all-tools", () => {
+  test("the default reviewer args use --permission-mode auto and no allowlist", () => {
+    const args = buildReviewerArgs({});
+    expect(args).toEqual(["-p", "--output-format", "json", "--permission-mode", "auto"]);
+    expect(args).not.toContain("--allowedTools");
+    expect(args).not.toContain("bypassPermissions");
+    expect(buildReviewerArgs({ model: "opus" })).toContain("opus");
+  });
+
+  test("an explicit allowlist (the ISH-883 native path) is preserved and needs no permission mode", () => {
+    const args = buildReviewerArgs({ allowedTools: "Read Grep Glob Bash" });
+    expect(args).toContain("--allowedTools");
+    expect(args).toContain("Read Grep Glob Bash");
+    expect(args).not.toContain("--permission-mode");
+  });
+
+  test("bypassPermissions can NEVER be emitted, even if a caller smuggles the removed field", () => {
+    // The field is gone from `ReviewerSpawnContext`; cast past the type to prove
+    // the ceiling is structural, not just documented.
+    const smuggle = { permissionMode: "bypassPermissions" } as unknown as Parameters<typeof buildReviewerArgs>[0];
+    expect(buildReviewerArgs(smuggle)).toEqual(["-p", "--output-format", "json", "--permission-mode", "auto"]);
+    expect(buildReviewerArgs(smuggle).join(" ")).not.toContain("bypassPermissions");
+    const withAllowlist = {
+      allowedTools: "Read Grep Glob Bash",
+      permissionMode: "bypassPermissions",
+    } as unknown as Parameters<typeof buildReviewerArgs>[0];
+    expect(buildReviewerArgs(withAllowlist).join(" ")).not.toContain("bypassPermissions");
+    expect(buildReviewerArgs(withAllowlist)).not.toContain("--permission-mode");
+  });
+});
+
+describe("reviewBlockedReason (ISH-830e: a blocked review is never an empty reason)", () => {
+  test("prefers the reviewer summary, then findings, then a precise description", () => {
+    expect(
+      reviewBlockedReason({ verdict: { verdict: "blocked", head: null, findings: [], summary: "cannot judge" }, evidenceRef: null })
+    ).toBe("cannot judge");
+    expect(
+      reviewBlockedReason({
+        verdict: {
+          verdict: "blocked",
+          head: null,
+          findings: [{ severity: "blocker", file: "a.ts", line: 3, message: "unresolved" }],
+          summary: "",
+        },
+        evidenceRef: null,
+      })
+    ).toContain("[blocker] a.ts:3: unresolved");
+    const empty = reviewBlockedReason({
+      verdict: { verdict: "blocked", head: null, findings: [], summary: "" },
+      evidenceRef: "/tmp/T1/review/attempt-1-abc.json",
+    });
+    expect(empty.length).toBeGreaterThan(0);
+    expect(empty).toContain("review blocked");
+    expect(empty).toContain("no summary or findings");
+    expect(empty).toContain("/tmp/T1/review/attempt-1-abc.json");
+    expect(reviewBlockedReason({ verdict: null, evidenceRef: null })).toContain("no structured verdict");
+  });
+});
+
+describe("buildReviewBrief (ISH-830e: sandbox VERIFY evidence is in the brief)", () => {
+  test("renders the ALREADY-RUN verify result with the check output tail, and says not to re-run", () => {
+    const id = newTask();
+    const task = getTask(db, id)!;
+    const brief = buildReviewBrief(db, task, {
+      head: "a".repeat(40),
+      worktree: "/tmp/review-wt",
+      verify: {
+        head: "a".repeat(40),
+        outcome: "pass",
+        checks: [
+          {
+            name: "noop",
+            outcome: "pass",
+            exitCode: 0,
+            output: "line one\nNOS_CHECK_DONE\n",
+          },
+        ],
+      },
+    });
+    expect(brief).toContain("## Mechanical VERIFY — ALREADY RUN");
+    expect(brief).toContain("Outcome: `pass`");
+    expect(brief).toContain("- noop (`true`): pass (exit 0)");
+    expect(brief).toContain("NOS_CHECK_DONE");
+    expect(brief).toContain("do NOT re-run");
+    // No verify evidence -> no VERIFY section (backward compatible).
+    expect(buildReviewBrief(db, task, { head: "a".repeat(40), worktree: "/tmp/review-wt" })).not.toContain(
+      "## Mechanical VERIFY"
+    );
+  });
+});
+
+describe("ISH-830e: VERIFY block reason + sandbox .relay exclusion", () => {
+  test("verifyChecksReason names the check, its outcome, and an output tail", () => {
+    const s = verifyChecksReason([
+      { name: "srl-nos-readback", outcome: "not_run", exitCode: null, output: "sandbox working tree is dirty before the check" },
+    ]);
+    expect(s).toContain("srl-nos-readback=not_run");
+    expect(s).toContain("dirty");
+    expect(verifyChecksReason([])).toBe("no checks executed");
+  });
+
+  test("ensureSandboxRelayExcluded adds .relay/ to the clone's git info/exclude", () => {
+    const calls: string[][] = [];
+    const cli = {
+      run: (args: string[]) => {
+        calls.push(args);
+        return { ok: true, code: 0, out: "", err: "" };
+      },
+    } as unknown as SbxCli;
+    ensureSandboxRelayExcluded(cli, "sbx-1", "/in-vm/repo");
+    const joined = calls.map((a) => a.join(" ")).join("\n");
+    expect(joined).toContain("git rev-parse --path-format=absolute --git-common-dir");
+    expect(joined).toContain("info/exclude");
+    expect(joined).toContain(".relay/");
+    expect(joined).toContain("sbx-1");
+  });
+});
+
 describe("extractReviewerVerdict (fail-closed parsing)", () => {
   test("parses a bare verdict object", () => {
     expect(extractReviewerVerdict('{"verdict":"pass","head":"abc","summary":"ok"}')).toEqual({
@@ -374,6 +500,10 @@ describe("Factory E2E: real worktree, fake headless dsh + independent reviewer",
     // Two coding attempts, two reviews, same worktree.
     expect(res.attempts.map((a) => a.reviewVerdict)).toEqual(["fix", "pass"]);
     expect(res.attempts.map((a) => a.verifyOutcome)).toEqual(["pass", "pass"]);
+    // ISH-830e: the host reviewer is handed the mechanical VERIFY result as
+    // context (it never sees the sandbox where the checks ran).
+    expect(rev.calls[0].brief).toContain("## Mechanical VERIFY — ALREADY RUN");
+    expect(rev.calls[0].brief).toContain("Outcome: `pass`");
     const runs = listRuns(db, { taskId: id });
     expect(runs).toHaveLength(2);
     expect(runs[0].state).toBe("submitted");
@@ -387,6 +517,23 @@ describe("Factory E2E: real worktree, fake headless dsh + independent reviewer",
 
     // A read-only merge gate was evaluated (never merged).
     expect(res.gate).not.toBeNull();
+  });
+
+  test("ISH-830e: a resumed Factory (Task already in review) still carries the durable VERIFY evidence", async () => {
+    const dsh = fakeDsh("dsh-commit", COMMITTING_DSH);
+    const id = newTask();
+    // Drive the Task to `review` in a PRIOR process: launch -> submit -> verify.
+    // The VERIFY result is durable (a VerificationResult row); this new
+    // `runFactoryTask` call has NO in-process memory of the verify step.
+    const head = await driveToReview(id, dsh);
+    const rev = reviewerHarness(["pass"]);
+    const res = await runFactoryTask(db, id, factoryDeps(dsh, rev.spawner));
+    expect(res.outcome).toBe("merge_ready");
+    expect(rev.calls).toHaveLength(1);
+    expect(rev.calls[0].head).toBe(head);
+    // The brief still has the Mechanical VERIFY section, read from the row.
+    expect(rev.calls[0].brief).toContain("## Mechanical VERIFY — ALREADY RUN");
+    expect(rev.calls[0].brief).toContain("Outcome: `pass`");
   });
 
   test("ISH-878: a Sandbox-backed Task IMPLEMENTs + FIXes INSIDE the Sandbox (never the host)", async () => {
@@ -654,6 +801,8 @@ describe("Factory E2E: real worktree, fake headless dsh + independent reviewer",
     const res = await runFactoryTask(db, id, factoryDeps(dsh, rev.spawner));
     expect(res.outcome).toBe("blocked");
     expect(res.reason).toContain("not_run");
+    // ISH-830e: the reason now NAMES the fence/check (not a bare "verify not_run").
+    expect(res.reason).toContain("hang=not_run");
     expect(getTask(db, id)!.state).toBe("blocked_human");
     expect(rev.calls).toHaveLength(0);
   });
@@ -809,6 +958,20 @@ describe("Gateway is told only for judgment", () => {
     const msgs = inboxFor(db, "gateway");
     expect(msgs.length).toBe(1);
     expect(msgs[0].task_id).toBe(blockId);
+  });
+
+  test("a blocked review with an EMPTY summary still yields a precise non-empty reason", async () => {
+    process.env.RELAY_HUMAN = "gateway";
+    const dsh = fakeDsh("dsh-commit", COMMITTING_DSH);
+    const id = newTask();
+    const res = await runFactoryTask(db, id, {
+      ...factoryDeps(dsh, reviewerHarness(["blockedempty"]).spawner),
+      maxAttempts: 1,
+    });
+    expect(res.outcome).toBe("blocked");
+    expect(res.reason).toBeTruthy();
+    expect(res.reason).toContain("review blocked");
+    expect(res.reason).not.toBe("");
   });
 });
 

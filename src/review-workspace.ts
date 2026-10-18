@@ -2,7 +2,7 @@ import { hostGit } from "./sandbox";
 import { gitHead } from "./verify";
 
 /**
- * ISH-829 — the reviewer's independent, fixed-HEAD READ-ONLY workspace.
+ * ISH-829 — the reviewer's independent, fixed-HEAD disposable detached workspace.
  *
  * The mechanical VERIFY runs against the writer's checkout. The independent
  * reviewer must NOT read that live checkout: a writer (or a stray process) could

@@ -10,6 +10,7 @@ import { isCanonicalToken, processPgid, spawnIdentityToken } from "./proc-identi
 import { defaultRunner, type CheckSpec, type CommandRunner } from "./verify";
 import { defaultVerifyTarget, type VerifyTarget } from "./sandbox-verify";
 import { runMechanicalVerification, submitPhase, taskChecks } from "./workflow";
+import { findTaskResult } from "./results";
 import { acceptRunSubmission, getRun, type DshSpawner } from "./dsh-runner";
 import { launchTaskRun, type LaunchRunOptions } from "./run-lifecycle";
 import { getSandbox, SANDBOX_ERROR, type SbxCli } from "./sandbox";
@@ -25,6 +26,8 @@ import {
   DEFAULT_REVIEWER_WORKER,
   runHeadlessReview,
   type ReviewerSpawner,
+  type ReviewerVerdict,
+  type ReviewVerifyEvidence,
 } from "./reviewer-runner";
 import { checkMergeGate, type MergeGateDecision, type MergeGateDeps } from "./merge-gate";
 import { prepareReadOnlyReviewWorktree, removeReviewWorktree } from "./review-workspace";
@@ -102,7 +105,7 @@ export interface FactoryDeps {
    */
   terminateOrphan?: (pid: number) => Promise<boolean>;
   /**
-   * ISH-829: when set, the independent reviewer runs in a DETACHED read-only
+   * ISH-829: when set, the independent reviewer runs in a disposable DETACHED
    * worktree at the fixed head (created under this directory), not the writer's
    * live worktree. Unset -> existing behavior (the writer's worktree).
    */
@@ -631,6 +634,89 @@ function reviewEvidenceBase(deps: FactoryDeps, taskId: string): string {
 }
 
 /**
+ * ISH-830e: the DURABLE mechanical VERIFY evidence for a review — read from the
+ * `VerificationResult` row (SQLite is the only source of truth), never from
+ * process memory, so a Factory resumed directly into `review` still hands the
+ * host reviewer the sandbox result. Only a PASSING verify at the EXACT reviewed
+ * head is used; anything else yields no VERIFY section (fail closed to the old
+ * behaviour: the reviewer sees only the declared checks).
+ */
+export function durableVerifyEvidence(
+  db: Database,
+  taskId: string,
+  attempt: number,
+  reviewHead: string | null
+): ReviewVerifyEvidence | null {
+  const row = findTaskResult(db, taskId, "verify", attempt, "VerificationResult");
+  if (!row || row.passed !== 1 || !reviewHead || row.head_sha !== reviewHead) return null;
+  let payload: unknown;
+  try {
+    payload = JSON.parse(row.payload_json);
+  } catch {
+    return null;
+  }
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
+  const p = payload as Record<string, unknown>;
+  const checksRaw = Array.isArray(p.checks) ? p.checks : [];
+  const checks = checksRaw
+    .filter((c): c is Record<string, unknown> => !!c && typeof c === "object" && !Array.isArray(c))
+    .map((c) => ({
+      name: String(c.name ?? ""),
+      required: c.required !== false,
+      outcome: String(c.outcome ?? ""),
+      exitCode: typeof c.exitCode === "number" ? c.exitCode : null,
+      ...(typeof c.output === "string" ? { output: c.output } : {}),
+    }));
+  return {
+    head: row.head_sha,
+    outcome: typeof p.outcome === "string" ? p.outcome : "",
+    checks,
+  };
+}
+
+/**
+ * ISH-830e: a BLOCKED VERIFY must name the fence that failed. `verify not_run`
+ * alone is opaque (it hid a dirty-tree fence failure in the ISH-830 harness); the
+ * per-check outcome + a bounded output tail make the block diagnosable.
+ */
+export function verifyChecksReason(
+  checks: { name: string; outcome: string; exitCode: number | null; output?: string }[]
+): string {
+  const parts = checks.map(
+    (c) =>
+      `${c.name}=${c.outcome}${c.exitCode === null ? "" : `(exit ${c.exitCode})`}: ${(c.output ?? "")
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, 300)}`
+  );
+  return parts.join("; ") || "no checks executed";
+}
+
+/**
+ * ISH-830e: a BLOCKED review must yield a PRECISE, non-empty reason. The reviewer
+ * may legitimately answer `{"verdict":"blocked","summary":""}` (or omit the
+ * summary) when it cannot judge — collapsing that to `""` loses the only signal
+ * the caller (and the ISH-830 harness) has, and looks like an unexplained block.
+ * Prefer the reviewer's summary, then its findings, then a deterministic
+ * description naming the verdict and the durable evidence path.
+ */
+export function reviewBlockedReason(r: {
+  verdict: ReviewerVerdict | null;
+  evidenceRef: string | null;
+}): string {
+  const summary = r.verdict?.summary?.trim() ?? "";
+  const findings = (r.verdict?.findings ?? []).map(
+    (f) => `[${f.severity}] ${f.file ? `${f.file}${f.line ? `:${f.line}` : ""}: ` : ""}${f.message}`
+  );
+  const parts = [summary, ...findings].filter(Boolean);
+  if (parts.length > 0) return parts.join("\n");
+  const detail = r.verdict
+    ? `reviewer returned verdict '${r.verdict.verdict}' with no summary or findings`
+    : "reviewer returned no structured verdict";
+  return `review blocked: ${detail}${r.evidenceRef ? ` (evidence: ${r.evidenceRef})` : ""}`;
+}
+
+/**
  * Run the whole factory for one Task. Returns a structured result; it NEVER
  * merges, accepts, pushes, or writes to a provider/Linear.
  */
@@ -733,7 +819,7 @@ export async function runFactoryTask(
           // fail -> implement (new attempt) for a real breakage; NOT_RUN -> blocked.
           const live = getTask(db, taskId)!;
           if (live.state === "blocked_human") {
-            return { taskId, outcome: "blocked", head: live.head_sha, attempts, gate: null, reason: `verify ${v.outcome}`, steps };
+            return { taskId, outcome: "blocked", head: live.head_sha, attempts, gate: null, reason: `verify ${v.outcome}: ${verifyChecksReason(v.checks)}`, steps };
           }
           push(`verify:${v.outcome}@${task.attempt} -> new attempt`);
           continue;
@@ -792,6 +878,14 @@ export async function runFactoryTask(
             // dangle).
             evidenceBase: task.worktree ? undefined : reviewEvidenceBase(deps, taskId),
             nativeReview: deps.nativeReview,
+            // ISH-830e: give the host reviewer the sandbox VERIFY evidence so it
+            // can judge the code without re-running the lab. Sourced from the
+            // DURABLE VerificationResult row (not process memory), so a resumed
+            // Factory still carries it.
+            ...(() => {
+              const evidence = durableVerifyEvidence(db, taskId, task.attempt, reviewHead);
+              return evidence ? { verifyEvidence: evidence } : {};
+            })(),
           });
         } finally {
           if (reviewWorktree) removeReviewWorktree(deps.repo ?? projectRoot(), reviewWorktree);
@@ -802,7 +896,7 @@ export async function runFactoryTask(
         }
         if (r.outcome === "blocked") {
           const live = getTask(db, taskId)!;
-          return { taskId, outcome: "blocked", head: live.head_sha, attempts, gate: null, reason: r.verdict?.summary ?? "review blocked", steps };
+          return { taskId, outcome: "blocked", head: live.head_sha, attempts, gate: null, reason: reviewBlockedReason(r), steps };
         }
         push(`review:${r.outcome}@${task.attempt}`);
         continue;
