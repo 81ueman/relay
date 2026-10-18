@@ -4,10 +4,11 @@ name: ishiul-coding
 displayName: Ishiul coding sandbox
 description: >-
   Reproducible lightweight ARM64 coding sandbox for Ishiul work: dsh
-  0.2.1-rc.2 headless, the Rust/Cargo toolchain, Python with PyYAML, uv, and
-  the `network-lab` agent skill (files/home/.agents/skills). It carries no NOS
-  image and no inner containerlab: lab work happens on the persistent Shared
-  Lab (see labs/labctl). Git is used over the forwarded SSH agent.
+  0.2.1-rc.2 headless, the Rust/Cargo toolchain, Python with PyYAML, uv, the
+  pinned gnmic 0.49.0 gNMI client, and the `network-lab` agent skill
+  (files/home/.agents/skills). It carries no NOS image and no inner
+  containerlab: lab work happens on the persistent Shared Lab (see
+  labs/labctl). Git is used over the forwarded SSH agent.
 version: 0.1.0
 sourceURL: https://github.com/81ueman/ishiul
 licenses:
@@ -94,6 +95,14 @@ setup:
     - description: "uv (Python tool/library runner) as the agent user"
       command: "curl -LsSf https://astral.sh/uv/install.sh | sh"
       user: "1000"
+    - description: "gnmic 0.49.0 gNMI client (Linux aarch64, pinned) for real gNMI read-backs"
+      command: >-
+        curl -sSLf -o /tmp/gnmic.tgz
+        https://github.com/openconfig/gnmic/releases/download/v0.49.0/gnmic_0.49.0_Linux_aarch64.tar.gz &&
+        tar -xzf /tmp/gnmic.tgz -C /usr/local/bin gnmic &&
+        chmod 0755 /usr/local/bin/gnmic &&
+        rm -f /tmp/gnmic.tgz
+      user: "0"
     - description: "Persist the agent tool PATH for interactive and non-interactive bash"
       command: >-
         grep -q '.cargo/bin' /etc/sandbox-persistent.sh 2>/dev/null ||
