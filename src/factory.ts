@@ -550,7 +550,9 @@ async function adoptLiveSandboxRun(db: Database, live: Run, deps: FactoryDeps): 
     payload: { runId: live.id, pid: live.pid, sandbox: live.sandbox_name },
   });
   if (!hostSandboxClientAlive(live)) {
-    sweepOrphanedSandboxRuns(db, { apply: true, cli: deps.sandboxCli });
+    // Scope the sweep to THIS adopted Run: a concurrent Task's just-inserted
+    // `starting` Run (pid still NULL) must never be swept from here.
+    sweepOrphanedSandboxRuns(db, { apply: true, cli: deps.sandboxCli, runId: live.id });
     const r = getRun(db, live.id)!;
     if (RUN_TERMINAL_STATES.has(r.state)) {
       return {

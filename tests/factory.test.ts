@@ -120,6 +120,8 @@ class FakeSbxCli implements SbxCli {
   created: string[] = [];
   currentBranch: string | null = "main";
   dshVersion = PINNED_DSH_VERSION;
+  /** When true, `pgrep` reports the in-VM dsh ALIVE (and `pkill` does not stop it). */
+  inVmDshAlive = false;
   constructor(private readonly head: () => string) {}
   run(args: string[]): SbxResult {
     const ok = (out = ""): SbxResult => ({ ok: true, code: 0, out, err: "" });
@@ -142,8 +144,8 @@ class FakeSbxCli implements SbxCli {
       if (joined.includes("rev-parse HEAD")) return ok(this.head());
       if (joined.includes("rev-parse --abbrev-ref HEAD")) return ok(this.currentBranch ?? "");
       if (joined.includes("--version")) return ok(this.dshVersion);
-      if (joined.includes("pgrep")) return ok("GONE");
       if (joined.includes("pkill")) return ok("");
+      if (joined.includes("pgrep")) return ok(this.inVmDshAlive ? "ALIVE" : "GONE");
       return ok("");
     }
     return ok("");
@@ -481,7 +483,7 @@ describe("Factory E2E: real worktree, fake headless dsh + independent reviewer",
     }
   });
 
-  test("ISH-878: re-entry ADOPTS the live Sandbox Run and never starts a duplicate writer", async () => {
+  test("ISH-878: re-entry ADOPTS the live Sandbox Run and resolves the orphan (no duplicate writer)", async () => {
     const id = newTask();
     const sbx = new FakeSbxCli(() => git(repo, "rev-parse", "HEAD"));
     const spawner = new FakeSandboxSpawner();
@@ -496,17 +498,95 @@ describe("Factory E2E: real worktree, fake headless dsh + independent reviewer",
     });
     expect(live.run.sandbox_name).toBe(sandboxNameForTask(getTask(db, id)!));
     expect(spawner.procs).toHaveLength(1);
+    // Prove the recorded host client is GONE, deterministically (a dead pid, so
+    // the fake pid can never collide with a real live host process).
+    const dead = Bun.spawnSync(["true"]);
+    db.query(`UPDATE runs SET pid = ?, spawn_lstart = NULL WHERE id = ?`).run(dead.pid ?? 999999, live.handle.id);
 
     const res = await runFactoryTask(db, id, {
       ...factoryDeps(fakeDsh("dsh-x", COMMITTING_DSH), reviewerHarness(["pass"]).spawner),
       sandboxCli: sbx,
       sandboxSpawner: spawner,
     });
-    // The adopted Run was orphan-resolved (client gone) -> fail closed, and a
-    // SECOND dsh was NEVER spawned into the same sandbox.
+    // Adoption (NOT a fresh launch) resolved the orphan: the host `sbx exec`
+    // client is gone and the in-VM dsh is confirmed GONE, so the Run is terminal
+    // `failed` — and a SECOND dsh was NEVER spawned into the same sandbox.
     expect(res.outcome).toBe("coding_failed");
+    expect(res.reason).toContain("orphaned sandbox run");
+    const runs = listRuns(db, { taskId: id });
+    expect(runs).toHaveLength(1);
+    expect(runs[0].id).toBe(live.handle.id);
+    expect(runs[0].state).toBe("failed");
     expect(spawner.procs).toHaveLength(1);
-    expect(listRuns(db, { taskId: id })).toHaveLength(1);
+  });
+
+  test("ISH-878: an adopted Run whose in-VM dsh SURVIVES keeps the single-writer fence", async () => {
+    const id = newTask();
+    const sbx = new FakeSbxCli(() => git(repo, "rev-parse", "HEAD"));
+    sbx.inVmDshAlive = true; // `pgrep` says ALIVE before AND after `pkill`
+    const spawner = new FakeSandboxSpawner();
+    spawner.onSpawn = (p) => p.writeOut(JSON.stringify({ type: "session", sessionId: "stubborn" }) + "\n");
+    const live = await launchTaskSandboxRun(db, id, {
+      source: repo,
+      cli: sbx,
+      spawner,
+      outputRoot: join(dir, "runs"),
+      fastExitMs: 0,
+    });
+    // A dead client pid (deterministic) with the in-VM dsh still ALIVE.
+    const dead = Bun.spawnSync(["true"]);
+    db.query(`UPDATE runs SET pid = ?, spawn_lstart = NULL WHERE id = ?`).run(dead.pid ?? 999999, live.handle.id);
+
+    const res = await runFactoryTask(db, id, {
+      ...factoryDeps(fakeDsh("dsh-x", COMMITTING_DSH), reviewerHarness(["pass"]).spawner),
+      sandboxCli: sbx,
+      sandboxSpawner: spawner,
+    });
+    // The sweep could NOT confirm the in-VM dsh gone: the Run must stay
+    // NON-TERMINAL so the fence keeps holding, and no second writer is admitted.
+    expect(res.outcome).toBe("coding_failed");
+    expect(res.reason).toContain("still holds the single-writer fence");
+    const runs = listRuns(db, { taskId: id });
+    expect(runs).toHaveLength(1);
+    expect(runs[0].id).toBe(live.handle.id);
+    expect(runs[0].state).toBe("running");
+    expect(spawner.procs).toHaveLength(1);
+  });
+
+  test("ISH-878: an adopted Run with a LIVE client is bounded by its budget (fence held)", async () => {
+    const id = newTask();
+    const sbx = new FakeSbxCli(() => git(repo, "rev-parse", "HEAD"));
+    const spawner = new FakeSandboxSpawner();
+    spawner.onSpawn = (p) => p.writeOut(JSON.stringify({ type: "session", sessionId: "alive" }) + "\n");
+    const live = await launchTaskSandboxRun(db, id, {
+      source: repo,
+      cli: sbx,
+      spawner,
+      outputRoot: join(dir, "runs"),
+      fastExitMs: 0,
+    });
+    // Make the recorded client pid provably ALIVE: this very process, with its
+    // own canonical start token, so `hostSandboxClientAlive` returns true.
+    db.query(`UPDATE runs SET pid = ?, spawn_lstart = ? WHERE id = ?`).run(
+      process.pid,
+      spawnIdentityToken(process.pid),
+      live.handle.id
+    );
+
+    const res = await runFactoryTask(db, id, {
+      ...factoryDeps(fakeDsh("dsh-x", COMMITTING_DSH), reviewerHarness(["pass"]).spawner),
+      sandboxCli: sbx,
+      sandboxSpawner: spawner,
+      timeoutMs: 300,
+    });
+    // The live client never finished: the bounded wait times out and the fence
+    // is held (the Run is left for the operator `relay run sandbox sweep`).
+    expect(res.outcome).toBe("coding_failed");
+    expect(res.reason).toContain("exceeded its 300ms budget");
+    const runs = listRuns(db, { taskId: id });
+    expect(runs).toHaveLength(1);
+    expect(runs[0].state).toBe("running");
+    expect(spawner.procs).toHaveLength(1);
   });
 
   test("ISH-878: a Task with NO sandbox row still uses the host worktree path", async () => {
