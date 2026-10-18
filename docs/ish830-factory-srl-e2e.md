@@ -349,12 +349,16 @@ no TLC run is required (AGENTS.md).
 ## Not verified / follow-ups
 
 - The **real model chain** (DeepSeek IMPLEMENT → Claude FIX → PASS → MergeReady):
-  BLOCKED on a provider credential. Export `DEEPSEEK_API_KEY` and re-run the
-  `factory` stage (`RELAY_ISH830_E2E=1 LABCTL_API=… … ISH830_STAGES=factory bun
-  scripts/ish830-real-e2e.ts`): the harness forwards `DEEPSEEK_API_KEY` into the
-  Sandbox Run (`dshEnv`) and runs `warmLab()`, so the Run can reach the provider;
-  `PASS` is credited only when the FIX→fresh-Run→PASS chain and the HEAD equality
-  hold.
+  BLOCKED on the provider and Shared-Lab credentials. **Prerequisites
+  (ISH-830c):** a **global** `sbx` custom secret (target `ollama.com`, env
+  `OLLAMA_CLOUD_V41_API_KEY`) and a sandbox created **after** it from the Coding
+  Kit (`./sandbox/coding-kit`), plus `LABCTL_API` and the Shared-Lab credentials
+  (`LABCTL_USER`/`LABCTL_PASSWORD` or `LABCTL_TOKEN`). Re-run the `factory` stage
+  (`RELAY_ISH830_E2E=1 LABCTL_API=… … ISH830_STAGES=factory bun
+  scripts/ish830-real-e2e.ts`); the harness forwards **no** provider key — the
+  Run's dsh reads the credential from the sandbox env via the kit's `headless`
+  profile (see [`ish830c-kit-dsh-profile.md`](ish830c-kit-dsh-profile.md)). `PASS`
+  is credited only when the FIX→fresh-Run→PASS chain and the HEAD equality hold.
 - Real SSH and real gNMI read-backs now run (`nos.ssh` / `nos.gnmi` `PASS`). The
   **Coding Kit's** `gnmic` install is pinned and validated (`sbx kit validate`),
   and a unit test (`tests/ish830-e2e.test.ts`) keeps the kit and harness gnmic

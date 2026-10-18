@@ -44,7 +44,8 @@ agent (`extends: shell`) and adds only the Ishiul development tools:
   [`skills/network-lab/SKILL.md`](../skills/network-lab/SKILL.md); it tells the
   agent to deploy an arbitrary containerlab topology with `labctl`, pinned to the
   task's `RELAY_LAB_OWNER`;
-- a focused network allowlist (npm/rust/crates/PyPI, GitHub, `ollama.com`)
+- a focused network allowlist (npm/rust/crates/PyPI, GitHub, `api.deepseek.com`,
+  `ollama.com`)
   and the Shared Lab's **fixed host ports** (`host.docker.internal:49170` API,
   `:18002` gNMI — never a bare host), plus an SSH config that routes GitHub to
   `ssh.github.com:443` (the sandbox policy has no `:22` rule).
