@@ -11,6 +11,19 @@ import type { Task } from "./schema";
 import { gitHead } from "./verify";
 import { recordReview, taskChecks } from "./workflow";
 import { getWorker, registerWorker } from "./workers";
+import {
+  headsMatch,
+  latestReviewInvalidationAt,
+  markerAfterInvalidation,
+  parsePrUrl,
+  reviewBodyHasMarker,
+  type GitHubReadOnly,
+  type MarkerVerdict,
+  type NativeReviewDeps,
+  type PrRef,
+  type ReviewMarker,
+  type ReviewView,
+} from "./providers";
 
 /**
  * ISH-762: the independent HEADLESS reviewer.
@@ -29,6 +42,12 @@ import { getWorker, registerWorker } from "./workers";
  *   - the worktree HEAD moved since the Run was bound            -> REFUSED;
  *   - the reviewer is not an independent reviewer principal      -> REFUSED
  *     (`recordReview` AUTHORITY check: not the submitter, holds REVIEWER_ROLE).
+ *
+ * ISH-883 adds an OPTIONAL native PR-review path: when configured, the reviewer
+ * posts a native GitHub Pull Request Review and Relay accepts the verdict only
+ * after reading the ACTUAL review back at the exact reviewed HEAD (see
+ * `verifyNativeReview`). It is deny-by-default and never changes the authority,
+ * HEAD-binding or duplicate rules above.
  */
 
 export const REVIEW_ERROR = "REVIEW_ERROR";
@@ -39,12 +58,23 @@ export const REVIEW_NOT_INDEPENDENT = "REVIEW_NOT_INDEPENDENT";
 export const REVIEW_NOT_IN_REVIEW = "REVIEW_NOT_IN_REVIEW";
 /** The reviewer process itself failed (non-zero exit / a signal): never a verdict. */
 export const REVIEW_PROCESS_FAILED = "REVIEW_PROCESS_FAILED";
+/** ISH-883: no bound PR to post a native review to (fail closed). */
+export const REVIEW_NATIVE_NO_PR = "REVIEW_NATIVE_NO_PR";
+/** ISH-883: the reviewer posted no matching native review at the reviewed HEAD. */
+export const REVIEW_NATIVE_MISSING = "REVIEW_NATIVE_MISSING";
+/** ISH-883: the reviewer's NEWEST review at the HEAD contradicts the structured verdict. */
+export const REVIEW_NATIVE_CONTRADICTED = "REVIEW_NATIVE_CONTRADICTED";
+/** ISH-883: a native review could not be read back, or did not match the reviewed HEAD. */
+export const REVIEW_NATIVE_UNVERIFIED = "REVIEW_NATIVE_UNVERIFIED";
 
 /** The worker row a headless Claude review is recorded under (role: reviewer). */
 export const DEFAULT_REVIEWER_WORKER = "claude-review";
 
 /** The default real reviewer command (`claude -p --output-format json`). */
 export const DEFAULT_REVIEW_COMMAND = "claude";
+
+/** ISH-883: the default reviewer model (an Opus-class reviewer), configurable. */
+export const DEFAULT_REVIEW_MODEL = "opus";
 
 /** A reviewer is a READ-ONLY principal: it may inspect, never write the work. */
 export const REVIEW_READONLY_TOOLS = "Read Grep Glob";
@@ -74,6 +104,8 @@ export interface ReviewerSpawnContext {
   env: Record<string, string>;
   timeoutMs: number;
   model?: string;
+  /** ISH-883: the reviewer's tool allowlist (default: read-only inspection). */
+  allowedTools?: string;
 }
 
 export interface ReviewerProcess {
@@ -113,6 +145,14 @@ export interface HeadlessReviewDeps {
    * per-Task directory — the read-only review worktree is removed afterwards.
    */
   evidenceBase?: string;
+  /**
+   * ISH-883: post a NATIVE GitHub Pull Request Review and read it back. When
+   * omitted (the default), the reviewer keeps the local structured-verdict path
+   * and Relay performs no external write. When present, a valid verdict is only
+   * recorded AFTER the posted review is read back and bound to the reviewed HEAD;
+   * a missing/mismatched/unauthorized/failed post is REFUSED (fail closed).
+   */
+  nativeReview?: NativeReviewDeps;
 }
 
 export interface HeadlessReviewResult {
@@ -124,6 +164,8 @@ export interface HeadlessReviewResult {
   /** Non-null on a refusal (a fail-closed reason), for evidence/tests. */
   error: string | null;
   evidenceRef: string | null;
+  /** ISH-883: the verified native GitHub review, when native posting is enabled. */
+  nativeReview: ReviewView | null;
   raw: string;
 }
 
@@ -147,14 +189,24 @@ export function reviewEvidencePath(worktree: string, attempt: number, head: stri
  * required output contract. The reviewer is told explicitly that it is
  * independent and READ-ONLY, and that a pass naming a different head is refused.
  */
-export function buildReviewBrief(db: Database, task: Task, opts: { head: string; worktree: string }): string {
+export function buildReviewBrief(
+  db: Database,
+  task: Task,
+  opts: { head: string; worktree: string; native?: { ref: PrRef; author: string } }
+): string {
   const checks = taskChecks(task);
   const findings = inheritFindingsForBrief(db, task);
   const lines: string[] = [
     `# Independent review — Task ${task.id} (attempt ${task.attempt})`,
     "",
-    "You are an INDEPENDENT code reviewer. You did NOT write this change. You have",
-    "READ-ONLY access: do not modify any file, do not commit, do not merge.",
+    "You are an INDEPENDENT code reviewer. You did NOT write this change. Treat this",
+    "checkout as READ-ONLY: do not modify the code, do not commit, push or merge.",
+    ...(opts.native
+      ? [
+          "You MAY run `git`/`gh` in this DISPOSABLE checkout (never in the coding",
+          "writer's tree) to POST one native GitHub Pull Request Review.",
+        ]
+      : []),
     "",
     `Judge ONLY the revision at HEAD \`${opts.head}\` in \`${opts.worktree}\`.`,
     "",
@@ -169,6 +221,27 @@ export function buildReviewBrief(db: Database, task: Task, opts: { head: string;
   if (findings.length > 0) {
     lines.push("", `## Prior findings @ attempt ${token(task)} (context — verify they are actually fixed)`);
     for (const f of findings) lines.push(`- ${f}`);
+  }
+  if (opts.native) {
+    const { ref, author } = opts.native;
+    lines.push(
+      "",
+      "## Native GitHub review (REQUIRED)",
+      `Post ONE Pull Request Review on \`${ref.repo}#${ref.number}\` for the EXACT commit`,
+      `\`${opts.head}\`, as a COMMENT review (\`gh pr review --comment\`, or`,
+      `\`gh api --method POST repos/${ref.repo}/pulls/${ref.number}/reviews\`). Include`,
+      "actionable inline `path:line` comments where you have concrete findings. The",
+      "review BODY MUST contain EXACTLY this marker (OK for pass, NG for fix, HOLD for",
+      "blocked):",
+      `<!-- ishiul-review head=${opts.head} verdict=OK|NG|HOLD reviewer=${author} -->`,
+      `Post ONE review for THIS review attempt (attempt=${task.attempt}). If a review by`,
+      "the same reviewer at this EXACT HEAD was already posted for THIS attempt, do NOT",
+      "post another (check with `gh api repos/" + ref.repo + "/pulls/" + ref.number + "/reviews`).",
+      "After a base retarget the SAME HEAD is re-reviewed at a new attempt — then post a",
+      "fresh review. Do NOT post at another commit; do NOT approve or request changes (a",
+      "COMMENT review is enough). Relay reads the ACTUAL GitHub review back — a missing,",
+      "stale (before a base change), or non-COMMENTED review is refused."
+    );
   }
   lines.push(
     "",
@@ -314,7 +387,7 @@ export function bunReviewerSpawner(command = DEFAULT_REVIEW_COMMAND): ReviewerSp
         "--output-format",
         "json",
         "--allowedTools",
-        REVIEW_READONLY_TOOLS,
+        ctx.allowedTools ?? REVIEW_READONLY_TOOLS,
       ];
       if (ctx.model) args.push("--model", ctx.model);
       const proc = Bun.spawn([command, ...args], {
@@ -360,6 +433,113 @@ export function bunReviewerSpawner(command = DEFAULT_REVIEW_COMMAND): ReviewerSp
 }
 
 // ---------------------------------------------------------------------------
+// ISH-883: native GitHub Pull Request Review (reviewer posts, Relay reads back)
+// ---------------------------------------------------------------------------
+
+/** The marker verdict a structured verdict maps onto (the existing contract). */
+export function markerVerdictFor(verdict: ReviewerVerdict["verdict"]): MarkerVerdict {
+  return verdict === "pass" ? "OK" : verdict === "fix" ? "NG" : "HOLD";
+}
+
+/** The bound PR ref for a task (url, then repo+branch), or null when none. */
+function resolveBoundPr(task: Task, github?: GitHubReadOnly): PrRef | null {
+  const ref = parsePrUrl(task.pr_url, task.pr_repo);
+  if (ref) return ref;
+  if (github && task.pr_repo && task.branch) {
+    return github.findPullRequestForBranch(task.pr_repo, task.branch)?.ref ?? null;
+  }
+  return null;
+}
+
+export interface NativeReviewOutcome {
+  ok: boolean;
+  review: ReviewView | null;
+  error: string | null;
+}
+
+/**
+ * Read the reviewer's native PR review BACK from GitHub and accept it only when
+ * the reviewer's CURRENT word at the HEAD — the newest fresh `COMMENTED` review
+ * authored by the expected GitHub identity, pinned to the EXACT reviewed HEAD,
+ * posted AFTER any base-changed invalidation — carries the marker matching the
+ * structured verdict, and the PR's CURRENT head is still that commit. A
+ * missing/foreign/PENDING/DISMISSED/stale/moved-HEAD review, a newer review whose
+ * verdict contradicts the structured one, or a failed read is `ok:false` — the
+ * caller records NOTHING. Relay never trusts the reviewer's own URL/JSON.
+ */
+export function verifyNativeReview(
+  db: Database,
+  task: Task,
+  verdict: ReviewerVerdict,
+  head: string,
+  native: NativeReviewDeps
+): NativeReviewOutcome {
+  const fail = (error: string): NativeReviewOutcome => ({ ok: false, review: null, error });
+  const ref = resolveBoundPr(task, native.github);
+  if (!ref) return fail(`${REVIEW_NATIVE_NO_PR}: ${task.id} has no bound PR to read a native review from`);
+
+  const marker = markerVerdictFor(verdict.verdict);
+  const reviews = native.reader.listReviews(ref);
+  if (reviews === null) {
+    return fail(`${REVIEW_NATIVE_UNVERIFIED}: could not read reviews for ${ref.repo}#${ref.number} (failed read)`);
+  }
+  // A base-branch retarget re-opens the review at the SAME HEAD (attempt+1). A
+  // review posted before that invalidation judged the OLD base's diff, so it must
+  // not be re-accepted (the same rule the marker path uses).
+  const invalidatedAt = latestReviewInvalidationAt(db, task.id, head);
+  // The reviewer's CURRENT word at this HEAD: the NEWEST fresh `COMMENTED` review
+  // by the expected author, whatever its verdict. Only then is its marker checked
+  // against the structured verdict — so a newer contradicting review is never
+  // shadowed by an older matching one. A PENDING (never submitted) or
+  // DISMISSED/APPROVED/CHANGES_REQUESTED review is never a valid verdict; the
+  // brief allows a COMMENT only.
+  const candidates = reviews.filter(
+    (r) =>
+      (r.author ?? "").toLowerCase() === native.author.toLowerCase() &&
+      (r.state ?? "").toUpperCase() === "COMMENTED" &&
+      headsMatch(r.headSha, head) &&
+      markerAfterInvalidation({ createdAt: r.createdAt } as ReviewMarker, invalidatedAt)
+  );
+  // Prefer the NEWEST review. Unparseable timestamps sort last.
+  const timeOf = (r: ReviewView): number => {
+    const t = Date.parse(r.createdAt);
+    return Number.isFinite(t) ? t : Number.NEGATIVE_INFINITY;
+  };
+  candidates.sort((a, b) => timeOf(b) - timeOf(a));
+  const newest = candidates[0] ?? null;
+  if (!newest) {
+    return fail(
+      `${REVIEW_NATIVE_MISSING}: no fresh COMMENTED '${native.author}' review at HEAD ${head} on ${ref.repo}#${ref.number}` +
+        (invalidatedAt > 0 ? ` (reviews before the base-changed invalidation do not count)` : "")
+    );
+  }
+  // The newest review IS the reviewer's current verdict at this HEAD. If it does
+  // not carry the marker matching the structured verdict (a different verdict, or
+  // no marker at all), the run is contradicted — refuse, never fall back to an
+  // older review that happens to agree.
+  if (!reviewBodyHasMarker(newest.body, head, marker)) {
+    return fail(
+      `${REVIEW_NATIVE_CONTRADICTED}: the newest '${native.author}' review at HEAD ${head} (id ${newest.id}) does not carry a ${marker} marker on ${ref.repo}#${ref.number}; refusing to accept an older review`
+    );
+  }
+  const found = newest;
+  // A moved PR HEAD invalidates the review even when the read-back review is
+  // pinned: GitHub's CURRENT head must still be the reviewed commit.
+  if (native.github) {
+    const pr = native.github.getPullRequest(ref);
+    if (!pr) {
+      return fail(`${REVIEW_NATIVE_UNVERIFIED}: could not re-read ${ref.repo}#${ref.number} to confirm the current HEAD`);
+    }
+    if (!headsMatch(pr.headSha, head)) {
+      return fail(
+        `${REVIEW_NATIVE_UNVERIFIED}: PR ${ref.repo}#${ref.number} moved to ${pr.headSha || "none"}, not the reviewed HEAD ${head}`
+      );
+    }
+  }
+  return { ok: true, review: found, error: null };
+}
+
+// ---------------------------------------------------------------------------
 // Run one headless review
 // ---------------------------------------------------------------------------
 
@@ -368,7 +548,7 @@ function refusal(
   task: Task,
   extra: Partial<HeadlessReviewResult> = {}
 ): HeadlessReviewResult {
-  return { outcome: "refused", task, verdict: null, sessionId: null, error, evidenceRef: null, raw: "", ...extra };
+  return { outcome: "refused", task, verdict: null, sessionId: null, error, evidenceRef: null, nativeReview: null, raw: "", ...extra };
 }
 
 /**
@@ -423,22 +603,31 @@ export async function runHeadlessReview(
     return refusal(`${REVIEW_NOT_INDEPENDENT}: ${reviewerWorker} (role '${reviewerRow.role}') may not review ${taskId}`, task);
   }
 
-  const brief = buildReviewBrief(db, task, { head, worktree });
+  // ISH-883: when native posting is enabled, the reviewer is told which PR to
+  // post to; Relay reads the ACTUAL GitHub review back afterwards.
+  const native = deps.nativeReview;
+  const nativeRef = native ? resolveBoundPr(task, native.github) : null;
+  const brief = buildReviewBrief(db, task, {
+    head,
+    worktree,
+    ...(native && nativeRef ? { native: { ref: nativeRef, author: native.author } } : {}),
+  });
   pinReviewBrief(worktree, brief);
   logEvent(db, {
     source: "factory",
     taskId,
     type: "factory.review_started",
-    payload: { head, attempt: task.attempt, reviewer: reviewerWorker, worktree },
+    payload: { head, attempt: task.attempt, reviewer: reviewerWorker, worktree, nativeReview: !!native },
   });
 
   const spawner = deps.spawner ?? bunReviewerSpawner(deps.command ?? DEFAULT_REVIEW_COMMAND);
   const proc = await spawner.run({
     cwd: worktree,
     brief,
-    env: deps.env ?? {},
+    env: { ...(deps.env ?? {}), ...(native?.spawnEnv ?? {}) },
     timeoutMs: deps.timeoutMs ?? 20 * 60_000,
     model: deps.model,
+    ...(native?.allowedTools ? { allowedTools: native.allowedTools } : {}),
   });
   const raw = `${proc.stdout}\n${proc.stderr}`;
   const verdict = extractReviewerVerdict(proc.stdout) ?? extractReviewerVerdict(proc.stderr);
@@ -446,33 +635,38 @@ export async function runHeadlessReview(
   // Retain the RAW reviewer output as evidence. ISH-829: this is written to a
   // DURABLE base — the Task's own worktree — never inside a temporary
   // `reviewWorktree` that the caller removes, so a recorded `evidence_ref` never
-  // dangles.
+  // dangles. ISH-883: the verified native review (id/url/head), when posted, is
+  // recorded alongside the structured verdict.
   const evidenceBase = deps.evidenceBase ?? task.worktree ?? worktree;
   const evidencePath = reviewEvidencePath(evidenceBase, task.attempt, head);
-  try {
-    mkdirSync(dirname(evidencePath), { recursive: true });
-    writeFileSync(
-      evidencePath,
-      `${JSON.stringify(
-        {
-          taskId,
-          attempt: task.attempt,
-          head,
-          reviewer: reviewerWorker,
-          command: deps.command ?? DEFAULT_REVIEW_COMMAND,
-          exitCode: proc.exitCode,
-          signal: proc.signal,
-          structured: verdict,
-          stdout: proc.stdout.slice(0, 32_768),
-          stderr: proc.stderr.slice(0, 8_192),
-        },
-        null,
-        2
-      )}\n`
-    );
-  } catch {
-    /* evidence write is best effort, never a verdict */
-  }
+  const writeEvidence = (native: ReviewView | null): void => {
+    try {
+      mkdirSync(dirname(evidencePath), { recursive: true });
+      writeFileSync(
+        evidencePath,
+        `${JSON.stringify(
+          {
+            taskId,
+            attempt: task.attempt,
+            head,
+            reviewer: reviewerWorker,
+            command: deps.command ?? DEFAULT_REVIEW_COMMAND,
+            exitCode: proc.exitCode,
+            signal: proc.signal,
+            structured: verdict,
+            native,
+            stdout: proc.stdout.slice(0, 32_768),
+            stderr: proc.stderr.slice(0, 8_192),
+          },
+          null,
+          2
+        )}\n`
+      );
+    } catch {
+      /* evidence write is best effort, never a verdict */
+    }
+  };
+  writeEvidence(null);
 
   // A FAILED reviewer process is not a verdict, even when its stdout happens to
   // contain a well-formed pass: the exit code / signal is authoritative for
@@ -554,6 +748,43 @@ export async function runHeadlessReview(
     );
   }
 
+  // ISH-883: when native review is enabled, the verdict is only ACCEPTED after
+  // the ACTUAL GitHub review the reviewer posted is read back and bound to the
+  // reviewed HEAD. A missing/mismatched/moved-HEAD/failed read is a refusal — the
+  // Task never advances on the reviewer's own URL/JSON alone.
+  let nativeReview: ReviewView | null = null;
+  if (deps.nativeReview) {
+    const nr = verifyNativeReview(db, task, verdict, head, deps.nativeReview);
+    if (!nr.ok) {
+      logEvent(db, {
+        source: "factory",
+        taskId,
+        type: "factory.native_review_refused",
+        payload: { reason: nr.error, head, evidence: evidencePath },
+      });
+      writeEvidence(null);
+      return refusal(nr.error ?? `${REVIEW_NATIVE_UNVERIFIED}: native review not verified`, task, {
+        verdict,
+        evidenceRef: evidencePath,
+        raw,
+      });
+    }
+    nativeReview = nr.review;
+    writeEvidence(nativeReview);
+    logEvent(db, {
+      source: "factory",
+      taskId,
+      type: "factory.native_review_verified",
+      payload: {
+        id: nativeReview!.id,
+        url: nativeReview!.url,
+        author: nativeReview!.author,
+        head,
+        prNumber: nativeReview!.prNumber,
+      },
+    });
+  }
+
   // Independence: the review is recorded as the reviewer worker, which holds
   // REVIEWER_ROLE and is never the Run submitter. Take the review claim for THIS
   // task (a review carries no lease; a live holder cannot be stolen).
@@ -612,6 +843,7 @@ export async function runHeadlessReview(
       sessionId: extractSessionId(proc.stdout),
       error: null,
       evidenceRef: evidencePath,
+      nativeReview,
       raw,
     };
   } catch (e) {

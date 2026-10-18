@@ -46,9 +46,10 @@ import {
 } from "./sandbox-lifecycle";
 import { getSandbox as getTaskSandbox, listSandboxes } from "./sandbox";
 import { applyLabCleanup, planLabCleanup, type LabCleanupPlan } from "./lab-cleanup";
-import { providerDepsFromEnv } from "./provider-adapters";
+import { providerDepsFromEnv, nativeReviewDepsFromEnv } from "./provider-adapters";
 import { checkMergeGate, formatMergeGateDecision } from "./merge-gate";
 import { runFactoryTask } from "./factory";
+import { DEFAULT_REVIEW_MODEL } from "./reviewer-runner";
 import {
   bindSession, findWorkerBySession, getWorker, listWorkers,
   quietActive, registerWorker, retireWorker, setWorkerState, touchSeen, unretireWorker,
@@ -1766,13 +1767,16 @@ async function main(): Promise<void> {
             repo: flag(rest, "--repo") ?? undefined,
             dshBin: flag(rest, "--dsh") ?? process.env.RELAY_DSH_BIN ?? undefined,
             reviewerCommand: flag(rest, "--reviewer") ?? process.env.RELAY_REVIEW_CMD ?? undefined,
-            reviewerModel: flag(rest, "--model") ?? process.env.RELAY_REVIEW_MODEL ?? undefined,
+            reviewerModel: flag(rest, "--model") ?? process.env.RELAY_REVIEW_MODEL ?? DEFAULT_REVIEW_MODEL,
             timeoutMs: timeoutRaw ? parseDuration(timeoutRaw) : undefined,
             permissionMode: flag(rest, "--permission") ?? undefined,
             maxAttempts: maxRaw ? Number(maxRaw) : undefined,
             // ISH-829: the independent reviewer reads a detached read-only
             // worktree at the fixed head, outside the writer's checkout.
             reviewWorktreeRoot: flag(rest, "--review-worktrees") ?? join(repoRoot, STATE_DIR, "review-worktrees"),
+            // ISH-883: post a native GitHub PR review + read it back, ONLY when
+            // the operator has granted the explicit external-write authorization.
+            nativeReview: nativeReviewDepsFromEnv(),
           });
           if (hasFlag(rest, "--json")) {
             console.log(JSON.stringify(result, null, 2));

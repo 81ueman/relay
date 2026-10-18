@@ -374,6 +374,37 @@ The Factory never pushes, merges, accepts, or writes a provider/Linear. One-shot
 smoke:factory:real` (real dsh 0.2.1-rc.2 + real Claude) — see
 [`docs/factory-e2e.md`](docs/factory-e2e.md).
 
+### Native GitHub PR Review, HEAD-bound (ISH-883)
+
+The independent headless reviewer can **post a native GitHub Pull Request Review
+itself** (a `COMMENT` review, with actionable `path:line` inline comments, from its
+disposable review checkout — never the coding writer's tree, never a push or a
+merge). Relay then accepts the verdict only after reading the **actual** GitHub
+review back — never the reviewer's own URL or JSON verdict. The review body must
+carry the head-pinned `<!-- ishiul-review head=<sha> verdict=OK|NG|HOLD
+reviewer=<id> -->` marker, and Relay requires that the reviewer's **newest**
+review at that HEAD is a submitted **`COMMENTED`** review (a
+`PENDING`/`DISMISSED` review is never a verdict) by the expected GitHub `author`,
+pinned to the exact reviewed `commit_id`, on the bound `PR number`, posted
+**after any base-change invalidation at that HEAD**, with GitHub's **current** PR
+head still that commit. That newest review's marker must match the structured
+verdict — a newer contradicting review is **REFUSED**, never shadowed by an older
+matching one. A missing review, a foreign author, a mismatched HEAD/PR, a moved
+HEAD, a stale same-HEAD review, a contradicting newest review, or an unreadable
+read is **REFUSED** (fail closed — the Task never advances); the verified review
+id/url is retained in the local evidence next to the structured verdict.
+Mechanical VERIFY and the merge gate are unchanged.
+
+This external write is **deny-by-default** (ISH-288): the reviewer is given the
+`gh` shell + a scoped token (`RELAY_REVIEW_GH_TOKEN`, else `GH_TOKEN`) ONLY when
+an operator grants `RELAY_GITHUB_REVIEW_WRITE=1` **and** names the
+gh-authenticated login the review posts as (`RELAY_REVIEW_AUTHOR=<login>`) with
+`RELAY_PROVIDER_GITHUB=gh`. Without the grant the reviewer keeps the local
+structured-verdict path and Relay requires no native review. `--allowedTools` is
+an approval allowlist, **not** an OS sandbox — Relay does not claim process
+isolation from it. The reviewer model is configurable (`RELAY_REVIEW_MODEL` /
+`--model`, default `opus`).
+
 ### Headless dsh Runs (no Herdr)
 
 A coding attempt can run as **one `dsh --profile headless --json` process** — no

@@ -83,6 +83,62 @@ export interface GitHubReadOnly {
   listComments(ref: PrRef): CommentView[] | null;
 }
 
+// ---------------------------------------------------------------------------
+// ISH-883 native Pull Request Review (posted by the reviewer, read back by Relay)
+// ---------------------------------------------------------------------------
+
+/**
+ * A GitHub Pull Request Review as READ BACK. The identity Relay verifies is the
+ * GitHub-assigned `id` + `author` + pinned `headSha` (`commit_id`) + `prNumber` —
+ * NEVER an agent-provided URL or JSON verdict. The head-pinned verdict travels in
+ * the review BODY marker (the same contract `parseReviewMarkers` reads).
+ */
+export interface ReviewView {
+  /** The GitHub review id. */
+  id: number;
+  /** `owner/name`. */
+  repo: string;
+  prNumber: number;
+  /** The GitHub login the review is authored by. */
+  author: string;
+  /** The commit the review is pinned to (GitHub `commit_id`). */
+  headSha: string;
+  /** COMMENTED / APPROVED / CHANGES_REQUESTED / PENDING. */
+  state: string;
+  body: string;
+  url: string;
+  createdAt: string;
+}
+
+/**
+ * Read-only: list a PR's existing reviews. `null` means the READ FAILED (any
+ * endpoint), so a caller never treats a transient error as "no review".
+ */
+export interface GitHubReviewReader {
+  readonly name: string;
+  listReviews(ref: PrRef): ReviewView[] | null;
+}
+
+/**
+ * ISH-883: how Relay VERIFIES a native PR review that the headless reviewer
+ * posted. The reviewer is the untrusted principal: Relay never accepts the
+ * reviewer's own URL/JSON, it reads the ACTUAL GitHub review back and binds it to
+ * the exact reviewed HEAD. `spawnEnv` (a scoped auth channel) and `allowedTools`
+ * are what let the reviewer POST; they are only ever supplied under an explicit
+ * owner authorization (`nativeReviewDepsFromEnv`).
+ */
+export interface NativeReviewDeps {
+  reader: GitHubReviewReader;
+  /** Re-read the live PR head, so a moved HEAD invalidates the posted review. */
+  github?: GitHubReadOnly;
+  /** The GitHub login the posted review is expected to be authored by. */
+  author: string;
+  /** Scoped env (e.g. `GH_TOKEN`) forwarded to the reviewer so it can post. */
+  spawnEnv?: Record<string, string>;
+  /** The reviewer's allowedTools; must include a shell so it can run `gh`. */
+  allowedTools?: string;
+}
+
 export interface IssueView {
   id: string;
   state: string;
@@ -181,6 +237,21 @@ const MARKER_RE =
   /<!--\s*ishiul-review\s+head=([0-9a-fA-F]{7,64})\s+verdict=(OK|NG|HOLD)\s+reviewer=([A-Za-z0-9_.@-]+)\s*-->/g;
 
 export type MarkerVerdict = "OK" | "NG" | "HOLD";
+
+/**
+ * ISH-883: true when a review body carries the head-pinned verdict marker
+ * (`<!-- ishiul-review head=<sha> verdict=OK|NG|HOLD reviewer=<id> -->`) naming
+ * exactly this head and verdict. The reviewer posts the marker; Relay reads it
+ * back to bind the native review to the reviewed HEAD.
+ */
+export function reviewBodyHasMarker(body: string, headSha: string, verdict: MarkerVerdict): boolean {
+  MARKER_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = MARKER_RE.exec(body ?? "")) !== null) {
+    if (m[2] === verdict && headsMatch(m[1], headSha)) return true;
+  }
+  return false;
+}
 
 export interface ReviewMarker {
   headSha: string;

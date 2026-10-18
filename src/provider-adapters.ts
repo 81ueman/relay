@@ -5,11 +5,14 @@ import {
   type ChecksReadOnly,
   type CommentView,
   type GitHubReadOnly,
+  type GitHubReviewReader,
   type IssueView,
   type LinearReadOnly,
+  type NativeReviewDeps,
   type PrRef,
   type PrState,
   type PrView,
+  type ReviewView,
 } from "./providers";
 import { defaultVerifyTarget } from "./sandbox-verify";
 
@@ -94,8 +97,24 @@ function toPrView(ref: PrRef, j: GhPrJson): PrView {
   };
 }
 
+/** Normalize one GitHub review object (`/pulls/N/reviews`) to a `ReviewView`. */
+function toReviewView(ref: PrRef, raw: Record<string, unknown>): ReviewView {
+  const user = (raw.user ?? {}) as Record<string, unknown>;
+  return {
+    id: Number(raw.id ?? 0),
+    repo: ref.repo,
+    prNumber: ref.number,
+    author: typeof user.login === "string" ? user.login : "",
+    headSha: String(raw.commit_id ?? ""),
+    state: String(raw.state ?? ""),
+    body: String(raw.body ?? ""),
+    url: String(raw.html_url ?? ""),
+    createdAt: String(raw.submitted_at ?? ""),
+  };
+}
+
 /** GET-only GitHub reader backed by the `gh` CLI (read verbs only). */
-export class GhCliGitHub implements GitHubReadOnly, ChecksReadOnly {
+export class GhCliGitHub implements GitHubReadOnly, ChecksReadOnly, GitHubReviewReader {
   readonly name = "gh-cli";
   readonly readOnly = true as const;
 
@@ -151,6 +170,22 @@ export class GhCliGitHub implements GitHubReadOnly, ChecksReadOnly {
           out.push({ author, createdAt, body });
         }
       }
+    }
+    return out;
+  }
+
+  /**
+   * ISH-883: list a PR's reviews (the READ-BACK side of a native review). A
+   * FAILED read returns `null` (never an empty list), so Relay can distinguish
+   * "no review" from "could not verify".
+   */
+  listReviews(ref: PrRef): ReviewView[] | null {
+    const r = this.exec(["gh", "api", "--paginate", `repos/${ref.repo}/pulls/${ref.number}/reviews`]);
+    if (!r.ok) return null;
+    const out: ReviewView[] = [];
+    for (const page of parseJsonStream(r.stdout)) {
+      const items = Array.isArray(page) ? page : [page];
+      for (const v of items as Record<string, unknown>[]) out.push(toReviewView(ref, v));
     }
     return out;
   }
@@ -357,5 +392,41 @@ export function providerDepsFromEnv(env: EnvLike = process.env, exec: Exec = def
     // INSIDE that sandbox at the recorded HEAD; a Task without one falls back to
     // the host runner (see runPendingMechanicalVerifications).
     verifyTarget: defaultVerifyTarget,
+  };
+}
+
+/**
+ * ISH-883: build the native-review deps for the headless reviewer. This is OFF
+ * unless an operator gives BOTH an explicit owner authorization for the external
+ * GitHub write AND the identity the review is expected to be authored by:
+ *
+ *   RELAY_GITHUB_REVIEW_WRITE=1     explicit owner authorization (ISH-288)
+ *   RELAY_REVIEW_AUTHOR=<login>     the gh-authenticated login the review posts as
+ *   RELAY_PROVIDER_GITHUB=gh        the (read-only) gh CLI reader for read-back
+ *
+ * The reviewer is the POSTER (it runs `gh` in its disposable review checkout);
+ * Relay only reads the review back. The reviewer gets a GitHub shell + a scoped
+ * token env (`RELAY_REVIEW_GH_TOKEN` or an inherited `GH_TOKEN`) ONLY under this
+ * explicit grant; `linearWrite` and `merge` are never granted. Absent the
+ * authorization (or the reader/identity) this returns `undefined`, so the
+ * reviewer keeps the local structured-verdict path and Relay requires no native
+ * review.
+ */
+export function nativeReviewDepsFromEnv(env: EnvLike = process.env, exec: Exec = defaultExec): NativeReviewDeps | undefined {
+  if (env.RELAY_GITHUB_REVIEW_WRITE !== "1") return undefined;
+  if (env.RELAY_PROVIDER_GITHUB !== "gh") return undefined;
+  const author = (env.RELAY_REVIEW_AUTHOR ?? "").trim();
+  if (!author) return undefined;
+  const github = new GhCliGitHub(exec);
+  const token = env.RELAY_REVIEW_GH_TOKEN ?? env.GH_TOKEN;
+  return {
+    reader: github,
+    github,
+    author,
+    ...(token ? { spawnEnv: { GH_TOKEN: token } } : {}),
+    // The reviewer must be able to run `gh` (and git) to post; this is an
+    // approval allowlist, NOT an OS sandbox (ISH-883 explicitly does not claim
+    // isolation from it).
+    allowedTools: "Read Grep Glob Bash",
   };
 }

@@ -28,6 +28,7 @@ import {
 } from "./reviewer-runner";
 import { checkMergeGate, type MergeGateDecision, type MergeGateDeps } from "./merge-gate";
 import { prepareReadOnlyReviewWorktree, removeReviewWorktree } from "./review-workspace";
+import type { NativeReviewDeps } from "./providers";
 
 /**
  * ISH-762 Factory driver.
@@ -113,6 +114,12 @@ export interface FactoryDeps {
   sandboxCli?: SbxCli;
   /** ISH-878: test seam for the `sbx exec … dsh` process of a Sandbox Run. */
   sandboxSpawner?: DshSpawner;
+  /**
+   * ISH-883: post a NATIVE GitHub PR review and read it back for HEAD-bound
+   * acceptance. Undefined -> the reviewer keeps the local structured-verdict
+   * path and Relay performs no external write (backward compatible).
+   */
+  nativeReview?: NativeReviewDeps;
 }
 
 export interface FactoryAttempt {
@@ -755,6 +762,7 @@ export async function runFactoryTask(
             // review worktree is removed below — a recorded evidence_ref must not
             // dangle).
             evidenceBase: task.worktree ? undefined : reviewEvidenceBase(deps, taskId),
+            nativeReview: deps.nativeReview,
           });
         } finally {
           if (reviewWorktree) removeReviewWorktree(deps.repo ?? projectRoot(), reviewWorktree);
