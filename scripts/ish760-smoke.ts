@@ -5,7 +5,10 @@
  *   bun run smoke:run-lifecycle
  *
  * Builds a throwaway git repo + control plane and drives the REAL Task lifecycle
- * with a FAKE `dsh` binary (no network, no real dsh, no Herdr):
+ * with a FAKE `dsh` binary (no network, no real dsh, no Herdr). The source repo
+ * is a DEDICATED parent of the worktrees root, and the fixture `dsh` commits only
+ * in the workspace it was started in — the smoke therefore never writes into the
+ * checkout it runs from (ISH-904: the workspace is a self-contained clone).
  *
  *   ensure worktree -> launch (pin brief) -> duplicate writer REFUSED ->
  *   submit -> implement -> verify PASS -> review FIX -> a NEW Run on the SAME
@@ -24,6 +27,7 @@ import { registerWorker } from "../src/workers";
 import { intakeTask, recordReview, confirmMerged, runMechanicalVerification, taskChecks } from "../src/workflow";
 import { defaultRunner } from "../src/verify";
 import { acceptRunSubmission, getRun, listRuns, DUPLICATE_WRITER } from "../src/dsh-runner";
+import { PINNED_DSH_VERSION } from "../src/dsh-version";
 import {
   applyWorkspaceCleanup,
   ensureTaskWorktree,
@@ -75,11 +79,11 @@ try {
   const fast = join(binDir, "dsh-fast");
   writeFileSync(
     fast,
-    `#!/bin/sh\nset -e\necho "smoke: implementing [${"$"}RELAY_RUN_ID]"\necho "${"$"}RELAY_RUN_ID" > smoke-"${"$"}RELAY_RUN_ID".txt\ngit add -A\ngit -c user.email=smoke@test -c user.name=smoke commit -qm "smoke ${"$"}RELAY_RUN_ID"\necho DONE\n`
+    `#!/bin/sh\nif [ "${"$"}1" = "--version" ]; then echo ${PINNED_DSH_VERSION}; exit 0; fi\nset -e\ncd "${"$"}PWD"\necho "smoke: implementing [${"$"}RELAY_RUN_ID]"\necho "${"$"}RELAY_RUN_ID" > smoke-"${"$"}RELAY_RUN_ID".txt\ngit add -A\ngit -c user.email=smoke@test -c user.name=smoke commit -qm "smoke ${"$"}RELAY_RUN_ID"\necho DONE\n`
   );
   chmodSync(fast, 0o755);
   const slow = join(binDir, "dsh-slow");
-  writeFileSync(slow, "#!/bin/sh\nsleep 2\nexit 0\n");
+  writeFileSync(slow, `#!/bin/sh\nif [ "${"$"}1" = "--version" ]; then echo ${PINNED_DSH_VERSION}; exit 0; fi\nsleep 2\nexit 0\n`);
   chmodSync(slow, 0o755);
 
   process.env.RELAY_DB = join(dir, "state.db");

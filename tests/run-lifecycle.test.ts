@@ -1,5 +1,5 @@
 import { describe, expect, test, beforeEach, afterEach } from "bun:test";
-import { existsSync, chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -16,7 +16,9 @@ import {
   DUPLICATE_WRITER,
   ensureTaskWorktree,
   findActiveWriter,
+  gitOriginUrl,
   inheritFindings,
+  isSelfContainedWorkspace,
   launchTaskRun,
   planWorkspaceCleanup,
   runSubmitterError,
@@ -144,6 +146,16 @@ function newTask(extra: { prUrl?: string; prRepo?: string; checks?: { name: stri
 
 const outputRoot = () => join(dir, "runs");
 
+/** True when `cwd`'s repo has the commit object (no throw on absence). */
+function hasCommit(cwd: string, sha: string): boolean {
+  try {
+    execFileSync("git", ["-C", cwd, "cat-file", "-e", `${sha}^{commit}`], { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 describe("Task worktree: create / select / own (one branch+worktree per Task)", () => {
   test("creates a worktree on a deterministic branch and records it on the Task", () => {
     const id = newTask();
@@ -165,9 +177,8 @@ describe("Task worktree: create / select / own (one branch+worktree per Task)", 
     expect(b2.created).toBe(false);
     expect(b2.worktree).toBe(b1.worktree);
     expect(b2.branch).toBe(b1.branch);
-    // Exactly one worktree listing for that path.
-    const list = git(repo, "worktree", "list", "--porcelain");
-    expect(list.split(`${b1.worktree}`).length - 1).toBe(1);
+    // The SOURCE repo was never enlisted as a worktree owner (ISH-904).
+    expect(git(repo, "worktree", "list", "--porcelain")).not.toContain(b1.worktree);
   });
 
   test("refuses a non-code-change task", () => {
@@ -180,6 +191,218 @@ describe("Task worktree: create / select / own (one branch+worktree per Task)", 
     const t = getTask(db, id)!;
     expect(taskBranchName(t)).toContain("ish-760-");
     expect(taskBranchName({ ...t, branch: "feature/x" })).toBe("feature/x");
+  });
+});
+
+// ISH-904: the Task workspace must be SELF-CONTAINED — every git dir it needs
+// lives INSIDE it, so a `workspace-write` Run (writable set = the cwd) can
+// commit/push. A linked `git worktree add` checkout keeps its git dir at
+// `<source>/.git/worktrees/<T>` and its common dir at `<source>/.git`: both
+// outside, so every git mutation (index.lock, ORIG_HEAD, refs) was denied.
+describe("ISH-904: the workspace is self-contained (git dir + common dir inside)", () => {
+  const gitDirOf = (wt: string) => execFileSync("git", ["-C", wt, "rev-parse", "--path-format=absolute", "--git-dir"], { encoding: "utf8" }).trim();
+  const commonDirOf = (wt: string) =>
+    execFileSync("git", ["-C", wt, "rev-parse", "--path-format=absolute", "--git-common-dir"], { encoding: "utf8" }).trim();
+
+  test("git-dir AND git-common-dir resolve INSIDE the workspace (no <source>/.git)", () => {
+    const id = newTask();
+    const b = ensureTaskWorktree(db, id, { repo });
+    const gd = realpathSync(gitDirOf(b.worktree));
+    const cd = realpathSync(commonDirOf(b.worktree));
+    const wtr = realpathSync(b.worktree);
+    expect(gd.startsWith(wtr + "/")).toBe(true);
+    expect(cd.startsWith(wtr + "/")).toBe(true);
+    expect(gd).toBe(join(wtr, ".git"));
+    expect(cd).toBe(gd);
+    // Nothing in the workspace points back at the source repo's git dir.
+    expect(gd).not.toContain(realpathSync(join(repo, ".git")));
+    expect(cd).not.toContain(realpathSync(join(repo, ".git")));
+    expect(git(repo, "worktree", "list", "--porcelain")).not.toContain(wtr);
+    expect(isSelfContainedWorkspace(b.worktree)).toBe(true);
+  });
+
+  test("a legacy linked worktree is NOT self-contained (the ISH-904 regression)", () => {
+    const legacy = join(dir, "legacy-linked");
+    git(repo, "worktree", "add", "-q", "-b", "legacy/branch", legacy, "HEAD");
+    expect(isSelfContainedWorkspace(legacy)).toBe(false);
+    expect(realpathSync(gitDirOf(legacy)).startsWith(realpathSync(legacy) + "/")).toBe(false);
+  });
+
+  test("with the source repo's .git unwritable, the workspace still commits (workspace-write shape)", () => {
+    const id = newTask();
+    const b = ensureTaskWorktree(db, id, { repo });
+    const sourceGit = join(repo, ".git");
+    chmodSync(sourceGit, 0o500); // no writes under the SOURCE .git at all
+    try {
+      writeFileSync(join(b.worktree, "work.txt"), "implemented\n");
+      git(b.worktree, "add", "work.txt");
+      git(b.worktree, "-c", "user.email=relay@test", "-c", "user.name=relay-test", "commit", "-q", "-m", "ish-904");
+      expect(git(b.worktree, "rev-parse", "HEAD")).not.toBe(git(repo, "rev-parse", "HEAD"));
+      expect(git(b.worktree, "log", "-1", "--format=%s")).toBe("ish-904");
+    } finally {
+      chmodSync(sourceGit, 0o755);
+    }
+  });
+
+  test("origin points at the SOURCE repo's origin URL (never the local source path) and pushes", () => {
+    // A stand-in "GitHub": a bare repo OUTSIDE both the source and the workspace.
+    const remote = join(dir, "remote.git");
+    execFileSync("git", ["clone", "-q", "--bare", repo, remote]);
+    git(repo, "remote", "add", "origin", remote);
+    const id = newTask();
+    const b = ensureTaskWorktree(db, id, { repo });
+    expect(gitOriginUrl(repo)).toBe(remote);
+    expect(git(b.worktree, "remote", "get-url", "origin")).toBe(remote);
+    expect(git(b.worktree, "remote", "get-url", "--push", "origin")).toBe(remote);
+    expect(git(b.worktree, "remote", "get-url", "origin")).not.toBe(realpathSync(repo));
+
+    // The pinned brief's push command works as written.
+    execFileSync("git", ["-C", b.worktree, "push", "origin", `HEAD:refs/heads/${b.branch}`], { stdio: ["ignore", "pipe", "pipe"] });
+    expect(git(remote, "rev-parse", `refs/heads/${b.branch}`)).toBe(git(b.worktree, "rev-parse", "HEAD"));
+    expect(buildRunBrief(db, { ...getTask(db, id)!, pr_url: "81ueman/relay#9" }, { worktree: b.worktree, branch: b.branch }).text).toContain(
+      `git push origin HEAD:refs/heads/${b.branch}`
+    );
+  });
+
+  test("a source checkout that itself has alternates yields a clone with NO alternates escape", () => {
+    // The real shape: relay's source checkout may be a clone/worktree sharing
+    // `<main>/.git/objects`. A local clone of THAT would record an alternates
+    // path back outside the workspace.
+    const shared = join(dir, "shared-clone");
+    execFileSync("git", ["clone", "-q", "--shared", repo, shared], { stdio: ["ignore", "pipe", "pipe"] });
+    expect(existsSync(join(shared, ".git", "objects", "info", "alternates"))).toBe(true);
+    const id = newTask();
+    const b = ensureTaskWorktree(db, id, { repo: shared, base: "HEAD" });
+    expect(existsSync(join(b.worktree, ".git", "objects", "info", "alternates"))).toBe(false);
+    expect(isSelfContainedWorkspace(b.worktree)).toBe(true);
+    // And the workspace still has every object (it can check out + commit).
+    writeFileSync(join(b.worktree, "x.txt"), "x\n");
+    git(b.worktree, "add", "x.txt");
+    git(b.worktree, "-c", "user.email=relay@test", "-c", "user.name=relay-test", "commit", "-q", "-m", "x");
+    expect(git(b.worktree, "log", "-1", "--format=%s")).toBe("x");
+  });
+
+  test("a repo WITHOUT an origin gets NO remote (never the local source path)", () => {
+    const id = newTask();
+    const b = ensureTaskWorktree(db, id, { repo });
+    expect(gitOriginUrl(repo)).toBeNull();
+    // The local clone's origin was the source PATH; it is dropped, so nothing can
+    // push into the source checkout by accident.
+    expect(git(b.worktree, "remote")).toBe("");
+  });
+
+  test("the DEFAULT base is the SOURCE's origin/main, even when the source's local main is behind", () => {
+    const remote = join(dir, "remote.git");
+    execFileSync("git", ["clone", "-q", "--bare", repo, remote]);
+    git(repo, "remote", "add", "origin", remote);
+    git(repo, "fetch", "-q", "origin");
+    // The remote moves ahead of the source's local main.
+    const scratch = join(dir, "scratch");
+    execFileSync("git", ["clone", "-q", remote, scratch]);
+    execFileSync("git", ["-C", scratch, "config", "user.email", "r@test"]);
+    execFileSync("git", ["-C", scratch, "config", "user.name", "r-test"]);
+    writeFileSync(join(scratch, "remote-only.txt"), "remote\n");
+    execFileSync("git", ["-C", scratch, "add", "remote-only.txt"]);
+    execFileSync("git", ["-C", scratch, "commit", "-q", "-m", "remote ahead"]);
+    execFileSync("git", ["-C", scratch, "push", "-q", "origin", "HEAD:refs/heads/main"]);
+    git(repo, "fetch", "-q", "origin");
+    const remoteMain = git(repo, "rev-parse", "refs/remotes/origin/main");
+    const localMain = git(repo, "rev-parse", "refs/heads/main");
+    expect(remoteMain).not.toBe(localMain);
+
+    const id = newTask();
+    const b = ensureTaskWorktree(db, id, { repo });
+    // The clone's own origin/main would be the SOURCE's local main: the base must
+    // come from the source's remote-tracking ref instead.
+    expect(git(b.worktree, "rev-parse", "HEAD")).toBe(remoteMain);
+    expect(git(b.worktree, "rev-parse", "HEAD")).not.toBe(localMain);
+    expect(existsSync(join(b.worktree, "remote-only.txt"))).toBe(true);
+  });
+
+  test("the default base works when the source has no LOCAL main (origin/main is the only main)", () => {
+    const remote = join(dir, "remote.git");
+    execFileSync("git", ["clone", "-q", "--bare", repo, remote]);
+    git(repo, "remote", "add", "origin", remote);
+    git(repo, "fetch", "-q", "origin");
+    const remoteMain = git(repo, "rev-parse", "refs/remotes/origin/main");
+    git(repo, "update-ref", "-d", "refs/heads/main"); // orphan the source's local main
+    git(repo, "symbolic-ref", "HEAD", "refs/heads/main");
+    const id = newTask();
+    const b = ensureTaskWorktree(db, id, { repo });
+    expect(git(b.worktree, "rev-parse", "HEAD")).toBe(remoteMain);
+  });
+
+  test("a branch that exists ONLY on origin is checked out (re-running a pushed Task)", () => {
+    const remote = join(dir, "remote.git");
+    execFileSync("git", ["clone", "-q", "--bare", repo, remote]);
+    git(repo, "remote", "add", "origin", remote);
+    git(repo, "fetch", "-q", "origin");
+    git(repo, "checkout", "-q", "-b", "relay/ish-904");
+    writeFileSync(join(repo, "pushed.txt"), "pushed\n");
+    git(repo, "add", "pushed.txt");
+    git(repo, "commit", "-q", "-m", "pushed work");
+    const pushedSha = git(repo, "rev-parse", "HEAD");
+    git(repo, "push", "-q", "origin", "relay/ish-904");
+    // The source has neither the local branch nor a local fetch of the push: only
+    // the remote-tracking side of a fresh fetch exists — drop that too.
+    git(repo, "checkout", "-q", "main");
+    git(repo, "branch", "-q", "-D", "relay/ish-904");
+    git(repo, "update-ref", "-d", "refs/remotes/origin/relay/ish-904");
+    git(repo, "fetch", "-q", "origin"); // the branch now exists ONLY on origin
+
+    const t = intakeTask(db, { provider: "test", issueId: "ISH-904", codeChange: true, title: "x" });
+    const b = ensureTaskWorktree(db, t.id, { repo, branch: "relay/ish-904" });
+    expect(b.branch).toBe("relay/ish-904");
+    expect(git(b.worktree, "rev-parse", "--abbrev-ref", "HEAD")).toBe("relay/ish-904");
+    expect(git(b.worktree, "rev-parse", "HEAD")).toBe(pushedSha);
+    expect(existsSync(join(b.worktree, "pushed.txt"))).toBe(true);
+  });
+
+  test("creating a workspace never touches the network (the remote is unreachable)", () => {
+    git(repo, "remote", "add", "origin", "https://unreachable.invalid/never.git");
+    const id = newTask();
+    const b = ensureTaskWorktree(db, id, { repo });
+    expect(b.created).toBe(true);
+    expect(git(b.worktree, "remote", "get-url", "origin")).toBe("https://unreachable.invalid/never.git");
+    expect(git(b.worktree, "rev-parse", "--abbrev-ref", "HEAD")).toBe(b.branch);
+  });
+
+  test("reuses an existing Task branch (local source branch) and checks it out", () => {
+    git(repo, "branch", "relay/ish-904", "HEAD");
+    const t = intakeTask(db, { provider: "test", issueId: "ISH-904", codeChange: true, title: "x" });
+    const b = ensureTaskWorktree(db, t.id, { repo, branch: "relay/ish-904" });
+    expect(b.branch).toBe("relay/ish-904");
+    expect(git(b.worktree, "rev-parse", "--abbrev-ref", "HEAD")).toBe("relay/ish-904");
+    expect(isSelfContainedWorkspace(b.worktree)).toBe(true);
+  });
+
+  test("an explicit base that only exists in the SOURCE local refs is honoured", () => {
+    git(repo, "checkout", "-q", "-b", "base/local-only");
+    writeFileSync(join(repo, "base-only.txt"), "local base\n");
+    git(repo, "add", "base-only.txt");
+    git(repo, "commit", "-q", "-m", "local-only base");
+    const baseSha = git(repo, "rev-parse", "HEAD");
+    git(repo, "checkout", "-q", "-");
+    const id = newTask();
+    const b = ensureTaskWorktree(db, id, { repo, base: "base/local-only" });
+    expect(git(b.worktree, "rev-parse", "HEAD")).toBe(baseSha);
+    expect(existsSync(join(b.worktree, "base-only.txt"))).toBe(true);
+  });
+
+  test("an existing NON self-contained directory at the path is refused", () => {
+    const id = newTask();
+    const target = join(dir, "worktrees", getTask(db, id)!.id);
+    mkdirSync(join(dir, "worktrees"), { recursive: true });
+    git(repo, "worktree", "add", "-q", "-b", "linked/at-path", target, "HEAD");
+    expect(() => ensureTaskWorktree(db, id, { repo, worktreesRoot: join(dir, "worktrees") })).toThrow(/not a self-contained git clone/);
+  });
+
+  test("a failed checkout leaves NO half-made workspace behind (fail closed)", () => {
+    const id = newTask();
+    const target = join(dir, "worktrees", getTask(db, id)!.id);
+    expect(() => ensureTaskWorktree(db, id, { repo, path: target, base: "does/not/exist" })).toThrow(/WORKTREE_ERROR/);
+    expect(existsSync(target)).toBe(false);
+    expect(getTask(db, id)!.worktree).toBeNull();
   });
 });
 
@@ -454,6 +677,70 @@ describe("safe cleanup: permissions, evidence, PR lifecycle", () => {
     expect(plan.removed).toBe(true);
     expect(existsSync(b.worktree)).toBe(false);
     expect(getTask(db, id)!.worktree).toBeNull();
+  });
+
+  test("reclaiming a clone workspace is idempotent and never touches the SOURCE .git", async () => {
+    const id = newTask();
+    const b = ensureTaskWorktree(db, id, { repo });
+    const sourceHead = git(repo, "rev-parse", "HEAD");
+    const opts = { apply: true, abort: "abort", repo, worktreesRoot: join(dir, "worktrees") };
+    expect(applyWorkspaceCleanup(db, id, opts).removed).toBe(true);
+    expect(existsSync(b.worktree)).toBe(false);
+    // Second apply: the ledger binding is gone -> a plain no-op, never a throw.
+    const again = applyWorkspaceCleanup(db, id, opts);
+    expect(again.removed).toBe(false);
+    expect(again.reasons.join(" ")).toMatch(/no recorded worktree/);
+    // The source repo is unchanged: same HEAD, no worktree enlisted, still clean.
+    expect(git(repo, "rev-parse", "HEAD")).toBe(sourceHead);
+    expect(git(repo, "worktree", "list", "--porcelain")).not.toContain(b.worktree);
+    expect(git(repo, "status", "--porcelain")).toBe("");
+  });
+
+  test("an UNPUSHED commit on the workspace is copied into the SOURCE repo before removal", () => {
+    const remote = join(dir, "remote.git");
+    execFileSync("git", ["clone", "-q", "--bare", repo, remote]);
+    git(repo, "remote", "add", "origin", remote);
+    const id = newTask();
+    const b = ensureTaskWorktree(db, id, { repo });
+    writeFileSync(join(b.worktree, "wip.txt"), "wip\n");
+    git(b.worktree, "add", "wip.txt");
+    git(b.worktree, "-c", "user.email=relay@test", "-c", "user.name=relay-test", "commit", "-q", "-m", "unpushed work");
+    const unpushed = git(b.worktree, "rev-parse", "HEAD");
+    expect(hasCommit(repo, unpushed)).toBe(false); // not in the source yet
+
+    const opts = { apply: true, abort: "abandoned", repo, worktreesRoot: join(dir, "worktrees") };
+    const plan = applyWorkspaceCleanup(db, id, opts);
+    expect(plan.removed).toBe(true);
+    expect(existsSync(b.worktree)).toBe(false);
+    // The commit survived in the source repo (what a linked worktree used to give).
+    expect(hasCommit(repo, unpushed)).toBe(true);
+    expect(git(repo, "log", "-1", "--format=%s", "refs/relay-kept/HEAD")).toBe("unpushed work");
+  });
+
+  test("a PUSHED commit needs no rescue (cleanup is a plain removal)", () => {
+    const remote = join(dir, "remote.git");
+    execFileSync("git", ["clone", "-q", "--bare", repo, remote]);
+    git(repo, "remote", "add", "origin", remote);
+    const id = newTask();
+    const b = ensureTaskWorktree(db, id, { repo });
+    writeFileSync(join(b.worktree, "pushed.txt"), "pushed\n");
+    git(b.worktree, "add", "pushed.txt");
+    git(b.worktree, "-c", "user.email=relay@test", "-c", "user.name=relay-test", "commit", "-q", "-m", "pushed work");
+    git(b.worktree, "push", "-q", "origin", `HEAD:refs/heads/${b.branch}`);
+    const plan = applyWorkspaceCleanup(db, id, { apply: true, abort: "aborted", repo, worktreesRoot: join(dir, "worktrees") });
+    expect(plan.removed).toBe(true);
+  });
+
+  test("--force really discards unpushed commits (no rescue ref is written)", () => {
+    git(repo, "remote", "add", "origin", join(dir, "no-remote.git"));
+    const id = newTask();
+    const b = ensureTaskWorktree(db, id, { repo });
+    writeFileSync(join(b.worktree, "wip.txt"), "wip\n");
+    git(b.worktree, "add", "wip.txt");
+    git(b.worktree, "-c", "user.email=relay@test", "-c", "user.name=relay-test", "commit", "-q", "-m", "discarded");
+    const plan = applyWorkspaceCleanup(db, id, { apply: true, force: true, abort: "discard", repo, worktreesRoot: join(dir, "worktrees") });
+    expect(plan.removed).toBe(true);
+    expect(git(repo, "for-each-ref", "--format=%(refname)", "refs/relay-kept/")).toBe("");
   });
 
   test("a real merge allows cleanup and the run evidence is retained", async () => {
