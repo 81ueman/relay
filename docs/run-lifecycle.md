@@ -59,11 +59,24 @@ complete on its own.
 
 `origin` is re-pointed at the **source repo's `origin` URL**
 (`git -C <source> remote get-url origin`), so the pinned brief's
-`git push origin HEAD:refs/heads/<branch>` pushes to the real provider (a source
-with no origin keeps the clone's local origin; Relay never invents a remote).
-The base ref may only exist in the source's local refs; it is then fetched from
-the source PATH (`refs/relay-base/<name>`) — still no network. A `HEAD` base is
-imported from the source likewise.
+`git push origin HEAD:refs/heads/<branch>` pushes to the real provider. A source
+with no origin has no provider to push to, so the clone's local-path origin is
+**removed** (Relay never invents a remote, and nothing can push into the source
+checkout by accident).
+
+Everything else is answered from **local** refs — creating a workspace never
+runs `ls-remote`, so it needs no network or credentials:
+
+- **Base** is resolved in the SOURCE (`git -C <source> rev-parse <base>^{commit}`)
+  and that commit is fetched from the source path. This matters because the
+  clone's own `refs/remotes/origin/*` are copies of the source's **local**
+  branches: left to itself, the default `origin/main` would mean the source's
+  local `main`, not the real `refs/remotes/origin/main`. So `origin/main` means
+  the same thing it did before ISH-904.
+- **Existing branch** (a re-run/FIX of `relay/<n>`): the source's local branch if
+  it has one, else its `refs/remotes/origin/<branch>` — a branch that was pushed
+  to GitHub but has no local source branch, which a linked `git worktree add` used
+  to resolve. It is imported into the clone at the same name (local path fetch).
 
 Consumers that read a produced head from the SOURCE repo (the ISH-829 detached
 review worktree) import it first: the source does not share the workspace's
@@ -159,7 +172,8 @@ guard passes:
 - no Run still holds the worktree/branch;
 - the worktree is **relay-owned** (under the Relay worktrees root, never the main
   checkout or a human workspace);
-- it has **no uncommitted changes** (`--force` overrides only the last two).
+- it has **no uncommitted changes** (`--force` overrides only the last two);
+- its commits are on a remote, or were copied back into the source repo (above).
 
 The `runs` rows and their output directories are **never** deleted by cleanup —
 they are the evidence. The Task row and its structured results survive too.
@@ -169,6 +183,16 @@ SOURCE repo's `.git` is never touched (a linked `git worktree remove` would have
 mutated it). A legacy linked worktree recorded before ISH-904 is still reclaimed
 through `git worktree remove` in its own source. Cleanup is idempotent: a second
 `--apply` sees no recorded workspace and is a no-op.
+
+Deleting the directory also deletes the Task branch. A linked worktree left its
+branch (and every commit on it) in the source repo, so before removal cleanup
+checks whether the workspace holds commits **no remote has**
+(`git rev-list <head/branch> --not --remotes`, after refreshing `origin`; an
+unreachable remote just keeps the last known tracking state). Those commits are
+copied back into the source repo under `refs/relay-kept/<branch>/*` and
+`refs/relay-kept/HEAD` (a local path fetch, event `worktree.commits_kept`), which
+is the custody the linked worktree used to provide. If the copy fails, removal is
+refused. `--force` skips this and really discards the commits.
 
 ## One-command fixture smoke
 
