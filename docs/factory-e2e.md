@@ -15,8 +15,12 @@ merged, NOT Linear Done).
 - **Coding worker = `dsh` headless** — `dsh --profile headless --json`, **pinned
   `0.2.1-rc.2`**. One Run = one process = one coding attempt.
 - **Independent reviewer = Claude** — `claude -p --output-format json`, invoked
-  **read-only** (`--allowedTools "Read Grep Glob"`), returning ONE structured
-  verdict. The Gateway and reviewer deliberately use different models/harnesses.
+  **read-only** with `--permission-mode auto` by default (**never**
+  `bypassPermissions`, no all-tools allowlist; the brief still says READ-ONLY),
+  returning ONE structured verdict. The brief also carries the mechanical VERIFY
+  result already produced in the Task's sandbox, so the host reviewer can judge
+  the code without re-running the lab. The Gateway and reviewer deliberately use
+  different models/harnesses.
 
 ## Pipeline and where it lives
 

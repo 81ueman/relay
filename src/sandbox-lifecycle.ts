@@ -250,9 +250,26 @@ function ensureSandboxBranch(cli: SbxCli, name: string, workspace: string, branc
   return cur.ok && cur.out.trim() === branch;
 }
 
+/**
+ * ISH-830e: make the pinned `.relay/` directory (the Run brief) invisible to the
+ * sandbox clone's `git status`, mirroring the host worktree's `ensureRelayExcluded`.
+ * The brief pin is untracked; a repo without `.relay/` in its tracked `.gitignore`
+ * would otherwise be "dirty", and the VERIFY clean-tree fence (`sandboxTreeState`)
+ * would fail closed with `not_run` — the Factory then blocks with `verify not_run`
+ * and the review leg is never reached. Best-effort: a failure never blocks the Run.
+ */
+export function ensureSandboxRelayExcluded(cli: SbxCli, name: string, workspace: string): void {
+  const script = [
+    "mkdir -p .relay",
+    "g=$(git rev-parse --path-format=absolute --git-common-dir)",
+    'mkdir -p "$g/info"',
+    `grep -qxF '.relay/' "$g/info/exclude" 2>/dev/null || printf '.relay/\\n' >> "$g/info/exclude"`,
+  ].join(" && ");
+  cli.run(sbxExecArgv(name, bashLc(script), { workdir: workspace }));
+}
+
 /** The in-clone HEAD (used as the Run's base/staleness fence). */
-export function sandboxHead(cli: SbxCli, name: string, workspace: string): string | null {
-  const r = cli.run(sbxExecArgv(name, ["git", "rev-parse", "HEAD"], { workdir: workspace }));
+export function sandboxHead(cli: SbxCli, name: string, workspace: string): string | null {  const r = cli.run(sbxExecArgv(name, ["git", "rev-parse", "HEAD"], { workdir: workspace }));
   const sha = r.ok ? r.out.trim().split(/\s+/)[0] : "";
   return /^[0-9a-f]{7,40}$/.test(sha) ? sha : null;
 }
@@ -607,7 +624,11 @@ export async function launchTaskSandboxRun(
   let briefPath: string | null = null;
   const briefDest = join(binding.workspace, ".relay", "run-brief.md");
   // `sbx cp` tar-extracts into the destination dir, which must already exist.
-  cli.run(sbxExecArgv(binding.name, bashLc("mkdir -p .relay"), { workdir: binding.workspace }));
+  // ISH-830e: also make `.relay/` invisible to the clone's `git status` (via
+  // `.git/info/exclude`, mirroring the host worktree). The pin is untracked; a
+  // fixture repo without `.relay/` in its tracked `.gitignore` would otherwise be
+  // "dirty", and the VERIFY clean-tree fence would fail closed with `not_run`.
+  ensureSandboxRelayExcluded(cli, binding.name, binding.workspace);
   const cp = cli.run(["cp", specPath, `${binding.name}:${briefDest}`]);
   if (cp.ok) briefPath = briefDest;
   else events({ t: "sandbox.brief_pin_failed", error: cp.err || cp.out });

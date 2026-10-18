@@ -363,7 +363,8 @@ logs each new decision identity once. One-command real-PR dry run:
 whole factory with **no hand-driven TUI/pane for the coding**: a real headless
 dsh Run implements, Relay **mechanically VERIFYs** the recorded worktree/HEAD, an
 **independent headless Claude** reviewer (`claude -p --output-format json`,
-read-only) returns a **structured** FIX/PASS, a FIX is the **SAME worktree + a
+read-only; `--permission-mode auto` by default — **never** `bypassPermissions`;
+the brief carries the mechanical VERIFY result) returns a **structured** FIX/PASS, a FIX is the **SAME worktree + a
 fresh dsh Run** with the findings, and a PASS reaches **read-only MergeReady**.
 It is sequencing only — every transition reuses the ordinary durable results
 (`acceptRunSubmission`, `runMechanicalVerification`, `recordReview`,

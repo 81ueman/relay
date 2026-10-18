@@ -25,6 +25,8 @@ import {
   DEFAULT_REVIEWER_WORKER,
   runHeadlessReview,
   type ReviewerSpawner,
+  type ReviewerVerdict,
+  type ReviewVerifyEvidence,
 } from "./reviewer-runner";
 import { checkMergeGate, type MergeGateDecision, type MergeGateDeps } from "./merge-gate";
 import { prepareReadOnlyReviewWorktree, removeReviewWorktree } from "./review-workspace";
@@ -631,6 +633,47 @@ function reviewEvidenceBase(deps: FactoryDeps, taskId: string): string {
 }
 
 /**
+ * ISH-830e: a BLOCKED VERIFY must name the fence that failed. `verify not_run`
+ * alone is opaque (it hid a dirty-tree fence failure in the ISH-830 harness); the
+ * per-check outcome + a bounded output tail make the block diagnosable.
+ */
+export function verifyChecksReason(
+  checks: { name: string; outcome: string; exitCode: number | null; output?: string }[]
+): string {
+  const parts = checks.map(
+    (c) =>
+      `${c.name}=${c.outcome}${c.exitCode === null ? "" : `(exit ${c.exitCode})`}: ${(c.output ?? "")
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, 300)}`
+  );
+  return parts.join("; ") || "no checks executed";
+}
+
+/**
+ * ISH-830e: a BLOCKED review must yield a PRECISE, non-empty reason. The reviewer
+ * may legitimately answer `{"verdict":"blocked","summary":""}` (or omit the
+ * summary) when it cannot judge — collapsing that to `""` loses the only signal
+ * the caller (and the ISH-830 harness) has, and looks like an unexplained block.
+ * Prefer the reviewer's summary, then its findings, then a deterministic
+ * description naming the verdict and the durable evidence path.
+ */
+export function reviewBlockedReason(r: {
+  verdict: ReviewerVerdict | null;
+  evidenceRef: string | null;
+}): string {  const summary = r.verdict?.summary?.trim() ?? "";
+  const findings = (r.verdict?.findings ?? []).map(
+    (f) => `[${f.severity}] ${f.file ? `${f.file}${f.line ? `:${f.line}` : ""}: ` : ""}${f.message}`
+  );
+  const parts = [summary, ...findings].filter(Boolean);
+  if (parts.length > 0) return parts.join("\n");
+  const detail = r.verdict
+    ? `reviewer returned verdict '${r.verdict.verdict}' with no summary or findings`
+    : "reviewer returned no structured verdict";
+  return `review blocked: ${detail}${r.evidenceRef ? ` (evidence: ${r.evidenceRef})` : ""}`;
+}
+
+/**
  * Run the whole factory for one Task. Returns a structured result; it NEVER
  * merges, accepts, pushes, or writes to a provider/Linear.
  */
@@ -654,6 +697,9 @@ export async function runFactoryTask(
   const guardMax = maxAttempts * 6 + 12;
   let lastAttempt = -1;
   let current: FactoryAttempt | null = null;
+  // ISH-830e: the mechanical VERIFY result for the CURRENT attempt, captured at
+  // the (sandbox) verify step and handed to the host reviewer as context.
+  let lastVerify: (ReviewVerifyEvidence & { attempt: number }) | null = null;
 
   const push = (s: string) => {
     steps.push(s);
@@ -733,12 +779,26 @@ export async function runFactoryTask(
           // fail -> implement (new attempt) for a real breakage; NOT_RUN -> blocked.
           const live = getTask(db, taskId)!;
           if (live.state === "blocked_human") {
-            return { taskId, outcome: "blocked", head: live.head_sha, attempts, gate: null, reason: `verify ${v.outcome}`, steps };
+            return { taskId, outcome: "blocked", head: live.head_sha, attempts, gate: null, reason: `verify ${v.outcome}: ${verifyChecksReason(v.checks)}`, steps };
           }
           push(`verify:${v.outcome}@${task.attempt} -> new attempt`);
           continue;
         }
         push(`verify:pass@${task.attempt}`);
+        // ISH-830e: capture the sandbox VERIFY result (with the raw check output)
+        // for the review brief — the host reviewer never sees the sandbox.
+        lastVerify = {
+          attempt: task.attempt,
+          head: getTask(db, taskId)!.head_sha,
+          outcome: v.outcome,
+          checks: v.checks.map((c) => ({
+            name: c.name,
+            required: c.required,
+            outcome: c.outcome,
+            exitCode: c.exitCode,
+            output: c.output,
+          })),
+        };
         continue;
       }
       case "review": {
@@ -792,6 +852,9 @@ export async function runFactoryTask(
             // dangle).
             evidenceBase: task.worktree ? undefined : reviewEvidenceBase(deps, taskId),
             nativeReview: deps.nativeReview,
+            // ISH-830e: give the host reviewer the sandbox VERIFY evidence so it
+            // can judge the code without re-running the lab.
+            ...(lastVerify && lastVerify.attempt === task.attempt ? { verifyEvidence: lastVerify } : {}),
           });
         } finally {
           if (reviewWorktree) removeReviewWorktree(deps.repo ?? projectRoot(), reviewWorktree);
@@ -802,7 +865,7 @@ export async function runFactoryTask(
         }
         if (r.outcome === "blocked") {
           const live = getTask(db, taskId)!;
-          return { taskId, outcome: "blocked", head: live.head_sha, attempts, gate: null, reason: r.verdict?.summary ?? "review blocked", steps };
+          return { taskId, outcome: "blocked", head: live.head_sha, attempts, gate: null, reason: reviewBlockedReason(r), steps };
         }
         push(`review:${r.outcome}@${task.attempt}`);
         continue;
