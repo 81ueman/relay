@@ -5,6 +5,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb } from "../src/db";
+import { logEvent } from "../src/events";
 import { claimTask, getTask } from "../src/tasks";
 import { registerWorker } from "../src/workers";
 import { intakeTask, recordVerification, submitPhase } from "../src/workflow";
@@ -102,7 +103,7 @@ class FakeNativeGitHub implements GitHubReadOnly, GitHubReviewReader {
   }
 
   /** Simulate the reviewer's native POST (via its own `gh`). */
-  record(b: { headSha: string; body: string; author?: string }): ReviewView {
+  record(b: { headSha: string; body: string; author?: string; state?: string; createdAt?: string }): ReviewView {
     const id = this.nextId++;
     const v: ReviewView = {
       id,
@@ -110,10 +111,10 @@ class FakeNativeGitHub implements GitHubReadOnly, GitHubReviewReader {
       prNumber: this.pr.ref.number,
       author: b.author ?? this.author,
       headSha: b.headSha,
-      state: "COMMENTED",
+      state: b.state ?? "COMMENTED",
       body: b.body,
       url: `https://github.com/${this.pr.ref.repo}/pull/${this.pr.ref.number}#discussion_r${id}`,
-      createdAt: "2026-01-01T00:00:00Z",
+      createdAt: b.createdAt ?? "2026-01-01T00:00:00Z",
     };
     this.reviews.push(v);
     return v;
@@ -137,7 +138,7 @@ class FakeNativeGitHub implements GitHubReadOnly, GitHubReviewReader {
   }
 }
 
-type PostPlan = "ok" | "missing" | "wronghead" | "nomarker" | "wrongauthor";
+type PostPlan = "ok" | "missing" | "wronghead" | "nomarker" | "wrongauthor" | "pending" | "dismissed";
 
 /**
  * A fake headless Claude reviewer: it reads its cwd HEAD, optionally POSTs a
@@ -161,7 +162,8 @@ function reviewer(
           post === "nomarker"
             ? "reviewed, no marker"
             : `<!-- ishiul-review head=${markerHead} verdict=${MARKER_VERDICT[v]} reviewer=${gh.author} -->\n\nrelay review`;
-        gh.record({ headSha: markerHead, body, ...(post === "wrongauthor" ? { author: "someone-else" } : {}) });
+        const state = post === "pending" ? "PENDING" : post === "dismissed" ? "DISMISSED" : "COMMENTED";
+        gh.record({ headSha: markerHead, body, state, ...(post === "wrongauthor" ? { author: "someone-else" } : {}) });
       }
       return {
         exitCode: 0,
@@ -265,6 +267,68 @@ describe("runHeadlessReview verifies the reviewer's native GitHub review (ISH-88
     const r = await runHeadlessReview(db, id, { spawner: reviewer(gh, { post: "wrongauthor" }).spawner, nativeReview: nativeDeps(gh) });
     expect(r.outcome).toBe("refused");
     expect(r.error).toContain(REVIEW_NATIVE_MISSING);
+  });
+
+  test("refuses a PENDING (never-submitted) review", async () => {
+    const head = HEAD();
+    const id = driveToReview(head);
+    const gh = new FakeNativeGitHub(prView(head));
+    const r = await runHeadlessReview(db, id, { spawner: reviewer(gh, { post: "pending" }).spawner, nativeReview: nativeDeps(gh) });
+    expect(gh.reviews[0].state).toBe("PENDING");
+    expect(r.outcome).toBe("refused");
+    expect(r.error).toContain(REVIEW_NATIVE_MISSING);
+    expect(getTask(db, id)!.phase).toBe("review");
+  });
+
+  test("refuses a DISMISSED review", async () => {
+    const head = HEAD();
+    const id = driveToReview(head);
+    const gh = new FakeNativeGitHub(prView(head));
+    const r = await runHeadlessReview(db, id, { spawner: reviewer(gh, { post: "dismissed" }).spawner, nativeReview: nativeDeps(gh) });
+    expect(gh.reviews[0].state).toBe("DISMISSED");
+    expect(r.outcome).toBe("refused");
+    expect(r.error).toContain(REVIEW_NATIVE_MISSING);
+    expect(getTask(db, id)!.phase).toBe("review");
+  });
+
+  test("refuses an old same-HEAD review after a base-changed invalidation", async () => {
+    const head = HEAD();
+    const id = driveToReview(head);
+    const gh = new FakeNativeGitHub(prView(head));
+    // A review at the HEAD that predates the base retarget (posted for the old base).
+    const old = gh.record({
+      headSha: head,
+      state: "COMMENTED",
+      createdAt: "2000-01-01T00:00:00Z",
+      body: `<!-- ishiul-review head=${head} verdict=OK reviewer=${gh.author} -->\n\nold base review`,
+    });
+    // A base retarget re-opens the review at the SAME HEAD (attempt+1).
+    logEvent(db, {
+      source: "workflow",
+      taskId: id,
+      type: "workflow.review_invalidated",
+      payload: { reason: "base-changed", toHead: head, toAttempt: 1 },
+    });
+    // The reviewer posts nothing new; the old review must NOT be re-accepted.
+    const r = await runHeadlessReview(db, id, { spawner: reviewer(gh, { post: "missing" }).spawner, nativeReview: nativeDeps(gh) });
+    expect(old.createdAt).toBe("2000-01-01T00:00:00Z");
+    expect(r.outcome).toBe("refused");
+    expect(r.error).toContain(REVIEW_NATIVE_MISSING);
+    expect(getTask(db, id)!.phase).toBe("review");
+  });
+
+  test("prefers the NEWEST matching same-HEAD review", async () => {
+    const head = HEAD();
+    const id = driveToReview(head);
+    const gh = new FakeNativeGitHub(prView(head));
+    const marker = `<!-- ishiul-review head=${head} verdict=OK reviewer=${gh.author} -->`;
+    const older = gh.record({ headSha: head, body: marker, createdAt: "2020-01-01T00:00:00Z" });
+    const newer = gh.record({ headSha: head, body: marker, createdAt: "2025-01-01T00:00:00Z" });
+    // The reviewer posts nothing new; the read-back must pick the newest.
+    const r = await runHeadlessReview(db, id, { spawner: reviewer(gh, { post: "missing" }).spawner, nativeReview: nativeDeps(gh) });
+    expect(r.outcome).toBe("pass");
+    expect(r.nativeReview?.id).toBe(newer.id);
+    expect(r.nativeReview?.id).not.toBe(older.id);
   });
 
   test("refuses when the PR has moved off the reviewed HEAD", async () => {

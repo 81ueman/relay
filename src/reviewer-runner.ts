@@ -13,12 +13,15 @@ import { recordReview, taskChecks } from "./workflow";
 import { getWorker, registerWorker } from "./workers";
 import {
   headsMatch,
+  latestReviewInvalidationAt,
+  markerAfterInvalidation,
   parsePrUrl,
   reviewBodyHasMarker,
   type GitHubReadOnly,
   type MarkerVerdict,
   type NativeReviewDeps,
   type PrRef,
+  type ReviewMarker,
   type ReviewView,
 } from "./providers";
 
@@ -229,11 +232,13 @@ export function buildReviewBrief(
       "review BODY MUST contain EXACTLY this marker (OK for pass, NG for fix, HOLD for",
       "blocked):",
       `<!-- ishiul-review head=${opts.head} verdict=OK|NG|HOLD reviewer=${author} -->`,
-      "If a review by the same reviewer at this EXACT HEAD already exists, do NOT",
+      `Post ONE review for THIS review attempt (attempt=${task.attempt}). If a review by`,
+      "the same reviewer at this EXACT HEAD was already posted for THIS attempt, do NOT",
       "post another (check with `gh api repos/" + ref.repo + "/pulls/" + ref.number + "/reviews`).",
-      "Do NOT post at another commit; do NOT approve or request changes (a COMMENT",
-      "review is enough). Relay reads the ACTUAL GitHub review back — a missing",
-      "review, or one not at this HEAD, is refused."
+      "After a base retarget the SAME HEAD is re-reviewed at a new attempt — then post a",
+      "fresh review. Do NOT post at another commit; do NOT approve or request changes (a",
+      "COMMENT review is enough). Relay reads the ACTUAL GitHub review back — a missing,",
+      "stale (before a base change), or non-COMMENTED review is refused."
     );
   }
   lines.push(
@@ -452,13 +457,15 @@ export interface NativeReviewOutcome {
 
 /**
  * Read the reviewer's native PR review BACK from GitHub and accept it only when
- * it was authored by the expected GitHub identity, is pinned to the EXACT
- * reviewed HEAD, carries the head-pinned verdict marker, and the PR's CURRENT
- * head is still that commit. A missing review, a failed read, a foreign author,
- * a mismatched HEAD/PR, or a moved HEAD is `ok:false` — the caller records
+ * it is a submitted `COMMENTED` review authored by the expected GitHub identity,
+ * pinned to the EXACT reviewed HEAD, carrying the head-pinned verdict marker,
+ * posted AFTER any base-changed invalidation at that HEAD, and the PR's CURRENT
+ * head is still that commit. A missing/foreign/PENDING/DISMISSED/mismatched/
+ * stale/moved-HEAD review or a failed read is `ok:false` — the caller records
  * NOTHING. Relay never trusts the reviewer's own URL/JSON, and never posts here.
  */
 export function verifyNativeReview(
+  db: Database,
   task: Task,
   verdict: ReviewerVerdict,
   head: string,
@@ -473,20 +480,35 @@ export function verifyNativeReview(
   if (reviews === null) {
     return fail(`${REVIEW_NATIVE_UNVERIFIED}: could not read reviews for ${ref.repo}#${ref.number} (failed read)`);
   }
-  const found =
-    reviews.find(
-      (r) =>
-        (r.author ?? "").toLowerCase() === native.author.toLowerCase() &&
-        headsMatch(r.headSha, head) &&
-        reviewBodyHasMarker(r.body, head, marker)
-    ) ?? null;
+  // A base-branch retarget re-opens the review at the SAME HEAD (attempt+1). A
+  // review posted before that invalidation judged the OLD base's diff, so it must
+  // not be re-accepted (the same rule the marker path uses).
+  const invalidatedAt = latestReviewInvalidationAt(db, task.id, head);
+  // Accept ONLY a submitted COMMENT review by the expected author at the exact
+  // HEAD whose body carries the matching verdict marker and that is fresh enough.
+  // A PENDING (never submitted) or DISMISSED/APPROVED/CHANGES_REQUESTED review is
+  // never a valid Relay verdict; the brief allows a COMMENT only.
+  const candidates = reviews.filter(
+    (r) =>
+      (r.author ?? "").toLowerCase() === native.author.toLowerCase() &&
+      (r.state ?? "").toUpperCase() === "COMMENTED" &&
+      headsMatch(r.headSha, head) &&
+      reviewBodyHasMarker(r.body, head, marker) &&
+      markerAfterInvalidation({ createdAt: r.createdAt } as ReviewMarker, invalidatedAt)
+  );
+  // Prefer the NEWEST match: an older same-HEAD review must not win over a newer
+  // one (an older OK never beats a newer NG). Unparseable timestamps sort last.
+  const timeOf = (r: ReviewView): number => {
+    const t = Date.parse(r.createdAt);
+    return Number.isFinite(t) ? t : Number.NEGATIVE_INFINITY;
+  };
+  candidates.sort((a, b) => timeOf(b) - timeOf(a));
+  const found = candidates[0] ?? null;
   if (!found) {
     return fail(
-      `${REVIEW_NATIVE_MISSING}: no '${native.author}' review at HEAD ${head} with verdict ${marker} on ${ref.repo}#${ref.number}`
+      `${REVIEW_NATIVE_MISSING}: no fresh COMMENTED '${native.author}' review at HEAD ${head} with verdict ${marker} on ${ref.repo}#${ref.number}` +
+        (invalidatedAt > 0 ? ` (reviews before the base-changed invalidation do not count)` : "")
     );
-  }
-  if (found.prNumber !== ref.number) {
-    return fail(`${REVIEW_NATIVE_UNVERIFIED}: review ${found.id} is on PR ${found.prNumber}, not ${ref.number}`);
   }
   // A moved PR HEAD invalidates the review even when the read-back review is
   // pinned: GitHub's CURRENT head must still be the reviewed commit.
@@ -719,7 +741,7 @@ export async function runHeadlessReview(
   // Task never advances on the reviewer's own URL/JSON alone.
   let nativeReview: ReviewView | null = null;
   if (deps.nativeReview) {
-    const nr = verifyNativeReview(task, verdict, head, deps.nativeReview);
+    const nr = verifyNativeReview(db, task, verdict, head, deps.nativeReview);
     if (!nr.ok) {
       logEvent(db, {
         source: "factory",

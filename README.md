@@ -382,13 +382,16 @@ disposable review checkout — never the coding writer's tree, never a push or a
 merge). Relay then accepts the verdict only after reading the **actual** GitHub
 review back — never the reviewer's own URL or JSON verdict. The review body must
 carry the head-pinned `<!-- ishiul-review head=<sha> verdict=OK|NG|HOLD
-reviewer=<id> -->` marker, and Relay requires a review by the expected GitHub
-`author`, pinned to the exact reviewed `commit_id`, on the bound `PR number`, with
-GitHub's **current** PR head still that commit. A missing review, a foreign
-author, a mismatched HEAD/PR, a moved HEAD, or an unreadable read is **REFUSED**
-(fail closed — the Task never advances); the verified review id/url is retained in
-the local evidence next to the structured verdict. Mechanical VERIFY and the merge
-gate are unchanged.
+reviewer=<id> -->` marker, and Relay requires a submitted **`COMMENTED`** review
+(a `PENDING`/`DISMISSED` review is never a verdict) by the expected GitHub
+`author`, pinned to the exact reviewed `commit_id`, on the bound `PR number`,
+posted **after any base-change invalidation at that HEAD** (the newest fresh match
+wins, so a stale pre-retarget review is not re-accepted), with GitHub's **current**
+PR head still that commit. A missing review, a foreign author, a mismatched
+HEAD/PR, a moved HEAD, a stale same-HEAD review, or an unreadable read is
+**REFUSED** (fail closed — the Task never advances); the verified review id/url is
+retained in the local evidence next to the structured verdict. Mechanical VERIFY
+and the merge gate are unchanged.
 
 This external write is **deny-by-default** (ISH-288): the reviewer is given the
 `gh` shell + a scoped token (`RELAY_REVIEW_GH_TOKEN`, else `GH_TOKEN`) ONLY when
