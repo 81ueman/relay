@@ -222,15 +222,47 @@ export function findMergedResult(db: Database, taskId: string): TaskResult | nul
 }
 
 /**
+ * The durable audit snapshot of the row a deliberate `supersedes` replaces. The
+ * replacement keeps the row id/identity, so without this the previous verdict's
+ * passed/reason/worker would survive only in the event log; SQLite is the source
+ * of truth, so copy it into the replacement payload.
+ */
+function supersededSnapshot(prior: TaskResult): Record<string, unknown> {
+  return {
+    id: prior.id,
+    passed: prior.passed,
+    reason: prior.reason,
+    worker_id: prior.worker_id,
+    head_sha: prior.head_sha,
+    profile: prior.profile,
+    evidence_ref: prior.evidence_ref,
+    created_at: prior.created_at,
+    // The row's own payload (including any earlier `superseded` snapshot) so a
+    // second replacement cannot erase the previous audit chain.
+    payload_json: prior.payload_json,
+  };
+}
+
+/** Merge `superseded` into a replacement payload without losing its fields. */
+function payloadWithSuperseded(payload: unknown, prior: TaskResult): Record<string, unknown> {
+  const base =
+    payload && typeof payload === "object" && !Array.isArray(payload)
+      ? (payload as Record<string, unknown>)
+      : {};
+  return { ...base, superseded: supersededSnapshot(prior) };
+}
+
+/**
  * Write one structured result.
  *
  * ISH-904: a repeated write for the same (task, phase, attempt, kind) is
  * IDEMPOTENT — the existing row is returned instead of crashing on the identity
  * UNIQUE constraint when a Factory retry/resume replays a stage. A caller that
  * deliberately REPLACES a result (a superseding review verdict) passes
- * `supersedes: <id>`; the row is then updated in place (same id, same
- * (task, phase, attempt, kind) identity), which is what makes `--supersedes`
- * actually accept the replacement verdict at the same attempt.
+ * `supersedes: <id>`; the named row must be the one at that identity, and it is
+ * updated in place (same id, same (task, phase, attempt, kind) identity), which
+ * is what makes `--supersedes` actually accept the replacement verdict at the
+ * same attempt. The replaced verdict is preserved in `payload.superseded`.
  *
  * On any OTHER write failure the Task is parked `blocked_internal` with the
  * concrete error and a `ResultWriteError` is thrown — callers must rethrow it
@@ -249,6 +281,16 @@ export function insertTaskResult(db: Database, r: TaskResultInput): TaskResult {
     });
     return existing;
   }
+  // A deliberate replacement may only replace the row it NAMES. Silently
+  // overwriting a different result at the identity would destroy an unreviewed
+  // verdict; refuse before any write (and before the write-failure park below).
+  if (existing && r.supersedes !== undefined && existing.id !== r.supersedes) {
+    throw new Error(
+      `refusing to replace result ${existing.id} for ${r.taskId} ` +
+      `(${r.phase}/attempt ${r.attempt}/${r.kind}): supersedes names result ${r.supersedes}, ` +
+      `not the row at that identity`
+    );
+  }
   const t = now();
   try {
     if (existing && r.supersedes !== undefined) {
@@ -266,7 +308,7 @@ export function insertTaskResult(db: Database, r: TaskResultInput): TaskResult {
         r.profile ?? null,
         r.evidenceRef ?? null,
         r.reason ?? null,
-        JSON.stringify(r.payload ?? {}),
+        JSON.stringify(payloadWithSuperseded(r.payload, existing)),
         t,
         existing.id
       );

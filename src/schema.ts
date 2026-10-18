@@ -207,6 +207,9 @@ export interface Worker {
    * stream and their liveness/idle/blocked are POLLED from Herdr agent status.
    * Set at attach time from the resolved Herdr agent kind; defaults to
    * "opencode" so every pre-existing worker row is unchanged.
+   *
+   * ISH-904: the Factory's reviewer/integrator are NOT harnesses and never own
+   * a pane; they store HEADLESS_AGENT_KIND instead (see `src/workers.ts`).
    */
   agent_kind: string;
   runtime_id: string | null;

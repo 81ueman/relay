@@ -3,7 +3,7 @@ import { dirname, join } from "node:path";
 import { defaultDbPath, now, projectRoot } from "./db";
 import { logEvent } from "./events";
 import { getTask, claimTask } from "./tasks";
-import { ensureHeadlessWorker } from "./workers";
+import { ensureHeadlessWorker, HEADLESS_AGENT_KIND } from "./workers";
 import { INTEGRATOR_ROLE, REVIEWER_ROLE } from "./schema";
 import type { Run, RunState, Task, TaskState } from "./schema";
 import { isCanonicalToken, processPgid, spawnIdentityToken } from "./proc-identity";
@@ -771,8 +771,8 @@ export async function runFactoryTask(
   const resolveVerifyTarget = deps.verifyTarget ?? defaultVerifyTarget;
   // ISH-904: these principals are headless — register them `idle` (never
   // `starting`) so neither surface reports a permanent stuck attach.
-  ensureHeadlessWorker(db, reviewerWorker, { role: REVIEWER_ROLE, agentKind: "claude" });
-  ensureHeadlessWorker(db, integratorWorker, { role: INTEGRATOR_ROLE, agentKind: "relay" });
+  ensureHeadlessWorker(db, reviewerWorker, { role: REVIEWER_ROLE, agentKind: HEADLESS_AGENT_KIND });
+  ensureHeadlessWorker(db, integratorWorker, { role: INTEGRATOR_ROLE, agentKind: HEADLESS_AGENT_KIND });
 
   const attempts: FactoryAttempt[] = [];
   const steps: string[] = [];
@@ -991,9 +991,12 @@ export async function runFactoryTask(
     }
   }
   } catch (e) {
-    // ISH-904: a result-write (or any other Factory) failure must not leave a
-    // half-applied phase behind. Park the Task blocked_internal with the concrete
-    // error and return a structured blocked result instead of crashing.
+    // ISH-904: ONLY a failed result write leaves a half-applied phase behind (the
+    // Task may already have been advanced by the caller's transaction). Park that
+    // `blocked_internal` with the concrete error. A transient worktree/git/dsh
+    // launch failure is NOT a durable park: rethrow it so the Task stays runnable
+    // and does not need a human to unblock.
+    if (!isResultWriteError(e)) throw e;
     const detail = e instanceof Error ? e.message : String(e);
     const reason = detail.startsWith(FACTORY_ERROR) ? detail : `${FACTORY_ERROR}: ${detail}`;
     markTaskBlockedInternal(db, taskId, reason);

@@ -102,6 +102,59 @@ describe("ISH-904: structured result writes", () => {
     expect(replaced.reason).toBe("OK after the fix");
     expect(countRows(t.id)).toBe(1);
     expect(findTaskResult(db, t.id, "review", 0, "ReviewResult")!.id).toBe(ng.id);
+    // The SQLite row keeps the REPLACED verdict too (not only the event log).
+    const payload = JSON.parse(replaced.payload_json) as {
+      superseded?: { id: number; passed: number | null; reason: string | null; worker_id: string | null };
+    };
+    expect(payload.superseded).toMatchObject({
+      id: ng.id,
+      passed: 0,
+      reason: "NG: broken",
+      worker_id: "rev",
+    });
+  });
+
+  test("a supersedes that names a different result is refused without overwriting it", () => {
+    const t = codeTask();
+    const current = insertTaskResult(db, {
+      taskId: t.id,
+      phase: "review",
+      attempt: 0,
+      kind: "ReviewResult",
+      workerId: "rev",
+      passed: false,
+      headSha: "d".repeat(40),
+      profile: "default",
+      reason: "the row at this identity",
+    });
+    const named = insertTaskResult(db, {
+      taskId: t.id,
+      phase: "implement",
+      attempt: 0,
+      kind: "TaskSubmitted",
+      workerId: "impl",
+      headSha: "d".repeat(40),
+    });
+    expect(() =>
+      insertTaskResult(db, {
+        taskId: t.id,
+        phase: "review",
+        attempt: 0,
+        kind: "ReviewResult",
+        workerId: "rev",
+        passed: true,
+        headSha: "d".repeat(40),
+        profile: "default",
+        reason: "should not land",
+        supersedes: named.id,
+      })
+    ).toThrow(/refusing to replace result/);
+    // The unnamed identity row is untouched, and the refusal is not a durable
+    // write-failure park.
+    expect(findTaskResult(db, t.id, "review", 0, "ReviewResult")!.id).toBe(current.id);
+    expect(findTaskResult(db, t.id, "review", 0, "ReviewResult")!.reason).toBe("the row at this identity");
+    expect(countRows(t.id)).toBe(2);
+    expect(getTask(db, t.id)!.state).toBe("queued");
   });
 
   test("a real write failure parks the task blocked_internal with the error", () => {

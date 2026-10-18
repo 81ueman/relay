@@ -58,40 +58,48 @@ export function registerWorker(
 }
 
 /**
- * ISH-904: a principal Relay drives HEADLESSLY — the Factory's
- * `claude-review` reviewer and `factory-integrator` integrator — has no Herdr
- * tab/pane of its own. `agent_kind` is the durable marker (the Factory registers
- * them as `claude`/`relay`); no new column is needed. Such a worker must never
- * be reported as "no visible runtime pane" or "starting for a while (attach
- * stuck?)" by the dashboard, which is what made the two ATTENTION surfaces
- * disagree after a factory run.
+ * ISH-904: the durable `agent_kind` marker for a principal Relay drives
+ * HEADLESSLY — the Factory's `claude-review` reviewer and `factory-integrator`
+ * integrator — which has no Herdr tab/pane of its own. This is deliberately NOT
+ * a real harness id: `claude` names a pane-supervised Claude Code worker, so
+ * treating every `claude` row as headless hid genuine stuck attaches. No new
+ * column is needed.
+ */
+export const HEADLESS_AGENT_KIND = "headless";
+
+/**
+ * True only for the Factory's headless principals (see HEADLESS_AGENT_KIND).
+ * Such a worker must never be reported as "no visible runtime pane" or
+ * "starting for a while (attach stuck?)" by the dashboard, which is what made
+ * the two ATTENTION surfaces disagree after a factory run.
  */
 export function isHeadlessWorker(w: Pick<Worker, "agent_kind">): boolean {
-  return w.agent_kind === "claude" || w.agent_kind === "relay";
+  return w.agent_kind === HEADLESS_AGENT_KIND;
 }
 
 /**
  * Register a headless principal in `idle` (never `starting`) and repair a row
- * left `starting` by an older factory run. The worker's ROLE is preserved when it
- * already exists (a non-reviewer principal must still be refused by the ordinary
- * authority check, never silently promoted). Its `agent_kind` is aligned to the
- * headless kind when it has no runtime/session yet, so the dashboard knows no
- * pane is expected.
+ * left `starting`/with a harness `agent_kind` by an older factory run. The
+ * worker's ROLE is preserved when it already exists (a non-reviewer principal
+ * must still be refused by the ordinary authority check, never silently
+ * promoted). Its `agent_kind` is aligned to HEADLESS_AGENT_KIND when it has no
+ * runtime/session yet, so the dashboard knows no pane is expected.
  */
 export function ensureHeadlessWorker(
   db: Database,
   id: string,
   opts: { role?: string; agentKind?: string } = {}
 ): Worker {
+  const headlessKind = opts.agentKind ?? HEADLESS_AGENT_KIND;
   let existing = getWorker(db, id);
-  if (!existing) return registerWorker(db, id, { ...opts, state: "idle" });
-  if (opts.agentKind && existing.agent_kind !== opts.agentKind && !existing.runtime_id && !existing.opencode_session_id) {
-    db.query(`UPDATE workers SET agent_kind = ?, updated_at = ? WHERE id = ?`).run(opts.agentKind, now(), id);
+  if (!existing) return registerWorker(db, id, { role: opts.role, agentKind: headlessKind, state: "idle" });
+  if (existing.agent_kind !== headlessKind && !existing.runtime_id && !existing.opencode_session_id) {
+    db.query(`UPDATE workers SET agent_kind = ?, updated_at = ? WHERE id = ?`).run(headlessKind, now(), id);
     logEvent(db, {
       source: "cli",
       workerId: id,
       type: "worker.normalized",
-      payload: { wasKind: existing.agent_kind, agentKind: opts.agentKind, reason: "headless" },
+      payload: { wasKind: existing.agent_kind, agentKind: headlessKind, reason: "headless" },
     });
     existing = getWorker(db, id)!;
   }

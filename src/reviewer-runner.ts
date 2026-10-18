@@ -10,7 +10,7 @@ import { REVIEWER_ROLE } from "./schema";
 import type { Task } from "./schema";
 import { gitHead } from "./verify";
 import { recordReview, taskChecks } from "./workflow";
-import { ensureHeadlessWorker, getWorker } from "./workers";
+import { ensureHeadlessWorker, getWorker, HEADLESS_AGENT_KIND } from "./workers";
 import {
   headsMatch,
   latestReviewInvalidationAt,
@@ -760,7 +760,7 @@ export async function runHeadlessReview(
   // non-reviewer principal is refused by `recordReview` (never silently promoted).
   // ISH-904: a headless reviewer is registered `idle`, never `starting` — there is
   // no pane to attach, so a `starting` row was a permanent stuck-attach ATTENTION.
-  ensureHeadlessWorker(db, reviewerWorker, { role: REVIEWER_ROLE, agentKind: "claude" });
+  ensureHeadlessWorker(db, reviewerWorker, { role: REVIEWER_ROLE, agentKind: HEADLESS_AGENT_KIND });
   // Explicit independence precheck (recordReview re-enforces it as the authority
   // of record): a principal that neither holds REVIEWER_ROLE nor the review claim
   // can never review — a fake/foreign reviewer identity is refused up front.

@@ -6,7 +6,7 @@ import { join } from "node:path";
 import type { Database } from "bun:sqlite";
 import { openDb } from "../src/db";
 import { blockTask, claimNext, claimTask, addTask, getTask } from "../src/tasks";
-import { getWorker, registerWorker } from "../src/workers";
+import { getWorker, registerWorker, HEADLESS_AGENT_KIND } from "../src/workers";
 import { inboxFor } from "../src/messages";
 import {
   findPassingReview,
@@ -961,20 +961,21 @@ describe("ISH-904: factory defects (phase-null, worker state, merge_ready rework
   test("headless reviewer/integrator workers are idle (never starting) and raise no pane ATTENTION", async () => {
     const dsh = fakeDsh("dsh-commit", COMMITTING_DSH);
     const id = newTask();
-    // Simulate rows left `starting` (and default kind) by an older factory run:
-    // the headless path must repair them, not leave a permanent attach-stuck
-    // ATTENTION or a false "no visible runtime pane".
-    registerWorker(db, REVIEWER_WORKER, { role: "reviewer" });
-    registerWorker(db, DEFAULT_INTEGRATOR_WORKER, { role: "integrator" });
+    // Simulate rows left `starting` with the OLD harness-style markers
+    // (`claude`/`relay`) by an older factory run: the headless path must repair
+    // them, not leave a permanent attach-stuck ATTENTION or a false "no visible
+    // runtime pane".
+    registerWorker(db, REVIEWER_WORKER, { role: "reviewer", agentKind: "claude" });
+    registerWorker(db, DEFAULT_INTEGRATOR_WORKER, { role: "integrator", agentKind: "relay" });
     expect(getWorker(db, REVIEWER_WORKER)!.state).toBe("starting");
-    expect(getWorker(db, REVIEWER_WORKER)!.agent_kind).toBe("opencode");
+    expect(getWorker(db, REVIEWER_WORKER)!.agent_kind).toBe("claude");
     const res = await runFactoryTask(db, id, factoryDeps(dsh, reviewerHarness(["pass"]).spawner));
     expect(res.outcome).toBe("merge_ready");
     for (const wid of [REVIEWER_WORKER, DEFAULT_INTEGRATOR_WORKER]) {
       expect(getWorker(db, wid)!.state).toBe("idle");
     }
-    expect(getWorker(db, REVIEWER_WORKER)!.agent_kind).toBe("claude");
-    expect(getWorker(db, DEFAULT_INTEGRATOR_WORKER)!.agent_kind).toBe("relay");
+    expect(getWorker(db, REVIEWER_WORKER)!.agent_kind).toBe(HEADLESS_AGENT_KIND);
+    expect(getWorker(db, DEFAULT_INTEGRATOR_WORKER)!.agent_kind).toBe(HEADLESS_AGENT_KIND);
     const view = buildDashboardView(db, { root: dir, panes: new Map(), at: Date.now() });
     const attention = view.attention.filter((a) => a.id === REVIEWER_WORKER || a.id === DEFAULT_INTEGRATOR_WORKER);
     expect(attention).toHaveLength(0);
@@ -989,9 +990,23 @@ describe("ISH-904: factory defects (phase-null, worker state, merge_ready rework
     expect(statusText).not.toContain("starting for a while");
     // A normal (pane-supervised) worker with no runtime is still actionable.
     registerWorker(db, "pane-worker", { role: "worker" });
+    // A REAL pane-supervised Claude Code worker stuck in `starting` must still
+    // raise the attach-stuck ATTENTION: `claude` is a harness, not a headless
+    // marker (the regression this guards against).
+    registerWorker(db, "pane-claude", { role: "worker", agentKind: "claude", runtimeId: "w9:p1" });
+    db.query(`UPDATE workers SET state = 'starting', last_progress_at = ? WHERE id = ?`).run(
+      Date.now() - 130_000,
+      "pane-claude"
+    );
     const view2 = buildDashboardView(db, { root: dir, panes: new Map(), at: Date.now() });
     expect(
       view2.attention.some((a) => a.id === "pane-worker" && a.text.includes("no visible runtime pane"))
+    ).toBe(true);
+    expect(
+      view2.attention.some((a) => a.id === "pane-claude" && a.text.includes("starting for a while (attach stuck?)"))
+    ).toBe(true);
+    expect(
+      view2.attention.some((a) => a.id === "pane-claude" && a.text.includes("no visible runtime pane"))
     ).toBe(true);
   });
 
@@ -1095,6 +1110,20 @@ describe("ISH-904: factory defects (phase-null, worker state, merge_ready rework
     } finally {
       db.exec(`DROP TRIGGER IF EXISTS ish904_fail_results`);
     }
+  });
+
+  test("a transient launch failure is rethrown, not turned into a durable block", async () => {
+    const id = newTask();
+    // A missing dsh fails the pinned-version guard after the worktree was cut.
+    // That is an environment/launch error, not a result-write failure: it must
+    // surface to the caller and leave the Task runnable.
+    const missingDsh = join(binDir, "missing-dsh");
+    await expect(
+      runFactoryTask(db, id, { ...factoryDeps(missingDsh, reviewerHarness(["pass"]).spawner), maxAttempts: 1 })
+    ).rejects.toThrow(/DSH_VERSION_MISMATCH/);
+    const task = getTask(db, id)!;
+    expect(task.state).toBe("queued");
+    expect(task.phase).toBe("implement");
   });
 });
 

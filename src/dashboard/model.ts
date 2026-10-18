@@ -58,9 +58,11 @@ export interface DashboardWorker {
   paneId: string | null;
   /**
    * ISH-904: whether a visible Herdr runtime pane is EXPECTED for this worker.
-   * Headless principals (the Factory's `claude-review`/`factory-integrator`) have
-   * no pane, so "starting for a while" / "no visible runtime pane" would be a
-   * permanent false ATTENTION. The surface and `relay status` must agree.
+   * Headless principals (the Factory's `claude-review`/`factory-integrator`,
+   * marked by `agent_kind = headless`) have no pane, so "starting for a while" /
+   * "no visible runtime pane" would be a permanent false ATTENTION. Real
+   * pane-supervised harnesses (including `claude`) still raise it. The surface
+   * and `relay status` must agree.
    */
   paneSupervised: boolean;
   progressAgeMs: number | null;
