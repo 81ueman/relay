@@ -105,7 +105,7 @@ export interface FactoryDeps {
    */
   terminateOrphan?: (pid: number) => Promise<boolean>;
   /**
-   * ISH-829: when set, the independent reviewer runs in a DETACHED read-only
+   * ISH-829: when set, the independent reviewer runs in a disposable DETACHED
    * worktree at the fixed head (created under this directory), not the writer's
    * live worktree. Unset -> existing behavior (the writer's worktree).
    */

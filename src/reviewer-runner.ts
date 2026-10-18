@@ -29,12 +29,13 @@ import {
  * ISH-762: the independent HEADLESS reviewer.
  *
  * The Factory's reviewer is a SEPARATE principal from the coding worker: a real
- * Claude process (`claude -p --output-format json`) invoked with READ-ONLY
- * access, given a brief pinned to the Task's worktree, that prints ONE
- * structured verdict. Relay parses ONLY that structured verdict and records it
- * through the ordinary `recordReview` path — so the existing authority,
- * independence, HEAD-binding and duplicate/unresolved-NG rules all apply
- * unchanged. Nothing here is a second review state machine.
+ * Claude process (`claude -p --output-format json`) invoked with
+ * `--permission-mode auto` (an approval mode, not an OS sandbox) and a brief that
+ * instructs it to treat the checkout as READ-ONLY, given a brief pinned to the
+ * Task's worktree, that prints ONE structured verdict. Relay parses ONLY that
+ * structured verdict and records it through the ordinary `recordReview` path — so
+ * the existing authority, independence, HEAD-binding and duplicate/unresolved-NG
+ * rules all apply unchanged. Nothing here is a second review state machine.
  *
  * Fail-closed rules (a reviewer can never manufacture an advance):
  *   - no structured result / malformed output / unknown verdict  -> REFUSED;
