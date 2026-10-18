@@ -46,11 +46,11 @@ import {
 } from "./sandbox-lifecycle";
 import { getSandbox as getTaskSandbox, listSandboxes } from "./sandbox";
 import { applyLabCleanup, planLabCleanup, type LabCleanupPlan } from "./lab-cleanup";
-import { providerDepsFromEnv, nativeReviewDepsFromEnv, defaultExec } from "./provider-adapters";
+import { providerDepsFromEnv, nativeReviewDepsFromEnv } from "./provider-adapters";
 import { checkMergeGate, formatMergeGateDecision } from "./merge-gate";
 import { runFactoryTask } from "./factory";
 import { DEFAULT_REVIEW_MODEL } from "./reviewer-runner";
-import { bindTaskPr, formatPrBindingResult, GitGhPrPublisher } from "./pr-binding";
+import { bindTaskPr, formatPrBindingResult } from "./pr-binding";
 import {
   bindSession, findWorkerBySession, getWorker, listWorkers,
   quietActive, registerWorker, retireWorker, setWorkerState, touchSeen, unretireWorker,
@@ -107,7 +107,7 @@ Usage:
   relay result accept <task-id> [--worker <id>]
   relay verify <task-id> [--cwd <dir>] [--head SHA]   # mechanical verify (Relay runs the commands)
   relay merge-check <task-id> [--json] [--authority merge]   # read-only HEAD-bound merge readiness (dry-run)
-  relay pr bind <task-id> [--publish] [--json]   # bind the produced commit (task.head_sha) to a real PR (re-read/verify; --publish is an authorized write)
+  relay pr bind <task-id> [--json]   # READ-ONLY: bind the produced commit (task.head_sha) to a real PR the Agent created (re-read/verify; Relay never writes to GitHub)
 
   relay next [--worker <id>] [--role <r>] [--any-role]
   relay claim <task-id> [--worker <id>] [--role <r>] [--any-role]
@@ -333,8 +333,8 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
   },
   pr: {
     about:
-      "ISH-880 Task↔PR binding. Bridges a Sandbox-produced commit to a real GitHub PR and binds the PR's CURRENT remote HEAD to the SAME Task/attempt. The head is ALWAYS the Task's produced commit (`task.head_sha`, a full 40-hex SHA) — there is no caller-supplied head. By default it is READ-ONLY: it re-reads an already-recorded PR (owner/repo#n) and requires its live head to equal the produced commit; a moved/unreadable PR, a different/fork repo, or no recorded identity is BLOCKED (never a fake pass). With `--publish` it may push the produced commit and find-or-create the PR through normal `git`/`gh` — an EXPLICIT point-of-use write grant, opt-in per invocation; it never merges, approves, deletes a branch or writes Linear. Requires RELAY_PROVIDER_GITHUB=gh for the read-only reader.",
-    usage: ["relay pr bind <task-id> [--publish] [--repo R] [--base REF] [--json]"],
+      "ISH-880/885 READ-ONLY Task↔PR check. Bridges a Sandbox-produced commit to a real GitHub PR and binds the PR's CURRENT remote HEAD to the SAME Task/attempt — by READING GitHub only. The head is ALWAYS the Task's produced commit (`task.head_sha`, a full 40-hex SHA) — there is no caller-supplied head. It re-reads an already-recorded PR (owner/repo#n) or adopts an existing PR for the task's (repo, branch), and requires its live head to equal the produced commit; a moved/unreadable PR, a different/fork repo, or no identity/adoptable PR is BLOCKED (never a fake pass). Relay NEVER writes to GitHub — no push, no create/update, no review; the Coding Agent performs those with normal `git`/`gh`, then Relay observes. Requires RELAY_PROVIDER_GITHUB=gh for the read-only reader.",
+    usage: ["relay pr bind <task-id> [--repo R] [--json]"],
   },
   "task list": { about: "List tasks (id, state, priority, role, assignee, plan, depends, title).", usage: ["relay task list [--state <state>]"] },
   "task show": { about: "Print one task as JSON (includes depends_on). Notes go to stderr so stdout stays parseable; --json emits ONE document with the task, its dependencies and its notes.", usage: ["relay task show <id> [--json]"] },
@@ -1364,25 +1364,20 @@ async function main(): Promise<void> {
       }
 
       case "pr": {
-        // ISH-880: bind a Task's produced commit to a real PR and its current
-        // remote HEAD. Read-only by default; `--publish` is an explicit
-        // point-of-use write grant (push + find-or-create) — never implicit.
+        // ISH-880/885: READ-ONLY bind of a Task's produced commit to a real PR
+        // and its current remote HEAD. Relay never writes to GitHub — the Coding
+        // Agent pushes and creates/updates the PR with normal `git`/`gh` first.
         const rest = argv.slice(1);
         const sub = rest[0];
-        if (sub !== "bind") throw new Error("usage: relay pr bind <task-id> [--publish] [--head SHA] [--repo R] [--base REF] [--json]");
+        if (sub !== "bind") throw new Error("usage: relay pr bind <task-id> [--repo R] [--json]");
         const args = rest.slice(1);
         const id = positionals(args)[0];
-        if (!id) throw new Error("usage: relay pr bind <task-id> [--publish] [--head SHA] [--repo R] [--base REF] [--json]");
+        if (!id) throw new Error("usage: relay pr bind <task-id> [--repo R] [--json]");
         if (!getTask(db, id)) throw new Error(`unknown task: ${id}`);
-        const publish = hasFlag(args, "--publish");
         const base = providerDepsFromEnv();
-        const authority = publish ? { ...base.authority, githubWrite: true } : base.authority;
         const result = bindTaskPr(db, id, {
           github: base.github,
-          publisher: publish ? new GitGhPrPublisher(projectRoot(), defaultExec) : undefined,
-          authority,
           repo: flag(args, "--repo") ?? undefined,
-          base: flag(args, "--base") ?? undefined,
         });
         console.log(hasFlag(args, "--json") ? JSON.stringify(result, null, 2) : formatPrBindingResult(result));
         if (result.status === "blocked") process.exitCode = 1;
@@ -1810,6 +1805,13 @@ async function main(): Promise<void> {
             // ISH-883: post a native GitHub PR review + read it back, ONLY when
             // the operator has granted the explicit external-write authorization.
             nativeReview: nativeReviewDepsFromEnv(),
+            // ISH-885: the READ-ONLY Task↔PR check, when a GitHub reader is
+            // configured. Relay re-reads the PR the Coding Agent created/updated
+            // and binds its current remote HEAD; Relay never writes to GitHub.
+            prBinding: (() => {
+              const github = providerDepsFromEnv().github;
+              return github ? { github } : undefined;
+            })(),
           });
           if (hasFlag(rest, "--json")) {
             console.log(JSON.stringify(result, null, 2));

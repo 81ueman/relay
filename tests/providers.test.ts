@@ -94,16 +94,15 @@ describe("review verdict markers (absorbed from lane.sh)", () => {
 
 describe("side-effect authority (ISH-288 point-of-use rule)", () => {
   test("default authority denies every side effect and fails closed", () => {
-    expect(sideEffectAllowed(NO_AUTHORITY, "github-write")).toBe(false);
     expect(sideEffectAllowed(NO_AUTHORITY, "linear-write")).toBe(false);
     expect(sideEffectAllowed(NO_AUTHORITY, "merge")).toBe(false);
     expect(() => assertSideEffectAllowed(NO_AUTHORITY, "merge")).toThrow(/AUTHORITY/);
-    expect(() => assertSideEffectAllowed(NO_AUTHORITY, "github-write")).toThrow(/failing closed/);
+    expect(() => assertSideEffectAllowed(NO_AUTHORITY, "linear-write")).toThrow(/failing closed/);
   });
 
   test("a merge through Relay needs explicit authority and is still dry-run", () => {
     expect(() => performMerge(NO_AUTHORITY)).toThrow(/AUTHORITY/);
-    const withAuthority = { githubWrite: false, linearWrite: false, merge: true };
+    const withAuthority = { linearWrite: false, merge: true };
     const r = performMerge(withAuthority, { dryRun: true });
     expect(r.performed).toBe(false);
     expect(r.dryRun).toBe(true);

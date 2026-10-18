@@ -380,22 +380,18 @@ export function isApprovalSignal(signal: ApprovalSignal): boolean {
 // ---------------------------------------------------------------------------
 
 export interface ProviderAuthority {
-  /** Post/refresh a PR comment or mutate a GitHub label. */
-  githubWrite: boolean;
   /** Write a Linear issue (status/comment). */
   linearWrite: boolean;
   /** Perform a real GitHub merge. */
   merge: boolean;
 }
 
-export const NO_AUTHORITY: ProviderAuthority = { githubWrite: false, linearWrite: false, merge: false };
+export const NO_AUTHORITY: ProviderAuthority = { linearWrite: false, merge: false };
 
-export type SideEffect = "github-write" | "linear-write" | "merge";
+export type SideEffect = "linear-write" | "merge";
 
 export function sideEffectAllowed(a: ProviderAuthority, kind: SideEffect): boolean {
   switch (kind) {
-    case "github-write":
-      return a.githubWrite;
     case "linear-write":
       return a.linearWrite;
     case "merge":

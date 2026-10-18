@@ -2,44 +2,44 @@ import type { Database } from "bun:sqlite";
 import { logEvent } from "./events";
 import type { Task } from "./schema";
 import { getTask } from "./tasks";
-import {
-  NO_AUTHORITY,
-  parsePrUrl,
-  type GitHubReadOnly,
-  type PrRef,
-  type ProviderAuthority,
-  type PrView,
-} from "./providers";
+import { parsePrUrl, type GitHubReadOnly, type PrRef, type PrView } from "./providers";
 import { linkTask } from "./workflow";
-import { defaultExec, type Exec } from "./provider-adapters";
 
 /**
- * ISH-880 — bind a Sandbox-produced commit to a real GitHub PR and its CURRENT
- * remote HEAD, before the Task may enter the review stage.
+ * ISH-885 — the READ-ONLY Task↔PR check.
  *
- * The Factory stops at reading GitHub (ISH-761); it never publishes. This module
- * is the ONE seam that bridges the exact Sandbox commit (fetched to the host by
- * ISH-828, HEAD-verified by ISH-829) to a GitHub branch/PR, and then binds the
- * PR's live remote HEAD to the SAME Task/attempt. It composes existing pieces
- * only — the read-only `GitHubReadOnly` reader, `linkTask` (whose HEAD fence
- * already invalidates a Review/VERIFY at a moved HEAD) and the point-of-use
- * `ProviderAuthority` — and adds no second workflow engine, provider framework
- * or credential grant.
+ * The GitHub PR workflow is Agent-owned: the Coding Agent (dsh/DeepSeek) does
+ * `git commit` + `git push` + `gh pr create`/update in its own Task Sandbox, and
+ * the independent Claude reviewer posts a native `gh pr review`. Relay is the
+ * supervisor and NEVER writes to GitHub — it has no publisher, no `git push`, no
+ * PR mutation and no review submission. (The ISH-880 `GitGhPrPublisher` /
+ * `--publish` write path was removed by ISH-885: Agent tools, not Relay
+ * capabilities.)
+ *
+ * This module is the ONE seam that binds the exact Sandbox-produced commit
+ * (fetched to the host by ISH-828, HEAD-verified by ISH-829) to a GitHub PR by
+ * RE-READING GitHub and then binds the PR's live remote HEAD to the SAME
+ * Task/attempt. It composes existing pieces only — the read-only `GitHubReadOnly`
+ * reader and `linkTask` (whose HEAD fence already invalidates a Review/VERIFY at
+ * a moved HEAD) — and adds no second workflow engine, provider framework,
+ * credential grant or write path.
  *
  * Fail-closed rules (a coding agent can never manufacture a PR binding):
- *   - Task↔PR identity is EXPLICIT: a recorded `pr_url`/`pr_repo#number`. It is
- *     never inferred from a branch name or output text alone. A crash-retry may
- *     ADOPT an existing PR for the task's branch only when BOTH the repo AND the
- *     observed head equal the task's own recorded repo/produced commit.
+ *   - Task↔PR identity is EXPLICIT: a recorded `pr_url`/`pr_repo#number`, or a
+ *     crash-retry ADOPTION of an existing PR for the task's (repo, branch) whose
+ *     observed head equals the task's own produced commit. It is never inferred
+ *     from a branch name or output text alone.
  *   - the PR is re-read from GitHub and its `headSha` MUST equal the produced
  *     commit; a moved/unreadable/other-repo PR is BLOCKED — never bound, never a
  *     fake review_pass.
- *   - publishing (push + create/update) requires an EXPLICIT point-of-use
- *     `githubWrite` grant AND an authorized publisher; otherwise BLOCKED. There
- *     is no implicit grant and no default publisher.
+ *   - ISH-885 legitimate FIX: the Agent updates the SAME PR from old commit A to
+ *     new commit B and pushes B FIRST; Relay then only OBSERVES B. If the PR still
+ *     shows A while the Task has produced B, Relay refuses (the Agent has not
+ *     published yet) rather than overwriting the remote head itself.
  *   - retry/restart never creates a duplicate PR: an already-recorded identity is
- *     only re-read, and the publisher is find-or-create.
- *   - NOTHING here merges, approves, deletes a branch, or writes Linear.
+ *     only re-read, and no adoption ever creates.
+ *   - NOTHING here pushes, creates/updates a PR, posts a review, merges, approves,
+ *     deletes a branch, or writes Linear.
  */
 
 export const PR_BINDING_ERROR = "PR_BINDING";
@@ -54,14 +54,10 @@ export type PrBindBlockCode =
   | "PR_NOT_OPEN"
   | "HEAD_MOVED"
   | "REPO_CHANGED"
-  | "PUBLISH_UNAUTHORIZED"
-  | "NO_PUBLISHER"
-  | "REPO_UNKNOWN"
-  | "BRANCH_UNKNOWN"
-  | "PUBLISH_FAILED"
+  | "NO_PR_IDENTITY"
   | "STALE";
 
-export type PrBindStatus = "bound" | "adopted" | "published" | "blocked";
+export type PrBindStatus = "bound" | "adopted" | "blocked";
 
 export interface PrBindingResult {
   taskId: string;
@@ -71,49 +67,11 @@ export interface PrBindingResult {
   expectedHead: string | null;
   /** The PR's observed remote head (null when unreadable). */
   remoteHead: string | null;
-  /** True only when THIS pass created the PR (never on a re-read/idempotent pass). */
+  /** Always false: Relay never creates a PR (Agent-owned GitHub writes). */
   created: boolean;
   reason: string | null;
   /** Stable identity of this binding decision (task, head, status, ref). */
   identity: string;
-}
-
-// ---------------------------------------------------------------------------
-// The authorized publisher seam (push + find-or-create PR)
-// ---------------------------------------------------------------------------
-
-export interface PublishRequest {
-  /** `owner/name`. */
-  repo: string;
-  branch: string;
-  /** The exact commit to publish (the Sandbox-produced head). */
-  headSha: string;
-  base: string | null;
-  title: string;
-  body: string;
-}
-
-export interface PublishResult {
-  ok: boolean;
-  ref: PrRef | null;
-  /** True when this call CREATED the PR; false when it reused an existing one. */
-  created: boolean;
-  error?: string;
-}
-
-/**
- * The one publisher seam. A real implementation runs `git push` + `gh pr
- * create`/`gh pr edit` (see `GitGhPrPublisher`); tests use a fake. It is
- * deliberately NOT wired on by default: an operator grants it at the call site.
- */
-export interface PrPublisher {
-  readonly name: string;
-  publish(req: PublishRequest): PublishResult;
-}
-
-export interface GitGhPublisherOptions {
-  /** The git remote to push the produced commit through (default `origin`). */
-  remote?: string;
 }
 
 /** Full 40-hex commit SHAs only — a short/abbreviated SHA is never an identity. */
@@ -139,26 +97,6 @@ export function normalizeRepo(repo: string): string {
 }
 
 /**
- * Parse a git remote URL to its `owner/name`, or null when it is not a GitHub
- * remote. Understands `https://github.com/O/R(.git)?` (with optional userinfo),
- * `git@github.com:O/R(.git)?` and `ssh://git@github.com[:port]/O/R(.git)?`.
- *
- * This exists so the publisher's "the remote points at the target repo" guard
- * compares PARSED owner/name — a substring test would accept `relay-private`,
- * `relay-fork` and `x81ueman/relay` for `81ueman/relay`.
- */
-export function parseGitRemote(url: string): string | null {
-  const s = (url ?? "").trim();
-  let m = s.match(/^git@github\.com:([^/\s]+)\/([^/\s]+?)(?:\.git)?\/?$/i);
-  if (m) return `${m[1]}/${m[2]}`;
-  m = s.match(/^ssh:\/\/git@github\.com(?::\d+)?\/([^/\s]+)\/([^/\s]+?)(?:\.git)?\/?$/i);
-  if (m) return `${m[1]}/${m[2]}`;
-  m = s.match(/^https?:\/\/(?:[^@/\s]+@)?github\.com\/([^/\s]+)\/([^/\s]+?)(?:\.git)?\/?$/i);
-  if (m) return `${m[1]}/${m[2]}`;
-  return null;
-}
-
-/**
  * True only when a PR's HEAD branch is provably in `repo` — never a fork. A
  * `gh pr list --head <branch>` lookup returns CROSS-REPOSITORY (fork) PRs, so a
  * fork PR with a same-named branch at the same SHA must never be adopted as the
@@ -173,95 +111,6 @@ export function prHeadRepoSafe(view: PrView, repo: string | null): boolean {
 }
 
 /**
- * The real publisher: push the produced commit to the repo's GitHub remote, then
- * find-or-create the PR with the `gh` CLI (normal `git`/`gh`, no new engine).
- * The remote's URL must point at `req.repo`, so a misconfigured checkout can
- * never push a Task's commit into an unrelated repository.
- */
-export class GitGhPrPublisher implements PrPublisher {
-  readonly name = "git-gh";
-  constructor(
-    private repoDir: string,
-    private exec: Exec = defaultExec,
-    private opts: GitGhPublisherOptions = {}
-  ) {}
-
-  publish(req: PublishRequest): PublishResult {
-    const remote = this.opts.remote ?? "origin";
-    const url = this.exec(["git", "-C", this.repoDir, "remote", "get-url", remote]);
-    // Parse the remote to owner/name and require CASE-INSENSITIVE EQUALITY with
-    // the target repo. A substring test would accept `relay-private`,
-    // `relay-fork` and `x81ueman/relay` for `81ueman/relay`.
-    const remoteRepo = url.ok ? parseGitRemote(url.stdout) : null;
-    if (!remoteRepo || normalizeRepo(remoteRepo) !== normalizeRepo(req.repo)) {
-      return {
-        ok: false,
-        ref: null,
-        created: false,
-        error: `remote ${remote} (${url.stdout.trim() || "unreadable"}) does not point at ${req.repo}`,
-      };
-    }
-    const push = this.exec(["git", "-C", this.repoDir, "push", remote, `${req.headSha}:refs/heads/${req.branch}`]);
-    if (!push.ok) {
-      return { ok: false, ref: null, created: false, error: `git push failed: ${(push.stderr || push.stdout).slice(0, 200)}` };
-    }
-    const found = this.findOpenPr(req.repo, req.branch);
-    if (found) return { ok: true, ref: found, created: false };
-    const created = this.exec([
-      "gh", "pr", "create",
-      "--repo", req.repo,
-      "--head", req.branch,
-      "--base", req.base ?? "main",
-      "--title", req.title,
-      "--body", req.body || " ",
-    ]);
-    if (!created.ok) {
-      return { ok: false, ref: null, created: false, error: `gh pr create failed: ${(created.stderr || created.stdout).slice(0, 200)}` };
-    }
-    const out = created.stdout.trim();
-    const ref = parsePrUrl(out.split(/\s+/).pop() ?? "", req.repo) ?? parsePrUrl(out, req.repo);
-    if (!ref) return { ok: false, ref: null, created: true, error: "gh pr create printed no recognizable PR url/number" };
-    return { ok: true, ref, created: true };
-  }
-
-  /**
-   * Find an OPEN, SAME-REPO PR for `branch`. `gh pr list --head` also returns
-   * cross-repository (fork) PRs, so a fork PR is SKIPPED — its head branch is in
-   * another repo, and adopting it would bind the Task to a stranger's PR. A
-   * skipped fork is fail-closed: the caller then attempts `gh pr create`.
-   */
-  private findOpenPr(repo: string, branch: string): PrRef | null {
-    const r = this.exec([
-      "gh", "pr", "list", "--repo", repo, "--head", branch, "--state", "open", "--limit", "10",
-      "--json", "url,number,isCrossRepository,headRepository",
-    ]);
-    if (!r.ok) return null;
-    try {
-      const arr = JSON.parse(r.stdout) as {
-        url?: string;
-        number?: number;
-        isCrossRepository?: boolean;
-        headRepository?: { nameWithOwner?: string } | null;
-      }[];
-      if (!Array.isArray(arr)) return null;
-      for (const j of arr) {
-        if (j.isCrossRepository === true) continue;
-        const headRepo = j.headRepository?.nameWithOwner;
-        if (headRepo && normalizeRepo(headRepo) !== normalizeRepo(repo)) continue;
-        return parsePrUrl(j.url ?? (j.number ? `${repo}#${j.number}` : null), repo);
-      }
-      return null;
-    } catch {
-      return null;
-    }
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Identity + the bind orchestration
-// ---------------------------------------------------------------------------
-
-/**
  * The EXPLICIT Task↔PR identity recorded on the task, or null. Only a recorded
  * `pr_url` (`owner/repo#n`, a github PR URL, or `#n` with a `pr_repo`) counts —
  * a branch name is never an identity.
@@ -273,17 +122,10 @@ export function resolveTaskPrRef(task: Pick<Task, "pr_url" | "pr_repo">): PrRef 
 export interface PrBindingDeps {
   /** Read-only GitHub reader. Required to re-read + verify the remote head. */
   github?: GitHubReadOnly;
-  /** The authorized publisher. Absent -> a publish attempt is refused. */
-  publisher?: PrPublisher;
-  /** Point-of-use authority. Publishing requires `githubWrite`. */
-  authority?: ProviderAuthority;
   /** The produced commit the PR head must equal (default `task.head_sha`). */
   expectedHead?: string | null;
   /** The target repository (default `task.pr_repo`). */
   repo?: string | null;
-  base?: string | null;
-  title?: string;
-  body?: string;
 }
 
 function short(sha: string | null | undefined): string {
@@ -303,14 +145,14 @@ function viewLink(view: PrView) {
 }
 
 /**
- * Bind a Task's produced commit to a GitHub PR and its CURRENT remote HEAD.
- *
- * Passes, in order:
+ * Bind a Task's produced commit to a GitHub PR and its CURRENT remote HEAD — by
+ * READING GitHub only. Passes, in order:
  *   1. the task's EXPLICIT PR identity (if recorded) -> re-read and verify;
  *   2. a crash-retry ADOPTION of an existing PR on the task's (repo, branch)
  *      whose head equals the produced commit (no create);
- *   3. otherwise PUBLISH (push + find-or-create) — only with explicit authority;
- * and in every case the re-read remote head must equal the produced commit.
+ *   3. otherwise BLOCKED: Relay never publishes; the Coding Agent must push and
+ *      create/update the PR first.
+ * In every case the re-read remote head must equal the produced commit.
  */
 export function bindTaskPr(db: Database, taskId: string, deps: PrBindingDeps = {}): PrBindingResult {
   const task = getTask(db, taskId);
@@ -325,8 +167,7 @@ export function bindTaskPr(db: Database, taskId: string, deps: PrBindingDeps = {
     code: PrBindBlockCode,
     message: string,
     ref: PrRef | null = null,
-    remoteHead: string | null = null,
-    created = false
+    remoteHead: string | null = null
   ): PrBindingResult => {
     const identity = `pr-binding:${taskId}:${expectedHead ?? "none"}:blocked:${code}`;
     logEvent(db, {
@@ -341,24 +182,19 @@ export function bindTaskPr(db: Database, taskId: string, deps: PrBindingDeps = {
       ref,
       expectedHead,
       remoteHead,
-      created,
+      created: false,
       reason: `${PR_BINDING_ERROR}: ${code}: ${message}`,
       identity,
     };
   };
 
-  const bound = (
-    status: "bound" | "adopted" | "published",
-    view: PrView,
-    created: boolean,
-    event: string
-  ): PrBindingResult => {
+  const bound = (status: "bound" | "adopted", view: PrView, event: string): PrBindingResult => {
     const linked = linkTask(db, taskId, viewLink(view));
     // linkTask is a no-op on a terminal task / a settled head: a binding that
     // did not actually land on the produced commit is not a binding. EXACT full
     // SHA (case-insensitive), never a prefix.
     if (!sameCommitSha(linked.head_sha, expectedHead)) {
-      return blocked("STALE", `linked head ${short(linked.head_sha)} != produced commit ${short(expectedHead)}`, view.ref, view.headSha, created);
+      return blocked("STALE", `linked head ${short(linked.head_sha)} != produced commit ${short(expectedHead)}`, view.ref, view.headSha);
     }
     const ref = view.ref;
     const identity = `pr-binding:${taskId}:${expectedHead}:${status}:${ref.repo}#${ref.number}`;
@@ -366,11 +202,17 @@ export function bindTaskPr(db: Database, taskId: string, deps: PrBindingDeps = {
       source: "pr-binding",
       taskId,
       type: event,
-      payload: { repo: ref.repo, number: ref.number, head: view.headSha, expectedHead, created },
+      payload: { repo: ref.repo, number: ref.number, head: view.headSha, expectedHead },
     });
-    return { taskId, status, ref, expectedHead, remoteHead: view.headSha, created, reason: null, identity };
+    return { taskId, status, ref, expectedHead, remoteHead: view.headSha, created: false, reason: null, identity };
   };
 
+  /**
+   * Re-read the PR and verify its IDENTITY (repo, non-fork, open) AND that its
+   * live head is the produced commit. Relay only ever OBSERVES; it never moves
+   * the head. If the Agent has not pushed the produced commit yet, the head
+   * mismatch is a HEAD_MOVED block (retry the Agent), not a Relay write.
+   */
   const verifiable = (ref: PrRef): { view: PrView } | PrBindingResult => {
     if (!deps.github) return blocked("PROVIDER_UNREADABLE", "no read-only GitHub reader is configured", ref);
     const view = deps.github.getPullRequest(ref);
@@ -397,7 +239,7 @@ export function bindTaskPr(db: Database, taskId: string, deps: PrBindingDeps = {
     if (!sameCommitSha(view.headSha, expectedHead)) {
       return blocked(
         "HEAD_MOVED",
-        `PR head ${short(view.headSha)} != the produced commit ${short(expectedHead)}`,
+        `PR head ${short(view.headSha)} != the produced commit ${short(expectedHead)}; the Coding Agent must push the produced commit to the same PR before Relay can bind it`,
         ref,
         view.headSha
       );
@@ -418,12 +260,12 @@ export function bindTaskPr(db: Database, taskId: string, deps: PrBindingDeps = {
   }
   if (!deps.github) return blocked("PROVIDER_UNREADABLE", "no read-only GitHub reader is configured");
 
-  // 1. Explicit identity wins: re-read only (never publish over a recorded PR).
+  // 1. Explicit identity wins: re-read + verify only.
   const existing = resolveTaskPrRef(task);
   if (existing) {
     const r = verifiable(existing);
     if ("status" in r) return r;
-    return bound("bound", r.view, false, "pr.bound");
+    return bound("bound", r.view, "pr.bound");
   }
 
   // 2. Crash-retry adoption: an existing PR for THIS repo+branch whose head is
@@ -444,33 +286,16 @@ export function bindTaskPr(db: Database, taskId: string, deps: PrBindingDeps = {
       if (found.state !== "open") {
         return blocked("PR_NOT_OPEN", `adoptable PR ${found.ref.repo}#${found.ref.number} is ${found.state}`, found.ref, found.headSha);
       }
-      return bound("adopted", found, false, "pr.adopted");
+      return bound("adopted", found, "pr.adopted");
     }
   }
 
-  // 3. Publish — only with an explicit point-of-use grant AND a publisher.
-  const authority = deps.authority ?? NO_AUTHORITY;
-  if (!authority.githubWrite) {
-    return blocked("PUBLISH_UNAUTHORIZED", "no point-of-use GitHub write authority; refusing to push or create a PR");
-  }
-  if (!deps.publisher) return blocked("NO_PUBLISHER", "no authorized PR publisher is configured");
-  if (!repo) return blocked("REPO_UNKNOWN", "the task records no pr_repo to publish into");
-  if (!task.branch) return blocked("BRANCH_UNKNOWN", "the task records no branch to publish");
-
-  const published = deps.publisher.publish({
-    repo,
-    branch: task.branch,
-    headSha: expectedHead,
-    base: deps.base ?? task.pr_base ?? null,
-    title: deps.title ?? task.title ?? taskId,
-    body: deps.body ?? "",
-  });
-  if (!published.ok || !published.ref) {
-    return blocked("PUBLISH_FAILED", published.error ?? "the publisher returned no PR", null, null, published.created);
-  }
-  const r = verifiable(published.ref);
-  if ("status" in r) return r;
-  return bound("published", r.view, published.created, "pr.published");
+  // 3. No identity and no adoptable PR: Relay does NOT publish. The Coding Agent
+  // owns the GitHub write and must create/update the PR first.
+  return blocked(
+    "NO_PR_IDENTITY",
+    "the task records no PR identity and no open PR for its (repo, branch) matches the produced commit; the Coding Agent must push and create/update the PR first (Relay never writes to GitHub)"
+  );
 }
 
 /** One-line summary + the reason, for CLI rendering. */
