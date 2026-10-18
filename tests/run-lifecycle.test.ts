@@ -129,13 +129,14 @@ afterEach(() => {
 });
 
 /** A code-change task with NO linked worktree/branch (a fresh manual injection). */
-function newTask(extra: { prUrl?: string; checks?: { name: string; command: string }[] } = {}) {
+function newTask(extra: { prUrl?: string; prRepo?: string; checks?: { name: string; command: string }[] } = {}) {
   const t = intakeTask(db, {
     provider: "test",
     issueId: `ISH-760-${issueSeq++}`,
     codeChange: true,
     title: "implement the thing",
     prUrl: extra.prUrl,
+    prRepo: extra.prRepo,
     checks: extra.checks,
   });
   return t.id;
@@ -354,6 +355,29 @@ describe("FIX: same worktree + previous findings + a new Run (no session continu
     expect(brief.text).toContain("## Verification steps");
     expect(brief.text).toContain("bun run typecheck");
     expect(brief.findings).toEqual([]);
+  });
+
+  // ISH-885: the Factory's read-only Task<->PR gate requires the Coding Agent to
+  // have pushed/created the PR, so a PR-bound brief MUST say so.
+  test("buildRunBrief tells a PR-bound Task to push/open the PR (never default branch / merge / review)", () => {
+    const id = newTask({ prUrl: "81ueman/relay#7", prRepo: "81ueman/relay" });
+    const b = ensureTaskWorktree(db, id, { repo });
+    const brief = buildRunBrief(db, getTask(db, id)!, { worktree: b.worktree, branch: b.branch });
+    expect(brief.text).toContain("## Publish the Task branch as a GitHub PR");
+    expect(brief.text).toContain(`git push origin HEAD:refs/heads/${b.branch}`);
+    expect(brief.text).toContain("gh pr create --repo 81ueman/relay");
+    expect(brief.text).toContain("NEVER the default branch");
+    expect(brief.text).toContain("SAME PR");
+    expect(brief.text).toContain("NEVER merge");
+  });
+
+  test("buildRunBrief omits the PR instruction for a local-only Task", () => {
+    const id = newTask();
+    const b = ensureTaskWorktree(db, id, { repo });
+    const brief = buildRunBrief(db, getTask(db, id)!, { worktree: b.worktree, branch: b.branch });
+    expect(brief.text).not.toContain("Publish the Task branch as a GitHub PR");
+    expect(brief.text).not.toContain("gh pr create");
+    expect(brief.text).not.toContain("git push origin HEAD");
   });
 });
 

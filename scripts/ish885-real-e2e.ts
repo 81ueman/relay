@@ -205,47 +205,58 @@ try {
   step("relay-readback-OK-at-B", { ok: okRead.ok, reviewId: okRead.review.id, author: okRead.review.author, headSha: okRead.review.headSha, state: okRead.review.state, url: okRead.review.url });
   recordReview(db, task.id, REVIEWER, { verdict: "pass", headSha: B, externalReviewer: REVIEWER, evidence: okRead.review.url });
 
-  evidence.result = "PASS";
   evidence.prNumber = prNumber;
   evidence.shas = { A, B };
   evidence.reviewIds = { ngA: ngRead.review.id, okB: okRead.review.id };
   evidence.zeroRelayWrites =
     "static: no write argv (git push / gh pr create|edit|merge|review|comment / gh api --method) in src/; Relay's gh calls are pr view / pr list / GET api only. This run shares ONE GitHub account (81ueman), so it does not independently prove that.";
   evidence.mergeReadyDrive = "NOT_RUN (full dsh+factory MergeReady covered by tests; this script proves the GitHub write/read boundary)";
-  evidence.finishedAt = new Date().toISOString();
-  mkdirSync(join(process.cwd(), "docs"), { recursive: true });
-  writeFileSync(evidencePath, JSON.stringify(evidence, null, 2) + "\n");
-  console.log(`\nPASS — real GitHub PR ${REPO}#${prNumber}: stand-in pushed A then B (same PR); Claude posted NG@A and OK@B; Relay read both back via verifyNativeReview and bound each to its exact HEAD.`);
-  console.log(`evidence: ${evidencePath}`);
 
-  // ---- Cleanup AFTER durable evidence. ----
+  // ---- Cleanup, THEN persist evidence (so cleanup is recorded). ----
+  let cleanupOk = true;
   try {
     gh("pr", "close", String(prNumber), "--repo", REPO);
     git(repo, "push", "-q", "origin", "--delete", branch);
     step("cleanup", { closed: prNumber, deletedBranch: branch });
-    evidence.cleanedUp = true;
   } catch (e) {
-    evidence.cleanedUp = false;
+    cleanupOk = false;
     step("cleanup-failed", { error: e instanceof Error ? e.message : String(e) });
   }
+  evidence.cleanedUp = cleanupOk;
+  evidence.result = cleanupOk ? "PASS" : "FAIL";
+  if (!cleanupOk) evidence.error = "cleanup failed: the disposable PR/branch may remain";
+  evidence.finishedAt = new Date().toISOString();
+  mkdirSync(join(process.cwd(), "docs"), { recursive: true });
+  writeFileSync(evidencePath, JSON.stringify(evidence, null, 2) + "\n");
   db.close();
+  if (cleanupOk) {
+    console.log(`\nPASS — real GitHub PR ${REPO}#${prNumber}: stand-in pushed A then B (same PR); Claude posted NG@A and OK@B; Relay read both back via verifyNativeReview and bound each to its exact HEAD.`);
+    console.log(`evidence: ${evidencePath}`);
+  } else {
+    console.error(`FAIL — the GitHub write/read boundary passed, but cleanup of PR ${REPO}#${prNumber} / branch ${branch} failed; the disposable resources may remain.`);
+    process.exitCode = 1;
+  }
 } catch (e) {
   evidence.result = "FAIL";
   evidence.error = e instanceof Error ? e.stack ?? e.message : String(e);
-  evidence.finishedAt = new Date().toISOString();
+  // Best-effort cleanup, RECORDED (never silently swallowed).
+  const cleanupErrors: string[] = [];
   if (prNumber) {
     try {
       gh("pr", "close", String(prNumber), "--repo", REPO);
-      evidence.cleanedUp = true;
-    } catch {
-      /* best effort */
+    } catch (ce) {
+      cleanupErrors.push(`pr close: ${ce instanceof Error ? ce.message : String(ce)}`);
     }
   }
   try {
     git(repo, "push", "-q", "origin", "--delete", branch);
-  } catch {
-    /* best effort */
+  } catch (ce) {
+    cleanupErrors.push(`branch delete: ${ce instanceof Error ? ce.message : String(ce)}`);
   }
+  if (cleanupErrors.length > 0) step("cleanup-failed", { errors: cleanupErrors });
+  else if (prNumber) step("cleanup", { closed: prNumber, deletedBranch: branch });
+  evidence.cleanedUp = cleanupErrors.length === 0;
+  evidence.finishedAt = new Date().toISOString();
   try {
     mkdirSync(join(process.cwd(), "docs"), { recursive: true });
     writeFileSync(evidencePath, JSON.stringify(evidence, null, 2) + "\n");
