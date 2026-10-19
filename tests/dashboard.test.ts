@@ -256,3 +256,86 @@ describe("dashboard renderer", () => {
     expect(d.stdout.toString()).toContain("current runtimes");
   });
 });
+
+// ISH-944: the WORK section is about the code-change PHASE (a live factory lane
+// and a merge_ready task both sit in state `queued`), while terminal history is
+// summarised separately instead of being interleaved with live lanes.
+describe("dashboard WORK phase + history (ISH-944)", () => {
+  function codeTask(title: string, phase: string, attempt: number, state: string) {
+    const t = addTask(db, { title });
+    db.query(`UPDATE tasks SET code_change=1, phase=?, attempt=?, state=? WHERE id=?`)
+      .run(phase, attempt, state, t.id);
+    return t;
+  }
+
+  function workSection(out: string): string {
+    return out.split("\nWORK\n")[1]?.split("\nHISTORY\n")[0]?.split("\nWORKERS\n")[0] ?? "";
+  }
+
+  function historySection(out: string): string {
+    return out.split("\nHISTORY\n")[1]?.split("\nWORKERS\n")[0] ?? "";
+  }
+
+  function row(out: string, id: string): string {
+    return out.split("\n").find((l) => l.startsWith(id.padEnd(8))) ?? "";
+  }
+
+  test("an implement-phase task with a live Run shows its phase, not bare queued", () => {
+    const t = codeTask("factory lane", "implement", 2, "running");
+    db.query(
+      `INSERT INTO runs (id, task_id, phase, attempt, generation, cwd, prompt, output_dir,
+                         state, started_at, created_at, updated_at)
+       VALUES ('run-live', ?, 'implement', 2, 1, ?, '', ?, 'running', ?, ?, ?)`
+    ).run(t.id, dir, join(dir, "run-live"), at, at, at);
+
+    const out = renderDashboard(view(), { color: false, links: false, width: 120 });
+    const line = row(out, t.id);
+    expect(line).toContain("implement/2");
+    expect(line).toContain("running"); // the live lifecycle state stays visible
+    expect(workSection(out)).not.toContain("queued");
+  });
+
+  test("a merge_ready task renders merge_ready (its state is queued)", () => {
+    const t = codeTask("awaiting acceptance", "merge_ready", 0, "queued");
+    expect(t.state).toBe("queued");
+
+    const out = renderDashboard(view(), { color: false, links: false, width: 120 });
+    const line = row(out, t.id);
+    expect(line).toContain("merge_ready");
+    expect(line).not.toContain("queued");
+  });
+
+  test("blocked stays visible next to the phase", () => {
+    const t = codeTask("parked lane", "implement", 1, "blocked_human");
+    const out = renderDashboard(view(), { color: false, links: false, width: 120 });
+    expect(row(out, t.id)).toContain("blocked_human implement/1");
+  });
+
+  test("done/cancelled leave WORK but are summarised in HISTORY and counted", () => {
+    const live = addTask(db, { title: "live work" });
+    const done = addTask(db, { title: "finished work" });
+    setState(done.id, "done");
+    const cancelled = addTask(db, { title: "abandoned work" });
+    setState(cancelled.id, "cancelled");
+
+    const out = renderDashboard(view(), { color: false, links: false, width: 120 });
+    const work = workSection(out);
+    expect(work).toContain(live.id);
+    expect(work).not.toContain(done.id);
+    expect(work).not.toContain(cancelled.id);
+    expect(work).not.toContain("finished work");
+    expect(work).not.toContain("abandoned work");
+
+    const history = historySection(out);
+    expect(history).toContain("1 done");
+    expect(history).toContain("1 cancelled");
+    // The global summary keeps counting them too.
+    expect(out.split("\n").slice(0, 3).join("\n")).toContain("1 done");
+  });
+
+  test("a legacy (non-code-change) task still shows its lifecycle state", () => {
+    const t = addTask(db, { title: "legacy task" });
+    const out = renderDashboard(view(), { color: false, links: false, width: 120 });
+    expect(row(out, t.id)).toContain("queued");
+  });
+});

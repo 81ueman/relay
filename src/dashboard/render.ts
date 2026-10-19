@@ -19,6 +19,13 @@ const TASK_COLOR: Record<string, keyof typeof A> = {
   blocked_human: "red", blocked_internal: "magenta", failed: "red", done: "gray",
   cancelled: "gray",
 };
+// ISH-944: colour code-change rows by PHASE, not by the underlying lifecycle
+// state. The phase is what tells an operator whether a lane is coding,
+// verifying, reviewing, integrating or waiting for acceptance.
+const PHASE_COLOR: Record<string, keyof typeof A> = {
+  implement: "cyan", verify: "yellow", review: "yellow",
+  integration: "magenta", merge_ready: "green",
+};
 const WORKER_COLOR: Record<string, keyof typeof A> = {
   working: "green", idle: "gray", waiting_input: "yellow", stalled: "red", dead: "red", starting: "cyan",
 };
@@ -127,6 +134,19 @@ export function renderDashboard(view: DashboardView, opts: RenderOptions = {}): 
   lines.push(c("WORK", "bold"));
   renderWork(lines, view.taskForest, width, c);
 
+  // ISH-944: closed work is summarised separately. The top summary already
+  // counts every task; this line keeps the WORK section about live lanes while
+  // never hiding how much terminal history sits behind them.
+  const history = historyCounts(view.taskForest);
+  if (history.done || history.cancelled) {
+    const parts: string[] = [];
+    if (history.done) parts.push(`✓ ${history.done} done`);
+    if (history.cancelled) parts.push(`✕ ${history.cancelled} cancelled`);
+    lines.push("");
+    lines.push(c("HISTORY", "bold"));
+    lines.push(c(trim(`  ${parts.join("   ")}`, width), "gray"));
+  }
+
   lines.push("");
   lines.push(c("WORKERS", "bold"));
   if (!view.workers.length) lines.push(c("  (none)", "gray"));
@@ -150,14 +170,18 @@ export function renderDashboard(view: DashboardView, opts: RenderOptions = {}): 
 }
 
 function renderWork(lines: string[], forest: DashboardTaskNode[], width: number, c: ColorFn): void {
-  if (!forest.length) {
+  // ISH-944: terminal (done/cancelled) work is HISTORY, never interleaved with
+  // live lanes. Containers stay in WORK only while they still hold a live leaf.
+  const live = forest.filter(hasLiveWork);
+  if (!live.length) {
     lines.push(c("  (none)", "gray"));
     return;
   }
-  const stW = width >= 64 ? 15 : 8;
+  const stW = width >= 64 ? Math.max(15, Math.min(28, maxTagWidth(live))) : 8;
   const cols = 8 + 1 + stW + 1;
 
   const emitNode = (n: DashboardTaskNode, prefix: string, branch: string, childPrefix: string): void => {
+    if (!hasLiveWork(n)) return;
     const tree = prefix + branch;
     const avail = width - cols - dwidth(tree);
     if (n.children.length) {
@@ -172,7 +196,8 @@ function renderWork(lines: string[], forest: DashboardTaskNode[], width: number,
       emitGroup(n.children, childPrefix, false);
       return;
     }
-    const tag = c(trim(n.state, stW).padEnd(stW), TASK_COLOR[n.state]);
+    const { text, color } = taskTag(n);
+    const tag = c(trim(text, stW).padEnd(stW), color);
     const owner = n.assignee ?? n.role ?? "-";
     let role = n.role && n.assignee ? `  role=${n.role}` : "";
     if (avail - 8 < dwidth(role)) role = "";
@@ -180,34 +205,70 @@ function renderWork(lines: string[], forest: DashboardTaskNode[], width: number,
     if (avail - dwidth(role) - 8 < dwidth(tail)) tail = "";
     const title = trim(n.title, Math.max(1, avail - dwidth(role) - dwidth(tail)));
     const line = `${n.id.padEnd(8)} ${tag} ${tree}${title}${role}${tail}`;
-    lines.push(n.state === "done" || n.state === "cancelled" ? c(line, "dim") : line);
-    if (n.children.length) emitGroup(n.children, childPrefix, false);
+    lines.push(line);
   };
 
   const emitGroup = (nodes: DashboardTaskNode[], prefix: string, top: boolean): void => {
-    const active = nodes.filter((n) => n.state !== "done");
-    const dones = nodes.filter((n) => n.state === "done").sort((a, b) => (a.id < b.id ? -1 : 1));
-    const items: (DashboardTaskNode | null)[] = [...active];
-    let fold = 0;
-    if (dones.length <= 3) items.push(...dones);
-    else {
-      fold = dones.reduce((acc, n) => acc + n.subtreeSize, 0);
-      items.push(null);
-    }
+    const items = nodes.filter(hasLiveWork);
     items.forEach((n, i) => {
       const isLast = i === items.length - 1;
       const branch = top ? "" : isLast ? "└─ " : "├─ ";
       const childPrefix = top ? "" : prefix + (isLast ? "   " : "│  ");
-      if (n === null) {
-        const tag = c("✓", "gray").padEnd(stW);
-        lines.push(c(`${"".padEnd(8)} ${tag} ${prefix}${branch}${fold} done`, "gray"));
-        return;
-      }
       emitNode(n, prefix, branch, childPrefix);
     });
   };
 
-  emitGroup(forest, "", true);
+  emitGroup(live, "", true);
+}
+
+/**
+ * ISH-944: the WORK tag for a task. A code-change task shows its PHASE (with
+ * the implement attempt as `implement/N`) instead of the bare lifecycle state,
+ * because a live lane and a merge_ready task both sit in state `queued`.
+ * `running`, `failed` and the blocked states stay visible next to the phase:
+ * those are the statuses an operator must not lose when the phase replaces the
+ * state.
+ */
+function taskTag(n: DashboardTaskNode): { text: string; color: keyof typeof A } {
+  const phase = n.codeChange ? n.phase : null;
+  if (!phase) return { text: n.state, color: TASK_COLOR[n.state] ?? "gray" };
+  const label = phase === "implement" ? `implement/${n.attempt}` : phase;
+  if (n.state === "running" || n.state === "failed" || n.state.startsWith("blocked_")) {
+    return { text: `${n.state} ${label}`, color: TASK_COLOR[n.state] ?? "red" };
+  }
+  return { text: label, color: PHASE_COLOR[phase] ?? "cyan" };
+}
+
+/** A done/cancelled leaf is terminal HISTORY (failed stays a live WORK row). */
+function isHistoryTask(n: DashboardTaskNode): boolean {
+  return n.state === "done" || n.state === "cancelled";
+}
+
+/** A node belongs in WORK while its subtree still has a non-terminal leaf. */
+function hasLiveWork(n: DashboardTaskNode): boolean {
+  if (!n.children.length) return !isHistoryTask(n);
+  return n.children.some(hasLiveWork);
+}
+
+/** Widest tag a live leaf will render, so the column never truncates needlessly. */
+function maxTagWidth(nodes: DashboardTaskNode[]): number {
+  let w = 0;
+  for (const n of nodes) {
+    if (!hasLiveWork(n)) continue;
+    if (!n.children.length) w = Math.max(w, dwidth(taskTag(n).text));
+    else w = Math.max(w, maxTagWidth(n.children));
+  }
+  return w;
+}
+
+/** Counts for the separate HISTORY summary (leaf work units only). */
+function historyCounts(nodes: DashboardTaskNode[], out = { done: 0, cancelled: 0 }): { done: number; cancelled: number } {
+  for (const n of nodes) {
+    if (n.children.length) historyCounts(n.children, out);
+    else if (n.state === "done") out.done++;
+    else if (n.state === "cancelled") out.cancelled++;
+  }
+  return out;
 }
 
 /** Descendant-LEAF progress for a container: done leaves / total leaves. */

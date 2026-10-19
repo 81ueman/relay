@@ -651,6 +651,28 @@ two columns. Three things keep it readable:
   readable, and space resumes at the live top. `Ctrl-C`/`q` exits and restores
   the terminal (cursor, screen).
 
+### WORK (phase, not bare state)
+
+A code-change task renders its workflow **phase** instead of the lifecycle
+state, because a live factory lane and a `merge_ready` task both sit in state
+`queued`:
+
+```text
+WORK
+T140     running implement/2  storage engine  [fix-rust]
+T141     merge_ready          ready for acceptance  [-]
+
+HISTORY
+  ✓ 34 done   ✕ 2 cancelled
+```
+
+`implement/N` carries the current rework attempt; `verify`, `review`,
+`integration` and `merge_ready` render as themselves. `running`, `failed` and
+the `blocked_*` states stay visible next to the phase so the phase never hides
+an actionable lifecycle state. Terminal `done`/`cancelled` leaves are not
+interleaved with live work; they are summarised in `HISTORY` (and still counted
+in the header summary). `failed` stays in WORK because it needs attention.
+
 Worker and Runtime stay distinct. A worker row is:
 
 ```text
