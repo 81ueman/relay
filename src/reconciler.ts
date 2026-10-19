@@ -137,17 +137,44 @@ export const CONTEXT_ROTATE_NUDGE = (percent: number) =>
   `Write \`relay note <task> "HANDOFF: <state, files, next steps, blockers>"\`, then END YOUR TURN. ` +
   `relay will rotate you to a fresh session and pass the handoff to your successor.`;
 
+/** Role of the persistent integration agent (the Gateway) in the ishiul fleet. */
+export const GATEWAY_ROLE = "gateway";
+
 /**
- * T551 #3: the SESSION-PER-TASK variant for an ADOPTED lane relay cannot retire.
- * The worker must do the rotation itself: finish/checkpoint the current task,
- * then start a fresh session and re-attach (agent_attach). Relay detects the
- * re-attach as a new generation and clears the pending request.
+ * T551 #3 / ISH-935: the directive for an ADOPTED lane relay cannot retire.
+ * The worker must do the rotation itself.
+ *
+ * A `gateway` worker is the persistent integration agent (the human's front
+ * door, Linear patrol, lane integration), so its session is long-lived and
+ * hand-over is the standard rotation: write the durable hand-off, spawn a fresh
+ * successor (same logical worker id), wait until it has attached and read the
+ * hand-off, then detach and close its own pane (die). This is the
+ * `integration-handover` recipe; it must NOT tell the worker relay will rotate
+ * the lane. Every OTHER adopted lane keeps the generic session-per-task wording
+ * (finish/checkpoint, start a fresh session, re-attach, `relay next`).
  */
-export const CONTEXT_SELF_ROTATE_NUDGE = (percent: number) =>
-  `CONTEXT HIGH (${Math.round(percent)}%): checkpoint now. ` +
-  `Write \`relay note <task> "HANDOFF: <state, files, next steps, blockers>"\`, then END YOUR TURN. ` +
-  `This lane is adopted, so relay cannot rotate it: at the next TASK BOUNDARY start a FRESH ` +
-  `session (session-per-task) and re-attach it, then \`relay next\`. Your successor re-claims the task.`;
+export const CONTEXT_SELF_ROTATE_NUDGE = (percent: number, role?: string | null) => {
+  const head = `CONTEXT HIGH (${Math.round(percent)}%): checkpoint now. `;
+  if ((role ?? "").trim().toLowerCase() === GATEWAY_ROLE) {
+    return (
+      head +
+      `Write the full hand-off to \`.lane/INTEGRATION-HANDOFF.md\` (identity, in-flight lanes/PRs/heads, ` +
+      `next steps, blockers) AND a durable \`relay note <task> "HANDOFF: ..."\`, then release your claim. ` +
+      `At the next TASK BOUNDARY spawn a fresh successor session: ` +
+      `\`herdr pane split --pane "$HERDR_PANE_ID" --direction down --cwd <repo> --no-focus\`, ` +
+      `\`herdr agent start <successor> --kind opencode --pane <new-pane>\`, then prompt it to ` +
+      `\`agent_attach\` with the SAME \`gateway\` worker id. Wait until the successor has attached and ` +
+      `confirmed it read \`.lane/INTEGRATION-HANDOFF.md\`; then \`agent_detach\` and close your OWN pane ` +
+      `(\`herdr pane close "$HERDR_PANE_ID"\`) — die. Your successor owns the lane from then on.`
+    );
+  }
+  return (
+    head +
+    `Write \`relay note <task> "HANDOFF: <state, files, next steps, blockers>"\`, then END YOUR TURN. ` +
+    `This lane is adopted, so relay cannot rotate it: at the next TASK BOUNDARY start a FRESH ` +
+    `session (session-per-task) and re-attach it, then \`relay next\`. Your successor re-claims the task.`
+  );
+};
 
 function wakeCooldownMs(): number {
   const v = Number(process.env.RELAY_WAKE_COOLDOWN_MS ?? "30000");
@@ -1071,7 +1098,9 @@ async function processContextRotation(db: Database, rt: Runtime, actions: string
     // session-per-task wording (it must rotate itself).
     if (w.context_rotate_requested_at === null) {
       const selfRotate = adopted && !replaceAdopted;
-      const text = selfRotate ? CONTEXT_SELF_ROTATE_NUDGE(contextPercent(w)) : CONTEXT_ROTATE_NUDGE(contextPercent(w));
+      const text = selfRotate
+        ? CONTEXT_SELF_ROTATE_NUDGE(contextPercent(w), w.role)
+        : CONTEXT_ROTATE_NUDGE(contextPercent(w));
       sendMessage(db, "relay", w.id, `${RELAY_TAG}${text}`, {
         kind: "handoff",
         taskId: w.current_task_id ?? undefined,
