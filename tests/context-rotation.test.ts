@@ -7,7 +7,7 @@ import { openDb } from "../src/db";
 import { listEvents } from "../src/events";
 import { handleSocketMessage, type SocketContext } from "../src/socket";
 import { MockRuntime } from "../src/runtime/runtime";
-import { reconcile } from "../src/reconciler";
+import { CONTEXT_SELF_ROTATE_NUDGE, reconcile } from "../src/reconciler";
 import { addNote, addTask, claimNext, getTask } from "../src/tasks";
 import { attachSession, getSession } from "../src/sessions";
 import { findRuntime, recordRuntime } from "../src/runtimes";
@@ -98,11 +98,11 @@ function seedSpawned(id: string, generation: number, state = "idle"): void {
 }
 
 /** Register a worker and ADOPT an existing runtime (relay_owned=0) via a manual attach. */
-function managed(id: string): void {
+function managed(id: string, role = "worker"): void {
   const runtimeId = `${id}-agent`;
-  registerWorker(db, id, { role: "worker", runtimeId });
+  registerWorker(db, id, { role, runtimeId });
   attachSession(db, `ses_${id}`, {
-    role: "worker",
+    role,
     workerId: id,
     identity: { agent: runtimeId, tabId: `tab-${id}`, paneId: `pane-${id}`, workspaceId: "w-ext", agentKind: "opencode" },
   });
@@ -476,5 +476,58 @@ describe("adopted-lane rotation (T551 #2/#3)", () => {
     expect(getSession(db, "ses_w1")!.managed).toBe(0);
     const rotate = listEvents(db, { limit: 200 }).find((e) => e.type === "worker.context_rotate")!;
     expect(rotate.payload_json).toContain("session-per-task");
+  });
+});
+
+// ISH-935: the adopted-lane directive is ROLE-AWARE. The persistent gateway
+// integration agent must hand over to a FRESH successor and die; it must never
+// be told "relay cannot rotate it" (there is no relay-owned rotation for an
+// adopted lane, so that wording left the gateway waiting on the wrong actor).
+describe("adopted gateway handover directive (ISH-935)", () => {
+  test("gateway role gets spawn-successor / hand-over / die, not 'relay cannot rotate it'", () => {
+    const text = CONTEXT_SELF_ROTATE_NUDGE(90, "gateway");
+
+    expect(text).toContain("CONTEXT HIGH (90%)");
+    // Hand-off first, in the file the integration handover skill names.
+    expect(text).toContain(".lane/INTEGRATION-HANDOFF.md");
+    expect(text).toContain("relay note");
+    // The standard rotation recipe: split a pane, start the successor, attach it
+    // with the SAME logical worker id.
+    expect(text).toContain("spawn a fresh successor session");
+    expect(text).toContain("herdr pane split");
+    expect(text).toContain('"$HERDR_PANE_ID"');
+    expect(text).toContain("herdr agent start");
+    expect(text).toContain("--kind opencode");
+    expect(text).toContain("agent_attach");
+    expect(text).toContain("SAME `gateway` worker id");
+    // Wait for the successor to prove it read the hand-off, then die.
+    expect(text).toContain("successor has attached");
+    expect(text).toContain("INTEGRATION-HANDOFF.md`; then `agent_detach`");
+    expect(text).toContain("herdr pane close");
+    expect(text).toContain("die");
+    expect(text).not.toContain("relay cannot rotate it");
+  });
+
+  test("other adopted roles keep the generic session-per-task wording", () => {
+    const text = CONTEXT_SELF_ROTATE_NUDGE(90, "worker");
+    expect(text).toContain("session-per-task");
+    expect(text).toContain("relay next");
+    expect(text).not.toContain(".lane/INTEGRATION-HANDOFF.md");
+  });
+
+  test("reconcile sends the gateway directive to an adopted gateway worker", async () => {
+    delete process.env.RELAY_ROTATE_ADOPTED;
+    managed("gateway", "gateway");
+    await sendContext("gateway", 900000);
+
+    await reconcile(db, rt);
+
+    const nudge = rt.wakes.map((x) => x.text).find((t) => t.includes("CONTEXT HIGH"));
+    expect(nudge).toBeDefined();
+    expect(nudge).toContain("herdr pane split");
+    expect(nudge).toContain("agent_detach");
+    expect(nudge).not.toContain("relay cannot rotate it");
+    expect(rt.starts).toHaveLength(0); // adopted: relay still never spawns it
+    expect(getWorker(db, "gateway")!.context_rotate_requested_at).not.toBeNull();
   });
 });
