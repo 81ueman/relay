@@ -6,7 +6,8 @@ import { findRuntime, listRuntimes } from "../runtimes";
 import { getNotes, listTasks, taskCounts, unclaimableRunnableTasks } from "../tasks";
 import { toolHardCapMs, toolMaxMs, toolNoOutputMs, toolWarnMs, unresponsiveWindowMs } from "../scheduler";
 import { listWorkers, isHeadlessWorker, quietActive, type WorkerRow } from "../workers";
-import type { Task, WorkerRuntime } from "../schema";
+import type { CodePhase, Task, WorkerRuntime } from "../schema";
+import { derivePhase } from "../workflow";
 import { readPanes, relayWorkspaces, type PaneTelemetry } from "./herdr";
 import { buildAffinity, NO_AFFINITY, type WorkerAffinity, type WorkerCluster } from "./affinity";
 
@@ -27,6 +28,16 @@ export interface DashboardTaskNode {
   parent: string | null;
   priority: number | null;
   updatedAt: number;
+  /**
+   * ISH-944: the code-change PHASE is the stage operators need on the WORK row
+   * (`implement/N`, verify, review, integration, merge_ready); `state` stays the
+   * lifecycle truth underneath it. Derived for old code tasks that predate the
+   * phase column; null on legacy (non-code-change) tasks.
+   */
+  phase: CodePhase | null;
+  codeChange: boolean;
+  /** Monotonic rework counter within `phase` (implement/N on the row). */
+  attempt: number;
   depth: number;
   children: DashboardTaskNode[];
   allDone: boolean;
@@ -281,6 +292,7 @@ export function buildForest(tasks: Task[]): { forest: DashboardTaskNode[]; byId:
     byId[t.id] = {
       id: t.id, title: t.title, state: t.state, role: t.role, assignee: t.assignee,
       parent: t.parent_task_id, priority: t.priority, updatedAt: t.updated_at,
+      phase: derivePhase(t), codeChange: t.code_change === 1, attempt: t.attempt,
       depth: 0, children: [], allDone: false, isContainer: false, subtreeSize: 1,
     };
   }
