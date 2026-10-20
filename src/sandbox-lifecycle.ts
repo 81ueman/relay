@@ -2,6 +2,13 @@ import type { Database } from "bun:sqlite";
 import { appendFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { defaultDbPath, now, projectRoot } from "./db";
+import {
+  assertLaunchDiskSpace,
+  defaultDiskPaths,
+  minFreeDindBytes,
+  probeSandboxDindFreeBytes,
+  type DiskGuardOptions,
+} from "./disk-guard";
 import { logEvent } from "./events";
 import { getTask } from "./tasks";
 import type { Run, RunState, Sandbox, Task } from "./schema";
@@ -416,8 +423,17 @@ export interface LaunchSandboxOptions extends EnsureSandboxOptions {
   installDsh?: boolean;
   /** The sbx executable (default `sbx`, or $RELAY_SBX_BIN). */
   sbxBin?: string;
+  /** ISH-1009: host + in-sandbox DinD disk-space guard seams. */
+  diskGuard?: SandboxDiskGuardOptions;
   /** Test seam for the `sbx exec … dsh` process. */
   spawner?: DshSpawner;
+}
+
+export interface SandboxDiskGuardOptions extends DiskGuardOptions {
+  /** Override `RELAY_MIN_FREE_DIND_BYTES` for the in-sandbox DinD volume. */
+  dindMinFreeBytes?: number;
+  /** Test seam; may throw to simulate a failed in-sandbox probe. */
+  dindProbe?: (cli: SbxCli, name: string) => number;
 }
 
 export interface SandboxRunHandle {
@@ -570,11 +586,41 @@ export async function launchTaskSandboxRun(
   if (task.phase !== "implement" && task.phase !== "integration") {
     throw new Error(`${SANDBOX_ERROR}: task ${task.id} is in phase '${task.phase ?? "none"}' (a Run starts in implement/integration)`);
   }
+  const { dindMinFreeBytes, dindProbe, ...hostDiskGuard } = opts.diskGuard ?? {};
+  // ISH-1009: refuse BEFORE creating the sandbox or pinning the brief. The Task
+  // stays queued and nothing is spawned; the next tick after space is freed
+  // proceeds normally. A failed probe is fail-closed, never a pass.
+  assertLaunchDiskSpace(db, {
+    taskId,
+    phase: task.phase,
+    target: "sandbox",
+    ...hostDiskGuard,
+    paths: hostDiskGuard.paths ?? defaultDiskPaths(db),
+  });
   const cli = opts.cli ?? realSbxCli;
   const binding = ensureTaskSandbox(db, taskId, opts);
 
   // Refuse BEFORE pinning/writing when the sandbox already has a live writer.
   assertNoActiveSandboxWriter(db, { sandboxName: binding.name, branch: binding.branch });
+
+  // ISH-1009: the in-sandbox DinD volume is a SEPARATE 10g budget. Probe it
+  // after the sandbox exists (the name is needed) and before the Run starts.
+  // `0` disables this optional probe; a probe failure refuses the launch.
+  const dindMin = dindMinFreeBytes ?? minFreeDindBytes();
+  if (dindMin > 0) {
+    assertLaunchDiskSpace(db, {
+      taskId,
+      phase: task.phase,
+      target: "sandbox",
+      scope: "dind",
+      sandbox: binding.name,
+      minFreeBytes: dindMin,
+      paths: ["/var/lib/docker"],
+      probe: dindProbe
+        ? () => dindProbe(cli, binding.name)
+        : () => probeSandboxDindFreeBytes(cli, binding.name),
+    });
+  }
 
   const dsh = prepareSandboxDsh(binding, { installDsh: opts.installDsh, cli, dshBin: opts.dshBin });
   logSandbox(db, taskId, "sandbox.dsh", { name: binding.name, version: dsh.version, installed: dsh.installed });
