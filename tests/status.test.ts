@@ -9,6 +9,7 @@ import { daemonIdentity } from "../src/singleton";
 import { startSocketServer, type SocketContext } from "../src/socket";
 import { addTask, claimNext, submitTask } from "../src/tasks";
 import { registerWorker } from "../src/workers";
+import { assertLaunchDiskSpace } from "../src/disk-guard";
 
 // `relay status` annotates each worker with the tasks it would pick up next.
 // Presentation only: the list must match what `relay next --worker <id>` offers
@@ -135,6 +136,41 @@ describe("relay status: what each worker picks up next", () => {
     expect(workerLine(out, "w")).toContain("next: (none)");
     expect(out).toContain("Unclaimable");
     expect(out).toContain("role=dataplane-rust");
+  });
+});
+
+// ISH-1009: a refused launch must be visible with the measured free space, not
+// just as a task that silently never starts.
+describe("relay status: disk guard (ISH-1009)", () => {
+  test("a low-disk refusal shows the measurement and the last refusal", () => {
+    const task = addTask(db, { title: "waiting for disk" });
+    expect(() =>
+      assertLaunchDiskSpace(db, {
+        taskId: task.id,
+        target: "host",
+        minFreeBytes: 20 * 1024 ** 3,
+        paths: ["/volume"],
+        probe: () => 12 * 1024 ** 3,
+      })
+    ).toThrow(/LOW_DISK/);
+
+    const r = Bun.spawnSync(["bun", cli, "status"], {
+      cwd: dir,
+      env: {
+        ...process.env,
+        FORCE_COLOR: "0",
+        RELAY_DB: join(dir, ".relay", "state.db"),
+        // Force the live measurement below its floor without depending on the
+        // free space of the machine running the suite.
+        RELAY_MIN_FREE_DISK_BYTES: String(Number.MAX_SAFE_INTEGER),
+      },
+    });
+    expect(r.exitCode).toBe(0);
+    const out = r.stdout.toString();
+    expect(out).toContain("Disk guard");
+    expect(out).toContain("BELOW MINIMUM");
+    expect(out).toContain("launch guard: REFUSING");
+    expect(out).toContain(`last launch refusal: ${task.id} low_disk free=12.0 GiB threshold=20.0 GiB`);
   });
 });
 

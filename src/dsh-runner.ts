@@ -9,6 +9,7 @@ import { isTerminalTaskState } from "./schema";
 import { spawnIdentityToken } from "./proc-identity";
 import { childEnv } from "./child-env";
 import { isPinnedDsh, PINNED_DSH_VERSION, readDshVersion } from "./dsh-version";
+import { assertLaunchDiskSpace, type DiskGuardOptions } from "./disk-guard";
 import { gitHead } from "./verify";
 import { submitImplementationFromRun, type RunImplementation } from "./workflow";
 import {
@@ -122,6 +123,14 @@ export interface StartRunOptions {
   fastExitMs?: number;
   /** Extra env for the child (merged over a small allowlist, never all of process.env). */
   env?: Record<string, string>;
+  /** ISH-1009: disk-space guard override (test/operator seam). */
+  diskGuard?: DiskGuardOptions;
+  /**
+   * ISH-1009: internal composition seam. `launchTaskRun` measures BEFORE it
+   * creates/pins the worktree and then starts the Run; setting this avoids a
+   * second probe of the same volume. Public entrypoints leave it unset.
+   */
+  skipDiskGuard?: boolean;
   /** Test seam. */
   spawner?: DshSpawner;
 }
@@ -413,6 +422,18 @@ export async function startDshRun(db: Database, opts: StartRunOptions): Promise<
   const phase = task.phase;
   if (phase !== "implement" && phase !== "integration") {
     throw new Error(`task ${task.id} is in phase '${phase ?? "none"}' (a Run starts in implement/integration)`);
+  }
+
+  // ISH-1009: refuse BEFORE any Run row / output directory / dsh process. A
+  // refusal leaves the Task exactly as it was (queued), so the next attempt
+  // after space is freed launches normally. A probe failure is never a pass.
+  if (!opts.skipDiskGuard) {
+    assertLaunchDiskSpace(db, {
+      taskId: task.id,
+      phase,
+      target: "host",
+      ...opts.diskGuard,
+    });
   }
 
   const cwd = opts.cwd ?? task.worktree ?? process.cwd();

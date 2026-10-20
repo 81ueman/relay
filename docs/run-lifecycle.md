@@ -93,6 +93,35 @@ the Task **owns** its workspace. A second call on the same Task returns the
 existing binding (`worktree.selected`) instead of creating a new one — this is
 what makes a FIX the *same worktree*.
 
+## Pre-launch disk-space guard (ISH-1009)
+
+Before a Run row is inserted, and before `launchTaskRun` creates/pins a
+worktree, Relay measures free space on the **worktrees root** and the volume
+holding the **Relay DB** (`src/disk-guard.ts`). The threshold is
+`RELAY_MIN_FREE_DISK_BYTES` (default 20 GiB; `0` turns off the threshold only —
+an unmeasurable volume still refuses). If **either** volume is below it:
+
+- no workspace, Run row, output directory or dsh process is created;
+- the Task is left exactly as it was (`queued`), so the next launch attempt
+  after space is freed proceeds normally — no manual requeue/unblock;
+- a durable `run.launch_refused` event is written with `reason: "low_disk"`,
+  `freeBytes`, `minFreeBytes`, the per-path probe results and the launch
+  `target`/`scope`;
+- `relay status` and the dashboard show the live measurement and the last
+  refusal (free space and threshold).
+
+A probe that cannot measure is **not** a pass: the launch is refused with
+`reason: "probe_failed"` and the probe error is recorded in the event and
+surfaced by both UIs. This is fail-closed by design: an unmeasurable volume is
+treated like a full one.
+
+The guard is enforced in `startDshRun` (so raw `relay run start` cannot bypass
+it) and in `launchTaskSandboxRun` before the sandbox is created. The Task
+lifecycle calls the same guard earlier so a low-disk refusal never creates a
+worktree. Sandbox Runs additionally probe the in-VM DinD volume
+(`/var/lib/docker`) against `RELAY_MIN_FREE_DIND_BYTES` (default 2 GiB; `0`
+disables) — a separate budget from the host, since `DinDVolumeSize` is 10g.
+
 ## The Run brief is pinned BEFORE launch
 
 `launchTaskRun` composes a brief and writes it to
@@ -222,7 +251,9 @@ covers the same ground with a fake process and asserts every rejection case.
   submitter binding
   (moved head, superseded/late Run); safe cleanup (merge, abort, open PR, dirty,
   human workspace) with evidence retention; the CLI paths `run worktree|launch|
-  cleanup`.
+  cleanup`; and the ISH-1009 pre-launch disk guard (threshold refusal, fail-closed
+  probe error, and the same queued Task launching after space is freed) surfaced
+  in `relay status` and the dashboard.
 - **NOT verified here**: launching the **real** `dsh` binary (see
   [`dsh-headless-runner.md`](dsh-headless-runner.md), the opt-in
   `RELAY_DSH_SMOKE=1` smoke); deleting the old Herdr coding-runner path

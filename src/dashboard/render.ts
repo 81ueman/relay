@@ -3,6 +3,7 @@ import type {
   DashboardView,
   DashboardWorker,
 } from "./model";
+import { formatBytes, formatDiskStatus, worstDiskProbe } from "../disk-guard";
 
 /**
  * Dashboard rendering: DashboardView -> text (ANSI/plain) or JSON.
@@ -118,6 +119,20 @@ export function renderDashboard(view: DashboardView, opts: RenderOptions = {}): 
     if (s.counts[st]) parts.push(`${s.counts[st]} ${st}`);
   }
   lines.push(trim(parts.join("   "), width));
+
+  // ISH-1009: the disk guard sits immediately under the summary so a full
+  // volume (and the fact that launches are refused) is visible before WORK.
+  if (view.disk) {
+    const worst = worstDiskProbe(view.disk.status);
+    const where = worst?.path ? `  ${worst.path}` : "";
+    const last = view.disk.lastRefusal
+      ? `  last: ${view.disk.lastRefusal.taskId ?? "-"} ${view.disk.lastRefusal.reason} free=${formatBytes(view.disk.lastRefusal.freeBytes)}`
+      : "";
+    lines.push(
+      c(trim(`  disk: ${formatDiskStatus(view.disk.status)}${last}${where}`, width),
+        view.disk.status.ok ? "gray" : "red")
+    );
+  }
 
   // ATTENTION is the "what needs me" section. It renders FIRST (before WORK):
   // the pane-height clip (T326) can hide anything below a long WORK tree, and
@@ -490,5 +505,6 @@ export function renderDashboardJson(view: DashboardView): string {
       claimable_task_ids: cl.claimableTaskIds,
     })),
     attention: view.attention,
+    disk: view.disk,
   }, null, 2);
 }
