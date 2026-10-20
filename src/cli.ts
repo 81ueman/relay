@@ -29,6 +29,7 @@ import { defaultRunner, type CheckSpec } from "./verify";
 import { sandboxVerifyTarget } from "./sandbox-verify";
 import { acceptRunSubmission, getRun, listRuns, startDshRun } from "./dsh-runner";
 import { formatDshEvent, readDshEvents } from "./dsh-events";
+import { parseRunFailureClass } from "./run-failure";
 import { signalRunProcess } from "./run-signal";
 import {
   applyWorkspaceCleanup,
@@ -1667,11 +1668,15 @@ async function main(): Promise<void> {
           if (!id) throw new Error("usage: relay run show <run-id> [--json]");
           const r = getRun(db, id);
           if (!r) throw new Error(`unknown run: ${id}`);
+          // ISH-1008: the liveness sweep stores `cause=<CLASS>` in `error`.
+          // Project it explicitly so a died Run reads the same in text and JSON.
+          const failureClass = parseRunFailureClass(r.error);
           if (hasFlag(rest, "--json")) {
-            console.log(JSON.stringify(r, null, 2));
+            console.log(JSON.stringify(failureClass ? { ...r, failure_class: failureClass } : r, null, 2));
             break;
           }
           for (const [k, v] of Object.entries(r)) console.log(`${k}: ${v ?? "-"}`);
+          if (failureClass) console.log(`failure_class: ${failureClass}`);
           break;
         }
         if (sub === "logs") {

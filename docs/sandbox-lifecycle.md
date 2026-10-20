@@ -152,6 +152,16 @@ terminal when the dsh is confirmed `gone`; otherwise it leaves it non-terminal a
 reports `stopped:false`. A terminal `error` event contradicting exit 0 is
 `failed`. No path fabricates a success.
 
+ISH-1008 makes the same fail-closed sweep **periodic**: the daemon's
+`reconcile()` loop runs it (throttled, `RELAY_RUN_LIVENESS_MS` default 45s) for
+every non-terminal sandbox Run, so a Run whose host client died is failed without
+waiting for factory adoption or a manual `sweep --apply`. The daemon then
+classifies the cause from the Run's evidence tails (`ENOSPC` / `OOM` / `signal` /
+`unknown`), appends `cause=<CLASS>` to the durable `orphaned:` error, emits
+`run.died`, and surfaces it on the dashboard and in coordinator mail. A probe
+failure or an `unknown` in-VM state still leaves the row non-terminal, exactly as
+above.
+
 ## The host `process.env` is not inherited
 
 Both child spawns (the host dsh runner and the `sbx exec` client) get a small

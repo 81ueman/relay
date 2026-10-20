@@ -132,6 +132,45 @@ launch that will be rejected never writes into the worktree the live Run owns �
 the pinned brief always keeps matching the Run that holds the worktree. The atomic
 guard inside `startDshRun` remains authoritative.
 
+## Daemon Run liveness sweep (ISH-1008)
+
+The launching coroutine is normally the **only** writer of a Run's terminal row.
+If it dies (daemon crash, reboot, or an `ENOSPC` terminal write), the row would
+stay `starting`/`running` forever: `DUPLICATE_WRITER` keeps fencing and nobody is
+alerted. `reconcile()` therefore runs a throttled liveness pass
+(`src/run-liveness.ts`, `RELAY_RUN_LIVENESS_MS` default **45s**) over every
+non-terminal Run. The durable throttle advances only after a **clean** pass, so
+a write failure (a full disk) retries on the next reconcile tick instead of
+waiting a whole interval.
+
+Local Runs reuse `identifyRunProcess`:
+
+| identity | outcome |
+| --- | --- |
+| `dead` | `failed` (`orphaned: owner pid … is not alive`) |
+| `reused` | `failed` (`orphaned: … unrelated process (reused)`); **no signal** |
+| `match` | untouched — the writer is live |
+| `undeterminable` | untouched — the single-writer fence stays held |
+
+A `starting` row that has not recorded a PID yet is left alone for
+`RELAY_RUN_START_GRACE_MS` (default `max(60s, 2 x interval)`), so a sweep never
+races a concurrent launch. The sweep never kills a local process: it only writes
+a terminal row after proving the original one is gone.
+
+Sandbox Runs reuse `sweepOrphanedSandboxRuns({ apply: true })` and inherit its
+fail-closed proof: the Run is terminal only when the in-VM dsh is confirmed
+**gone** (see [`sandbox-lifecycle.md`](sandbox-lifecycle.md)).
+
+A sweep failure is never a success. It reads the tail of the Run's
+`stderr.log`/`dsh.jsonl`, classifies the cause (`ENOSPC`, `OOM`, `signal`,
+`unknown`), stores `cause=<CLASS>: <evidence>` in `runs.error`, emits `run.died`,
+shows the cause on the dashboard (`RUNS` and `ATTENTION`), and sends immediate
+`run_died` mail to the responsible owner. `relay run show <id>` projects the
+class as `failure_class`. Per-run errors are isolated so a failed write cannot
+crash the daemon or prevent the remaining Runs from being swept. The sweep does
+**not** add a pre-launch disk guard (ISH-1009) or stall detection for a live but
+silent dsh.
+
 ## FIX = same worktree + previous findings + a new Run
 
 A review `--fail`/FIX (or a failed mechanical verify) sends the Task back to
