@@ -89,6 +89,34 @@ echo DONE
 const NOOP_DSH = `echo DONE
 `;
 
+/**
+ * ISH-1010: the first Run commits a change that still FAILS the required check
+ * (`test -f fixed.txt`); the FIX Run sees the marker left by the first Run,
+ * commits `fixed.txt` on top of the SAME worktree, and then passes.
+ */
+const VERIFY_FAIL_THEN_FIX_DSH = `set -e
+echo "[$RELAY_RUN_ID] implementing"
+if [ -f .relay/ish1010-verify-failed ]; then echo fixed > fixed.txt; fi
+touch .relay/ish1010-verify-failed
+echo "$RELAY_RUN_ID" > "change-$RELAY_RUN_ID.txt"
+git add -A
+git -c user.email=relay@test -c user.name=relay commit -qm "change $RELAY_RUN_ID"
+echo DONE
+`;
+
+/** ISH-1010: VERIFY fails on attempts 0 and 1, then passes on attempt 2. */
+const VERIFY_FAIL_TWICE_THEN_PASS_DSH = `set -e
+echo "[$RELAY_RUN_ID] implementing"
+if [ -f .relay/ish1010-verify-failed-2 ]; then echo fixed > fixed.txt
+elif [ -f .relay/ish1010-verify-failed-1 ]; then touch .relay/ish1010-verify-failed-2
+else touch .relay/ish1010-verify-failed-1
+fi
+echo "$RELAY_RUN_ID" > "change-$RELAY_RUN_ID.txt"
+git add -A
+git -c user.email=relay@test -c user.name=relay commit -qm "change $RELAY_RUN_ID"
+echo DONE
+`;
+
 // ---------------------------------------------------------------------------
 // ISH-878: fakes for the Sandbox IMPLEMENT/FIX path (no Docker, no sandbox).
 // A fake `sbx` CLI + a fake `sbx exec … dsh` process + a real local git remote
@@ -217,6 +245,7 @@ type ReviewPlan =
   | "blockedempty"
   | "garbage"
   | "wronghead"
+  | "oldhead"
   | "envelope"
   | "exitfail"
   | "signal"
@@ -255,6 +284,11 @@ function reviewerHarness(plan: ReviewPlan[]): ReviewerHarness {
           break;
         case "wronghead":
           stdout = JSON.stringify({ verdict: "pass", head: "0".repeat(40), summary: "x" });
+          break;
+        case "oldhead":
+          // ISH-1010: after a retry, name the head from the PREVIOUS attempt.
+          // The old attempt's code is no longer the reviewed revision.
+          stdout = JSON.stringify({ verdict: "pass", head: calls[0]?.head ?? "0".repeat(40), summary: "old head" });
           break;
         case "garbage":
           stdout = "I read it and it looks fine to me, no JSON.";
@@ -333,6 +367,21 @@ const factoryDeps = (dshBin: string, reviewer?: ReviewerSpawner) => ({
   reviewerSpawner: reviewer,
   mergeGateDeps: {},
 });
+
+interface TaskResultRow {
+  id: number;
+  attempt: number;
+  passed: number;
+  head_sha: string | null;
+  reason: string | null;
+}
+
+/** ISH-1010: the durable result rows a repair path wrote, in attempt order. */
+function taskResults(taskId: string, kind: "VerificationResult" | "ReviewResult"): TaskResultRow[] {
+  return db
+    .query(`SELECT id, attempt, passed, head_sha, reason FROM task_results WHERE task_id = ? AND kind = ? ORDER BY attempt, id`)
+    .all(taskId, kind) as TaskResultRow[];
+}
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "relay-ish762-"));
@@ -948,6 +997,210 @@ describe("Factory E2E: real worktree, fake headless dsh + independent reviewer",
     );
     expect(() => recordReview(db, id, REVIEWER_WORKER, { verdict: "pass", headSha: bogus })).toThrow();
     expect(getTask(db, id)!.head_sha).toBe(reviewedHead);
+  });
+});
+
+describe("ISH-1010: Factory repair convergence (VERIFY/REVIEW -> FIX)", () => {
+  test("VERIFY FAIL -> fresh FIX Run on the same worktree -> VERIFY PASS -> independent REVIEW PASS", async () => {
+    const dsh = fakeDsh("dsh-verify-fix", VERIFY_FAIL_THEN_FIX_DSH);
+    const id = newTask({ checks: [{ name: "fixed-marker", command: "test -f fixed.txt" }] });
+    const baseSha = git(repo, "rev-parse", "HEAD");
+    const rev = reviewerHarness(["pass"]);
+
+    const res = await runFactoryTask(db, id, factoryDeps(dsh, rev.spawner));
+
+    expect(res.outcome).toBe("merge_ready");
+    const task = getTask(db, id)!;
+    expect(task.id).toBe(id);
+    expect(task.attempt).toBe(1);
+    expect(task.phase).toBe("merge_ready");
+    expect(task.head_sha).toBe(res.head!);
+
+    const runs = listRuns(db, { taskId: id });
+    expect(runs).toHaveLength(2);
+    const r0 = runs.find((r) => r.attempt === 0)!;
+    const r1 = runs.find((r) => r.attempt === 1)!;
+    expect(r0).toBeTruthy();
+    expect(r1).toBeTruthy();
+    expect(r0.id).not.toBe(r1.id);
+    // The worktree/branch continues; the FIX starts on the first Run's commit.
+    expect(r1.cwd).toBe(r0.cwd);
+    expect(r1.branch).toBe(r0.branch);
+    expect(r0.base_head_sha).toBe(baseSha);
+    expect(r1.base_head_sha).toBe(r0.head_sha);
+    expect(git(r1.cwd!, "merge-base", "--is-ancestor", r0.head_sha!, r1.head_sha!)).toBe("");
+
+    // Attempt 0 failed VERIFY and never reached review; attempt 1 passed both.
+    expect(res.attempts.map((a) => a.attempt)).toEqual([0, 1]);
+    expect(res.attempts.map((a) => a.runId)).toEqual([r0.id, r1.id]);
+    expect(res.attempts.map((a) => a.producedHead)).toEqual([r0.head_sha, r1.head_sha]);
+    expect(res.attempts.map((a) => a.verifyOutcome)).toEqual(["fail", "pass"]);
+    expect(res.attempts.map((a) => a.reviewVerdict)).toEqual([null, "pass"]);
+
+    const verify = taskResults(id, "VerificationResult");
+    expect(verify.map((r) => [r.attempt, r.passed, r.head_sha])).toEqual([
+      [0, 0, r0.head_sha],
+      [1, 1, r1.head_sha],
+    ]);
+    const reviews = taskResults(id, "ReviewResult");
+    expect(reviews.map((r) => [r.attempt, r.passed, r.head_sha])).toEqual([[1, 1, r1.head_sha]]);
+    expect(findPassingReview(db, id, 1)!.head_sha).toBe(r1.head_sha);
+
+    // The reviewer judged the POST-FIX head; the FIX brief carried the failed
+    // mechanical check as the finding to repair.
+    expect(rev.calls).toHaveLength(1);
+    expect(rev.calls[0].head).toBe(r1.head_sha);
+    expect(rev.calls[0].cwd).toBe(r1.cwd!);
+    const brief = readFileSync(join(r1.cwd!, ".relay", "run-brief.md"), "utf-8");
+    expect(brief).toContain("Prior findings");
+    expect(brief).toContain("fixed-marker");
+    expect(brief).toContain("fail");
+  });
+
+  test("REVIEW FIX -> fresh Run -> re-VERIFY -> review PASS; attempt/SHA bindings and a late old Run are refused", async () => {
+    const dsh = fakeDsh("dsh-review-fix", COMMITTING_DSH);
+    const id = newTask();
+    const baseSha = git(repo, "rev-parse", "HEAD");
+    const rev = reviewerHarness(["fix", "pass"]);
+
+    const res = await runFactoryTask(db, id, factoryDeps(dsh, rev.spawner));
+
+    expect(res.outcome).toBe("merge_ready");
+    const task = getTask(db, id)!;
+    expect(task.id).toBe(id);
+    expect(task.attempt).toBe(1);
+    expect(task.phase).toBe("merge_ready");
+    expect(task.head_sha).toBe(res.head!);
+
+    const runs = listRuns(db, { taskId: id });
+    expect(runs).toHaveLength(2);
+    const r0 = runs.find((r) => r.attempt === 0)!;
+    const r1 = runs.find((r) => r.attempt === 1)!;
+    expect(r0.id).not.toBe(r1.id);
+    expect(r1.cwd).toBe(r0.cwd);
+    expect(r1.branch).toBe(r0.branch);
+    expect(r0.base_head_sha).toBe(baseSha);
+    expect(r1.base_head_sha).toBe(r0.head_sha);
+    expect(git(r1.cwd!, "merge-base", "--is-ancestor", r0.head_sha!, r1.head_sha!)).toBe("");
+
+    expect(res.attempts.map((a) => a.attempt)).toEqual([0, 1]);
+    expect(res.attempts.map((a) => a.runId)).toEqual([r0.id, r1.id]);
+    expect(res.attempts.map((a) => a.producedHead)).toEqual([r0.head_sha, r1.head_sha]);
+    expect(res.attempts.map((a) => a.verifyOutcome)).toEqual(["pass", "pass"]);
+    expect(res.attempts.map((a) => a.reviewVerdict)).toEqual(["fix", "pass"]);
+
+    const verify = taskResults(id, "VerificationResult");
+    expect(verify.map((r) => [r.attempt, r.passed, r.head_sha])).toEqual([
+      [0, 1, r0.head_sha],
+      [1, 1, r1.head_sha],
+    ]);
+    const reviews = taskResults(id, "ReviewResult");
+    expect(reviews.map((r) => [r.attempt, r.passed, r.head_sha])).toEqual([
+      [0, 0, r0.head_sha],
+      [1, 1, r1.head_sha],
+    ]);
+    expect(reviews[0].reason).toContain("needs the B marker");
+    expect(reviews[1].reason).toBe("looks correct");
+    expect(findPassingReview(db, id, 1)!.head_sha).toBe(r1.head_sha);
+
+    // The reviewer actually ran at H0 (FIX) and then H1 (PASS), in the same
+    // continuous worktree; only the attempt-1 brief inherits the finding.
+    expect(rev.calls.map((c) => c.head)).toEqual([r0.head_sha, r1.head_sha]);
+    expect(rev.calls[0].cwd).toBe(rev.calls[1].cwd);
+    expect(rev.calls[0].brief).not.toContain("needs the B marker");
+    const brief = readFileSync(join(r1.cwd!, ".relay", "run-brief.md"), "utf-8");
+    expect(brief).toContain("Prior findings");
+    expect(brief).toContain("needs the B marker");
+
+    // A late attempt-0 Run can never submit into the converged attempt-1 task.
+    expect(() => acceptRunSubmission(db, { runId: r0.id })).toThrow(/RUN_SUBMISSION_REJECTED/);
+    expect(findPassingReview(db, id, 0)).toBeNull();
+  });
+
+  test("maxAttempts stops before a new Run; restart re-enters the same worktree without duplicate progress", async () => {
+    const dsh = fakeDsh("dsh-cap", VERIFY_FAIL_TWICE_THEN_PASS_DSH);
+    const id = newTask({ checks: [{ name: "fixed-marker", command: "test -f fixed.txt" }] });
+    const baseSha = git(repo, "rev-parse", "HEAD");
+    const rev = reviewerHarness(["pass"]);
+
+    const capped = await runFactoryTask(db, id, { ...factoryDeps(dsh, rev.spawner), maxAttempts: 2 });
+    expect(capped.outcome).toBe("max_attempts");
+    expect(capped.reason).toContain("exceeded 2 attempts");
+    const atCap = getTask(db, id)!;
+    expect(atCap.phase).toBe("implement");
+    expect(atCap.attempt).toBe(2);
+    expect(atCap.head_sha).toBeNull();
+    expect(rev.calls).toHaveLength(0);
+
+    let runs = listRuns(db, { taskId: id });
+    expect(runs).toHaveLength(2);
+    expect(runs.some((r) => r.attempt === 2)).toBe(false);
+    const r0 = runs.find((r) => r.attempt === 0)!;
+    const r1 = runs.find((r) => r.attempt === 1)!;
+    expect(r1.cwd).toBe(r0.cwd);
+    expect(r0.base_head_sha).toBe(baseSha);
+    expect(r1.base_head_sha).toBe(r0.head_sha);
+    expect(git(r1.cwd!, "merge-base", "--is-ancestor", r0.head_sha!, r1.head_sha!)).toBe("");
+    // Exhaustion did not advance either old attempt: both late Runs are refused.
+    expect(() => acceptRunSubmission(db, { runId: r0.id })).toThrow(/RUN_SUBMISSION_REJECTED/);
+    expect(() => acceptRunSubmission(db, { runId: r1.id })).toThrow(/RUN_SUBMISSION_REJECTED/);
+
+    // Restart with one more allowed attempt: exactly ONE fresh Run, no second
+    // writer, and the same worktree continues from the last produced HEAD.
+    const restarted = await runFactoryTask(db, id, { ...factoryDeps(dsh, rev.spawner), maxAttempts: 3 });
+    expect(restarted.outcome).toBe("merge_ready");
+    expect(restarted.taskId).toBe(id);
+    expect(restarted.attempts.map((a) => [a.attempt, a.verifyOutcome, a.reviewVerdict])).toEqual([
+      [2, "pass", "pass"],
+    ]);
+    expect(getTask(db, id)!.attempt).toBe(2);
+    expect(getTask(db, id)!.head_sha).toBe(restarted.head!);
+
+    runs = listRuns(db, { taskId: id });
+    expect(runs).toHaveLength(3);
+    expect(new Set(runs.map((r) => r.id)).size).toBe(3);
+    const r2 = runs.find((r) => r.attempt === 2)!;
+    expect(r2.base_head_sha).toBe(r1.head_sha);
+    expect(r2.cwd).toBe(r1.cwd);
+    expect(git(r2.cwd!, "merge-base", "--is-ancestor", r1.head_sha!, r2.head_sha!)).toBe("");
+    expect(rev.calls).toHaveLength(1);
+    expect(rev.calls[0].head).toBe(r2.head_sha);
+
+    const verify = taskResults(id, "VerificationResult");
+    expect(verify.map((r) => [r.attempt, r.passed, r.head_sha])).toEqual([
+      [0, 0, r0.head_sha],
+      [1, 0, r1.head_sha],
+      [2, 1, r2.head_sha],
+    ]);
+    const reviews = taskResults(id, "ReviewResult");
+    expect(reviews.map((r) => [r.attempt, r.passed, r.head_sha])).toEqual([[2, 1, r2.head_sha]]);
+  });
+
+  test("a reviewer PASS naming the previous attempt's HEAD is refused after a retry", async () => {
+    const dsh = fakeDsh("dsh-oldhead", COMMITTING_DSH);
+    const id = newTask();
+    const rev = reviewerHarness(["fix", "oldhead"]);
+
+    const res = await runFactoryTask(db, id, { ...factoryDeps(dsh, rev.spawner), maxAttempts: 2 });
+
+    expect(res.outcome).toBe("review_refused");
+    expect(res.reason).toContain("HEAD_MISMATCH");
+    expect(rev.calls).toHaveLength(2);
+    const h0 = rev.calls[0].head!;
+    const h1 = rev.calls[1].head!;
+    const task = getTask(db, id)!;
+    expect(h0).not.toBe(h1);
+    expect(h1).toBe(task.head_sha!);
+    expect(task.phase).toBe("review");
+    expect(task.state).toBe("review");
+    expect(task.attempt).toBe(1);
+    expect(task.head_sha).toBe(h1);
+
+    // The stale PASS created NO row and cannot reach MergeReady.
+    expect(findPassingReview(db, id, 1)).toBeNull();
+    const reviews = taskResults(id, "ReviewResult");
+    expect(reviews.map((r) => [r.attempt, r.passed, r.head_sha])).toEqual([[0, 0, h0]]);
+    expect(res.attempts.map((a) => a.reviewVerdict)).toEqual(["fix", "refused"]);
   });
 });
 
