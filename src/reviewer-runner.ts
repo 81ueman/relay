@@ -74,6 +74,22 @@ export const DEFAULT_REVIEWER_WORKER = "claude-review";
 /** The default real reviewer command (`claude -p --output-format json`). */
 export const DEFAULT_REVIEW_COMMAND = "claude";
 
+/** Default headless-review budget (20 min); `RELAY_REVIEW_TIMEOUT_MS` may raise it. */
+export const DEFAULT_REVIEW_TIMEOUT_MS = 20 * 60_000;
+
+/**
+ * The headless-review budget. A very large but legitimate diff can exceed the
+ * default; an explicit positive integer in `RELAY_REVIEW_TIMEOUT_MS` raises it
+ * without changing the fixed 20-minute default. Invalid values keep the
+ * default (fail-safe, never an unbounded review).
+ */
+export function reviewTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.RELAY_REVIEW_TIMEOUT_MS;
+  if (!raw) return DEFAULT_REVIEW_TIMEOUT_MS;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : DEFAULT_REVIEW_TIMEOUT_MS;
+}
+
 /** ISH-883: the default reviewer model (an Opus-class reviewer), configurable. */
 export const DEFAULT_REVIEW_MODEL = "opus";
 
@@ -798,7 +814,7 @@ export async function runHeadlessReview(
     cwd: worktree,
     brief,
     env: { ...(deps.env ?? {}), ...(native?.spawnEnv ?? {}) },
-    timeoutMs: deps.timeoutMs ?? 20 * 60_000,
+    timeoutMs: deps.timeoutMs ?? reviewTimeoutMs(),
     model: deps.model,
     ...(native?.allowedTools ? { allowedTools: native.allowedTools } : {}),
   });
