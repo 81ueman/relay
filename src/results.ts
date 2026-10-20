@@ -1,5 +1,5 @@
 import type { Database } from "bun:sqlite";
-import { now } from "./db";
+import { isSqliteBusy, now } from "./db";
 import { logEvent } from "./events";
 import { RELAY_TAG, sendMessage } from "./messages";
 import type { ResultKind, Task, TaskResult } from "./schema";
@@ -46,6 +46,37 @@ export class ResultWriteError extends Error {
 
 export function isResultWriteError(e: unknown): e is ResultWriteError {
   return e instanceof ResultWriteError;
+}
+
+/**
+ * ISH-995: a transient SQLITE_BUSY on the structured-result write is retried a
+ * bounded number of times instead of parking the Task. The write path is
+ * synchronous (it runs inside the workflow's transactions), so the short
+ * backoff is a synchronous sleep. Only writer-lock contention is retried; every
+ * other write failure still fails closed through `ResultWriteError`.
+ */
+export const RESULT_WRITE_MAX_ATTEMPTS = 3;
+/** Base backoff; attempt N waits `N * this` (100ms, then 200ms). */
+export const RESULT_WRITE_RETRY_BACKOFF_MS = 100;
+
+/** A deliberate supersede that names the wrong row is a refusal, not a write failure. */
+class SupersedeRefusedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SupersedeRefusedError";
+  }
+}
+
+/** Run the result write, retrying ONLY transient SQLITE_BUSY contention. */
+function withResultWriteBusyRetry<T>(write: () => T): T {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return write();
+    } catch (e) {
+      if (attempt >= RESULT_WRITE_MAX_ATTEMPTS || !isSqliteBusy(e)) throw e;
+      Bun.sleepSync(RESULT_WRITE_RETRY_BACKOFF_MS * attempt);
+    }
+  }
 }
 
 /**
@@ -264,36 +295,84 @@ function payloadWithSuperseded(payload: unknown, prior: TaskResult): Record<stri
  * is what makes `--supersedes` actually accept the replacement verdict at the
  * same attempt. The replaced verdict is preserved in `payload.superseded`.
  *
+ * ISH-995: transient SQLITE_BUSY/writer-lock contention is retried (bounded) and
+ * never parks the Task. The write is the FIRST statement of this function (and
+ * therefore of the caller's transaction): if a deferred transaction read first,
+ * it would pin a read snapshot and a competing writer would turn the write into
+ * an immediate SQLITE_BUSY_SNAPSHOT that no busy_timeout or retry could clear.
+ * Writing first lets SQLite wait for the writer lock and lets the bounded retry
+ * succeed once the competing writer commits.
+ *
  * On any OTHER write failure the Task is parked `blocked_internal` with the
  * concrete error and a `ResultWriteError` is thrown — callers must rethrow it
  * rather than treating it as a normal refusal, so a half-applied phase is never
  * left behind.
  */
 export function insertTaskResult(db: Database, r: TaskResultInput): TaskResult {
-  const existing = findTaskResult(db, r.taskId, r.phase, r.attempt, r.kind);
-  if (existing && r.supersedes === undefined) {
-    logEvent(db, {
-      source: "workflow",
-      workerId: r.workerId ?? null,
-      taskId: r.taskId,
-      type: "workflow.result.idempotent",
-      payload: { id: existing.id, phase: r.phase, attempt: r.attempt, kind: r.kind },
-    });
-    return existing;
-  }
-  // A deliberate replacement may only replace the row it NAMES. Silently
-  // overwriting a different result at the identity would destroy an unreviewed
-  // verdict; refuse before any write (and before the write-failure park below).
-  if (existing && r.supersedes !== undefined && existing.id !== r.supersedes) {
-    throw new Error(
-      `refusing to replace result ${existing.id} for ${r.taskId} ` +
-      `(${r.phase}/attempt ${r.attempt}/${r.kind}): supersedes names result ${r.supersedes}, ` +
-      `not the row at that identity`
-    );
-  }
-  const t = now();
   try {
-    if (existing && r.supersedes !== undefined) {
+    return withResultWriteBusyRetry(() => {
+      const t = now();
+      // ISH-995: write first (see the doc comment above). INSERT OR IGNORE keeps
+      // a replay idempotent; a concurrent writer that won the identity race is
+      // resolved below by reading the authoritative row.
+      const row = db
+        .query(
+          `INSERT OR IGNORE INTO task_results
+             (task_id, phase, attempt, kind, worker_id, passed, head_sha, profile, evidence_ref, reason, payload_json, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run(
+          r.taskId,
+          r.phase,
+          r.attempt,
+          r.kind,
+          r.workerId ?? null,
+          r.passed === undefined || r.passed === null ? null : r.passed ? 1 : 0,
+          r.headSha ?? null,
+          r.profile ?? null,
+          r.evidenceRef ?? null,
+          r.reason ?? null,
+          JSON.stringify(r.payload ?? {}),
+          t
+        );
+      const id = Number(row.lastInsertRowid);
+      if (id && Number(row.changes) > 0) {
+        logEvent(db, {
+          source: "workflow",
+          workerId: r.workerId ?? null,
+          taskId: r.taskId,
+          type: `workflow.result.${r.kind}`,
+          payload: { id, phase: r.phase, attempt: r.attempt, passed: r.passed ?? null, head: r.headSha ?? null, reason: r.reason ?? null },
+        });
+        return getTaskResult(db, id)!;
+      }
+
+      // The insert was ignored: the row already exists at this identity. It is
+      // authoritative (never crash/replace it implicitly).
+      const existing = findTaskResult(db, r.taskId, r.phase, r.attempt, r.kind);
+      if (!existing) {
+        throw new Error("result insert was ignored and no existing row could be read");
+      }
+      if (r.supersedes === undefined) {
+        logEvent(db, {
+          source: "workflow",
+          workerId: r.workerId ?? null,
+          taskId: r.taskId,
+          type: "workflow.result.idempotent",
+          payload: { id: existing.id, phase: r.phase, attempt: r.attempt, kind: r.kind },
+        });
+        return existing;
+      }
+      // A deliberate replacement may only replace the row it NAMES. Silently
+      // overwriting a different result at the identity would destroy an unreviewed
+      // verdict; refuse without overwriting (and without the write-failure park).
+      if (existing.id !== r.supersedes) {
+        throw new SupersedeRefusedError(
+          `refusing to replace result ${existing.id} for ${r.taskId} ` +
+          `(${r.phase}/attempt ${r.attempt}/${r.kind}): supersedes names result ${r.supersedes}, ` +
+          `not the row at that identity`
+        );
+      }
       // A deliberate replacement of an existing result row. The row id is kept so
       // a `result:<id>` reference and the attempt history stay resolvable.
       db.query(
@@ -320,54 +399,10 @@ export function insertTaskResult(db: Database, r: TaskResultInput): TaskResult {
         payload: { id: existing.id, phase: r.phase, attempt: r.attempt, kind: r.kind, supersedes: r.supersedes },
       });
       return getTaskResult(db, existing.id)!;
-    }
-    const row = db
-      .query(
-        `INSERT OR IGNORE INTO task_results
-           (task_id, phase, attempt, kind, worker_id, passed, head_sha, profile, evidence_ref, reason, payload_json, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-      )
-      .run(
-        r.taskId,
-        r.phase,
-        r.attempt,
-        r.kind,
-        r.workerId ?? null,
-        r.passed === undefined || r.passed === null ? null : r.passed ? 1 : 0,
-        r.headSha ?? null,
-        r.profile ?? null,
-        r.evidenceRef ?? null,
-        r.reason ?? null,
-        JSON.stringify(r.payload ?? {}),
-        t
-      );
-    // INSERT OR IGNORE: a concurrent writer may have won the identity race. The
-    // row that exists is authoritative; never crash the caller for that.
-    const id = Number(row.lastInsertRowid);
-    if (!id || Number(row.changes) === 0) {
-      const winner = findTaskResult(db, r.taskId, r.phase, r.attempt, r.kind);
-      if (winner) {
-        logEvent(db, {
-          source: "workflow",
-          workerId: r.workerId ?? null,
-          taskId: r.taskId,
-          type: "workflow.result.idempotent",
-          payload: { id: winner.id, phase: r.phase, attempt: r.attempt, kind: r.kind },
-        });
-        return winner;
-      }
-      throw new Error("result insert was ignored and no existing row could be read");
-    }
-    logEvent(db, {
-      source: "workflow",
-      workerId: r.workerId ?? null,
-      taskId: r.taskId,
-      type: `workflow.result.${r.kind}`,
-      payload: { id, phase: r.phase, attempt: r.attempt, passed: r.passed ?? null, head: r.headSha ?? null, reason: r.reason ?? null },
     });
-    return getTaskResult(db, id)!;
   } catch (e) {
-    if (isResultWriteError(e)) throw e;
+    // A deliberate supersede refusal is not a write failure: do not park.
+    if (isResultWriteError(e) || e instanceof SupersedeRefusedError) throw e;
     const detail = e instanceof Error ? e.message : String(e);
     const message = `${RESULT_WRITE_ERROR}: ${r.kind} for ${r.taskId} phase '${r.phase}' attempt ${r.attempt} failed: ${detail}`;
     // Best effort: when this runs inside the caller's transaction the block rolls
