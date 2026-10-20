@@ -34,6 +34,7 @@ import {
   REVIEW_NOT_INDEPENDENT,
   REVIEW_NO_STRUCTURED_RESULT,
   REVIEW_PROCESS_FAILED,
+  reviewTimeoutMs,
   buildReviewBrief,
   buildReviewerArgs,
   runHeadlessReview,
@@ -43,6 +44,13 @@ import {
   type ReviewerSpawnContext,
   type ReviewerSpawner,
 } from "../src/reviewer-runner";
+
+test("reviewTimeoutMs defaults to 20 min and honors RELAY_REVIEW_TIMEOUT_MS", () => {
+  expect(reviewTimeoutMs({} as NodeJS.ProcessEnv)).toBe(20 * 60_000);
+  expect(reviewTimeoutMs({ RELAY_REVIEW_TIMEOUT_MS: "2700000" } as NodeJS.ProcessEnv)).toBe(2_700_000);
+  expect(reviewTimeoutMs({ RELAY_REVIEW_TIMEOUT_MS: "nope" } as NodeJS.ProcessEnv)).toBe(20 * 60_000);
+  expect(reviewTimeoutMs({ RELAY_REVIEW_TIMEOUT_MS: "-1" } as NodeJS.ProcessEnv)).toBe(20 * 60_000);
+});
 
 // ISH-762: the Factory E2E. A REAL temp git repo + a FAKE headless dsh process
 // (a shell script that commits, no network) + a FAKE reviewer spawner keep the
