@@ -9,6 +9,7 @@ import { getTask, claimTask, claimNext } from "../src/tasks";
 import { registerWorker } from "../src/workers";
 import { intakeTask, recordReview, recordVerification } from "../src/workflow";
 import { getRun, listRuns, type DshProcess, type DshSpawner } from "../src/dsh-runner";
+import { insertTaskResult } from "../src/results";
 import { PINNED_DSH_VERSION } from "../src/dsh-version";
 import {
   applyWorkspaceCleanup,
@@ -132,12 +133,20 @@ afterEach(() => {
 });
 
 /** A code-change task with NO linked worktree/branch (a fresh manual injection). */
-function newTask(extra: { prUrl?: string; prRepo?: string; checks?: { name: string; command: string }[] } = {}) {
+function newTask(
+  extra: {
+    prUrl?: string;
+    prRepo?: string;
+    checks?: { name: string; command: string }[];
+    acceptance?: string;
+  } = {}
+) {
   const t = intakeTask(db, {
     provider: "test",
     issueId: `ISH-760-${issueSeq++}`,
     codeChange: true,
     title: "implement the thing",
+    acceptance: extra.acceptance,
     prUrl: extra.prUrl,
     prRepo: extra.prRepo,
     checks: extra.checks,
@@ -692,6 +701,223 @@ describe("FIX: same worktree + previous findings + a new Run (no session continu
     expect(brief.text).not.toContain("Publish the Task branch as a GitHub PR");
     expect(brief.text).not.toContain("gh pr create");
     expect(brief.text).not.toContain("git push origin HEAD");
+  });
+});
+
+// ISH-1011: the fresh FIX Run must receive the ACTUAL previous failure, not only
+// a one-line summary. The fixtures below write the SAME `task_results` rows the
+// workflow writes and read the brief `buildRunBrief` pins at launch time.
+describe("ISH-1011: VERIFY/REVIEW diagnostics reach the pinned FIX brief", () => {
+  function advanceToFix(id: string, attempt: number) {
+    db.query(
+      `UPDATE tasks SET phase = 'implement', state = 'queued', attempt = ?, head_sha = NULL, updated_at = ? WHERE id = ?`
+    ).run(attempt, Date.now(), id);
+    return getTask(db, id)!;
+  }
+
+  test("VERIFY FAIL carries the check name, exit code, bounded output tail, HEAD, repro command and acceptance", () => {
+    const id = newTask({
+      acceptance: "the parser must reject an empty document",
+      checks: [{ name: "unit", command: "bun test" }],
+    });
+    const b = ensureTaskWorktree(db, id, { repo });
+    const head = git(b.worktree, "rev-parse", "HEAD");
+    // The stored tail is long and carries a secret: the brief must keep only a
+    // bounded, redacted diagnostic (never the raw full log).
+    const lines = Array.from({ length: 80 }, (_, i) => `noise line ${i} ${"x".repeat(200)}`);
+    lines.push('password="hunter2"', "AssertionError: empty document accepted");
+    insertTaskResult(db, {
+      taskId: id,
+      phase: "verify",
+      attempt: 0,
+      kind: "VerificationResult",
+      workerId: "relay",
+      passed: false,
+      headSha: head,
+      evidenceRef: "unit=fail(exit 7)",
+      reason: "unit=fail(exit 7)",
+      payload: {
+        outcome: "fail",
+        checks: [{ name: "unit", required: true, outcome: "fail", exitCode: 7, output: lines.join("\n") }],
+      },
+    });
+
+    const task = advanceToFix(id, 1);
+    expect(inheritFindings(db, task).map((f) => ({ kind: f.kind, defect: f.defect, outcome: f.outcome }))).toEqual([
+      { kind: "VerificationResult", defect: true, outcome: "fail" },
+    ]);
+
+    const brief = buildRunBrief(db, task, { worktree: b.worktree, branch: b.branch });
+    expect(brief.text).toContain("## Acceptance");
+    expect(brief.text).toContain("the parser must reject an empty document");
+    expect(brief.text).toContain("## Prior findings @ attempt 0 — FIX these");
+    expect(brief.text).toContain(`Base HEAD (this FIX Run starts here): \`${head}\``);
+    expect(brief.text).toContain(`Verified HEAD: \`${head}\``);
+    expect(brief.text).toContain("`unit`: fail, exit 7 — reproduce: `bun test`");
+    expect(brief.text).toContain("AssertionError: empty document accepted");
+    // Bounded tail + secret masking.
+    expect(brief.text).not.toContain("noise line 0");
+    expect(brief.text).not.toContain("hunter2");
+    expect(brief.text).toContain("<redacted>");
+    expect(brief.text).toContain("truncated");
+  });
+
+  test("REVIEW FIX carries head-pinned file/line/message findings and the unresolved acceptance", () => {
+    const id = newTask({ acceptance: "an empty input must return null, not throw" });
+    const b = ensureTaskWorktree(db, id, { repo });
+    const head = git(b.worktree, "rev-parse", "HEAD");
+    const evidence = join(dir, "reviews", "attempt-0.json");
+    insertTaskResult(db, {
+      taskId: id,
+      phase: "review",
+      attempt: 0,
+      kind: "ReviewResult",
+      workerId: "claude-review",
+      passed: false,
+      headSha: head,
+      profile: "default",
+      evidenceRef: evidence,
+      reason: "needs a null guard\n[blocker] src/parser.ts:42: null deref on empty input",
+    });
+
+    const task = advanceToFix(id, 1);
+    const findings = inheritFindings(db, task);
+    expect(findings).toHaveLength(1);
+    expect(findings[0].defect).toBe(true);
+    expect(findings[0].headSha).toBe(head);
+
+    const brief = buildRunBrief(db, task, { worktree: b.worktree, branch: b.branch });
+    expect(brief.text).toContain("## Acceptance");
+    expect(brief.text).toContain("an empty input must return null, not throw");
+    expect(brief.text).toContain(`Reviewed HEAD: \`${head}\``);
+    expect(brief.text).toContain("[blocker] src/parser.ts:42: null deref on empty input");
+    expect(brief.text).toContain(evidence);
+  });
+
+  test("only the IMMEDIATELY previous attempt of THIS Task leaks in (no old head/attempt, no other Task, no PASS)", () => {
+    const id = newTask({ acceptance: "scope is exact" });
+    const b = ensureTaskWorktree(db, id, { repo });
+    const head = git(b.worktree, "rev-parse", "HEAD");
+    // Attempt 0: an old failure at an old HEAD must never be inherited.
+    insertTaskResult(db, {
+      taskId: id,
+      phase: "verify",
+      attempt: 0,
+      kind: "VerificationResult",
+      passed: false,
+      headSha: "a".repeat(40),
+      reason: "OLD_ATTEMPT_FAILURE",
+      payload: { outcome: "fail", checks: [{ name: "old", outcome: "fail", exitCode: 1, output: "OLD_HEAD_OUTPUT" }] },
+    });
+    // Attempt 1: the immediate review FIX.
+    insertTaskResult(db, {
+      taskId: id,
+      phase: "review",
+      attempt: 1,
+      kind: "ReviewResult",
+      passed: false,
+      headSha: head,
+      reason: "IMMEDIATE_REVIEW_FIX",
+    });
+    // A PASS at the immediate attempt is never presented as a failure/finding.
+    insertTaskResult(db, {
+      taskId: id,
+      phase: "verify",
+      attempt: 1,
+      kind: "VerificationResult",
+      passed: true,
+      headSha: head,
+      reason: "FABRICATED_PASS",
+      payload: { outcome: "pass", checks: [] },
+    });
+    // Another Task's failure at the same attempt number must not leak.
+    const other = newTask();
+    insertTaskResult(db, {
+      taskId: other,
+      phase: "verify",
+      attempt: 0,
+      kind: "VerificationResult",
+      passed: false,
+      headSha: "b".repeat(40),
+      reason: "OTHER_TASK_FAILURE",
+    });
+
+    const task = advanceToFix(id, 2);
+    const findings = inheritFindings(db, task);
+    expect(findings).toHaveLength(1);
+    expect(findings[0].reason).toBe("IMMEDIATE_REVIEW_FIX");
+    const brief = buildRunBrief(db, task, { worktree: b.worktree, branch: b.branch });
+    expect(brief.text).toContain("IMMEDIATE_REVIEW_FIX");
+    expect(brief.text).not.toContain("OLD_ATTEMPT_FAILURE");
+    expect(brief.text).not.toContain("OLD_HEAD_OUTPUT");
+    expect(brief.text).not.toContain("FABRICATED_PASS");
+    expect(brief.text).not.toContain("OTHER_TASK_FAILURE");
+  });
+
+  test("a same-attempt finding recorded at another HEAD is omitted (never presented as this FIX)", () => {
+    const id = newTask({ acceptance: "head pinning is exact" });
+    const b = ensureTaskWorktree(db, id, { repo });
+    insertTaskResult(db, {
+      taskId: id,
+      phase: "review",
+      attempt: 1,
+      kind: "ReviewResult",
+      passed: false,
+      headSha: "c".repeat(40),
+      reason: "SAME_ATTEMPT_OLD_HEAD",
+    });
+    const task = advanceToFix(id, 2);
+    // It IS the immediately previous attempt, but not the current base HEAD.
+    expect(inheritFindings(db, task)).toHaveLength(1);
+    const brief = buildRunBrief(db, task, { worktree: b.worktree, branch: b.branch });
+    expect(brief.text).not.toContain("SAME_ATTEMPT_OLD_HEAD");
+    expect(brief.text).not.toContain("## Prior findings @ attempt 1");
+  });
+
+  test("NOT_RUN/INCONCLUSIVE is BLOCKED, never a FIX instruction; missing evidence never fabricates a PASS", () => {
+    const id = newTask({ acceptance: "no crash on an empty document" });
+    const b = ensureTaskWorktree(db, id, { repo });
+    const head = git(b.worktree, "rev-parse", "HEAD");
+    insertTaskResult(db, {
+      taskId: id,
+      phase: "verify",
+      attempt: 0,
+      kind: "VerificationResult",
+      passed: false,
+      headSha: head,
+      reason: "head-binding=not_run",
+      payload: {
+        outcome: "not_run",
+        checks: [{ name: "head-binding", required: true, outcome: "not_run", exitCode: null, output: "no recorded head_sha" }],
+      },
+    });
+    const blockedTask = advanceToFix(id, 1);
+    const blocked = inheritFindings(db, blockedTask);
+    expect(blocked).toHaveLength(1);
+    expect(blocked[0].defect).toBe(false);
+    const blockedBrief = buildRunBrief(db, blockedTask, { worktree: b.worktree, branch: b.branch });
+    expect(blockedBrief.text).toContain("Previous evidence BLOCKED");
+    expect(blockedBrief.text).toContain("a PASS was NOT fabricated");
+    expect(blockedBrief.text).not.toContain("## Prior findings @ attempt 0 — FIX these");
+    expect(blockedBrief.text).toContain("head-binding");
+    expect(blockedBrief.text).toContain("no recorded head_sha");
+
+    // A failed manual verification with NO payload/reason/output must not crash
+    // or invent a result; it is a code-fix signal with explicit missing evidence.
+    const bare = newTask({ acceptance: "bare row" });
+    const bareWt = ensureTaskWorktree(db, bare, { repo });
+    insertTaskResult(db, {
+      taskId: bare,
+      phase: "verify",
+      attempt: 0,
+      kind: "VerificationResult",
+      passed: false,
+    });
+    const bareTask = advanceToFix(bare, 1);
+    expect(inheritFindings(db, bareTask)[0].defect).toBe(true);
+    const bareBrief = buildRunBrief(db, bareTask, { worktree: bareWt.worktree, branch: bareWt.branch });
+    expect(bareBrief.text).toContain("(no captured output or findings; do not assume this check passed)");
+    expect(bareBrief.text).toContain("Check outcome: fail (manual verification)");
   });
 });
 

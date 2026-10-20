@@ -138,11 +138,24 @@ A review `--fail`/FIX (or a failed mechanical verify) sends the Task back to
 `implement` at `attempt+1` (ISH-758), clearing the head. The next `launchTaskRun`:
 
 - reuses the **same** worktree/branch (the Task still owns them);
-- computes the **previous findings** from the structured results of the preceding
-  attempt (`ReviewResult`/`VerificationResult` with `passed=0`) and pins them into
-  the brief;
+- computes the **previous findings** from the structured results of the
+  immediately preceding attempt (`ReviewResult`/`VerificationResult` with
+  `passed=0`) and pins them into the brief — never from another Task, an older
+  attempt, or an older HEAD;
+- carries the actionable evidence itself: for a VERIFY FAIL, the failing check
+  name, outcome, exit code, a bounded/redacted stdout+stderr tail, the verified
+  HEAD, the Run's base HEAD and the check's reproduction command (from
+  `payload_json.checks`, the existing result); for a REVIEW FIX, the reviewed
+  HEAD and the reviewer's `severity`/`file:line`/message findings (the existing
+  `reason`); in both cases the brief still contains the original acceptance;
+- labels `not_run`/`inconclusive`/blocked results as **BLOCKED evidence**, not a
+  code defect, so they never become a "fix this" instruction;
 - starts a **new** disposable dsh Run — there is no session continuation and the
   previous Run is already terminal.
+
+The inherited output is truncated (12 lines / 1200 chars per check) and passed
+through the same `redactSecrets` filter as other run evidence; raw logs and
+credentials are never copied into the brief.
 
 ## A Run is *not* a submission
 

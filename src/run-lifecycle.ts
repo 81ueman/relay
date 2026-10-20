@@ -18,6 +18,7 @@ import {
 } from "./dsh-runner";
 import { taskChecks } from "./workflow";
 import type { CheckSpec } from "./verify";
+import { redactSecrets } from "./lab";
 
 /**
  * ISH-760 — Task Worktree + disposable dsh Run lifecycle, single-writer.
@@ -602,12 +603,99 @@ export function ensureTaskWorktree(db: Database, taskId: string, opts: EnsureWor
 // Findings inheritance (FIX = same worktree + previous findings + a new Run)
 // ---------------------------------------------------------------------------
 
+/**
+ * One non-passing mechanical check, read back from a `VerificationResult`'s
+ * existing `payload_json.checks` (never a second evidence store). The output is
+ * still the UNBOUNDED stored tail here; `buildRunBrief` is what redacts and
+ * bounds it for the pinned brief.
+ */
+export interface RunCheckFinding {
+  name: string;
+  required: boolean;
+  outcome: string;
+  exitCode: number | null;
+  /** The declared reproduction command, when the Task still declares this check. */
+  command: string | null;
+  output: string | null;
+  timedOut: boolean;
+}
+
 export interface RunFinding {
   attempt: number;
   kind: string; // "ReviewResult" | "VerificationResult"
   reason: string | null;
   evidence: string | null;
   headSha: string | null;
+  /** The aggregate VERIFY outcome from the payload (`null` for a manual result). */
+  outcome?: string | null;
+  /** Non-passing check diagnostics from the VerificationResult payload. */
+  checks?: RunCheckFinding[];
+  /**
+   * True only when the previous result says the CODE is wrong (a real `fail` or
+   * a review `fix`). `not_run`/`inconclusive` and a blocked review are missing
+   * evidence, not a code defect: they must never become a FIX instruction.
+   * Absent on a caller-built legacy finding, which is treated as a real finding.
+   */
+  defect?: boolean;
+}
+
+/** Caps for the inherited diagnostics rendered into a pinned Run brief. */
+export const RUN_FINDING_MAX_RESULTS = 6;
+export const RUN_FINDING_MAX_CHECKS = 8;
+export const RUN_FINDING_OUTPUT_LINES = 12;
+export const RUN_FINDING_OUTPUT_CHARS = 1200;
+export const RUN_FINDING_REASON_CHARS = 2000;
+
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return !!v && typeof v === "object" && !Array.isArray(v);
+}
+
+/** The stored `payload_json` object, or null when absent/malformed. */
+function resultPayload(row: TaskResult): Record<string, unknown> | null {
+  try {
+    const parsed: unknown = JSON.parse(row.payload_json);
+    return isRecord(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Non-passing checks from a VerificationResult payload, bounded by identity only. */
+function verificationChecks(payload: Record<string, unknown> | null, commands: Map<string, string>): RunCheckFinding[] {
+  const raw = Array.isArray(payload?.checks) ? payload.checks : [];
+  const out: RunCheckFinding[] = [];
+  for (const item of raw) {
+    if (!isRecord(item)) continue;
+    const name = typeof item.name === "string" ? item.name.trim() : "";
+    const outcome = typeof item.outcome === "string" ? item.outcome : "";
+    if (!name || !outcome || outcome === "pass") continue;
+    // The host runner stores a combined `output`; the sandbox runner also keeps
+    // separate stdout/stderr. Prefer the combined tail, then stderr, then stdout.
+    const output =
+      (typeof item.output === "string" && item.output) ||
+      (typeof item.stderr === "string" && item.stderr) ||
+      (typeof item.stdout === "string" && item.stdout) ||
+      null;
+    out.push({
+      name,
+      required: item.required !== false,
+      outcome,
+      exitCode: typeof item.exitCode === "number" ? item.exitCode : null,
+      command:
+        commands.get(name) ??
+        (typeof item.command === "string" && item.command.trim() ? item.command.trim() : null),
+      output: output || null,
+      timedOut: item.timedOut === true,
+    });
+  }
+  return out;
+}
+
+function verificationDefect(outcome: string | null): boolean {
+  // A manual verification row has no payload outcome; `passed = 0` is then the
+  // explicit failure signal. A recorded `pass`/`not_run`/`inconclusive`/unknown
+  // outcome is never converted into a code-fix instruction.
+  return outcome === null ? true : outcome === "fail";
 }
 
 /**
@@ -615,27 +703,106 @@ export interface RunFinding {
  * current one (a review `fix`/`fail` reason or a failed mechanical verify). This
  * is what a new Run must fix; it is pinned into the brief, never carried by a
  * session continuation.
+ *
+ * The query is scoped to THIS Task AND exactly `attempt - 1`, so a finding from
+ * another Task, another attempt, or a superseded/older HEAD can never leak in. A
+ * `passed = 0` row is included for context but its `defect` flag decides whether
+ * the brief may instruct a code change (NOT_RUN/INCONCLUSIVE/blocked do not).
  */
-export function inheritFindings(db: Database, task: Pick<Task, "id" | "attempt">): RunFinding[] {
+export function inheritFindings(
+  db: Database,
+  task: Pick<Task, "id" | "attempt"> & { checks_json?: string | null }
+): RunFinding[] {
   if (task.attempt <= 0) return [];
   const rows = db
     .query(
       `SELECT * FROM task_results
-        WHERE task_id = ? AND attempt < ? AND kind IN ('ReviewResult','VerificationResult') AND passed = 0
-        ORDER BY attempt DESC, id DESC`
+        WHERE task_id = ? AND attempt = ? AND kind IN ('ReviewResult','VerificationResult') AND passed = 0
+        ORDER BY id DESC`
     )
-    .all(task.id, task.attempt) as TaskResult[];
+    .all(task.id, task.attempt - 1) as TaskResult[];
   if (rows.length === 0) return [];
-  const prior = Math.max(...rows.map((r) => r.attempt));
-  return rows
-    .filter((r) => r.attempt === prior)
-    .map((r) => ({
+  const commands = new Map(
+    taskChecks({ checks_json: task.checks_json ?? null }).map((c) => [c.name, c.command] as const)
+  );
+  return rows.slice(0, RUN_FINDING_MAX_RESULTS).map((r) => {
+    const payload = resultPayload(r);
+    const isVerify = r.kind === "VerificationResult";
+    const outcome = isVerify && typeof payload?.outcome === "string" ? payload.outcome : null;
+    const blockedReview = !isVerify && payload?.blocked === true;
+    return {
       attempt: r.attempt,
       kind: r.kind,
       reason: r.reason,
       evidence: r.evidence_ref,
       headSha: r.head_sha,
-    }));
+      outcome,
+      checks: isVerify ? verificationChecks(payload, commands) : [],
+      defect: isVerify ? verificationDefect(outcome) : !blockedReview,
+    };
+  });
+}
+
+/** Redact and bound a stored output tail for the pinned brief (never raw/full). */
+function boundedFindingOutput(text: string | null): string | null {
+  if (!text) return null;
+  const clean = redactSecrets(text.replace(/\r/g, "")).trim();
+  if (!clean) return null;
+  const lines = clean.split("\n");
+  const tail = lines.slice(Math.max(0, lines.length - RUN_FINDING_OUTPUT_LINES)).join("\n");
+  if (tail.length <= RUN_FINDING_OUTPUT_CHARS) return tail;
+  return `[… truncated …]\n${tail.slice(-RUN_FINDING_OUTPUT_CHARS)}`;
+}
+
+/** Redact and bound a stored finding reason for the pinned brief. */
+function boundedFindingReason(text: string | null): string | null {
+  if (!text) return null;
+  const clean = redactSecrets(text.replace(/\r/g, "")).trim();
+  if (!clean) return null;
+  return clean.length <= RUN_FINDING_REASON_CHARS
+    ? clean
+    : `${clean.slice(0, RUN_FINDING_REASON_CHARS)}\n[… truncated …]`;
+}
+
+/** Render one inherited finding's concrete diagnostics (already bounded). */
+function renderRunFinding(f: RunFinding): string[] {
+  const out: string[] = [];
+  const checks = f.checks ?? [];
+  const defect = f.defect !== false;
+  const label = defect ? (f.kind === "ReviewResult" ? "FIX" : "FAIL") : "BLOCKED";
+  out.push("", `### ${f.kind} — ${label} (attempt ${f.attempt})`);
+  if (f.headSha) {
+    const what = f.kind === "ReviewResult" ? "Reviewed HEAD" : "Verified HEAD";
+    out.push(`- ${what}: \`${f.headSha}\``);
+  }
+  if (f.evidence) out.push(`- Evidence: ${f.evidence}`);
+  if (f.kind === "VerificationResult") {
+    out.push(`- Check outcome: ${f.outcome ?? "fail (manual verification)"}`);
+    if (checks.length > 0) {
+      out.push("- Failed checks:");
+      for (const c of checks.slice(0, RUN_FINDING_MAX_CHECKS)) {
+        const optional = c.required ? "" : " (optional)";
+        const exit = c.exitCode === null ? "" : `, exit ${c.exitCode}`;
+        const timed = c.timedOut ? ", timed out" : "";
+        const repro = c.command ? ` — reproduce: \`${c.command}\`` : "";
+        out.push(`  - \`${c.name}\`${optional}: ${c.outcome}${exit}${timed}${repro}`);
+        const tail = boundedFindingOutput(c.output);
+        if (tail) out.push("    ```", ...tail.split("\n").map((l) => `    ${l}`), "    ```");
+        else out.push("    (no output captured)");
+      }
+      if (checks.length > RUN_FINDING_MAX_CHECKS) {
+        out.push(`  - … ${checks.length - RUN_FINDING_MAX_CHECKS} more failed check(s) omitted`);
+      }
+    }
+  }
+  const reason = boundedFindingReason(f.reason);
+  if (reason) {
+    out.push("- Findings:");
+    out.push(...reason.split("\n").map((l) => `  ${l}`));
+  } else if (checks.length === 0) {
+    out.push("- (no captured output or findings; do not assume this check passed)");
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -652,6 +819,12 @@ export interface BuildBriefOptions {
   worktree: string;
   branch: string;
   findings?: RunFinding[];
+  /**
+   * The exact base HEAD this Run starts from. Defaults to probing `worktree`
+   * (the host path); a Sandbox caller passes the in-VM HEAD because the path is
+   * not a host checkout. `null` means unknown (skip HEAD filtering).
+   */
+  baseHead?: string | null;
 }
 
 /** Compose the Run brief: ISH-803's task prompt + worktree + checks + findings. */
@@ -664,12 +837,34 @@ export function buildRunBrief(db: Database, task: Task, opts: BuildBriefOptions)
     lines.push("", "## Verification steps (Relay runs these mechanically after you submit)");
     for (const c of checks) lines.push(`- ${c.name}: \`${c.command}\`${c.required === false ? " (optional)" : ""}`);
   }
-  if (findings.length > 0) {
-    const attempt = findings[0].attempt;
-    lines.push("", `## Prior findings @ attempt ${attempt} — FIX these (same worktree, new Run)`);
-    for (const f of findings) {
-      const ev = f.evidence ? ` — ${f.evidence}` : "";
-      lines.push(`- [${f.kind}] ${f.reason ?? "(no reason recorded)"}${ev}`);
+  // The worktree HEAD is the exact base `startDshRun` will record. A finding
+  // recorded at a DIFFERENT head is from an older revision and must never be
+  // presented as this FIX's instruction (an unreadable/null head is admissible:
+  // there is nothing to disprove it).
+  const checkoutHead = opts.baseHead === undefined ? gitHeadOf(opts.worktree) : opts.baseHead;
+  const applicable = findings.filter((f) => !checkoutHead || !f.headSha || f.headSha === checkoutHead);
+  const defects = applicable.filter((f) => f.defect !== false);
+  const blocked = applicable.filter((f) => f.defect === false);
+  if (applicable.length > 0) {
+    const attempt = applicable[0].attempt;
+    if (defects.length > 0) {
+      // Fall back to the head the failed result actually judged when the
+      // checkout is unreadable (or the caller passed a synthetic path).
+      const baseHead = checkoutHead ?? defects.find((f) => f.headSha)?.headSha ?? null;
+      lines.push("", `## Prior findings @ attempt ${attempt} — FIX these (same worktree, new Run)`);
+      lines.push(
+        `- Base HEAD (this FIX Run starts here): ${baseHead ? `\`${baseHead}\`` : "(unreadable checkout HEAD)"}`
+      );
+      lines.push(
+        "- The Task acceptance above is unchanged and is the completion bar; this is a NEW Run, not a session replay."
+      );
+      for (const f of defects) lines.push(...renderRunFinding(f));
+    }
+    if (blocked.length > 0) {
+      lines.push("", `## Previous evidence BLOCKED @ attempt ${attempt} — not a code defect`);
+      lines.push("- The previous CHECK/REVIEW could not produce a trustworthy decision; a PASS was NOT fabricated.");
+      lines.push("- Do NOT change code merely to satisfy this section: the required evidence is missing.");
+      for (const f of blocked) lines.push(...renderRunFinding(f));
     }
   }
   // ISH-885: a PR-bound Task's GitHub write is the Coding Agent's job — Relay is
@@ -698,7 +893,7 @@ export function buildRunBrief(db: Database, task: Task, opts: BuildBriefOptions)
     "refused (RUN_OWNED) and can never advance the Task. Just make the change, run the checks, and commit."
   );
   lines.push("", "_Pinned by Relay (ISH-760) before launch: the Task/Worktree persists; this Run is disposable._");
-  return { text: lines.join("\n"), findings, checks };
+  return { text: lines.join("\n"), findings: applicable, checks };
 }
 
 /** The deterministic in-worktree path the brief is pinned to (gitignored). */
@@ -794,10 +989,18 @@ export async function launchTaskRun(db: Database, taskId: string, opts: LaunchRu
       attempt: run.attempt,
       generation: run.generation,
       brief: briefPath,
-      findings: findings.length,
+      findings: brief.findings.length,
     },
   });
-  return { handle, run, worktree: binding.worktree, branch: binding.branch, briefPath, findings, warnings: binding.warnings ?? [] };
+  return {
+    handle,
+    run,
+    worktree: binding.worktree,
+    branch: binding.branch,
+    briefPath,
+    findings: brief.findings,
+    warnings: binding.warnings ?? [],
+  };
 }
 
 // ---------------------------------------------------------------------------
