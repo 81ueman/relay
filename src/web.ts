@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { existsSync } from "node:fs";
 import { dirname } from "node:path";
-import { defaultDbPath, now } from "./db";
+import { defaultDbPath, now, setBusyTimeout } from "./db";
 import { buildDashboardView } from "./dashboard/model";
 import { sendMessage, unreadCounts } from "./messages";
 import { listTasks, taskDependencies } from "./tasks";
@@ -267,12 +267,14 @@ function json(status: number, body: unknown): Response {
 /** Read-only SQLite connection; falls back to a plain handle if WAL is unavailable. */
 function openReadOnly(path: string): Database {
   try {
-    return new Database(path, { readonly: true });
+    const db = new Database(path, { readonly: true });
+    setBusyTimeout(db);
+    return db;
   } catch {
     // A read-only WAL open can fail when no writer has created -shm yet. A
     // read-write handle that only ever runs SELECTs is still non-mutating.
     const db = new Database(path);
-    db.exec("PRAGMA busy_timeout = 5000;");
+    setBusyTimeout(db);
     return db;
   }
 }
@@ -280,7 +282,7 @@ function openReadOnly(path: string): Database {
 /** Read-write handle for the send path; never runs the schema or migrations. */
 function openWritable(path: string): Database {
   const db = new Database(path);
-  db.exec("PRAGMA busy_timeout = 5000;");
+  setBusyTimeout(db);
   return db;
 }
 

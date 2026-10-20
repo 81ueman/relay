@@ -333,12 +333,41 @@ function migrate(db: Database): void {
   // never re-created; that is enforced at the attach path.
 }
 
+/**
+ * Bounded wait for a competing SQLite writer before the lock is surfaced as
+ * SQLITE_BUSY. Connections that must react to contention immediately (the
+ * supervisor lock) deliberately use 0 instead.
+ */
+export const SQLITE_BUSY_TIMEOUT_MS = 5000;
+
+/** Apply the bounded writer-contention wait to one connection. */
+export function setBusyTimeout(db: Database, timeoutMs = SQLITE_BUSY_TIMEOUT_MS): void {
+  if (!Number.isInteger(timeoutMs) || timeoutMs < 0) {
+    throw new Error(`invalid SQLite busy_timeout: ${timeoutMs}`);
+  }
+  db.exec(`PRAGMA busy_timeout = ${timeoutMs};`);
+}
+
+/**
+ * True only for transient writer-lock contention: SQLITE_BUSY (including
+ * SQLITE_BUSY_SNAPSHOT) or SQLite's "database is locked" message. Other write
+ * failures are genuine and must fail closed rather than be retried.
+ */
+export function isSqliteBusy(e: unknown): boolean {
+  const code = (e as { code?: unknown } | null)?.code;
+  if (typeof code === "string" && (code === "SQLITE_BUSY" || code.startsWith("SQLITE_BUSY_"))) {
+    return true;
+  }
+  const message = e instanceof Error ? e.message : String(e);
+  return /database is locked/i.test(message);
+}
+
 export function openDb(path?: string): Database {
   const p = path ?? defaultDbPath();
   mkdirSync(dirname(p), { recursive: true });
   const db = new Database(p, { create: true });
   db.exec("PRAGMA journal_mode = WAL;");
-  db.exec("PRAGMA busy_timeout = 5000;");
+  setBusyTimeout(db);
   db.exec(SCHEMA);
   migrate(db);
   return db;
