@@ -371,7 +371,15 @@ It is sequencing only — every transition reuses the ordinary durable results
 (`acceptRunSubmission`, `runMechanicalVerification`, `recordReview`,
 `submitPhase`), so a `dsh` exit 0 / `final`, a missing/malformed reviewer result,
 a foreign/stale HEAD, or a non-independent reviewer **cannot advance** the Task.
-The Factory never pushes, merges, accepts, or writes a provider/Linear. One-shot:
+The Factory never pushes, merges, accepts, or writes a provider/Linear.
+A non-ready result (`max_attempts`, `review_refused`, `blocked`, …) also carries
+the **ISH-1013 failure projection**: a minimal class (code rework exhausted /
+infra blocked / permission-or-human decision / missing-or-inconclusive evidence /
+stale head / unknown), the evidence-derived cause, the last Run/attempt/HEAD,
+references to the failing check/review/log, and the concrete next action + resume
+condition. The same projection is a durable `factory.outcome` event and is shown
+by `relay run show` / `relay run logs` / `relay task show`; it never auto-unblocks
+a HOLD, a missing permission, a live writer or stale evidence. One-shot:
 `bun run smoke:factory` (fixture) and `RELAY_REAL_SMOKE=1 bun run
 smoke:factory:real` (real dsh 0.2.1-rc.2 + real Claude) — see
 [`docs/factory-e2e.md`](docs/factory-e2e.md).

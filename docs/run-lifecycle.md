@@ -205,6 +205,9 @@ shows the cause on the dashboard (`RUNS` and `ATTENTION`), and sends immediate
 all classes; `dsh.jsonl` contributes only its parsed terminal `error` events
 (never tool-call output or a success `final` summary), and the last matching line
 in a source wins. `relay run show <id>` projects the class as `failure_class`.
+When the Run is the one a Factory stop is bound to, `run show`/`run logs` also
+project the ISH-1013 `factory` report (classification, cause, evidence and next
+action) from the durable `factory.outcome` event; the Run row itself is unchanged.
 Per-run errors are isolated so a failed write cannot crash the daemon or prevent
 the remaining Runs from being swept. The sweep does **not** add a pre-launch disk
 guard (ISH-1009) or stall detection for a live but silent dsh.

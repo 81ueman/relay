@@ -137,6 +137,11 @@ TUI required):
 
 The raw JSONL remains the evidence; the CLI view is only a rendering.
 
+If the Run is the one a Factory stop is bound to, `relay run logs` prints the
+ISH-1013 Factory classification/next-action header before the raw logs (and
+`relay run show`/`--json` exposes the same report), so a rotated or empty log
+still explains why the Run stopped.
+
 **Web exposure is intentionally deferred.** `relay web` can bind a non-loopback
 address **without a token** (it warns but starts), so publishing unredacted
 `tool_call`/`tool_result` payloads there would leak tool traces to

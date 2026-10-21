@@ -40,6 +40,7 @@ import { checkMergeGate, type MergeGateDecision, type MergeGateDeps } from "./me
 import { importHeadIntoSource, prepareReadOnlyReviewWorktree, removeReviewWorktree } from "./review-workspace";
 import type { NativeReviewDeps } from "./providers";
 import { bindTaskPr, type PrBindingDeps } from "./pr-binding";
+import { recordFactoryOutcome, type FactoryFailureReport } from "./factory-failure";
 
 /**
  * ISH-762 Factory driver.
@@ -181,7 +182,15 @@ export interface FactoryResult {
   /** The fail-closed reason for a non-ready terminal outcome. */
   reason: string | null;
   steps: string[];
+  /**
+   * ISH-1013: the minimal operator classification + evidence + next action for
+   * a non-ready outcome. `null` at `merge_ready`.
+   */
+  failure: FactoryFailureReport | null;
 }
+
+/** A Factory result BEFORE the ISH-1013 operator projection is attached. */
+type RawFactoryResult = Omit<FactoryResult, "failure">;
 
 function latestRun(db: Database, taskId: string, phase: string, attempt: number): Run | null {
   return (
@@ -850,11 +859,11 @@ export function reviewBlockedReason(r: {
  * Run the whole factory for one Task. Returns a structured result; it NEVER
  * merges, accepts, pushes, or writes to a provider/Linear.
  */
-export async function runFactoryTask(
+async function runFactoryTaskInner(
   db: Database,
   taskId: string,
   deps: FactoryDeps = {}
-): Promise<FactoryResult> {
+): Promise<RawFactoryResult> {
   const maxAttempts = Math.max(1, deps.maxAttempts ?? 4);
   const reviewerWorker = deps.reviewerWorker ?? DEFAULT_REVIEWER_WORKER;
   const integratorWorker = deps.integratorWorker ?? DEFAULT_INTEGRATOR_WORKER;
@@ -1201,6 +1210,23 @@ export async function runFactoryTask(
     };
   }
   return { taskId, outcome: "max_attempts", head: getTask(db, taskId)!.head_sha, attempts, gate: null, reason: "guard exhausted", steps };
+}
+
+/**
+ * ISH-1013: run the Factory and attach the durable operator projection. The
+ * Factory's outcome/transition logic is unchanged; the report is derived from
+ * the rows it just wrote (Run, task_results, events) and logged as ONE
+ * `factory.outcome` event so a restart and `relay run show/logs` see the same
+ * classification. This never unblocks, retries, or releases an old attempt/HEAD.
+ */
+export async function runFactoryTask(
+  db: Database,
+  taskId: string,
+  deps: FactoryDeps = {}
+): Promise<FactoryResult> {
+  const result = await runFactoryTaskInner(db, taskId, deps);
+  const failure = recordFactoryOutcome(db, result);
+  return { ...result, failure };
 }
 
 function atAttemptCap(attempts: FactoryAttempt[], maxAttempts: number): boolean {
