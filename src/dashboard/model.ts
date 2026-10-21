@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import type { Database } from "bun:sqlite";
 import { now } from "../db";
+import { currentDiskStatus, latestLaunchRefusal, type DiskStatus, type LaunchRefusalRecord } from "../disk-guard";
 import { unreadCounts } from "../messages";
 import { findRuntime, listRuntimes } from "../runtimes";
 import { getNotes, listTasks, taskCounts, unclaimableRunnableTasks } from "../tasks";
@@ -130,6 +131,16 @@ export interface DashboardGit {
   dirty: number;
 }
 
+/**
+ * ISH-1009: the live pre-launch disk guard, plus the latest durable
+ * `run.launch_refused` event. The status is re-measured on every build so the
+ * dashboard shows current space (and turns red again before a launch fails).
+ */
+export interface DashboardDisk {
+  status: DiskStatus;
+  lastRefusal: LaunchRefusalRecord | null;
+}
+
 export interface DashboardView {
   root: string;
   summary: {
@@ -155,6 +166,8 @@ export interface DashboardView {
   runs: DashboardRun[];
   attention: DashboardAttention[];
   git: DashboardGit;
+  /** ISH-1009: current disk guard + the last refusal (read-only, never cached). */
+  disk: DashboardDisk;
 }
 
 const TASK_STATE_ORDER = ["running", "queued", "review", "blocked_human", "blocked_internal", "failed"];
@@ -167,6 +180,8 @@ export interface BuildOptions {
   /** Exclude this pane (the dashboard's own pane). */
   excludePane?: string | null;
   at?: number;
+  /** ISH-1009: inject the disk projection (tests); otherwise measured live. */
+  disk?: DashboardDisk;
 }
 
 export function buildDashboardView(db: Database, opts: BuildOptions): DashboardView {
@@ -294,6 +309,7 @@ export function buildDashboardView(db: Database, opts: BuildOptions): DashboardV
     runs,
     attention,
     git: readGit(root),
+    disk: opts.disk ?? { status: currentDiskStatus(db), lastRefusal: latestLaunchRefusal(db) },
   };
   return view;
 }

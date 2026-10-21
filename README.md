@@ -468,6 +468,17 @@ no open PR, no active writer, no uncommitted changes, relay-owned) and always
 `bun run smoke:run-lifecycle`. See
 [`docs/run-lifecycle.md`](docs/run-lifecycle.md).
 
+**Pre-launch disk guard (ISH-1009).** Before a Run row is created, and before a
+Task workspace is created or a sandbox Run starts, Relay measures free space on
+the worktrees root and the volume holding the Relay DB. Below
+`RELAY_MIN_FREE_DISK_BYTES` (default 20 GiB) no Run starts: the Task stays
+`queued` and `run.launch_refused` records reason `low_disk`, the measured bytes
+and the threshold. A failed probe is **also** a refusal (`probe_failed`), never
+a pass. `relay status` and the dashboard show the live measurement and the last
+refusal; the next launch attempt after space is freed proceeds normally. A
+Sandbox Run additionally probes the in-VM DinD volume (`/var/lib/docker`)
+against `RELAY_MIN_FREE_DIND_BYTES` (default 2 GiB; `0` disables).
+
 ### Task Coding Sandbox lifecycle (ISH-828)
 
 `relay run sandbox` runs a coding Task inside its own **Docker Sandboxes
@@ -982,6 +993,8 @@ RELAY_BOOTSTRAP_RETRY_MS=5000 RELAY_BOOTSTRAP_LOG_WINDOW_MS=60000
 RELAY_TOOL_WARN_MS=60000 RELAY_TOOL_BACKGROUND_MS=180000
 RELAY_TOOL_MAX_MS=3600000 RELAY_TOOL_STALE_GRACE_MS=60000
 RELAY_TOOL_HARD_CAP_MS=900000 RELAY_TOOL_NO_OUTPUT_MS=600000
+RELAY_MIN_FREE_DISK_BYTES=21474836480   # 20 GiB pre-launch floor (0 = threshold off)
+RELAY_MIN_FREE_DIND_BYTES=2147483648    # 2 GiB sandbox DinD floor (0 = probe off)
 RELAY_BACKGROUND_KEY=ctrl+b
 RELAY_WEB_TOKEN=<t>          # token required by `relay web` (unless --token is given)
 RELAY_DEDICATED=1            # opt-in: allow $RELAY_SOCK when no session dir is known

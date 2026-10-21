@@ -6,6 +6,7 @@ import {
   applyDbMove, configPath, describeDb, findLegacyDb, planDbMove, readConfig, resolveDb,
 } from "./db-location";
 import { formatEvent, listEvents, logEvent } from "./events";
+import { currentDiskStatus, formatBytes, latestLaunchRefusal } from "./disk-guard";
 import { AGENT_KINDS_HELP, inferKind, isKnownKind } from "./harness";
 import { ackMessage, claimInbox, deliverMessage, getMessage, inboxFor, RELAY_TAG, sendMessage, unreadCounts } from "./messages";
 import { isImmediateKind } from "./mail-policy";
@@ -167,6 +168,8 @@ Spawn: RELAY_HERDR_WORKSPACE (required to spawn; else $HERDR_WORKSPACE_ID)
 Manual attach: requires a live Herdr agent (use --pane/--tab or $HERDR_PANE_ID/$HERDR_TAB_ID)
 Runtime cleanup: RELAY_RUNTIME_CLEANUP_GRACE_MS RELAY_ATTACH_TIMEOUT_MS RELAY_RESTART_COOLDOWN_MS
 Task Lab cleanup: RELAY_LAB_CLEANUP_CMD RELAY_LAB_CLEANUP_TIMEOUT_MS (trusted hook; owner id per task)
+Run disk guard: RELAY_MIN_FREE_DISK_BYTES (default 20 GiB; 0 = threshold off)
+                RELAY_MIN_FREE_DIND_BYTES (sandbox DinD, default 2 GiB; 0 = probe off)
 Restart cap: RELAY_RESTART_CAP (default 3) RELAY_RESTART_CAP_WINDOW_MS (default 1800000)
 Herdr is required. RELAY_RUNTIME=mock is test-only.
 Help: relay <command> [subcommand] --help
@@ -2154,6 +2157,30 @@ async function main(): Promise<void> {
         console.log("System");
         console.log("------");
         console.log(view.status);
+        // ISH-1009: surface the pre-launch disk guard with the MEASURED free
+        // space (not just a sticky warning), plus the last durable refusal. A
+        // failure to measure is shown as REFUSING, never as healthy.
+        const disk = currentDiskStatus(db);
+        console.log("");
+        console.log("Disk guard");
+        console.log("----------");
+        for (const p of disk.probes) {
+          const measured = p.error ? `probe FAILED: ${p.error}` : `${formatBytes(p.freeBytes)} free`;
+          const low = disk.reason === "low_disk" && p.freeBytes !== null && p.freeBytes < disk.minFreeBytes;
+          console.log(`${p.path}  ${measured} (min ${formatBytes(disk.minFreeBytes)})${low ? "  BELOW MINIMUM" : ""}`);
+        }
+        if (disk.reason === "probe_failed") console.log("launch guard: REFUSING — probe failed (fail closed)");
+        else if (disk.reason === "low_disk") console.log(`launch guard: REFUSING — below the ${formatBytes(disk.minFreeBytes)} minimum`);
+        else console.log("launch guard: OK");
+        const refusal = latestLaunchRefusal(db);
+        if (refusal) {
+          console.log(
+            `last launch refusal: ${refusal.taskId ?? "-"} ${refusal.reason} ` +
+              `free=${formatBytes(refusal.freeBytes)} threshold=${formatBytes(refusal.minFreeBytes)} ` +
+              `at ${new Date(refusal.at).toISOString()}` +
+              `${refusal.error ? ` — ${refusal.error}` : ""}`
+          );
+        }
         // The daemon is a long-lived process: a rebuilt/reinstalled CLI does not
         // change it. Report the RUNNING daemon's build so a stale supervisor is
         // visible instead of silently serving old code.

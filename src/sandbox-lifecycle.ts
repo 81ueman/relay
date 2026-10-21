@@ -2,6 +2,13 @@ import type { Database } from "bun:sqlite";
 import { appendFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { defaultDbPath, now, projectRoot } from "./db";
+import {
+  assertLaunchDiskSpace,
+  defaultDiskPaths,
+  minFreeDindBytes,
+  probeSandboxDindFreeBytes,
+  type DiskGuardOptions,
+} from "./disk-guard";
 import { logEvent } from "./events";
 import { getTask } from "./tasks";
 import type { Run, RunState, Sandbox, Task } from "./schema";
@@ -422,8 +429,17 @@ export interface LaunchSandboxOptions extends EnsureSandboxOptions {
   installDsh?: boolean;
   /** The sbx executable (default `sbx`, or $RELAY_SBX_BIN). */
   sbxBin?: string;
+  /** ISH-1009: host + in-sandbox DinD disk-space guard seams. */
+  diskGuard?: SandboxDiskGuardOptions;
   /** Test seam for the `sbx exec … dsh` process. */
   spawner?: DshSpawner;
+}
+
+export interface SandboxDiskGuardOptions extends DiskGuardOptions {
+  /** Override `RELAY_MIN_FREE_DIND_BYTES` for the in-sandbox DinD volume. */
+  dindMinFreeBytes?: number;
+  /** Test seam; may throw to simulate a failed in-sandbox probe. */
+  dindProbe?: (cli: SbxCli, name: string) => number;
 }
 
 export interface SandboxRunHandle {
@@ -581,11 +597,41 @@ export async function launchTaskSandboxRun(
   if (task.phase !== "implement" && task.phase !== "integration") {
     throw new Error(`${SANDBOX_ERROR}: task ${task.id} is in phase '${task.phase ?? "none"}' (a Run starts in implement/integration)`);
   }
+  const { dindMinFreeBytes, dindProbe, ...hostDiskGuard } = opts.diskGuard ?? {};
+  // ISH-1009: refuse BEFORE creating the sandbox or pinning the brief. The Task
+  // stays queued and nothing is spawned; the next tick after space is freed
+  // proceeds normally. A failed probe is fail-closed, never a pass.
+  assertLaunchDiskSpace(db, {
+    taskId,
+    phase: task.phase,
+    target: "sandbox",
+    ...hostDiskGuard,
+    paths: hostDiskGuard.paths ?? defaultDiskPaths(db),
+  });
   const cli = opts.cli ?? realSbxCli;
   const binding = ensureTaskSandbox(db, taskId, opts);
 
   // Refuse BEFORE pinning/writing when the sandbox already has a live writer.
   assertNoActiveSandboxWriter(db, { sandboxName: binding.name, branch: binding.branch });
+
+  // ISH-1009: the in-sandbox DinD volume is a SEPARATE 10g budget. Probe it
+  // after the sandbox exists (the name is needed) and before the Run starts.
+  // `0` disables this optional probe; a probe failure refuses the launch.
+  const dindMin = dindMinFreeBytes ?? minFreeDindBytes();
+  if (dindMin > 0) {
+    assertLaunchDiskSpace(db, {
+      taskId,
+      phase: task.phase,
+      target: "sandbox",
+      scope: "dind",
+      sandbox: binding.name,
+      minFreeBytes: dindMin,
+      paths: ["/var/lib/docker"],
+      probe: dindProbe
+        ? () => dindProbe(cli, binding.name)
+        : () => probeSandboxDindFreeBytes(cli, binding.name),
+    });
+  }
 
   const dsh = prepareSandboxDsh(binding, { installDsh: opts.installDsh, cli, dshBin: opts.dshBin });
   logSandbox(db, taskId, "sandbox.dsh", { name: binding.name, version: dsh.version, installed: dsh.installed });
@@ -612,9 +658,18 @@ export async function launchTaskSandboxRun(
   const dshEventsPath = join(runDir, "dsh.jsonl");
   const specPath = join(runDir, "spec.md");
 
+  // The in-VM HEAD is the FIX base; read it BEFORE composing the brief so an
+  // inherited finding recorded at a different revision is not presented as this
+  // Run's instruction. The same value is recorded as the Run's base_head_sha.
+  const baseHead = sandboxHead(cli, binding.name, binding.workspace);
   const fresh = getTask(db, taskId)!;
   const findings = inheritFindings(db, fresh);
-  const brief = buildRunBrief(db, fresh, { worktree: binding.workspace, branch: binding.branch, findings });
+  const brief = buildRunBrief(db, fresh, {
+    worktree: binding.workspace,
+    branch: binding.branch,
+    findings,
+    baseHead,
+  });
   const briefText = [
     brief.text,
     "",
@@ -644,8 +699,6 @@ export async function launchTaskSandboxRun(
   const cp = cli.run(["cp", specPath, `${binding.name}:${briefDest}`]);
   if (cp.ok) briefPath = briefDest;
   else events({ t: "sandbox.brief_pin_failed", error: cp.err || cp.out });
-
-  const baseHead = sandboxHead(cli, binding.name, binding.workspace);
 
   const run = insertSandboxRunIfNoWriter(db, {
     id: runId,
@@ -705,7 +758,7 @@ export async function launchTaskSandboxRun(
     events({ t: "run.failed", error: message });
     const failed = patchRun(db, runId, { state: "failed", error: message, ended_at: now() });
     logSandbox(db, taskId, "sandbox.run.failed", { runId, error: message });
-    return { handle: { id: runId, wait: async () => failed, cancel: () => {} }, run: failed, sandbox: binding, briefPath, findings };
+    return { handle: { id: runId, wait: async () => failed, cancel: () => {} }, run: failed, sandbox: binding, briefPath, findings: brief.findings };
   }
 
   patchRun(db, runId, { state: "running", pid: proc.pid, spawn_lstart: spawnIdentityToken(proc.pid) });
@@ -908,7 +961,7 @@ export async function launchTaskSandboxRun(
     run,
     sandbox: binding,
     briefPath,
-    findings,
+    findings: brief.findings,
   };
 }
 

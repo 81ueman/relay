@@ -10,6 +10,7 @@ import { registerWorker } from "../src/workers";
 import { intakeTask } from "../src/workflow";
 import { getRun, listRuns, startDshRun, type DshProcess, type DshSpawner } from "../src/dsh-runner";
 import { childEnv } from "../src/child-env";
+import { latestLaunchRefusal } from "../src/disk-guard";
 import {
   acceptSandboxSubmission,
   applySandboxCleanup,
@@ -136,6 +137,8 @@ class FakeSbx implements SbxCli {
     }
     if (args[0] === "exec") {
       const joined = args.join(" ");
+      // ISH-1009: the in-sandbox DinD disk probe (8 GiB in KiB, above the 2 GiB floor).
+      if (joined.includes("df -Pk /var/lib/docker")) return ok(String(8 * 1024 * 1024));
       if (this.failProbe && (joined.includes("pgrep") || joined.includes("pkill"))) {
         return { ok: false, code: 1, out: "", err: "probe boom" };
       }
@@ -176,6 +179,9 @@ function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", ["-C", cwd, ...args], { encoding: "utf-8" }).trim();
 }
 
+let prevMinFreeDisk: string | undefined;
+let prevMinFreeDind: string | undefined;
+
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "relay-ish828-"));
   repo = join(dir, "repo");
@@ -187,6 +193,12 @@ beforeEach(() => {
   git(repo, "add", "README.md");
   git(repo, "commit", "-q", "-m", "base");
   process.env.RELAY_DB = join(dir, "state.db");
+  // ISH-1009: these tests exercise the sandbox lifecycle, not the host/DinD
+  // volumes of the machine running the suite.
+  prevMinFreeDisk = process.env.RELAY_MIN_FREE_DISK_BYTES;
+  prevMinFreeDind = process.env.RELAY_MIN_FREE_DIND_BYTES;
+  process.env.RELAY_MIN_FREE_DISK_BYTES = "0";
+  process.env.RELAY_MIN_FREE_DIND_BYTES = "0";
   db = openDb(process.env.RELAY_DB);
   registerWorker(db, "impl", { role: "worker" });
   registerWorker(db, "rev", { role: "reviewer" });
@@ -204,6 +216,10 @@ beforeEach(() => {
 afterEach(() => {
   db.close();
   delete process.env.RELAY_DSH_BIN;
+  if (prevMinFreeDisk === undefined) delete process.env.RELAY_MIN_FREE_DISK_BYTES;
+  else process.env.RELAY_MIN_FREE_DISK_BYTES = prevMinFreeDisk;
+  if (prevMinFreeDind === undefined) delete process.env.RELAY_MIN_FREE_DIND_BYTES;
+  else process.env.RELAY_MIN_FREE_DIND_BYTES = prevMinFreeDind;
   rmSync(dir, { recursive: true, force: true });
 });
 
@@ -607,6 +623,125 @@ describe("sandbox Run: one disposable dsh per attempt", () => {
     const run = await launched.handle.wait();
     expect(run.state).toBe("timeout");
     expect(run.head_sha).toBeNull();
+  });
+});
+
+describe("ISH-1009: sandbox disk guard", () => {
+  const hostPaths = () => [join(dir, "worktrees"), join(dir, "state.db")];
+
+  test("a low host volume refuses BEFORE the sandbox is created", async () => {
+    const id = newTask();
+    const sbx = new FakeSbx();
+    const spawner = new FakeSpawner();
+    await expect(
+      launchTaskSandboxRun(db, id, {
+        source: repo,
+        cli: sbx,
+        spawner,
+        outputRoot: outputRoot(),
+        diskGuard: { minFreeBytes: 1_000, paths: hostPaths(), probe: () => 100 },
+      })
+    ).rejects.toThrow(/LOW_DISK/);
+
+    expect(spawner.procs).toHaveLength(0);
+    expect(listRuns(db, { taskId: id })).toHaveLength(0);
+    expect(getSandbox(db, id)).toBeNull();
+    expect(getTask(db, id)!.state).toBe("queued");
+    const latest = latestLaunchRefusal(db)!;
+    expect(latest.reason).toBe("low_disk");
+    expect(latest.target).toBe("sandbox");
+    expect(latest.scope).toBe("host");
+    expect(latest.freeBytes).toBe(100);
+  });
+
+  test("a low in-sandbox DinD volume refuses after the host check, before dsh starts", async () => {
+    const id = newTask();
+    const sbx = new FakeSbx();
+    const spawner = new FakeSpawner();
+    await expect(
+      launchTaskSandboxRun(db, id, {
+        source: repo,
+        cli: sbx,
+        spawner,
+        outputRoot: outputRoot(),
+        diskGuard: {
+          minFreeBytes: 1_000,
+          paths: hostPaths(),
+          probe: () => 10_000,
+          dindMinFreeBytes: 1_000,
+          dindProbe: () => 100,
+        },
+      })
+    ).rejects.toThrow(/LOW_DISK/);
+
+    expect(spawner.procs).toHaveLength(0);
+    expect(listRuns(db, { taskId: id })).toHaveLength(0);
+    const latest = latestLaunchRefusal(db)!;
+    expect(latest.reason).toBe("low_disk");
+    expect(latest.scope).toBe("dind");
+    expect(latest.freeBytes).toBe(100);
+    expect(latest.minFreeBytes).toBe(1_000);
+    // The sandbox row is durable and may remain; no Run was started.
+    expect(getTask(db, id)!.state).toBe("queued");
+  });
+
+  test("a failed DinD probe refuses and surfaces the probe error", async () => {
+    const id = newTask();
+    const sbx = new FakeSbx();
+    const spawner = new FakeSpawner();
+    await expect(
+      launchTaskSandboxRun(db, id, {
+        source: repo,
+        cli: sbx,
+        spawner,
+        outputRoot: outputRoot(),
+        diskGuard: {
+          minFreeBytes: 1_000,
+          paths: hostPaths(),
+          probe: () => 10_000,
+          dindMinFreeBytes: 1_000,
+          dindProbe: () => {
+            throw new Error("df transport down");
+          },
+        },
+      })
+    ).rejects.toThrow(/DISK_PROBE_FAILED.*df transport down/);
+
+    expect(spawner.procs).toHaveLength(0);
+    expect(listRuns(db, { taskId: id })).toHaveLength(0);
+    const latest = latestLaunchRefusal(db)!;
+    expect(latest.reason).toBe("probe_failed");
+    expect(latest.scope).toBe("dind");
+    expect(latest.error).toContain("df transport down");
+  });
+
+  test("the default sbx df probe parses the DinD volume and applies its own floor", async () => {
+    const id = newTask();
+    const sbx = new FakeSbx();
+    const spawner = new FakeSpawner();
+    // The fake reports 8 GiB free in the VM; a 20 GiB DinD floor must refuse.
+    await expect(
+      launchTaskSandboxRun(db, id, {
+        source: repo,
+        cli: sbx,
+        spawner,
+        outputRoot: outputRoot(),
+        diskGuard: {
+          minFreeBytes: 1_000,
+          paths: hostPaths(),
+          probe: () => 10_000,
+          dindMinFreeBytes: 20 * 1024 ** 3,
+        },
+      })
+    ).rejects.toThrow(/LOW_DISK/);
+
+    expect(spawner.procs).toHaveLength(0);
+    expect(listRuns(db, { taskId: id })).toHaveLength(0);
+    const latest = latestLaunchRefusal(db)!;
+    expect(latest.reason).toBe("low_disk");
+    expect(latest.scope).toBe("dind");
+    expect(latest.freeBytes).toBe(8 * 1024 ** 3);
+    expect(latest.sandbox).toBe(sbx.created[0]);
   });
 });
 

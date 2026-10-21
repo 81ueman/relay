@@ -123,9 +123,14 @@ function fakeDshBin(name: string, version: string | null): string {
   return p;
 }
 
+let prevMinFreeDisk: string | undefined;
+
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "relay-dsh-run-"));
   process.env.RELAY_DB = join(dir, "state.db");
+  // ISH-1009: these tests exercise the runner, not the host's real free space.
+  prevMinFreeDisk = process.env.RELAY_MIN_FREE_DISK_BYTES;
+  process.env.RELAY_MIN_FREE_DISK_BYTES = "0";
   db = openDb(process.env.RELAY_DB);
   // ISH-869: the host runner probes `<dshBin> --version`; the fake-process tests
   // point it at a pinned fake so the guard passes without a real host dsh.
@@ -137,6 +142,8 @@ beforeEach(() => {
 afterEach(() => {
   db.close();
   delete process.env.RELAY_DSH_BIN;
+  if (prevMinFreeDisk === undefined) delete process.env.RELAY_MIN_FREE_DISK_BYTES;
+  else process.env.RELAY_MIN_FREE_DISK_BYTES = prevMinFreeDisk;
   rmSync(dir, { recursive: true, force: true });
 });
 

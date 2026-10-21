@@ -69,6 +69,19 @@ lifecycle log are written under `<control-plane>/runs/<run-id>/` exactly as the
 worktree runner does, and the run row records phase / attempt / generation /
 branch / `base_head_sha` / `head_sha` / `session_id` / exit code.
 
+### Pre-launch disk-space guard (ISH-1009)
+
+Before the sandbox is created, `launchTaskSandboxRun` measures the host volumes
+it depends on (the worktrees root and the Relay DB directory) against
+`RELAY_MIN_FREE_DISK_BYTES` (default 20 GiB; `0` turns off the threshold only —
+an unmeasurable host volume still refuses). After the sandbox exists and before
+`dsh` starts, it also probes the in-VM DinD volume with a cheap
+`sbx exec … df -Pk /var/lib/docker`, against `RELAY_MIN_FREE_DIND_BYTES` (default
+2 GiB; `0` disables; the volume itself is 10g). A failed probe refuses the
+launch (`run.launch_refused` with `reason: "probe_failed"`), never a pass. The
+Task stays `queued` and the next attempt after space is freed launches normally.
+The in-sandbox message says which scope failed (`scope: "host" | "dind"`).
+
 ### The pinned dsh (ISH-869)
 
 Relay pins exactly one build, `PINNED_DSH_VERSION = 0.2.1-rc.2`
@@ -220,7 +233,9 @@ provider, no bridge, no `relay lab`.
   fetch-and-save of a commit from a failed Run; `sbx ls` failure as a refusal; and
   the child-env allowlist. All with a **fake** `sbx`/`sbx exec` and a **real**
   local git remote for the fetch, plus a **real-DB** reopen from the pre-ISH-828
-  schema.
+  schema. ISH-1009 adds focused sandbox tests for a low host volume (refused
+  before the sandbox is created) and a low/failed in-VM DinD probe (refused
+  before dsh starts).
 - **Real sandbox smoke** — `RELAY_SANDBOX_SMOKE=1 bun run smoke:sandbox:real`
   creates a real clone-mode sandbox from a throwaway main checkout, runs a real
   `dsh`, fetches the produced commit and removes the sandbox. With
