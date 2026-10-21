@@ -107,6 +107,8 @@ function pinnedDshBin(): string {
   return p;
 }
 
+let prevMinFreeDisk: string | undefined;
+
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "relay-ish760-"));
   repo = join(dir, "repo");
@@ -118,6 +120,9 @@ beforeEach(() => {
   git(repo, "add", "README.md");
   git(repo, "commit", "-q", "-m", "base");
   process.env.RELAY_DB = join(dir, "state.db");
+  // ISH-1009: these tests exercise the lifecycle, not the host's real free space.
+  prevMinFreeDisk = process.env.RELAY_MIN_FREE_DISK_BYTES;
+  process.env.RELAY_MIN_FREE_DISK_BYTES = "0";
   db = openDb(process.env.RELAY_DB);
   registerWorker(db, "impl", { role: "worker" });
   registerWorker(db, "rev", { role: "reviewer" });
@@ -129,6 +134,8 @@ beforeEach(() => {
 afterEach(() => {
   db.close();
   delete process.env.RELAY_DSH_BIN;
+  if (prevMinFreeDisk === undefined) delete process.env.RELAY_MIN_FREE_DISK_BYTES;
+  else process.env.RELAY_MIN_FREE_DISK_BYTES = prevMinFreeDisk;
   rmSync(dir, { recursive: true, force: true });
 });
 

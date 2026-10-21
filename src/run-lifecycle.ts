@@ -3,6 +3,7 @@ import { execFileSync } from "node:child_process";
 import { copyFileSync, existsSync, linkSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve, sep } from "node:path";
 import { defaultDbPath, now, projectRoot } from "./db";
+import { assertLaunchDiskSpace, defaultDiskPaths, type DiskGuardOptions } from "./disk-guard";
 import { logEvent } from "./events";
 import type { Run, Task, TaskResult } from "./schema";
 import { isTerminalTaskState } from "./schema";
@@ -921,6 +922,8 @@ export interface LaunchRunOptions extends EnsureWorktreeOptions {
   timeoutMs?: number;
   fastExitMs?: number;
   env?: Record<string, string>;
+  /** ISH-1009: pre-launch disk-space guard override (test/operator seam). */
+  diskGuard?: DiskGuardOptions;
   /** Test seam. */
   spawner?: DshSpawner;
 }
@@ -951,6 +954,19 @@ export async function launchTaskRun(db: Database, taskId: string, opts: LaunchRu
   if (task.code_change !== 1) {
     throw new Error(`${WORKTREE_ERROR}: task ${taskId} is not a code-change task`);
   }
+
+  // ISH-1009: measure BEFORE creating/selecting/pinning the worktree, so a
+  // low-disk refusal writes nothing and the Task stays queued. `startDshRun`
+  // would run the same guard centrally; this early call also avoids creating a
+  // workspace under a full volume.
+  assertLaunchDiskSpace(db, {
+    taskId,
+    phase: task.phase,
+    target: "host",
+    ...opts.diskGuard,
+    paths: opts.diskGuard?.paths ?? defaultDiskPaths(db, { worktreesRoot: taskWorktreesRoot(opts.worktreesRoot) }),
+  });
+
   const binding = ensureTaskWorktree(db, taskId, opts);
 
   // ISH-760 (review round 1, finding 2): refuse a duplicate writer BEFORE
@@ -974,6 +990,8 @@ export async function launchTaskRun(db: Database, taskId: string, opts: LaunchRu
     timeoutMs: opts.timeoutMs,
     fastExitMs: opts.fastExitMs,
     env: opts.env,
+    // The guard already ran above, before the worktree was touched.
+    skipDiskGuard: true,
     spawner: opts.spawner,
   });
   const run = getRun(db, handle.id)!;

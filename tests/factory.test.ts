@@ -185,6 +185,8 @@ class FakeSbxCli implements SbxCli {
     }
     if (args[0] === "exec") {
       const joined = args.join(" ");
+      // ISH-1009: the in-sandbox DinD disk probe (8 GiB in KiB, above the 2 GiB floor).
+      if (joined.includes("df -Pk /var/lib/docker")) return ok(String(8 * 1024 * 1024));
       if (joined.includes("git checkout")) {
         const m = joined.match(/git checkout (?:-b )?([^\s;&|]+)/);
         if (m) this.currentBranch = m[1];
@@ -373,6 +375,8 @@ const factoryDeps = (dshBin: string, reviewer?: ReviewerSpawner) => ({
   mergeGateDeps: {},
 });
 
+let prevMinFreeDisk: string | undefined;
+
 interface TaskResultRow {
   id: number;
   attempt: number;
@@ -401,6 +405,9 @@ beforeEach(() => {
   git(repo, "add", "README.md");
   git(repo, "commit", "-q", "-m", "base");
   process.env.RELAY_DB = join(dir, "state.db");
+  // ISH-1009: these tests exercise the factory, not the host's real free space.
+  prevMinFreeDisk = process.env.RELAY_MIN_FREE_DISK_BYTES;
+  process.env.RELAY_MIN_FREE_DISK_BYTES = "0";
   db = openDb(process.env.RELAY_DB);
   issueSeq = 0;
   delete process.env.RELAY_HUMAN;
@@ -410,6 +417,8 @@ afterEach(() => {
   db.close();
   rmSync(dir, { recursive: true, force: true });
   delete process.env.RELAY_HUMAN;
+  if (prevMinFreeDisk === undefined) delete process.env.RELAY_MIN_FREE_DISK_BYTES;
+  else process.env.RELAY_MIN_FREE_DISK_BYTES = prevMinFreeDisk;
 });
 
 describe("ISH-830e: the reviewer runs under `auto`, never bypass/all-tools", () => {

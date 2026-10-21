@@ -6,6 +6,7 @@ import type { Database } from "bun:sqlite";
 import { openDb } from "../src/db";
 import { buildDashboardView, type DashboardView } from "../src/dashboard/model";
 import { dwidth, renderDashboard, renderDashboardJson, trim } from "../src/dashboard/render";
+import { evaluateDiskSpace } from "../src/disk-guard";
 import type { PaneTelemetry } from "../src/dashboard/herdr";
 import { recordRuntime } from "../src/runtimes";
 import { addTask, blockTask, claimTask } from "../src/tasks";
@@ -237,6 +238,40 @@ describe("dashboard renderer", () => {
     expect(payload.workers[0].runtime.generation).toBe(3);
     expect(payload.workers[0].execution.state).toBe("busy");
     expect(JSON.stringify(payload)).not.toContain("plan_id");
+  });
+
+  test("ISH-1009: a refused disk guard is rendered with the measured free space", () => {
+    const status = evaluateDiskSpace({
+      paths: [join(dir, ".relay", "worktrees")],
+      minFreeBytes: 20 * 1024 ** 3,
+      probe: () => 12 * 1024 ** 3,
+    });
+    const v = {
+      ...sample(),
+      disk: {
+        status,
+        lastRefusal: {
+          at,
+          taskId: "T30",
+          reason: "low_disk",
+          target: "host",
+          scope: "host",
+          sandbox: null,
+          minFreeBytes: 20 * 1024 ** 3,
+          freeBytes: 12 * 1024 ** 3,
+          error: null,
+          message: "LOW_DISK",
+        },
+      },
+    };
+    const out = renderDashboard(v, { color: false, links: false, width: 160 });
+    expect(out).toContain("disk: 12.0 GiB free");
+    expect(out).toContain("BELOW the 20.0 GiB minimum");
+    expect(out).toContain("Run launches refused");
+    expect(out).toContain("last: T30 low_disk free=12.0 GiB");
+    const payload = JSON.parse(renderDashboardJson(v));
+    expect(payload.disk.status.reason).toBe("low_disk");
+    expect(payload.disk.status.freeBytes).toBe(12 * 1024 ** 3);
   });
 
   test("CLI: relay dashboard --json and --doctor", () => {
