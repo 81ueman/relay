@@ -77,6 +77,7 @@ import {
 } from "./workers";
 import { RELAY_TAG, sendMessage } from "./messages";
 import { immediateKindSql, mailNudgeMs, ordinaryStarvationCapMs, starvationCapMs } from "./mail-policy";
+import { maybeSweepRunLiveness } from "./run-liveness";
 
 // Deterministic reconciler. No LLM: pure DB state + runtime transport.
 // Callers pass full Worker rows; only the Runtime adapter maps to targets.
@@ -1531,6 +1532,38 @@ export async function reconcile(db: Database, rt: Runtime, at = now(), deps: Wor
   // 0b. Polled workers (codex, claude) have no plugin event stream: poll Herdr
   //     agent status for liveness/idle/blocked before the transport-dead walk.
   await pollPolledWorkers(db, rt, at);
+
+  // 0c. ISH-1008 RUN LIVENESS: the launching coroutine is normally the only
+  //     writer of a Run's terminal state. If it died (crash/reboot/ENOSPC), the
+  //     durable row would stay starting/running forever and nothing would alert.
+  //     Throttled and identity-checked: a live Run is never touched, an
+  //     undeterminable identity keeps the single-writer fence, and a sandbox Run
+  //     is failed only once the in-VM dsh is confirmed gone. Kept fail-soft so a
+  //     full disk or an sbx probe failure cannot abort the whole reconcile pass.
+  try {
+    const liveness = maybeSweepRunLiveness(db, at);
+    for (const d of liveness.died) actions.push(`run-died:${d.runId}:${d.class}`);
+    if (liveness.errors.length > 0) {
+      actions.push(`run-liveness-error:${liveness.errors.length}`);
+      try {
+        logEvent(db, {
+          source: "supervisor",
+          type: "supervisor.run_liveness_error",
+          payload: { errors: liveness.errors },
+        });
+      } catch {
+        /* the DB may be full; the next tick retries */
+      }
+    }
+  } catch (e) {
+    // Defensive belt: a sweep bug must not take down lease expiry / workflow.
+    actions.push("run-liveness-error");
+    try {
+      logEvent(db, { source: "supervisor", type: "supervisor.run_liveness_error", payload: { error: String(e) } });
+    } catch {
+      /* ignore */
+    }
+  }
 
   // 1. Expire lapsed leases first (worker crash recovery). Only a missing or
   //    not-alive assignee is requeued; a live-but-slow worker keeps its lease.

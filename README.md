@@ -498,6 +498,45 @@ directory are saved; run logs are retained. One-command fixture smoke:
 `bun run smoke:sandbox`; the real-sandbox smoke is `bun run smoke:sandbox:real`
 (opt-in). See [`docs/sandbox-lifecycle.md`](docs/sandbox-lifecycle.md).
 
+### Daemon Run liveness sweep (ISH-1008)
+
+A Run's terminal row is normally written once by the coroutine that launched it.
+If that process dies — a crash, a reboot, or a failed ENOSPC terminal write — the
+durable row used to stay `starting`/`running` forever, holding the single-writer
+fence and alerting nobody. `reconcile()` now performs a **throttled liveness
+sweep** (`RELAY_RUN_LIVENESS_MS`, default 45s) over every non-terminal Run:
+
+- **launcher first** — the child can exit while the launching coroutine is still
+  finishing (`git rev-parse`, or a sandbox `git fetch` before its terminal
+  write). The Run row records the launcher PID + start-time token, and the sweep
+  leaves the Run alone while that launcher may still write. The lease is cleared
+  in the launcher's `finally`; only then may the sweep finish a row whose
+  terminal write did not land.
+- **local Run** — `identifyRunProcess` proves the recorded PID. A dead PID or a
+  **reused** PID (the original dsh is gone) becomes `failed` with an
+  `orphaned:` reason; a **live** PID is never touched and an **undeterminable**
+  identity leaves the Run running so the fence keeps holding. The sweep never
+  signals a local process.
+- **sandbox Run** — reuses `sweepOrphanedSandboxRuns({ apply: true })`; the Run
+  becomes terminal only when the in-VM dsh is confirmed **gone**. A still-alive
+  or `unknown` dsh keeps the Run non-terminal.
+- A just-inserted `starting` row with no PID yet gets a launch grace window
+  (`RELAY_RUN_START_GRACE_MS`, default 2x the sweep interval / at least 60s), so
+  the sweep never races a concurrent launch.
+
+A proven death is never a success. The sweep reads the tail of the Run's own
+`stderr.log`/`dsh.jsonl` and classifies the cause as `ENOSPC`, `OOM`, `signal` or
+`unknown`, stores `cause=<CLASS>: <evidence>` in `runs.error`, emits a `run.died`
+event, shows it on the dashboard (`RUNS` + `ATTENTION`), and sends immediate
+`run_died` coordinator mail to the responsible owner (`RELAY_HUMAN` or the
+nearest assigned ancestor). `stderr.log` is authoritative across all classes;
+`dsh.jsonl` contributes only parsed terminal `error` events (never tool output or
+a success `final` summary), and the last matching line in a source wins.
+`relay run show <id>` projects `failure_class`. The sweep is failure-isolated: a
+DB-write error (e.g. a full disk) does not crash the daemon, leaves the throttle
+unadvanced, and the next reconcile tick retries. It does **not** implement a
+pre-launch disk guard (ISH-1009) or stall detection for a live-but-silent dsh.
+
 ### Task-owned Network Lab skill + cleanup hook (ISH-845)
 
 A coding Task may deploy an **arbitrary containerlab topology** on the shared
@@ -615,8 +654,9 @@ re-check). Tests inject `MockRuntime` + `bypassSingleton` to bypass the guard.
 
 `relay status` stays a lightweight, greppable one-shot. `relay dashboard` is the
 human view: the **task tree**, the **workers** with each one's *current* runtime
-overlaid, and **ATTENTION** — all rendered from the Relay domain functions, never
-by re-reading the SQLite schema.
+overlaid, **ATTENTION**, and (ISH-1008) the **RUNS** — live headless Runs plus
+recently-died ones with their classified cause — all rendered from the Relay
+domain functions, never by re-reading the SQLite schema.
 
 ```bash
 relay dashboard                     # one render to the current terminal

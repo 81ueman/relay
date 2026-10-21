@@ -7,6 +7,12 @@ import { getTask } from "./tasks";
 import type { Run, RunState, Task } from "./schema";
 import { isTerminalTaskState } from "./schema";
 import { spawnIdentityToken } from "./proc-identity";
+import {
+  beginRunLaunch,
+  endRunLaunch,
+  launcherFields,
+  releaseRunLauncher,
+} from "./run-launcher";
 import { childEnv } from "./child-env";
 import { isPinnedDsh, PINNED_DSH_VERSION, readDshVersion } from "./dsh-version";
 import { assertLaunchDiskSpace, type DiskGuardOptions } from "./disk-guard";
@@ -249,14 +255,18 @@ interface InsertRunInput {
 
 function insertRun(db: Database, r: InsertRunInput): Run {
   const t = now();
+  // ISH-1008: record the launcher so the liveness sweep can tell "the child is
+  // gone but the coroutine is still finishing the terminal write" from "nobody
+  // owns this row any more".
+  const launcher = launcherFields();
   // `head_sha` (the PRODUCED head) is NULL until the Run ends and the cwd is
   // re-read; `base_head_sha` is the pre-run fence.
   db.query(
     `INSERT INTO runs
        (id, task_id, phase, attempt, generation, cwd, branch, head_sha, base_head_sha, prompt,
         spec_path, output_dir, state, stdout_path, stderr_path, events_path, dsh_events_path,
-        fast_exit, started_at, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, 'starting', ?, ?, ?, ?, 0, ?, ?, ?)`
+        launcher_pid, launcher_lstart, fast_exit, started_at, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, 'starting', ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`
   ).run(
     r.id,
     r.taskId,
@@ -273,6 +283,8 @@ function insertRun(db: Database, r: InsertRunInput): Run {
     r.stderrPath,
     r.eventsPath,
     r.dshEventsPath,
+    launcher.launcher_pid,
+    launcher.launcher_lstart,
     t,
     t,
     t
@@ -597,6 +609,7 @@ export async function startDshRun(db: Database, opts: StartRunOptions): Promise<
     }, opts.timeoutMs);
   }
 
+  beginRunLaunch(runId);
   const done = (async (): Promise<Run> => {
     let exitCode: number | null = null;
     let failure: string | null = null;
@@ -681,7 +694,14 @@ export async function startDshRun(db: Database, opts: StartRunOptions): Promise<
       },
     });
     return finalRun;
-  })();
+  })().finally(() => {
+    // The coroutine is done: it can no longer write the terminal row. Keep the
+    // in-process state for this pass and clear the durable launcher lease, so a
+    // failed terminal write is retried by the next liveness sweep instead of
+    // being held by a launcher PID that will never write again.
+    endRunLaunch(runId);
+    releaseRunLauncher(db, runId);
+  });
 
   return {
     id: runId,

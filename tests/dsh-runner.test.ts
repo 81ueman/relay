@@ -272,6 +272,31 @@ describe("one-shot headless dsh Run lifecycle", () => {
     expect(exited?.turnReason).toBe("completed");
   });
 
+  test("records the launcher lease and clears it when the launch coroutine finishes", async () => {
+    const { id, outputRoot } = newTask();
+    const spawner = new FakeSpawner();
+    const atSpawn: { pid: number | null; lstart: string | null; state: string }[] = [];
+    spawner.onSpawn = (p) => {
+      const row = listRuns(db, { taskId: id })[0]!;
+      atSpawn.push({ pid: row.launcher_pid, lstart: row.launcher_lstart, state: row.state });
+      emitHappyJsonl(p, "session-launcher-0000-1111-2222-333333333333");
+      p.finish(0);
+    };
+
+    const h = await startDshRun(db, { taskId: id, spawner, outputRoot, fastExitMs: 0 });
+    const run = await h.wait();
+    const settled = getRun(db, run.id)!;
+
+    // ISH-1008: the lease is durable from the insert (before the child pid is
+    // recorded), so a sweep cannot mistake the pre-spawn launch for an orphan.
+    expect(atSpawn[0]?.pid).toBe(process.pid);
+    expect(atSpawn[0]?.state).toBe("starting");
+    // The coroutine is done, so a failed terminal write can be retried by a sweep.
+    expect(run.state).toBe("exited");
+    expect(settled.launcher_pid).toBeNull();
+    expect(settled.launcher_lstart).toBeNull();
+  });
+
   test("a real tool_call + tool_result are preserved in per-Run dsh evidence", async () => {
     const { id, outputRoot } = newTask();
     const spawner = new FakeSpawner();

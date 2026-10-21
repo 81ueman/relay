@@ -435,6 +435,17 @@ export interface Run {
    * any orphan signal is sent — a reused PID must never be killed.
    */
   spawn_lstart: string | null;
+  /**
+   * ISH-1008: the process that inserted/launched this Run and may still write its
+   * terminal row. The periodic liveness sweep refuses to orphan a Run while that
+   * launcher is alive (and, for a launch in this process, still finishing), so a
+   * slow sandbox `git fetch` / local `git rev-parse` tail is never mistaken for a
+   * dead launcher. Both are cleared once the launcher's coroutine is done; NULL
+   * means no launcher lease is held (a legacy row from before ISH-1008, or a
+   * launch that has already finished).
+   */
+  launcher_pid: number | null;
+  launcher_lstart: string | null;
   error: string | null;
   fast_exit: number;
   started_at: number;
@@ -789,6 +800,10 @@ CREATE TABLE IF NOT EXISTS runs (
   -- sandbox single-writer/staleness fences key on.
   sandbox_name TEXT,
   spawn_lstart TEXT,
+  -- ISH-1008: the launcher process + its spawn identity. A NULL pair means the
+  -- launch coroutine is no longer holding a terminal-write lease (or a legacy row).
+  launcher_pid INTEGER,
+  launcher_lstart TEXT,
   error TEXT,
   fast_exit INTEGER NOT NULL DEFAULT 0,
   started_at INTEGER NOT NULL,
