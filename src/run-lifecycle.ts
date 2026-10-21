@@ -20,6 +20,7 @@ import {
 import { taskChecks } from "./workflow";
 import type { CheckSpec } from "./verify";
 import { redactSecrets } from "./lab";
+import { readEvidenceTail, terminalImplementRunSignature } from "./implement-recovery";
 
 /**
  * ISH-760 — Task Worktree + disposable dsh Run lifecycle, single-writer.
@@ -623,7 +624,7 @@ export interface RunCheckFinding {
 
 export interface RunFinding {
   attempt: number;
-  kind: string; // "ReviewResult" | "VerificationResult"
+  kind: string; // "ReviewResult" | "VerificationResult" | "ImplementRun"
   reason: string | null;
   evidence: string | null;
   headSha: string | null;
@@ -638,6 +639,18 @@ export interface RunFinding {
    * Absent on a caller-built legacy finding, which is treated as a real finding.
    */
   defect?: boolean;
+  // --- ISH-1012: a failed IMPLEMENT Run (kind === "ImplementRun") -----------
+  /** The failed Run id (the durable process record). */
+  runId?: string;
+  /** Its terminal state (`failed`/`timeout`/`cancelled`/`exited`). */
+  runState?: string;
+  runExitCode?: number | null;
+  /** The HEAD the failed Run started from. */
+  baseHead?: string | null;
+  /** The revision it produced (equal to `baseHead` for a missing commit). */
+  producedHead?: string | null;
+  /** The Factory's concrete bounded-recovery reason for the next attempt. */
+  retryReason?: string | null;
 }
 
 /** Caps for the inherited diagnostics rendered into a pinned Run brief. */
@@ -722,11 +735,7 @@ export function inheritFindings(
         ORDER BY id DESC`
     )
     .all(task.id, task.attempt - 1) as TaskResult[];
-  if (rows.length === 0) return [];
-  const commands = new Map(
-    taskChecks({ checks_json: task.checks_json ?? null }).map((c) => [c.name, c.command] as const)
-  );
-  return rows.slice(0, RUN_FINDING_MAX_RESULTS).map((r) => {
+  const findings: RunFinding[] = rows.slice(0, RUN_FINDING_MAX_RESULTS).map((r) => {
     const payload = resultPayload(r);
     const isVerify = r.kind === "VerificationResult";
     const outcome = isVerify && typeof payload?.outcome === "string" ? payload.outcome : null;
@@ -738,10 +747,96 @@ export function inheritFindings(
       evidence: r.evidence_ref,
       headSha: r.head_sha,
       outcome,
-      checks: isVerify ? verificationChecks(payload, commands) : [],
+      checks: isVerify ? verificationChecks(payload, commandsFor(task)) : [],
       defect: isVerify ? verificationDefect(outcome) : !blockedReview,
     };
   });
+  // ISH-1012: a FAILED IMPLEMENT attempt leaves no task_results row (nothing was
+  // submitted), so the existing result-only query would give the fresh Run NO
+  // context. Carry the failed Run row itself — the same durable evidence the
+  // Factory classified — into the brief.
+  const runFinding = implementRunFinding(db, task);
+  if (runFinding) findings.unshift(runFinding);
+  return findings.slice(0, RUN_FINDING_MAX_RESULTS);
+}
+
+/** The declared check commands for a Task, for reproduction in a brief. */
+function commandsFor(task: { checks_json?: string | null }): Map<string, string> {
+  return new Map(taskChecks({ checks_json: task.checks_json ?? null }).map((c) => [c.name, c.command] as const));
+}
+
+/**
+ * ISH-1012: the durable `factory.implement_retry` reason for the attempt that is
+ * about to start. Read from the events already written by the transition; never
+ * a second evidence store.
+ */
+function latestImplementRetryReason(db: Database, taskId: string, toAttempt: number): string | null {
+  const rows = db
+    .query(`SELECT payload_json FROM events WHERE task_id = ? AND type = 'factory.implement_retry' ORDER BY id DESC LIMIT 20`)
+    .all(taskId) as { payload_json: string }[];
+  for (const row of rows) {
+    try {
+      const payload: unknown = JSON.parse(row.payload_json);
+      if (isRecord(payload) && payload.toAttempt === toAttempt && typeof payload.reason === "string" && payload.reason) {
+        return payload.reason;
+      }
+    } catch {
+      /* a malformed event is not a finding */
+    }
+  }
+  return null;
+}
+
+/**
+ * ISH-1012: the previous attempt's IMPLEMENT Run when it ended WITHOUT an
+ * accepted submission. The Run row is the existing process record: its terminal
+ * state, exit code, base/produced HEAD and error are exactly what the fresh Run
+ * needs. `null` when the attempt was submitted (a normal FIX is described by its
+ * VerificationResult/ReviewResult instead) or when no Run exists.
+ */
+function implementRunFinding(
+  db: Database,
+  task: Pick<Task, "id" | "attempt">
+): RunFinding | null {
+  if (task.attempt <= 0) return null;
+  const prior = task.attempt - 1;
+  const submitted = db
+    .query(`SELECT id FROM task_results WHERE task_id = ? AND attempt = ? AND kind = 'TaskSubmitted' LIMIT 1`)
+    .get(task.id, prior) as { id: number } | null;
+  if (submitted) return null;
+  const run = db
+    .query(
+      `SELECT * FROM runs WHERE task_id = ? AND phase = 'implement' AND attempt = ?
+        ORDER BY created_at DESC, rowid DESC LIMIT 1`
+    )
+    .get(task.id, prior) as Run | null;
+  if (!run) return null;
+  // Only the two RETRY classes the Factory can actually rework (missing-commit /
+  // host partial-commit). A cancelled/timeout/unknown Run is never retried, so it
+  // must never be presented to a fresh Run as a RETRY instruction.
+  if (!terminalImplementRunSignature(run)) return null;
+  // The recorded Run error (e.g. "exit 3") plus its bounded stderr tail — the
+  // SAME per-Run evidence ISH-1008/ISH-810 already retain, never a new store.
+  const stderrTail = readEvidenceTail(run.stderr_path, 2000)?.trim() ?? null;
+  const failureText = [run.error, stderrTail].filter((s): s is string => !!s).join("\n");
+  return {
+    attempt: prior,
+    kind: "ImplementRun",
+    reason:
+      failureText ||
+      (run.state === "exited"
+        ? "the IMPLEMENT Run exited 0 but produced no new commit"
+        : `the IMPLEMENT Run ended '${run.state}'`),
+    evidence: `run:${run.id}`,
+    headSha: run.head_sha ?? run.base_head_sha,
+    defect: true,
+    runId: run.id,
+    runState: run.state,
+    runExitCode: run.exit_code,
+    baseHead: run.base_head_sha,
+    producedHead: run.head_sha,
+    retryReason: latestImplementRetryReason(db, task.id, task.attempt),
+  };
 }
 
 /** Redact and bound a stored output tail for the pinned brief (never raw/full). */
@@ -770,6 +865,29 @@ function renderRunFinding(f: RunFinding): string[] {
   const out: string[] = [];
   const checks = f.checks ?? [];
   const defect = f.defect !== false;
+  if (f.kind === "ImplementRun") {
+    out.push("", `### IMPLEMENT Run — RETRY (attempt ${f.attempt})`);
+    out.push(`- Run: \`${f.runId ?? "unknown"}\``);
+    out.push(
+      `- Outcome: \`${f.runState ?? "unknown"}\`${
+        f.runExitCode === null || f.runExitCode === undefined ? "" : ` (exit ${f.runExitCode})`
+      }`
+    );
+    if (f.baseHead) out.push(`- Base HEAD (where that Run started): \`${f.baseHead}\``);
+    if (f.producedHead && f.producedHead !== f.baseHead) {
+      out.push(`- Produced HEAD (progress it made): \`${f.producedHead}\``);
+    }
+    const retry = boundedFindingReason(f.retryReason ?? null);
+    if (retry) out.push(`- Retry reason: ${retry.split("\n")[0]}`);
+    const error = boundedFindingReason(f.reason);
+    if (error) {
+      out.push("- Error:");
+      out.push(...error.split("\n").map((l) => `  ${l}`));
+    } else {
+      out.push("- (no captured error; do not assume the attempt succeeded)");
+    }
+    return out;
+  }
   const label = defect ? (f.kind === "ReviewResult" ? "FIX" : "FAIL") : "BLOCKED";
   out.push("", `### ${f.kind} — ${label} (attempt ${f.attempt})`);
   if (f.headSha) {
@@ -859,6 +977,11 @@ export function buildRunBrief(db: Database, task: Task, opts: BuildBriefOptions)
       lines.push(
         "- The Task acceptance above is unchanged and is the completion bar; this is a NEW Run, not a session replay."
       );
+      if (defects.some((f) => f.kind === "ImplementRun")) {
+        lines.push(
+          "- The previous IMPLEMENT Run ended WITHOUT an accepted submission. Continue the SAME Task on this worktree and commit a NEW revision; do NOT re-run `relay` mutations."
+        );
+      }
       for (const f of defects) lines.push(...renderRunFinding(f));
     }
     if (blocked.length > 0) {

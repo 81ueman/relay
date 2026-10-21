@@ -20,6 +20,7 @@ import {
   recordChildBlocked,
   recordReview,
   recordVerification,
+  recordImplementRecovery,
   reconcileRequestToken,
   requestReconcile,
   submitPhase,
@@ -503,5 +504,92 @@ describe("CLI wiring (no GitHub/Linear API)", () => {
     cli(["submit", id, "--evidence", "implemented"], "impl");
     cli(["claim", id], "ver");
     expect(cli(["result", "verify", id, "--pass"], "ver")).toContain("phase=review");
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// ISH-1012: the bounded-recovery transition is conditional and fence-bound.
+// ---------------------------------------------------------------------------
+
+/** Insert the durable Run row the recovery policy judges (no process needed). */
+function insertImplementRun(
+  taskId: string,
+  overrides: { id: string; state?: string; attempt?: number; error?: string | null } = { id: "run-r0" }
+): void {
+  const t = Date.now();
+  db.query(
+    `INSERT INTO runs
+       (id, task_id, phase, attempt, generation, cwd, branch, head_sha, base_head_sha,
+        output_dir, state, error, started_at, created_at, updated_at)
+     VALUES (?, ?, 'implement', ?, 0, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    overrides.id,
+    taskId,
+    overrides.attempt ?? 0,
+    `/tmp/${taskId}-worktree`,
+    `/tmp/${taskId}-runs/${overrides.id}`,
+    overrides.state ?? "failed",
+    overrides.error ?? "exit 1",
+    t,
+    t,
+    t
+  );
+}
+
+describe("ISH-1012: implement recovery is a conditional, fence-bound transition", () => {
+  test("a stale replay can never bump the attempt twice; a live writer is refused", () => {
+    const id = intakeTask(db, {
+      provider: "test",
+      issueId: "ISH-1012-RECOVERY",
+      codeChange: true,
+      title: "recover",
+      checks: [{ name: "noop", command: "true" }],
+    }).id;
+    insertImplementRun(id);
+    const input = {
+      runId: "run-r0",
+      signature: "missing-commit:abc",
+      reason: "missing-commit: run run-r0 exited 0 with no new commit",
+      evidence: ["run run-r0: state=failed", "exit=1"],
+    };
+
+    const recovered = recordImplementRecovery(db, id, input);
+    expect(recovered.phase).toBe("implement");
+    expect(recovered.state).toBe("queued");
+    expect(recovered.attempt).toBe(1);
+
+    // REPLAY: the Run belongs to attempt 0, the Task is now attempt 1.
+    expect(() => recordImplementRecovery(db, id, input)).toThrow(/STALE_RESULT/);
+    expect(getTask(db, id)!.attempt).toBe(1);
+
+    // A LIVE writer for the current attempt holds the fence: no recovery.
+    insertImplementRun(id, { id: "run-r1", state: "running", attempt: 1 });
+    expect(() => recordImplementRecovery(db, id, { ...input, runId: "run-r1" })).toThrow(/still live|STALE_RESULT/);
+    expect(getTask(db, id)!.attempt).toBe(1);
+  });
+
+  test("an empty retry reason/evidence and a user HOLD are refused", () => {
+    const id = intakeTask(db, {
+      provider: "test",
+      issueId: "ISH-1012-RECOVERY-2",
+      codeChange: true,
+      title: "recover2",
+      checks: [{ name: "noop", command: "true" }],
+    }).id;
+    insertImplementRun(id, { id: "run-h0" });
+    expect(() =>
+      recordImplementRecovery(db, id, { runId: "run-h0", signature: "s", reason: "  ", evidence: ["run run-h0"] })
+    ).toThrow(/non-empty retry reason/);
+    expect(() =>
+      recordImplementRecovery(db, id, { runId: "run-h0", signature: "s", reason: "r", evidence: [] })
+    ).toThrow(/concrete evidence/);
+
+    blockTask(db, id, "human", "HOLD", true);
+    expect(() =>
+      recordImplementRecovery(db, id, { runId: "run-h0", signature: "s", reason: "r", evidence: ["x"] })
+    ).toThrow(/HOLD|block/);
+    expect(getTask(db, id)!.state).toBe("blocked_human");
+    expect(getTask(db, id)!.attempt).toBe(0);
   });
 });

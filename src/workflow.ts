@@ -13,7 +13,7 @@ import {
   insertTaskResult,
   notifyGatewayTo,
 } from "./results";
-import type { CodePhase, ResultKind, Task, TaskState, VerifyOutcome } from "./schema";
+import type { CodePhase, ResultKind, Run, Task, TaskState, VerifyOutcome } from "./schema";
 import { INTEGRATOR_ROLE, REVIEWER_ROLE, isTerminalTaskState } from "./schema";
 import {
   clearCurrentTaskOrRestoreParent,
@@ -23,7 +23,7 @@ import {
   resolveHumanInterface,
   taskChildren,
 } from "./tasks";
-import { findLiveRunFor, runOwnedError } from "./run-owner";
+import { findLiveRunFor, findActiveWriterRow, runOwnedError } from "./run-owner";
 import { clearCurrentTask, getWorker, normalizeWorkerAfterTaskRelease, touchProgress } from "./workers";
 import {
   gitHead,
@@ -164,6 +164,14 @@ interface PhaseUpdate {
   clearHead?: boolean;
   resultRef?: string | null;
   acceptedAt?: number | null;
+  /**
+   * ISH-1012: only move when the Task is still the phase/attempt the caller
+   * judged. A conditional transition is what makes a recovery/repair step
+   * idempotent under restart/re-entry: a second writer observes 0 changes and
+   * is refused instead of bumping the attempt a second time.
+   */
+  expectPhase?: CodePhase;
+  expectAttempt?: number;
 }
 
 /**
@@ -171,17 +179,31 @@ interface PhaseUpdate {
  * move releases ownership: `assignee` defaults to NULL and `lease_until` is
  * cleared, so a worker that still holds the pre-transition task can never submit
  * it again with a stale token.
+ *
+ * With `expectPhase`/`expectAttempt` the UPDATE is conditional and a mismatch
+ * throws `STALE_ATTEMPT` — a concurrent/replayed recovery can never advance the
+ * Task twice.
  */
 function applyPhase(db: Database, task: Task, phase: CodePhase, u: PhaseUpdate): Task {
   const t = now();
   const headProvided = u.headSha !== undefined ? 1 : 0;
-  db.query(
+  const guards: string[] = [];
+  const guardArgs: (string | number)[] = [];
+  if (u.expectPhase !== undefined) {
+    guards.push("AND phase = ?");
+    guardArgs.push(u.expectPhase);
+  }
+  if (u.expectAttempt !== undefined) {
+    guards.push("AND attempt = ?");
+    guardArgs.push(u.expectAttempt);
+  }
+  const r = db.query(
     `UPDATE tasks
         SET phase = ?, state = ?, assignee = ?, claim_role = ?, attempt = ?,
             head_sha = CASE WHEN ? = 1 THEN NULL WHEN ? = 1 THEN ? ELSE head_sha END,
             result_ref = ?, accepted_at = ?,
             lease_token = lease_token + 1, lease_until = NULL, updated_at = ?
-      WHERE id = ?`
+      WHERE id = ? ${guards.join(" ")}`
   ).run(
     phase,
     u.state,
@@ -194,8 +216,14 @@ function applyPhase(db: Database, task: Task, phase: CodePhase, u: PhaseUpdate):
     u.resultRef ?? null,
     u.acceptedAt ?? null,
     t,
-    task.id
+    task.id,
+    ...guardArgs
   );
+  if (guards.length > 0 && r.changes !== 1) {
+    throw new Error(
+      `${STALE_ATTEMPT}: task ${task.id} is no longer phase '${u.expectPhase ?? task.phase}' attempt ${u.expectAttempt ?? task.attempt}; the transition is stale`
+    );
+  }
   return getTask(db, task.id)!;
 }
 
@@ -655,6 +683,12 @@ export function submitImplementationFromRun(db: Database, taskId: string, impl: 
   if (isTerminalTaskState(task.state)) {
     throw new Error(`${WORKFLOW_ERROR}: cannot submit a Run for terminal task ${taskId} (state=${task.state})`);
   }
+  // ISH-1012: a user HOLD (blocked_human) is never bypassed by a Run that was
+  // already in flight when the HOLD landed. The Run stays a recorded process,
+  // but it cannot advance the HELD Task.
+  if (task.state === "blocked_human") {
+    throw new Error(`${WORKFLOW_ERROR}: cannot submit a Run for HELD task ${taskId} (state=blocked_human)`);
+  }
   const phase = phaseOf(task);
   if (phase !== "implement" && phase !== "integration") {
     throw new Error(
@@ -844,8 +878,18 @@ export interface MechanicalVerifyOptions {
  * Quietly block a task for a human without a wake storm: state -> blocked_human,
  * ownership released, one ChildBlocked result, and the Gateway told at most once.
  * The block occurrence identity is the bumped lease token (see recordChildBlocked).
+ *
+ * ISH-1012: `nextAttempt` lets an IMPLEMENT failure park the Task on the NEXT
+ * attempt, so a later `unblock` starts a FRESH Run instead of reusing the
+ * attempt whose Run already failed.
  */
-export function quietBlock(db: Database, task: Task, reason: string, actor: string): Task {
+export function quietBlock(
+  db: Database,
+  task: Task,
+  reason: string,
+  actor: string,
+  opts: { nextAttempt?: number } = {}
+): Task {
   // ISH-808: a terminal (e.g. cancelled) task is CLOSED and must not be parked
   // into blocked_human by a late verify/provider pass.
   if (isTerminalTaskState(task.state)) {
@@ -853,13 +897,14 @@ export function quietBlock(db: Database, task: Task, reason: string, actor: stri
   }
   const t = now();
   const prev = task.assignee;
+  const attempt = opts.nextAttempt ?? task.attempt;
   db.transaction(() => {
     db.query(
       `UPDATE tasks
           SET state = 'blocked_human', assignee = NULL, lease_until = NULL,
-              lease_token = lease_token + 1, updated_at = ?
+              attempt = ?, lease_token = lease_token + 1, updated_at = ?
         WHERE id = ?`
-    ).run(t, task.id);
+    ).run(attempt, t, task.id);
     db.query(
       `INSERT INTO task_notes (task_id, worker_id, kind, body, created_at) VALUES (?, ?, 'blocked_human', ?, ?)`
     ).run(task.id, actor, reason, t);
@@ -874,6 +919,136 @@ export function quietBlock(db: Database, task: Task, reason: string, actor: stri
   recordChildBlocked(db, task.id, actor, reason, { notifyGateway: true });
   requestReconcile(db, `blocked:${task.id}`);
   return getTask(db, task.id)!;
+}
+
+/**
+ * ISH-1012: the terminal IMPLEMENT Run states. A recovery transition is refused
+ * unless the previous Run is provably here — a still-live writer holds the fence.
+ */
+const IMPLEMENT_TERMINAL_RUN_STATES: ReadonlySet<string> = new Set(["exited", "failed", "cancelled", "timeout", "submitted"]);
+
+export interface ImplementRecoveryTransition {
+  /** The failed IMPLEMENT Run whose terminal state released the fence. */
+  runId: string;
+  /** Stable failure signature (same-failure stop; recorded for replay). */
+  signature: string;
+  /** Concrete, non-empty retry reason. */
+  reason: string;
+  /** Concrete evidence lines (Run state/exit/head/error). */
+  evidence: string[];
+  /** Actor label for events (default `factory`). */
+  actor?: string;
+}
+
+/**
+ * ISH-1012: route a FAILED IMPLEMENT attempt to a FRESH attempt on the SAME
+ * Task/worktree/Sandbox. This is the ordinary phase/attempt transition VERIFY
+ * FAIL already uses (`applyPhase`), NOT a new state machine:
+ *
+ *   implement@N (terminal failed Run) -> implement@N+1 (no Run yet)
+ *
+ * It refuses unless ALL of these hold:
+ *   - the Task is still a runnable code-change Task in `implement`;
+ *   - `runId` is THIS Task's CURRENT attempt's IMPLEMENT Run and is terminal;
+ *   - no live Run owns the current `(task, implement, attempt)`;
+ *   - the single-writer fence is released for the Run's worktree/branch;
+ *   - a non-empty retry reason AND concrete evidence were supplied.
+ *
+ * The conditional UPDATE additionally makes the transition idempotent: a
+ * replayed/concurrent call observes 0 changes and gets `STALE_ATTEMPT` instead of
+ * bumping the attempt twice / starting a second Run for one attempt.
+ */
+export function recordImplementRecovery(db: Database, taskId: string, input: ImplementRecoveryTransition): Task {
+  const task = getTask(db, taskId);
+  if (!task) throw new Error(`unknown task: ${taskId}`);
+  if (!isCodeTask(task)) throw new Error(`${WORKFLOW_ERROR}: ${taskId} is not a code-change task`);
+  if (isTerminalTaskState(task.state)) {
+    throw new Error(`${WORKFLOW_ERROR}: cannot recover terminal task ${taskId} (state=${task.state})`);
+  }
+  if (task.phase !== "implement") {
+    throw new Error(`${WORKFLOW_ERROR}: cannot recover implement on ${taskId} in phase '${task.phase ?? "none"}'`);
+  }
+  // A HOLD / durable block is never bypassed by an automatic recovery.
+  if (task.state !== "queued" && task.state !== "running") {
+    throw new Error(`${WORKFLOW_ERROR}: cannot recover implement on ${taskId} in state ${task.state} (a user HOLD/block stops recovery)`);
+  }
+  if (!input.reason.trim()) throw new Error(`${WORKFLOW_ERROR}: implement recovery requires a non-empty retry reason`);
+  if (input.evidence.length === 0 || input.evidence.every((e) => !e.trim())) {
+    throw new Error(`${WORKFLOW_ERROR}: implement recovery requires concrete evidence`);
+  }
+  const run = db.query(`SELECT * FROM runs WHERE id = ?`).get(input.runId) as Run | null;
+  if (!run) throw new Error(`${WORKFLOW_ERROR}: unknown run ${input.runId}`);
+  if (run.task_id !== taskId || run.phase !== "implement" || run.attempt !== task.attempt) {
+    throw new Error(
+      `${STALE_RESULT}: run ${run.id} is ${run.task_id} ${run.phase}/${run.attempt}, task ${taskId} is implement/${task.attempt}`
+    );
+  }
+  if (!IMPLEMENT_TERMINAL_RUN_STATES.has(run.state)) {
+    throw new Error(
+      `${STALE_RESULT}: run ${run.id} is still '${run.state}'; the single-writer fence is held and no new attempt may start`
+    );
+  }
+  const live = findLiveRunFor(db, taskId, "implement", task.attempt);
+  if (live) {
+    throw new Error(`${STALE_RESULT}: run ${live.id} is still live for ${taskId} implement/${task.attempt}; refusing a second writer`);
+  }
+  const writer = findActiveWriterRow(db, { cwd: run.cwd, branch: run.branch, excludeRunId: run.id });
+  if (writer) {
+    throw new Error(
+      `${STALE_RESULT}: run ${writer.id} still holds the writer fence on ${writer.cwd}/${writer.branch ?? "none"}; refusing a new attempt`
+    );
+  }
+
+  const updated = db.transaction(() => {
+    logEvent(db, {
+      source: "factory",
+      taskId,
+      type: "factory.implement_retry",
+      payload: {
+        runId: run.id,
+        fromAttempt: task.attempt,
+        toAttempt: task.attempt + 1,
+        signature: input.signature,
+        reason: input.reason,
+        evidence: input.evidence,
+        actor: input.actor ?? "factory",
+      },
+    });
+    return applyPhase(db, task, "implement", {
+      state: "queued",
+      attempt: task.attempt + 1,
+      claimRole: claimRoleForPhase("implement", task.role),
+      clearHead: true,
+      expectPhase: "implement",
+      expectAttempt: task.attempt,
+    });
+  })();
+  requestReconcile(db, `implement-recovery:${taskId}`);
+  return updated;
+}
+
+/**
+ * ISH-1012: STOP a non-recoverable IMPLEMENT attempt as a BLOCKED Task. The
+ * attempt is advanced BEFORE parking, so a later explicit `unblock` starts a
+ * fresh Run instead of reusing the attempt whose Run already failed. A Task that
+ * is already parked (e.g. a user HOLD landed first) is left untouched.
+ */
+export function blockImplementFailure(db: Database, taskId: string, reason: string, actor = "factory"): Task {
+  const task = getTask(db, taskId);
+  if (!task) throw new Error(`unknown task: ${taskId}`);
+  if (!isCodeTask(task)) throw new Error(`${WORKFLOW_ERROR}: ${taskId} is not a code-change task`);
+  if (isTerminalTaskState(task.state)) return task;
+  // A HOLD already parked it: never overwrite the human's reason.
+  if (task.state !== "queued" && task.state !== "running") return task;
+  if (task.phase !== "implement") return task;
+  const blocked = quietBlock(db, task, reason, actor, { nextAttempt: task.attempt + 1 });
+  logEvent(db, {
+    source: "factory",
+    taskId,
+    type: "factory.implement_blocked",
+    payload: { fromAttempt: task.attempt, toAttempt: task.attempt + 1, reason },
+  });
+  return blocked;
 }
 
 /**

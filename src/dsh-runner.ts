@@ -18,6 +18,7 @@ import { isPinnedDsh, PINNED_DSH_VERSION, readDshVersion } from "./dsh-version";
 import { assertLaunchDiskSpace, type DiskGuardOptions } from "./disk-guard";
 import { gitHead } from "./verify";
 import { submitImplementationFromRun, type RunImplementation } from "./workflow";
+import { findActiveWriterRow, type ActiveWriterQuery as ActiveWriterRowQuery } from "./run-owner";
 import {
   countDshLine,
   dshSessionId,
@@ -180,34 +181,18 @@ export const DUPLICATE_WRITER = "DUPLICATE_WRITER";
 /** ISH-869: the host headless `dsh` is not the pinned build — refuse to spawn. */
 export const DSH_VERSION_MISMATCH = "DSH_VERSION_MISMATCH";
 
-export interface ActiveWriterQuery {
-  /** The worktree the candidate writer would run in. */
-  cwd: string;
-  /** The branch the candidate writer would write (null when not a git checkout). */
-  branch?: string | null;
-  /** Ignore this Run (e.g. the row being re-checked). */
-  excludeRunId?: string;
-}
+export type ActiveWriterQuery = ActiveWriterRowQuery;
 
 /**
  * ISH-760 single-writer: the non-terminal Run that already holds a writer on the
  * SAME worktree (by resolved cwd) or the SAME branch. Two Runs in DIFFERENT
  * worktrees/branches never conflict, even when they touch the same files — the
  * spec permits that parallel case and only rejects a duplicate writer on one
- * branch/worktree.
+ * branch/worktree. The query itself lives in `run-owner.ts` so phase transitions
+ * can reuse the SAME fence without an import cycle.
  */
 export function findActiveWriter(db: Database, q: ActiveWriterQuery): Run | null {
-  const cwd = resolve(q.cwd);
-  const rows = db
-    .query(`SELECT * FROM runs WHERE state IN ('starting','running') ORDER BY created_at DESC, rowid DESC`)
-    .all() as Run[];
-  for (const r of rows) {
-    if (q.excludeRunId && r.id === q.excludeRunId) continue;
-    const sameWorktree = resolve(r.cwd) === cwd;
-    const sameBranch = !!(q.branch && r.branch && q.branch === r.branch);
-    if (sameWorktree || sameBranch) return r;
-  }
-  return null;
+  return findActiveWriterRow(db, q);
 }
 
 /** The DUPLICATE_WRITER error for a conflicting live Run. */

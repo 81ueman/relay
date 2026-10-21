@@ -9,10 +9,17 @@ import type { Run, RunState, Task, TaskState } from "./schema";
 import { isCanonicalToken, processPgid, spawnIdentityToken } from "./proc-identity";
 import { defaultRunner, type CheckSpec, type CommandRunner } from "./verify";
 import { defaultVerifyTarget, type VerifyTarget } from "./sandbox-verify";
-import { runMechanicalVerification, submitPhase, taskChecks } from "./workflow";
+import { runMechanicalVerification, submitPhase, taskChecks, blockImplementFailure, recordImplementRecovery } from "./workflow";
 import { findTaskResult, isResultWriteError, markTaskBlockedInternal } from "./results";
 import { acceptRunSubmission, getRun, type DshSpawner } from "./dsh-runner";
 import { launchTaskRun, type LaunchRunOptions } from "./run-lifecycle";
+import {
+  classifyImplementFailure,
+  implementStopReason,
+  IMPLEMENT_RECOVERY,
+  terminalImplementRunSignature,
+  type ImplementRecoveryDecision,
+} from "./implement-recovery";
 import { getSandbox, SANDBOX_ERROR, type SbxCli } from "./sandbox";
 import {
   acceptSandboxSubmission,
@@ -147,6 +154,11 @@ export interface FactoryAttempt {
   verifyOutcome: string | null;
   reviewVerdict: string | null;
   phase: string | null;
+  /**
+   * ISH-1012: why this attempt was issued a fresh Run after an IMPLEMENT
+   * failure (null when it was the first attempt / a VERIFY/REVIEW FIX).
+   */
+  retryReason?: string | null;
 }
 
 export type FactoryOutcome =
@@ -184,6 +196,74 @@ function latestRun(db: Database, taskId: string, phase: string, attempt: number)
 
 function isLive(run: Run | null): boolean {
   return !!run && (run.state === "running" || run.state === "starting");
+}
+
+/**
+ * ISH-1012: the latest TERMINAL IMPLEMENT Run for the Task's CURRENT attempt, or
+ * null. Once an attempt's Run is terminal it is CLOSED: a restart/re-entry must
+ * reuse its recorded outcome (or finish its clean submission) and must NEVER
+ * launch a second Run for the same attempt.
+ */
+function terminalAttemptRun(db: Database, task: Task): Run | null {
+  const run = latestRun(db, task.id, "implement", task.attempt);
+  return run && !isLive(run) ? run : null;
+}
+
+/**
+ * ISH-1012: reconstruct the Factory error a CLOSED attempt represents, from the
+ * Run row alone. This is what makes re-entry idempotent: the same classification
+ * (and therefore the same bounded-retry/stop decision) is reached without
+ * launching anything, and the decision is based on the ORIGINAL Run evidence.
+ */
+function closedAttemptError(run: Run): string {
+  if (run.state === "submitted") {
+    return `${SUBMIT_REFUSED}: attempt ${run.attempt} is closed: run ${run.id} was already submitted but the Task is still bound to it`;
+  }
+  if (run.state === "exited" && run.exit_code === 0) {
+    return `${NO_IMPLEMENTATION}: attempt ${run.attempt} is closed: run ${run.id} exited 0 but produced no new commit (head ${run.head_sha ?? "none"} unchanged)`;
+  }
+  return `${CODING_FAILED}: attempt ${run.attempt} is closed: run ${run.id} is '${run.state}' (exit ${run.exit_code ?? "none"})${run.error ? `: ${run.error}` : ""}`;
+}
+
+/**
+ * ISH-1012: reuse a CLOSED attempt without a second writer. A clean exit-0 Run
+ * that was never submitted (a crash between the process exit and the structured
+ * submission) is finished through the ordinary `finishImplement` submission
+ * fence; every other terminal outcome is surfaced as its recorded failure so the
+ * bounded-recovery policy can decide (and re-entry cannot relaunch it).
+ */
+function finishTerminalAttempt(db: Database, run: Run, deps: FactoryDeps): ImplementResult {
+  if (run.state === "exited" && run.exit_code === 0) {
+    return finishImplement(db, run, deps);
+  }
+  return { run, producedHead: run.head_sha, error: closedAttemptError(run) };
+}
+
+/**
+ * ISH-1012: signatures of the OTHER failed IMPLEMENT Runs of this Task, most
+ * recent first. The same signature means the same failure at the same base HEAD
+ * — no progress — so the policy stops instead of looping. Derived from the
+ * durable Run rows, so the check survives a restart/replay.
+ */
+function priorImplementFailureSignatures(db: Database, taskId: string, currentRunId: string | null): string[] {
+  const rows = db
+    .query(
+      `SELECT * FROM runs WHERE task_id = ? AND phase = 'implement'
+        ORDER BY created_at DESC, rowid DESC`
+    )
+    .all(taskId) as Run[];
+  const out: string[] = [];
+  for (const r of rows) {
+    if (r.id === currentRunId) continue;
+    const signature = terminalImplementRunSignature(r);
+    if (signature) out.push(signature);
+  }
+  return out;
+}
+
+/** ISH-1012: the durable, human-readable reason a recovery decision carries. */
+function recoveryRefusalReason(decision: ImplementRecoveryDecision): string {
+  return implementStopReason(decision);
 }
 
 /** Run states that are terminal (an adopted Run in one of these needs no wait). */
@@ -417,6 +497,21 @@ async function implementOnce(
     logEvent(db, { source: "factory", taskId: task.id, type: "factory.sandbox_unusable", payload: { reason: target.reason } });
     return { run: null, producedHead: null, error: `${CODING_FAILED}: ${target.reason}` };
   }
+
+  // ISH-1012: a TERMINAL Run for this attempt CLOSES the attempt. Reuse it (a
+  // clean unsubmitted Run is finished through the normal submission fence) and
+  // NEVER launch a second writer for the same attempt on restart/re-entry.
+  const closed = terminalAttemptRun(db, task);
+  if (closed) {
+    logEvent(db, {
+      source: "factory",
+      taskId: task.id,
+      type: "factory.attempt_closed",
+      payload: { runId: closed.id, state: closed.state, attempt: closed.attempt },
+    });
+    return finishTerminalAttempt(db, closed, deps);
+  }
+
   if (target.kind === "sandbox") {
     return await implementInSandbox(db, task, deps);
   }
@@ -786,6 +881,8 @@ export async function runFactoryTask(
   const guardMax = maxAttempts * 6 + 12;
   let lastAttempt = -1;
   let current: FactoryAttempt | null = null;
+  /** ISH-1012: why the NEXT attempt was issued (applied when it is created). */
+  let pendingRetryReason: string | null = null;
 
   const push = (s: string) => {
     steps.push(s);
@@ -813,7 +910,17 @@ export async function runFactoryTask(
     }
     if (task.attempt !== lastAttempt) {
       lastAttempt = task.attempt;
-      current = { attempt: task.attempt, runId: null, baseHead: null, producedHead: null, verifyOutcome: null, reviewVerdict: null, phase: task.phase };
+      current = {
+        attempt: task.attempt,
+        runId: null,
+        baseHead: null,
+        producedHead: null,
+        verifyOutcome: null,
+        reviewVerdict: null,
+        phase: task.phase,
+        retryReason: pendingRetryReason,
+      };
+      pendingRetryReason = null;
       attempts.push(current);
     }
     if (atAttemptCap(attempts, maxAttempts)) {
@@ -829,8 +936,83 @@ export async function runFactoryTask(
           current.producedHead = impl.producedHead;
         }
         if (impl.error) {
+          // ISH-1012: bounded recovery. Reuse the EXISTING Run evidence and the
+          // ordinary phase/attempt transition; never start a new FSM.
+          const decision = classifyImplementFailure({
+            run: impl.run,
+            error: impl.error,
+            priorSignatures: priorImplementFailureSignatures(db, taskId, impl.run?.id ?? null),
+          });
+          if (decision.retry) {
+            // `maxAttempts` is the JOINT budget with VERIFY/REVIEW FIX. At the
+            // cap the retry is not issued at all (no phantom attempt/Run).
+            if (task.attempt + 1 >= maxAttempts) {
+              const reason = `exceeded ${maxAttempts} attempts; retry not issued: ${decision.kind}: ${decision.reason} [${IMPLEMENT_RECOVERY}/ATTEMPT_CAP]`;
+              logEvent(db, {
+                source: "factory",
+                taskId,
+                type: "factory.implement_retry_refused",
+                payload: { runId: impl.run?.id ?? null, stop: "ATTEMPT_CAP", reason, attempt: task.attempt },
+              });
+              push(`implement:retry-cap@${task.attempt} ${decision.reason}`);
+              return { taskId, outcome: "max_attempts", head: getTask(db, taskId)!.head_sha, attempts, gate: null, reason, steps };
+            }
+            try {
+              // The transition itself re-proves: terminal Run, released
+              // single-writer fence, run belongs to THIS attempt, non-empty
+              // reason + evidence. A replay/stale call is refused.
+              recordImplementRecovery(db, taskId, {
+                runId: impl.run!.id,
+                signature: decision.signature!,
+                reason: decision.reason,
+                evidence: decision.evidence,
+              });
+            } catch (e) {
+              const detail = e instanceof Error ? e.message : String(e);
+              const reason = `${IMPLEMENT_RECOVERY}/RETRY_REFUSED: ${detail}`;
+              logEvent(db, {
+                source: "factory",
+                taskId,
+                type: "factory.implement_retry_refused",
+                payload: { runId: impl.run?.id ?? null, stop: "RETRY_REFUSED", reason, attempt: task.attempt },
+              });
+              push(`implement:retry-refused@${task.attempt} ${detail}`);
+              // A HOLD/block that landed between the decision and the transition
+              // is terminal for this run: report it as such, never as a coding
+              // failure that invites an automatic retry.
+              const live = getTask(db, taskId)!;
+              const outcome: FactoryOutcome = FACTORY_RUNNABLE_STATES.has(live.state) ? "coding_failed" : "terminal";
+              return { taskId, outcome, head: live.head_sha, attempts, gate: null, reason, steps };
+            }
+            pendingRetryReason = decision.reason;
+            push(`implement:${decision.kind}@${task.attempt} -> retry attempt ${task.attempt + 1} (${decision.reason})`);
+            continue;
+          }
+
+          // NOT recoverable: stop (and, for environment/invalid causes, park the
+          // Task BLOCKED). Re-entry re-reads the same closed attempt and reaches
+          // the same decision without launching a second Run.
+          const reason = recoveryRefusalReason(decision);
+          logEvent(db, {
+            source: "factory",
+            taskId,
+            type: "factory.implement_retry_refused",
+            payload: {
+              runId: impl.run?.id ?? null,
+              stop: decision.stop,
+              action: decision.action,
+              reason,
+              evidence: decision.evidence,
+              attempt: task.attempt,
+            },
+          });
+          push(`implement:no-retry@${task.attempt} (${decision.stop}) ${decision.reason}`);
+          if (decision.action === "block") {
+            const blocked = blockImplementFailure(db, taskId, reason, "factory");
+            return { taskId, outcome: "blocked", head: blocked.head_sha, attempts, gate: null, reason, steps };
+          }
           const outcome: FactoryOutcome = impl.error.startsWith(NO_IMPLEMENTATION) ? "no_implementation" : "coding_failed";
-          return { taskId, outcome, head: getTask(db, taskId)!.head_sha, attempts, gate: null, reason: impl.error, steps };
+          return { taskId, outcome, head: getTask(db, taskId)!.head_sha, attempts, gate: null, reason, steps };
         }
         push(`implement:run ${impl.run?.id ?? "none"} -> submitted (head ${impl.run?.head_sha ?? "none"})`);
         continue;

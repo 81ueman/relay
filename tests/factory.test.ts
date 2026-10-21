@@ -118,6 +118,58 @@ echo DONE
 `;
 
 // ---------------------------------------------------------------------------
+// ISH-1012: deterministic IMPLEMENT-failure fixtures (bounded recovery).
+// ---------------------------------------------------------------------------
+
+/**
+ * ISH-1012: the FIRST Run commits real work and then exits non-zero (a
+ * repairable partial commit); the fresh retry Run finishes cleanly.
+ */
+const PARTIAL_THEN_PASS_DSH = `set -e
+echo "[$RELAY_RUN_ID] implementing"
+echo "$RELAY_RUN_ID" > "change-$RELAY_RUN_ID.txt"
+git add -A
+git -c user.email=relay@test -c user.name=relay commit -qm "change $RELAY_RUN_ID"
+if [ -f .relay/ish1012-partial ]; then echo DONE; exit 0; fi
+touch .relay/ish1012-partial
+echo "dsh: tool step failed after committing" >&2
+exit 3
+`;
+
+/** ISH-1012: the FIRST Run exits 0 with NO commit; the retry commits. */
+const NOOP_THEN_PASS_DSH = `set -e
+if [ -f .relay/ish1012-noop ]; then
+  echo "$RELAY_RUN_ID" > "change-$RELAY_RUN_ID.txt"
+  git add -A
+  git -c user.email=relay@test -c user.name=relay commit -qm "change $RELAY_RUN_ID"
+else
+  touch .relay/ish1012-noop
+fi
+echo DONE
+`;
+
+/** ISH-1012: every Run commits a NEW revision and then exits non-zero. */
+const PARTIAL_ALWAYS_FAIL_DSH = `set -e
+echo "$RELAY_RUN_ID" > "change-$RELAY_RUN_ID.txt"
+git add -A
+git -c user.email=relay@test -c user.name=relay commit -qm "change $RELAY_RUN_ID"
+echo "dsh: still incomplete" >&2
+exit 4
+`;
+
+/** ISH-1012: exit 0 with no commit and a DISK-FULL failure on stderr. */
+const ENOSPC_NOOP_DSH = `echo "fatal: No space left on device" >&2
+echo DONE
+`;
+
+/** ISH-1012: a provider credential failure (never retried, never a fake PASS). */
+const MISSING_CREDENTIAL_DSH = `echo '{"type":"status","phase":"turn_end","turn":1,"reason":{"kind":"error","error":{"message":"no API key for provider","code":"MISSING_CREDENTIAL"}}}'
+echo '{"type":"final","text":""}'
+echo "dsh: MISSING_CREDENTIAL: no API key for provider" >&2
+exit 1
+`;
+
+// ---------------------------------------------------------------------------
 // ISH-878: fakes for the Sandbox IMPLEMENT/FIX path (no Docker, no sandbox).
 // A fake `sbx` CLI + a fake `sbx exec … dsh` process + a real local git remote
 // named `sandbox-<name>` so the host commit fetch and submit fence are exercised.
@@ -226,6 +278,20 @@ function publishSandboxCommit(name: string, branch: string, marker: string): str
   if (git(repo, "remote").split("\n").includes(remote)) git(repo, "remote", "set-url", remote, bare);
   else git(repo, "remote", "add", remote, bare);
   return sha;
+}
+
+/**
+ * ISH-1012: seed the sandbox host remote with an EXISTING commit (the Task base)
+ * so a no-commit sandbox Run observes a successful fetch at the same head — a
+ * legitimate `NO_IMPLEMENTATION`, not a fetch failure.
+ */
+function publishSandboxBase(name: string, branch: string, sha: string): void {
+  const bare = join(dir, `bare-${name}.git`);
+  if (!existsSync(bare)) git(repo, "init", "-q", "--bare", bare);
+  git(repo, "push", "-q", "--force", bare, `${sha}:refs/heads/${branch}`);
+  const remote = `sandbox-${name}`;
+  if (git(repo, "remote").split("\n").includes(remote)) git(repo, "remote", "set-url", remote, bare);
+  else git(repo, "remote", "add", remote, bare);
 }
 
 /** A fake `sbx exec` seam for VERIFY: HEAD tracks the task's recorded head. */
@@ -737,13 +803,19 @@ describe("Factory E2E: real worktree, fake headless dsh + independent reviewer",
         state,
       });
       const res = await runFactoryTask(db, id, factoryDeps(dsh, reviewerHarness(["pass"]).spawner));
-      expect(res.outcome).toBe("coding_failed");
+      // ISH-1012: a Sandbox problem is BLOCKED (never auto-retried), not a host
+      // fallback and not a coding retry.
+      expect(res.outcome).toBe("blocked");
+      expect(res.reason).toContain("IMPLEMENT_RECOVERY/SANDBOX");
       expect(res.reason).toContain("SANDBOX_ERROR");
       expect(res.reason).toContain("refusing to fall back to the host worktree");
       // NOTHING was launched — no host Run, no sandbox Run, no worktree.
       expect(listRuns(db, { taskId: id })).toHaveLength(0);
-      expect(getTask(db, id)!.worktree).toBeNull();
-      expect(getTask(db, id)!.phase).toBe("implement");
+      const task = getTask(db, id)!;
+      expect(task.worktree).toBeNull();
+      expect(task.phase).toBe("implement");
+      expect(task.state).toBe("blocked_human");
+      expect(task.attempt).toBe(1); // unblock starts a FRESH attempt
     }
   });
 
@@ -889,25 +961,47 @@ describe("Factory E2E: real worktree, fake headless dsh + independent reviewer",
     expect(row!.evidence_ref!.startsWith(cwd)).toBe(false);
   });
 
-  test("a coding Run that exits nonzero canNOT advance (exit 0/final is not a submission)", async () => {
+  test("a coding Run that exits nonzero canNOT advance and is not auto-retried on re-entry", async () => {
     const dsh = fakeDsh("dsh-fail", "exit 1\n");
     const id = newTask();
     const rev = reviewerHarness(["pass"]);
+    // ISH-1012: a bare non-zero exit with NO new commit is an UNKNOWN cause: it
+    // is stopped explicitly, never retried (and a restart cannot launch a second
+    // Run for the SAME attempt).
     const res = await runFactoryTask(db, id, factoryDeps(dsh, rev.spawner));
     expect(res.outcome).toBe("coding_failed");
+    expect(res.reason).toContain("IMPLEMENT_RECOVERY/UNKNOWN_CAUSE");
+    expect(res.reason).toContain("cause is unknown");
     const task = getTask(db, id)!;
     expect(task.phase).toBe("implement");
+    expect(task.attempt).toBe(0);
     expect(task.head_sha).toBeNull();
     expect(rev.calls).toHaveLength(0);
+    expect(listRuns(db, { taskId: id })).toHaveLength(1);
+
+    const again = await runFactoryTask(db, id, factoryDeps(dsh, rev.spawner));
+    expect(again.outcome).toBe("coding_failed");
+    expect(again.reason).toContain("IMPLEMENT_RECOVERY/UNKNOWN_CAUSE");
+    expect(listRuns(db, { taskId: id })).toHaveLength(1);
   });
 
-  test("a coding Run that exits 0 but commits nothing is NO_IMPLEMENTATION", async () => {
+  test("a coding Run that exits 0 but commits nothing gets ONE bounded rework, then stops on the same failure", async () => {
     const dsh = fakeDsh("dsh-noop", NOOP_DSH);
     const id = newTask();
     const rev = reviewerHarness(["pass"]);
     const res = await runFactoryTask(db, id, factoryDeps(dsh, rev.spawner));
+    // First missing-commit failure -> a fresh attempt; the second identical one
+    // (same base HEAD, no progress) -> REPEATED_FAILURE, no third Run.
     expect(res.outcome).toBe("no_implementation");
-    expect(getTask(db, id)!.phase).toBe("implement");
+    expect(res.reason).toContain("IMPLEMENT_RECOVERY/REPEATED_FAILURE");
+    const runs = listRuns(db, { taskId: id });
+    expect(runs.map((r) => r.attempt).sort((a, b) => a - b)).toEqual([0, 1]);
+    expect(runs.every((r) => r.state === "exited" && r.exit_code === 0)).toBe(true);
+    const task = getTask(db, id)!;
+    expect(task.phase).toBe("implement");
+    expect(task.attempt).toBe(1);
+    expect(task.head_sha).toBeNull();
+    expect(rev.calls).toHaveLength(0);
   });
 
   test("a REQUIRED check that cannot run BLOCKS (never PASS)", async () => {
@@ -959,12 +1053,15 @@ describe("Factory E2E: real worktree, fake headless dsh + independent reviewer",
     const live = await launchTaskRun(db, id, { repo, worktreesRoot: join(dir, "worktrees"), outputRoot: join(dir, "runs"), dshBin: slow });
     // A second factory invocation must NOT start a second writer for the same worktree.
     const rev = reviewerHarness(["pass"]);
-    const res = await runFactoryTask(db, id, factoryDeps(fakeDsh("dsh-commit", COMMITTING_DSH), rev.spawner));
-    // The live Run exited 0 but produced no commit -> NO_IMPLEMENTATION, and only ONE run exists.
-    expect(res.outcome).toBe("no_implementation");
+    // ISH-1012: the adopted Run exits 0 with no commit (one closed attempt). With
+    // the attempt budget exhausted there is no retry, so exactly ONE Run exists.
+    const res = await runFactoryTask(db, id, { ...factoryDeps(fakeDsh("dsh-commit", COMMITTING_DSH), rev.spawner), maxAttempts: 1 });
+    expect(res.outcome).toBe("max_attempts");
+    expect(res.reason).toContain("no new commit");
     const runs = listRuns(db, { taskId: id });
     expect(runs).toHaveLength(1);
     expect(runs[0].id).toBe(live.handle.id);
+    expect(getTask(db, id)!.attempt).toBe(0);
   });
 
   test("the same-worktree single-writer exclusion refuses a parallel launch", async () => {
@@ -1231,6 +1328,239 @@ describe("ISH-1010: Factory repair convergence (VERIFY/REVIEW -> FIX)", () => {
     const reviews = taskResults(id, "ReviewResult");
     expect(reviews.map((r) => [r.attempt, r.passed, r.head_sha])).toEqual([[0, 0, h0]]);
     expect(res.attempts.map((a) => a.reviewVerdict)).toEqual(["fix", "refused"]);
+  });
+});
+
+describe("ISH-1012: bounded IMPLEMENT recovery (fresh Run only for repairable failures)", () => {
+  test("recoverable partial commit -> fresh attempt/Run on the SAME worktree -> VERIFY PASS -> REVIEW PASS", async () => {
+    const dsh = fakeDsh("dsh-1012-partial", PARTIAL_THEN_PASS_DSH);
+    const id = newTask({
+      acceptance: "the recovery marker exists and the Task checks pass",
+      checks: [{ name: "marker", command: "true" }],
+    });
+    const baseSha = git(repo, "rev-parse", "HEAD");
+    const rev = reviewerHarness(["pass"]);
+
+    const res = await runFactoryTask(db, id, factoryDeps(dsh, rev.spawner));
+
+    expect(res.outcome).toBe("merge_ready");
+    const task = getTask(db, id)!;
+    expect(task.attempt).toBe(1);
+    expect(task.phase).toBe("merge_ready");
+    expect(task.head_sha).toBe(res.head!);
+
+    const runs = listRuns(db, { taskId: id });
+    expect(runs.map((r) => r.attempt).sort((a, b) => a - b)).toEqual([0, 1]);
+    const r0 = runs.find((r) => r.attempt === 0)!;
+    const r1 = runs.find((r) => r.attempt === 1)!;
+    expect(r0.id).not.toBe(r1.id);
+    // The failed Run is TERMINAL `failed` (exit 3) but produced a NEW commit;
+    // the fresh Run continues the SAME worktree/branch from that commit.
+    expect(r0.state).toBe("failed");
+    expect(r0.exit_code).toBe(3);
+    expect(r0.base_head_sha).toBe(baseSha);
+    expect(r0.head_sha).not.toBe(baseSha);
+    expect(r1.cwd).toBe(r0.cwd);
+    expect(r1.branch).toBe(r0.branch);
+    expect(r1.base_head_sha).toBe(r0.head_sha);
+    expect(git(r1.cwd!, "merge-base", "--is-ancestor", r0.head_sha!, r1.head_sha!)).toBe("");
+
+    expect(res.attempts.map((a) => a.attempt)).toEqual([0, 1]);
+    expect(res.attempts.map((a) => a.runId)).toEqual([r0.id, r1.id]);
+    expect(res.attempts.map((a) => a.verifyOutcome)).toEqual([null, "pass"]);
+    expect(res.attempts.map((a) => a.reviewVerdict)).toEqual([null, "pass"]);
+    // The retry reason is attached to the attempt that the recovery ISSUED.
+    expect(res.attempts[1].retryReason).toContain("partial-commit");
+    expect(res.attempts[1].retryReason).toContain(r0.head_sha!);
+
+    // The reviewer judged the POST-RECOVERY head, never the failed Run's head.
+    expect(rev.calls).toHaveLength(1);
+    expect(rev.calls[0].head).toBe(r1.head_sha);
+
+    // The fresh brief carries the failed Run/attempt, its error, both heads and
+    // the retry reason — while preserving the ORIGINAL acceptance.
+    const brief = readFileSync(join(r1.cwd!, ".relay", "run-brief.md"), "utf-8");
+    expect(brief).toContain("### IMPLEMENT Run — RETRY (attempt 0)");
+    expect(brief).toContain(`Run: \`${r0.id}\``);
+    expect(brief).toContain("Outcome: `failed` (exit 3)");
+    expect(brief).toContain(`Base HEAD (where that Run started): \`${baseSha}\``);
+    expect(brief).toContain(`Produced HEAD (progress it made): \`${r0.head_sha}\``);
+    expect(brief).toContain("tool step failed after committing");
+    expect(brief).toContain("Retry reason:");
+    expect(brief).toContain("The Task acceptance above is unchanged");
+    expect(brief).toContain("the recovery marker exists and the Task checks pass");
+  });
+
+  test("exit 0 with NO commit is recoverable: a fresh Run on the next attempt commits and passes", async () => {
+    const dsh = fakeDsh("dsh-1012-noop-then-pass", NOOP_THEN_PASS_DSH);
+    const id = newTask({ acceptance: "the no-commit recovery accepts the original acceptance" });
+    const baseSha = git(repo, "rev-parse", "HEAD");
+    const rev = reviewerHarness(["pass"]);
+
+    const res = await runFactoryTask(db, id, factoryDeps(dsh, rev.spawner));
+
+    expect(res.outcome).toBe("merge_ready");
+    const runs = listRuns(db, { taskId: id });
+    expect(runs.map((r) => r.attempt).sort((a, b) => a - b)).toEqual([0, 1]);
+    const r0 = runs.find((r) => r.attempt === 0)!;
+    const r1 = runs.find((r) => r.attempt === 1)!;
+    expect(r0.state).toBe("exited");
+    expect(r0.exit_code).toBe(0);
+    expect(r0.head_sha).toBe(baseSha);
+    expect(r0.base_head_sha).toBe(baseSha);
+    expect(r1.base_head_sha).toBe(baseSha);
+    expect(r1.head_sha).not.toBe(baseSha);
+    expect(res.attempts[1].retryReason).toContain("missing-commit");
+    expect(res.attempts[1].retryReason).toContain("produced no new commit");
+
+    const brief = readFileSync(join(r1.cwd!, ".relay", "run-brief.md"), "utf-8");
+    expect(brief).toContain("### IMPLEMENT Run — RETRY (attempt 0)");
+    expect(brief).toContain("Outcome: `exited` (exit 0)");
+    expect(brief).toContain("produced no new commit");
+    expect(brief).toContain("the no-commit recovery accepts the original acceptance");
+  });
+
+  test("exit 0 with no commit but ENOSPC evidence is DENIED: blocked, no retry, no second Run", async () => {
+    const dsh = fakeDsh("dsh-1012-enospc", ENOSPC_NOOP_DSH);
+    const id = newTask();
+    const rev = reviewerHarness(["pass"]);
+
+    const res = await runFactoryTask(db, id, factoryDeps(dsh, rev.spawner));
+
+    expect(res.outcome).toBe("blocked");
+    expect(res.reason).toContain("IMPLEMENT_RECOVERY/ENOSPC");
+    expect(res.reason).toContain("No space left on device");
+    const task = getTask(db, id)!;
+    expect(task.state).toBe("blocked_human");
+    expect(task.phase).toBe("implement");
+    expect(task.attempt).toBe(1); // an explicit unblock starts a FRESH attempt
+    expect(listRuns(db, { taskId: id })).toHaveLength(1);
+    expect(rev.calls).toHaveLength(0);
+
+    // Re-entry on the blocked Task launches nothing.
+    const again = await runFactoryTask(db, id, factoryDeps(dsh, rev.spawner));
+    expect(again.outcome).toBe("terminal");
+    expect(listRuns(db, { taskId: id })).toHaveLength(1);
+  });
+
+  test("a provider credential failure is DENIED (AUTH), blocked and never self-retried", async () => {
+    const dsh = fakeDsh("dsh-1012-auth", MISSING_CREDENTIAL_DSH);
+    const id = newTask();
+    const res = await runFactoryTask(db, id, factoryDeps(dsh, reviewerHarness(["pass"]).spawner));
+    expect(res.outcome).toBe("blocked");
+    expect(res.reason).toContain("IMPLEMENT_RECOVERY/AUTH");
+    expect(res.reason).toContain("MISSING_CREDENTIAL");
+    expect(getTask(db, id)!.state).toBe("blocked_human");
+    expect(listRuns(db, { taskId: id })).toHaveLength(1);
+  });
+
+  test("maxAttempts caps implement recovery too (no extra Run; explicit cap reason)", async () => {
+    const dsh = fakeDsh("dsh-1012-cap", PARTIAL_ALWAYS_FAIL_DSH);
+    const id = newTask();
+    const rev = reviewerHarness(["pass"]);
+
+    const res = await runFactoryTask(db, id, { ...factoryDeps(dsh, rev.spawner), maxAttempts: 2 });
+
+    expect(res.outcome).toBe("max_attempts");
+    expect(res.reason).toContain("exceeded 2 attempts");
+    expect(res.reason).toContain("retry not issued");
+    expect(res.reason).toContain("partial-commit");
+    expect(listRuns(db, { taskId: id }).map((r) => r.attempt).sort((a, b) => a - b)).toEqual([0, 1]);
+    expect(getTask(db, id)!.attempt).toBe(1);
+    expect(rev.calls).toHaveLength(0);
+  });
+
+  test("re-entry after the cap resumes recovery on a FRESH attempt without any second Run for the old attempt", async () => {
+    const dsh = fakeDsh("dsh-1012-resume", NOOP_THEN_PASS_DSH);
+    const id = newTask();
+    const rev = reviewerHarness(["pass"]);
+
+    const capped = await runFactoryTask(db, id, { ...factoryDeps(dsh, rev.spawner), maxAttempts: 1 });
+    expect(capped.outcome).toBe("max_attempts");
+    expect(listRuns(db, { taskId: id }).map((r) => r.attempt)).toEqual([0]);
+
+    // A restart re-reads the CLOSED attempt (it does NOT launch a second Run for
+    // it), classifies its recorded failure, and only then issues attempt 1.
+    const resumed = await runFactoryTask(db, id, { ...factoryDeps(dsh, rev.spawner), maxAttempts: 2 });
+    expect(resumed.outcome).toBe("merge_ready");
+    const runs = listRuns(db, { taskId: id });
+    expect(runs.map((r) => r.attempt).sort((a, b) => a - b)).toEqual([0, 1]);
+    expect(new Set(runs.map((r) => r.id)).size).toBe(2);
+    expect(getTask(db, id)!.attempt).toBe(1);
+    expect(resumed.attempts[1].retryReason).toContain("missing-commit");
+  });
+
+  test("a user HOLD is never bypassed by a Run that was already live", async () => {
+    const dsh = fakeDsh("dsh-1012-hold", COMMITTING_DSH);
+    const id = newTask();
+    const launched = await launchTaskRun(db, id, {
+      repo,
+      worktreesRoot: join(dir, "worktrees"),
+      outputRoot: join(dir, "runs"),
+      dshBin: dsh,
+      fastExitMs: 0,
+    });
+    const run = await launched.handle.wait();
+    blockTask(db, id, "human", "HOLD: do not proceed until reviewed", true);
+    expect(() => acceptRunSubmission(db, { runId: run.id })).toThrow(/HELD/);
+    const task = getTask(db, id)!;
+    expect(task.state).toBe("blocked_human");
+    expect(task.head_sha).toBeNull();
+    expect(task.phase).toBe("implement");
+  });
+
+  test("ISH-1012: a missing-commit Sandbox Run recovers on the SAME Sandbox (fresh Run, ONE create)", async () => {
+    const id = newTask({ acceptance: "the sandbox recovery acceptance is preserved" });
+    const task0 = getTask(db, id)!;
+    const sbxName = sandboxNameForTask(task0);
+    const branch = taskBranchName(task0);
+    const baseSha = git(repo, "rev-parse", "HEAD");
+    let tip = baseSha;
+    const sbx = new FakeSbxCli(() => getTask(db, id)!.head_sha ?? tip);
+    const spawner = new FakeSandboxSpawner();
+    let spawned = 0;
+    spawner.onSpawn = (p) => {
+      spawned++;
+      p.writeOut(JSON.stringify({ type: "session", sessionId: `sbx-recovery-${spawned}` }) + "\n");
+      // The FIRST Run exits 0 with NO new in-VM commit (the remote branch is the
+      // base); the retry publishes a real commit.
+      if (spawned > 1) tip = publishSandboxCommit(sbxName, branch, `sbx-recovery-${spawned}`);
+      p.writeOut(JSON.stringify({ type: "final", text: "done" }) + "\n");
+      p.finish(0);
+    };
+    await ensureTaskSandbox(db, id, { source: repo, cli: sbx });
+    // Seed the sandbox remote with the task base so the first Run's fetch is a
+    // legitimate no-op (head == base) rather than a fetch failure.
+    publishSandboxBase(sbxName, branch, baseSha);
+    const rev = reviewerHarness(["pass"]);
+    const res = await runFactoryTask(db, id, {
+      ...factoryDeps(fakeDsh("dsh-1012-host", COMMITTING_DSH), rev.spawner),
+      sandboxCli: sbx,
+      sandboxSpawner: spawner,
+      reviewWorktreeRoot: join(dir, "review-wt-1012"),
+      verifyTarget: (d, t, checks) =>
+        sandboxVerifyTarget(d, t, checks, {
+          exec: sandboxVerifyExec(() => getTask(db, id)!.head_sha),
+          headProbe: () => getTask(db, id)!.head_sha,
+        }),
+    });
+
+    expect(res.outcome).toBe("merge_ready");
+    const runs = listRuns(db, { taskId: id });
+    expect(runs.map((r) => r.attempt).sort((a, b) => a - b)).toEqual([0, 1]);
+    expect(runs.map((r) => r.sandbox_name)).toEqual([sbxName, sbxName]);
+    const sbxRun0 = runs.find((r) => r.attempt === 0)!;
+    expect(sbxRun0.state).toBe("exited");
+    expect(sbxRun0.exit_code).toBe(0);
+    expect(sbxRun0.head_sha).toBe(baseSha);
+    // ONE durable Sandbox; the fresh Run reused it (never a host worktree).
+    expect(sbx.created.filter((n) => n === sbxName)).toHaveLength(1);
+    expect(getTask(db, id)!.worktree).toBeNull();
+    const sbxRun1 = runs.find((r) => r.attempt === 1)!;
+    const brief = readFileSync(sbxRun1.spec_path!, "utf-8");
+    expect(brief).toContain("### IMPLEMENT Run — RETRY (attempt 0)");
+    expect(brief).toContain("produced no new commit");
+    expect(brief).toContain("the sandbox recovery acceptance is preserved");
   });
 });
 

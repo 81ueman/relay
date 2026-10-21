@@ -216,7 +216,7 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
       "Drive ONE code-change Task through the whole factory: headless dsh implement -> Relay mechanical VERIFY -> independent headless Claude review/FIX -> integration -> read-only MergeReady. It NEVER pushes, merges, accepts or writes to a provider. " +
       "CODE-CHANGE TASKS ONLY: a task must have a workflow phase (created with `relay task intake --code-change`); a plain `relay task add` task is refused UP FRONT, before any worktree, with the re-intake instruction. " +
       "VERIFY needs at least ONE REQUIRED mechanical check recorded at intake (`--check name=command`); with none (or only optional checks) the outcome is `no_checks` — an unrun gate is never a PASS. " +
-      "`--permission MODE` is forwarded to the headless dsh Run (default `workspace-write`). `--timeout` is the per-Run budget, `--max-attempts` the coding/review attempt cap. " +
+      "`--permission MODE` is forwarded to the headless dsh Run (default `workspace-write`). `--timeout` is the per-Run budget, `--max-attempts` the coding/review attempt cap (it also bounds a fresh IMPLEMENT Run issued for a repairable `NO_IMPLEMENTATION`/partial-commit failure; ENOSPC/resource/permission/auth/Sandbox/unknown failures are never auto-retried). " +
       "The task branch is cut from the SOURCE repo's freshly fetched `origin/main` (or the task's `pr_base`), and a resolved base behind `origin/main` is warned about, never silently accepted.",
     usage: [
       "relay run factory <task-id> [--max-attempts N] [--dsh BIN] [--reviewer CMD] [--model M] [--permission MODE] [--timeout 30m] [--repo DIR] [--review-worktrees DIR] [--json]",

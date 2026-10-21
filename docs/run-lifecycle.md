@@ -224,15 +224,37 @@ A review `--fail`/FIX (or a failed mechanical verify) sends the Task back to
   HEAD, the Run's base HEAD and the check's reproduction command (from
   `payload_json.checks`, the existing result); for a REVIEW FIX, the reviewed
   HEAD and the reviewer's `severity`/`file:line`/message findings (the existing
-  `reason`); in both cases the brief still contains the original acceptance;
+  `reason`); for a **failed IMPLEMENT Run** with no submission (ISH-1012), the
+  failed Run id, terminal state/exit code, base + produced HEAD, its recorded
+  error and a bounded stderr tail, plus the Factory's bounded-retry reason; in
+  all cases the brief still contains the original acceptance;
 - labels `not_run`/`inconclusive`/blocked results as **BLOCKED evidence**, not a
-  code defect, so they never become a "fix this" instruction;
+  code defect, so they never become a "fix this" instruction. A failed
+  IMPLEMENT Run is a **RETRY** instruction only because the Factory already
+  classified it as repairable and issued the next attempt; an environment
+  failure (ENOSPC/resource/permission/auth/Sandbox/launch) is never retried, so
+  the fresh brief never presents it as a code fix;
 - starts a **new** disposable dsh Run — there is no session continuation and the
   previous Run is already terminal.
 
 The inherited output is truncated (12 lines / 1200 chars per check) and passed
 through the same `redactSecrets` filter as other run evidence; raw logs and
 credentials are never copied into the brief.
+
+## A terminal Run CLOSES its attempt (Factory path)
+
+Once an IMPLEMENT Run for `(task, phase=implement, attempt=N)` is terminal it is
+**closed** for the Factory: `implementOnce` starts a Run only for a NEW attempt,
+and re-entering the Factory with a closed attempt does not start a second writer
+for it:
+
+- a clean `exit 0` Run that was never submitted (a crash between the process
+  exit and the structured submission) is finished through the ordinary
+  `acceptRunSubmission`/`acceptSandboxSubmission` fence — never re-launched;
+- a failed/cancelled/timed-out Run is surfaced as its recorded failure so the
+  Factory's bounded-recovery policy decides (new attempt, or an explicit stop);
+- `blocked_human` is a **HOLD**: an in-flight Run cannot submit and advance a HELD
+  Task, so a late `exit 0` never bypasses the human decision.
 
 ## A Run is *not* a submission
 

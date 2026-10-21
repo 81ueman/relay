@@ -31,7 +31,8 @@ merged, NOT Linear Done).
 implement ──Run submit──▶ verify ──checks──▶ review ──FIX──▶ implement (attempt+1)
    ▲  real dsh headless        Relay runs            │            same worktree,
    │  in the Task worktree     required checks       │            fresh Run
-   └────────────────────────────────────────────────┘
+   │                                                 └── IMPLEMENT failed (repairable) ──┐
+   └─────────────────────────────────────────────────────────────────────────────────────┘
                                         review ──PASS──▶ integration ──submit──▶ merge_ready
                                                                                   (read-only gate)
 ```
@@ -71,6 +72,48 @@ not in a host worktree:
   the ISH-828 sweep, which marks it terminal `failed` **only** once the in-VM dsh
   is confirmed gone — so the single-writer fence is never released under a live
   writer.
+
+## Bounded IMPLEMENT recovery (ISH-1012)
+
+VERIFY FAIL and REVIEW FIX already continue the Task at `attempt+1`. Before
+ISH-1012 an IMPLEMENT Run failure **stopped** the Task
+(`coding_failed`/`no_implementation`) with no bounded rework. The Factory now
+classifies the failed Run with a small, conservative policy
+(`src/implement-recovery.ts`) and, **only when it is provably safe**, issues a
+fresh disposable Run on the SAME Task/worktree/Sandbox through the ordinary
+phase/attempt transition (`workflow.recordImplementRecovery`):
+
+| failed IMPLEMENT Run | decision |
+| -- | -- |
+| `exit 0` + **no new commit** (`NO_IMPLEMENTATION`) | **RETRY** (missing-commit) |
+| non-zero exit **after producing a new commit** (host worktree) | **RETRY** (partial-commit) |
+| the SAME missing-commit/partial-commit at the SAME base HEAD again | **STOP** (`REPEATED_FAILURE`) — no progress, no loop |
+| `attempt + 1 >= maxAttempts` | **STOP** (`max_attempts`) — the SAME budget as VERIFY/REVIEW FIX |
+| ENOSPC / resource exhaustion (`ENOSPC`/`RESOURCE`) | **BLOCKED**, never retried |
+| permission / auth / credential (`PERMISSION`/`AUTH`) | **BLOCKED**, never retried |
+| Sandbox / launch problem (`SANDBOX`/`LAUNCH`) | **BLOCKED**, never retried |
+| invalid/stale submission (`INVALID_RESULT`) | **BLOCKED**, never retried |
+| cancelled / time-limited / unknown cause (`CANCELLED`/`TIMEOUT`/`UNKNOWN_CAUSE`) | **STOPPED**, never retried |
+| an unconfirmed live writer (`WRITER_NOT_TERMINAL`) | the fence is held; no new Run |
+| the adopted/orphaned Run path (`ORPHAN`) | **STOPPED**; ISH-1008 owns liveness/cause |
+
+The transition is conditional and only runs after the previous Run is
+**provably terminal**, no live Run owns `(task, implement, attempt)`, and the
+single-writer fence is released for the Run's worktree/branch. A stale/replayed
+call therefore observes 0 changes (`STALE_ATTEMPT`) instead of bumping the
+attempt twice.
+
+The fresh Run receives the failed Run's id, terminal state/exit code, base and
+produced HEAD, its recorded error and a bounded stderr tail, plus the retry
+reason, pinned into the SAME Run brief — the original Task acceptance and the
+durable Sandbox are unchanged. A terminal Run **closes** its attempt: restart/
+re-entry finishes a clean unsubmitted submission through the normal fence or
+re-reads the recorded failure, and **never starts a second Run for that
+attempt**. A `blocked_human` HOLD is never bypassed by an in-flight Run.
+
+An environment-class failure parks the Task `blocked_human` at `attempt+1`, so an
+explicit `unblock` starts a fresh attempt after the environment is fixed; it is
+not an automatic retry.
 
 ## PR check before review (ISH-880/885, read-only)
 
@@ -117,7 +160,15 @@ ordered `steps`. A non-`merge_ready` outcome exits non-zero.
   `acceptRunSubmission` advances the Task. A Run that exits 0 but commits
   **nothing** (`head == base_head`) is `NO_IMPLEMENTATION`; a non-zero/signalled/
   cancelled/timeout Run is `CODING_FAILED`; a stale/superseded Run's submission is
-  `RUN_SUBMISSION_REFUSED`.
+  `RUN_SUBMISSION_REFUSED`. A `NO_IMPLEMENTATION`/partial-commit failure may get a
+  bounded rework **only** through the ISH-1012 policy above; every other cause
+  stops (and environment/invalid causes BLOCK) with an explicit
+  `IMPLEMENT_RECOVERY/<CODE>` reason.
+- **An attempt with a terminal Run is CLOSED.** Restart/re-entry reuses the
+  recorded outcome (or finishes a clean, never-submitted `exit 0` Run through the
+  normal submission fence) and NEVER launches a second Run for the same
+  `(task, implement, attempt)`. A `blocked_human` HOLD is not advanced by any
+  in-flight Run.
 - **Only a runnable Task state is driven.** The Factory whitelists `queued`/
   `running`/`review`; **every** other state — including `blocked_internal` (which
   `blockTask` sets while leaving `phase` unchanged) and `blocked_human`/terminal —
@@ -288,7 +339,8 @@ unchanged by this issue.
 
 ## Verified / not verified
 
-- **Verified** — `bun run typecheck`; `bun test` (829 pass, 1 skipped, 0 fail);
+- **Verified** — `bun run typecheck`; `bun test` (see the ISH-1012 change for the
+  current count);
   `bun run smoke:factory` (PASS, 13 checks); `RELAY_REAL_SMOKE=1 bun run
   smoke:factory:real` (PASS with real `dsh 0.2.1-rc.2` + real Claude; see the raw
   output above); `tests/factory.test.ts` covers the FIX→fresh-Run→PASS loop, the
@@ -311,6 +363,16 @@ unchanged by this issue.
   `submitPhase` refuse with `RUN_OWNED` while a Run owns the phase/attempt — proven
   by a fake dsh that runs `relay claim`+`relay submit` during the Run and still
   reaches `merge_ready` only via the Run-bound submission.
+  ISH-1012 adds the bounded-recovery matrix above: a partial-commit failure →
+  fresh attempt/Run on the SAME worktree → VERIFY PASS → independent REVIEW PASS;
+  exit-0-no-commit → fresh Run → PASS; ENOSPC and MISSING_CREDENTIAL are BLOCKED
+  with no retry; a bare non-zero exit is stopped as `UNKNOWN_CAUSE`; the attempt
+  cap and the repeated-same-failure stop; restart after the cap resumes on a
+  fresh attempt without a second Run for the old one; a HOLD rejects an in-flight
+  submission; and a missing-commit Sandbox Run recovers on the SAME durable
+  Sandbox (one create). `tests/implement-recovery.test.ts` pins the classifier's
+  explicit allow/deny reasons, and the fresh brief is asserted to carry the
+  failed Run id/exit/heads/error/retry reason plus the original acceptance.
 - **NOT verified here** — an end-to-end **real-FIX** loop (real dsh attempt 0
   genuinely insufficient → real Claude FIX → real dsh attempt 1 → real Claude
   PASS): the real smoke reached MergeReady on attempt 0 because the real model
