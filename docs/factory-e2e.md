@@ -120,7 +120,17 @@ not an automatic retry.
 A non-ready Factory result now carries a `failure` projection derived **only**
 from the rows the Factory already wrote (the Task, its `runs`, `task_results`,
 `events` and retained log/review paths). It adds no state machine and no second
-evidence store, and it never mutates the Task.
+evidence store, and it never mutates the Task. A Factory call on an already
+finished Task (`done`/`failed`/`cancelled`) is not a new failure: it records no
+new `factory.outcome` event, so the success or diagnosis that actually ended the
+Task is never replaced by an UNKNOWN "investigate" projection.
+
+`CHECK_NOT_RUN` is decided from the structured `VerificationResult` row (a
+REQUIRED check with `not_run`/`inconclusive`), **before** any process-marker
+regex. The Factory's VERIFY-block reason embeds a bounded raw check-output tail,
+which may legitimately contain words like `command not found`, `permission
+denied` or `stale result`; that tail is evidence for the operator, never proof of
+a launch/permission/stale cause.
 
 `relay run factory <task-id> --json` includes the projection:
 
@@ -192,6 +202,11 @@ the detailed next action is on the surfaces above.
   explicit `relay unblock`, never an implicit release.
 - `max_attempts` is re-entered with a larger `--max-attempts`; the old attempt/
   HEAD is never reused.
+- `no_implementation` / `repeated_failure` keeps the closed attempt/HEAD closed
+  too: fix the brief/worktree or the repeated blocker, then re-enter through the
+  existing Factory (the projection's `next.command` is
+  `relay run factory <task> --max-attempts <n>`, or `relay unblock <task>` when
+  the Task is parked).
 - `review_refused` re-runs the review stage at the recorded HEAD; no structured
   verdict is never a PASS.
 - The durable event and the existing Run/result/log files are retained across

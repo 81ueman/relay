@@ -10,6 +10,8 @@ import { getTask } from "../src/tasks";
 import { intakeTask } from "../src/workflow";
 import {
   classifyFactoryOutcome,
+  factoryOutcomesForTask,
+  latestFactoryOutcome,
   recordFactoryOutcome,
   type FactoryOutcomeInput,
 } from "../src/factory-failure";
@@ -243,6 +245,72 @@ describe("ISH-1013: a Factory stop is classified from existing evidence, never g
     expect(report.next.action).toContain("unrun gate never PASSes");
   });
 
+  test("NOT_RUN check output naming a launch/permission error is still CHECK_NOT_RUN", () => {
+    const id = newTask([{ name: "required-test", command: "bun test" }]);
+    const run = insertRun({ taskId: id, attempt: 0, state: "submitted", headSha: SHA_A });
+    setTask(id, { phase: "verify", state: "blocked_human", attempt: 0, headSha: SHA_A });
+    insertTaskResult(db, {
+      taskId: id,
+      phase: "verify",
+      attempt: 0,
+      kind: "VerificationResult",
+      workerId: "relay",
+      passed: false,
+      headSha: SHA_A,
+      evidenceRef: join(dir, "verify-noisy-not-run.log"),
+      reason: "required-test=not_run",
+      payload: {
+        outcome: "not_run",
+        checks: [
+          {
+            name: "required-test",
+            required: true,
+            outcome: "not_run",
+            exitCode: null,
+            output: "bash: bun: command not found; permission denied",
+          },
+        ],
+      },
+    });
+
+    const report = classifyFactoryOutcome(
+      db,
+      resultInput(id, {
+        outcome: "blocked",
+        head: SHA_A,
+        // The Factory reason embeds the raw check output. Its words must never
+        // decide the cause: the structured VERIFY row says the check did not run.
+        reason:
+          "verify not_run: required-test=not_run(exit none): bash: bun: command not found; permission denied",
+        attempts: [attempt(0, run, { producedHead: SHA_A, verifyOutcome: "not_run", phase: "verify" })],
+      })
+    )!;
+
+    expect(report.class).toBe("missing_or_inconclusive_evidence");
+    expect(report.cause).toBe("CHECK_NOT_RUN");
+    expect(report.next.command).toBe(`relay unblock ${id}`);
+  });
+
+  test("a verify NOT_RUN reason cannot decide a cause from check output even without a stored row", () => {
+    const id = newTask([{ name: "required-test", command: "bun test" }]);
+    const run = insertRun({ taskId: id, attempt: 0, state: "submitted", headSha: SHA_A });
+    setTask(id, { phase: "verify", state: "blocked_human", attempt: 0, headSha: SHA_A });
+
+    const report = classifyFactoryOutcome(
+      db,
+      resultInput(id, {
+        outcome: "blocked",
+        head: SHA_A,
+        reason:
+          "verify not_run: required-test=not_run(exit none): permission denied; spawn failed; stale result",
+        attempts: [attempt(0, run, { producedHead: SHA_A, verifyOutcome: "not_run", phase: "verify" })],
+      })
+    )!;
+
+    expect(report.class).toBe("missing_or_inconclusive_evidence");
+    expect(report.cause).toBe("CHECK_NOT_RUN");
+  });
+
   test("ENOSPC -> infra blocked, with the exact cause and an explicit release after the fix", () => {
     const id = newTask();
     const run = insertRun({
@@ -382,6 +450,59 @@ describe("ISH-1013: a Factory stop is classified from existing evidence, never g
     expect(report.cause).toBe("UNKNOWN");
     expect(report.class).toBe("unknown");
     expect(report.evidence.join("\n")).not.toContain("old sandbox was removed");
+  });
+
+  test("a Factory call on a terminal Task records no new failure and preserves the real outcome", () => {
+    const id = newTask();
+    setTask(id, { phase: "implement", state: "queued", attempt: 0, headSha: null });
+    const prior = recordFactoryOutcome(
+      db,
+      resultInput(id, { outcome: "blocked", reason: "LOW_DISK: free space before relaunching" })
+    )!;
+    expect(prior.cause).toBe("LOW_DISK");
+    const eventsBefore = factoryOutcomesForTask(db, id);
+    expect(eventsBefore).toHaveLength(1);
+
+    for (const state of ["done", "cancelled", "failed"] as const) {
+      setTask(id, { state });
+      const terminal = recordFactoryOutcome(
+        db,
+        resultInput(id, { outcome: "terminal", reason: `state ${state}` })
+      );
+      expect(terminal).toBeNull();
+      // No second `factory.outcome` event replaces the real diagnosis.
+      expect(factoryOutcomesForTask(db, id)).toHaveLength(eventsBefore.length);
+      expect(latestFactoryOutcome(db, id)?.outcome).toBe("blocked");
+      expect(latestFactoryOutcome(db, id)?.failure?.cause).toBe("LOW_DISK");
+    }
+  });
+
+  test("NO_IMPLEMENTATION/REPEATED_FAILURE name the existing fresh-attempt Factory command", () => {
+    const id = newTask();
+    const run = insertRun({
+      taskId: id,
+      attempt: 1,
+      state: "exited",
+      exitCode: 0,
+      headSha: SHA_B,
+      baseHeadSha: SHA_B,
+    });
+    setTask(id, { phase: "implement", state: "queued", attempt: 1, headSha: null });
+
+    const report = classifyFactoryOutcome(
+      db,
+      resultInput(id, {
+        outcome: "no_implementation",
+        reason:
+          "IMPLEMENT_RECOVERY/REPEATED_FAILURE: run-1013 exited 0 with no new commit at base HEAD",
+        attempts: [attempt(1, run)],
+      })
+    )!;
+
+    expect(report.class).toBe("code_rework_exhausted");
+    expect(report.cause).toBe("REPEATED_FAILURE");
+    expect(report.next.command).toBe(`relay run factory ${id} --max-attempts 2`);
+    expect(report.next.action).toContain("closed attempt/HEAD is never relaunched");
   });
 
   test("an unverified failure stays UNKNOWN; no resume command is invented", () => {

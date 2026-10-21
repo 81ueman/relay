@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Database } from "bun:sqlite";
 import { openDb } from "../src/db";
-import { blockTask, claimNext, claimTask, addTask, getTask, unblockTask } from "../src/tasks";
+import { blockTask, claimNext, claimTask, addTask, cancelTask, getTask, unblockTask } from "../src/tasks";
 import { getWorker, registerWorker, HEADLESS_AGENT_KIND } from "../src/workers";
 import { inboxFor } from "../src/messages";
 import {
@@ -1005,7 +1005,7 @@ describe("Factory E2E: real worktree, fake headless dsh + independent reviewer",
     expect(res.reason).toContain("IMPLEMENT_RECOVERY/REPEATED_FAILURE");
     expect(res.failure?.class).toBe("code_rework_exhausted");
     expect(res.failure?.cause).toBe("REPEATED_FAILURE");
-    expect(res.failure?.next.command).toBeNull();
+    expect(res.failure?.next.command).toBe(`relay run factory ${id} --max-attempts 2`);
     const runs = listRuns(db, { taskId: id });
     expect(runs.map((r) => r.attempt).sort((a, b) => a - b)).toEqual([0, 1]);
     expect(runs.every((r) => r.state === "exited" && r.exit_code === 0)).toBe(true);
@@ -1033,6 +1033,41 @@ describe("Factory E2E: real worktree, fake headless dsh + independent reviewer",
     expect(res.failure?.cause).toBe("CHECK_NOT_RUN");
     expect(res.failure?.requiresUnblock).toBe(true);
     expect(res.failure?.next.command).toBe(`relay unblock ${id}`);
+  });
+
+  test("a REQUIRED check that cannot run is CHECK_NOT_RUN even when its output names a launch error", async () => {
+    const dsh = fakeDsh("dsh-commit", COMMITTING_DSH);
+    const id = newTask({ checks: [{ name: "required-test", command: "bun test" }] });
+    const rev = reviewerHarness(["pass"]);
+    const noisyNotRun: CommandRunner = {
+      async run(spec) {
+        return {
+          name: spec.name,
+          required: true,
+          outcome: "not_run",
+          exitCode: null,
+          output: "bash: bun: command not found; permission denied; stale result",
+          durationMs: 0,
+        };
+      },
+    };
+    const res = await runFactoryTask(db, id, { ...factoryDeps(dsh, rev.spawner), verifyRunner: noisyNotRun });
+    expect(res.outcome).toBe("blocked");
+    // The raw check output is retained as evidence in the Factory reason...
+    expect(res.reason).toContain("command not found");
+    expect(res.reason).toContain("permission denied");
+    // ...but the STRUCTURED VerificationResult decides the cause.
+    expect(res.failure?.class).toBe("missing_or_inconclusive_evidence");
+    expect(res.failure?.cause).toBe("CHECK_NOT_RUN");
+    expect(res.failure?.requiresUnblock).toBe(true);
+    expect(res.failure?.next.command).toBe(`relay unblock ${id}`);
+    expect(rev.calls).toHaveLength(0);
+    // Re-entry reads the SAME structured row and re-derives CHECK_NOT_RUN; the
+    // parked Task is never re-labelled from the raw output or as a human HOLD.
+    const again = await runFactoryTask(db, id, { ...factoryDeps(dsh, rev.spawner), verifyRunner: noisyNotRun });
+    expect(again.outcome).toBe("terminal");
+    expect(again.failure?.cause).toBe("CHECK_NOT_RUN");
+    expect(listRuns(db, { taskId: id })).toHaveLength(1);
   });
 
   test("a reviewer with NO structured result is REFUSED (no advance)", async () => {
@@ -1519,6 +1554,26 @@ describe("ISH-1012: bounded IMPLEMENT recovery (fresh Run only for repairable fa
     expect(runs.map((r) => r.attempt).sort((a, b) => a - b)).toEqual([0, 1]);
     expect(runs.filter((r) => r.attempt === 0)).toHaveLength(1);
     expect(rev.calls).toHaveLength(1);
+  });
+
+  test("ISH-1013: a Factory call on a terminal Task records no new failure outcome", async () => {
+    const dsh = fakeDsh("dsh-1013-terminal", COMMITTING_DSH);
+    const id = newTask();
+    const rev = reviewerHarness(["pass"]);
+    const ready = await runFactoryTask(db, id, factoryDeps(dsh, rev.spawner));
+    expect(ready.outcome).toBe("merge_ready");
+    expect(latestFactoryOutcome(db, id)?.outcome).toBe("merge_ready");
+    expect(listRuns(db, { taskId: id })).toHaveLength(1);
+
+    cancelTask(db, id, "operator", "fixture closed after MergeReady");
+    const after = await runFactoryTask(db, id, factoryDeps(dsh, rev.spawner));
+    expect(after.outcome).toBe("terminal");
+    expect(after.failure).toBeNull();
+    expect(listRuns(db, { taskId: id })).toHaveLength(1);
+    // The success that actually ended the Task is not replaced by an UNKNOWN
+    // "investigate" failure for the terminal call.
+    expect(latestFactoryOutcome(db, id)?.outcome).toBe("merge_ready");
+    expect(latestFactoryOutcome(db, id)?.failure).toBeNull();
   });
 
   test("a provider credential failure is DENIED (AUTH), blocked and never self-retried", async () => {

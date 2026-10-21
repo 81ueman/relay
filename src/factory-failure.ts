@@ -2,7 +2,7 @@ import type { Database } from "bun:sqlite";
 import { logEvent } from "./events";
 import { findTaskResult } from "./results";
 import { getTask } from "./tasks";
-import type { Run, Task } from "./schema";
+import { isTerminalTaskState, type Run, type Task } from "./schema";
 
 /**
  * ISH-1013 — the operator/Gateway view of a Factory that stopped.
@@ -202,6 +202,14 @@ interface CollectedEvidence {
   causeText: string[];
   reviewBlocked: boolean;
   reviewRefused: boolean;
+  /**
+   * The structured VERIFY row at this attempt says a REQUIRED check did not run
+   * (`not_run`/`inconclusive`). This is verified process evidence and must decide
+   * CHECK_NOT_RUN before any regex, because the Factory reason embeds raw check
+   * output (which may legitimately contain "command not found" or "permission
+   * denied" without proving a launch/permission cause).
+   */
+  verifyNotRun: boolean;
 }
 
 function addEvidence(collected: CollectedEvidence, line: string): void {
@@ -238,6 +246,16 @@ function collectVerificationEvidence(
   if (!row) return;
   const payload = parsePayload(row.payload_json);
   const checks = parseChecks(payload);
+  const outcome = typeof payload?.outcome === "string" ? payload.outcome : null;
+  const requiredUnrun = checks.some(
+    (c) => c.required !== false && ["not_run", "inconclusive"].includes(String(c.outcome ?? ""))
+  );
+  // The aggregate outcome is authoritative (`fail` outranks a not_run check and
+  // is a real code failure). Fall back to the per-check rows only when a legacy
+  // payload carries no aggregate outcome.
+  if (outcome === "not_run" || outcome === "inconclusive" || (!outcome && requiredUnrun)) {
+    collected.verifyNotRun = true;
+  }
   const failing = checks.filter((c) => c.required !== false && String(c.outcome ?? "") !== "pass");
   const failingText = failing
     .map((c) => {
@@ -348,6 +366,18 @@ const EVIDENCE_UNAVAILABLE_RE =
   /PR_BINDING.*(?:UNREADABLE|NOT_OPEN)|PROVIDER_UNREADABLE|PR_UNREADABLE|evidence .*unreadable|could not read/i;
 const CHECK_NOT_RUN_RE = /\bNOT_RUN\b|\bINCONCLUSIVE\b|unrun (?:gate|check)|check .* could not run/i;
 
+/**
+ * The Factory's VERIFY-block reason is `verify <outcome>: <per-check output>`.
+ * The per-check tail is arbitrary output and must stay EVIDENCE, never decide a
+ * process cause (a test may print "permission denied" or "command not found"
+ * legitimately). Keep only the structured outcome for cause detection.
+ */
+function factoryReasonCauseText(reason: string | null): string {
+  if (!reason) return "";
+  const verify = /^\s*verify\s+(\w+)\s*:/.exec(reason);
+  return verify ? `verify ${verify[1]}` : reason;
+}
+
 function detectCause(
   input: FactoryOutcomeInput,
   task: Task,
@@ -357,6 +387,12 @@ function detectCause(
   // A structured reviewer BLOCKED verdict is a human decision: its arbitrary
   // summary text must not be re-read as an infra/permission/stale marker.
   if (collected.reviewBlocked) return "REVIEW_BLOCKED";
+  // A structured VERIFY result (not_run/inconclusive for a REQUIRED check) is
+  // verified process evidence and is decided BEFORE any regex. The Factory reason
+  // for this stop embeds raw check output, which must not be read as a launch,
+  // permission, auth or stale marker. It is also the same evidence a later
+  // re-entry reads back from the parked Task.
+  if (collected.verifyNotRun) return "CHECK_NOT_RUN";
   if (STALE_HEAD_RE.test(text)) return "STALE_HEAD";
   if (ENOSPC_RE.test(text)) return "ENOSPC";
   if (LOW_DISK_RE.test(text)) return "LOW_DISK";
@@ -647,14 +683,18 @@ function nextFor(
       };
     }
     case "NO_IMPLEMENTATION":
-    case "REPEATED_FAILURE":
+    case "REPEATED_FAILURE": {
+      const nextBudget = attemptBudget(reason, report) + 1;
       return {
         action:
-          "The coding turn produced no new commit (or repeated the same failure at the same base HEAD). Read the Run evidence; the closed attempt is never relaunched.",
+          "The coding turn produced no new commit (or repeated the same failure at the same base HEAD). " +
+          "Fix the brief, the worktree or the repeated blocker; the closed attempt/HEAD is never relaunched, " +
+          "so re-enter through the existing Factory on a fresh attempt budget.",
         read,
-        command: null,
-        resumeWhen: "a new commit at the same Task worktree is verified and independently reviewed",
+        command: report.requiresUnblock ? unblock : `relay run factory ${taskId} --max-attempts ${nextBudget}`,
+        resumeWhen: `a fresh attempt produces a new commit that passes VERIFY and independent REVIEW at its HEAD (not ${head})`,
       };
+    }
     case "UNKNOWN":
     default:
       return {
@@ -670,12 +710,17 @@ function nextFor(
 /**
  * Derive the minimal classification/next-action report from the Factory result
  * and the EXISTING Run/result/event rows. Pure read: no Task/Run mutation.
- * Returns null only for `merge_ready` (there is nothing to repair).
+ * Returns null for `merge_ready`, an unknown Task, or an already-terminal Task
+ * (there is nothing to repair).
  */
 export function classifyFactoryOutcome(db: Database, input: FactoryOutcomeInput): FactoryFailureReport | null {
   if (input.outcome === "merge_ready") return null;
   const task = getTask(db, input.taskId);
   if (!task) return null;
+  // A Factory call on an already-finished Task is not a new failure: there is
+  // nothing to repair and no next action. Never overwrite the outcome that
+  // actually ended the Task with an UNKNOWN "investigate" projection.
+  if (isTerminalTaskState(task.state)) return null;
 
   // The LAST attempt that actually has an outcome. A cap may create an empty
   // attempt at the boundary; its evidence is the previous attempt's Run/result.
@@ -709,7 +754,13 @@ export function classifyFactoryOutcome(db: Database, input: FactoryOutcomeInput)
   }
 
   const attempt = run?.attempt ?? evidenceAttempt?.attempt ?? task.attempt;
-  const collected: CollectedEvidence = { lines: [], causeText: [input.reason ?? ""], reviewBlocked: false, reviewRefused: false };
+  const collected: CollectedEvidence = {
+    lines: [],
+    causeText: [factoryReasonCauseText(input.reason)],
+    reviewBlocked: false,
+    reviewRefused: false,
+    verifyNotRun: false,
+  };
   collectRunEvidence(run, collected);
   collectVerificationEvidence(db, task, attempt, collected);
   collectReviewEvidence(db, task, attempt, collected);
@@ -750,6 +801,15 @@ export function classifyFactoryOutcome(db: Database, input: FactoryOutcomeInput)
  * never turn an already-decided Factory result into a new failure.
  */
 export function recordFactoryOutcome(db: Database, input: FactoryOutcomeInput): FactoryFailureReport | null {
+  // A Factory call on an already-finished Task (done/failed/cancelled) is a
+  // no-op, not a new failure: do not log a `factory.outcome` event that would
+  // replace the diagnosis/success that actually ended the Task.
+  try {
+    const task = getTask(db, input.taskId);
+    if (!task || isTerminalTaskState(task.state)) return null;
+  } catch {
+    return null;
+  }
   let failure: FactoryFailureReport | null = null;
   try {
     failure = classifyFactoryOutcome(db, input);
