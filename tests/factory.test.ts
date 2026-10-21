@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Database } from "bun:sqlite";
 import { openDb } from "../src/db";
-import { blockTask, claimNext, claimTask, addTask, getTask } from "../src/tasks";
+import { blockTask, claimNext, claimTask, addTask, getTask, unblockTask } from "../src/tasks";
 import { getWorker, registerWorker, HEADLESS_AGENT_KIND } from "../src/workers";
 import { inboxFor } from "../src/messages";
 import {
@@ -28,6 +28,7 @@ import { ensureTaskSandbox, launchTaskSandboxRun, ensureSandboxRelayExcluded } f
 import { sandboxVerifyTarget, type SandboxExec } from "../src/sandbox-verify";
 import { processPgid, spawnIdentityToken } from "../src/proc-identity";
 import { DEFAULT_INTEGRATOR_WORKER, pidAlive, reviewBlockedReason, runFactoryTask, verifyChecksReason } from "../src/factory";
+import { findFactoryOutcomeForRun, latestFactoryOutcome } from "../src/factory-failure";
 import type { GitHubReadOnly } from "../src/providers";
 import {
   DEFAULT_REVIEWER_WORKER as REVIEWER_WORKER,
@@ -978,6 +979,14 @@ describe("Factory E2E: real worktree, fake headless dsh + independent reviewer",
     expect(task.head_sha).toBeNull();
     expect(rev.calls).toHaveLength(0);
     expect(listRuns(db, { taskId: id })).toHaveLength(1);
+    // ISH-1013: an unverified coding failure is UNKNOWN, not a guessed cause,
+    // and it never offers an automatic resume command.
+    expect(res.failure?.class).toBe("unknown");
+    expect(res.failure?.cause).toBe("UNKNOWN");
+    expect(res.failure?.runId).toBe(listRuns(db, { taskId: id })[0].id);
+    expect(res.failure?.next.command).toBeNull();
+    // ISH-1013: the SAME report is durable and addressable from the Run row.
+    expect(findFactoryOutcomeForRun(db, listRuns(db, { taskId: id })[0])?.failure?.cause).toBe("UNKNOWN");
 
     const again = await runFactoryTask(db, id, factoryDeps(dsh, rev.spawner));
     expect(again.outcome).toBe("coding_failed");
@@ -994,6 +1003,9 @@ describe("Factory E2E: real worktree, fake headless dsh + independent reviewer",
     // (same base HEAD, no progress) -> REPEATED_FAILURE, no third Run.
     expect(res.outcome).toBe("no_implementation");
     expect(res.reason).toContain("IMPLEMENT_RECOVERY/REPEATED_FAILURE");
+    expect(res.failure?.class).toBe("code_rework_exhausted");
+    expect(res.failure?.cause).toBe("REPEATED_FAILURE");
+    expect(res.failure?.next.command).toBeNull();
     const runs = listRuns(db, { taskId: id });
     expect(runs.map((r) => r.attempt).sort((a, b) => a - b)).toEqual([0, 1]);
     expect(runs.every((r) => r.state === "exited" && r.exit_code === 0)).toBe(true);
@@ -1015,6 +1027,12 @@ describe("Factory E2E: real worktree, fake headless dsh + independent reviewer",
     expect(res.reason).toContain("hang=not_run");
     expect(getTask(db, id)!.state).toBe("blocked_human");
     expect(rev.calls).toHaveLength(0);
+    // ISH-1013: an unrun REQUIRED gate is missing evidence and needs an explicit
+    // release; it is never classified as a code defect or PASSed.
+    expect(res.failure?.class).toBe("missing_or_inconclusive_evidence");
+    expect(res.failure?.cause).toBe("CHECK_NOT_RUN");
+    expect(res.failure?.requiresUnblock).toBe(true);
+    expect(res.failure?.next.command).toBe(`relay unblock ${id}`);
   });
 
   test("a reviewer with NO structured result is REFUSED (no advance)", async () => {
@@ -1027,6 +1045,9 @@ describe("Factory E2E: real worktree, fake headless dsh + independent reviewer",
     // ISH-904: the refusal carries the parse diagnostic ("no JSON" vs "wrong JSON").
     expect(res.reason).toContain("no JSON object");
     expect(getTask(db, id)!.phase).toBe("review");
+    expect(res.failure?.class).toBe("missing_or_inconclusive_evidence");
+    expect(res.failure?.cause).toBe("REVIEW_REFUSED");
+    expect(res.failure?.next.command).toBe(`relay run factory ${id}`);
   });
 
   test("an old/foreign HEAD verdict is REFUSED (old HEAD cannot advance)", async () => {
@@ -1037,6 +1058,9 @@ describe("Factory E2E: real worktree, fake headless dsh + independent reviewer",
     expect(res.outcome).toBe("review_refused");
     expect(res.reason).toContain("HEAD_MISMATCH");
     expect(getTask(db, id)!.phase).toBe("review");
+    expect(res.failure?.class).toBe("stale_head");
+    expect(res.failure?.cause).toBe("STALE_HEAD");
+    expect(res.failure?.next.command).toBe(`relay run factory ${id}`);
   });
 
   test("the envelope form (claude --output-format json) is accepted", async () => {
@@ -1253,6 +1277,9 @@ describe("ISH-1010: Factory repair convergence (VERIFY/REVIEW -> FIX)", () => {
     const capped = await runFactoryTask(db, id, { ...factoryDeps(dsh, rev.spawner), maxAttempts: 2 });
     expect(capped.outcome).toBe("max_attempts");
     expect(capped.reason).toContain("exceeded 2 attempts");
+    expect(capped.failure?.class).toBe("code_rework_exhausted");
+    expect(capped.failure?.cause).toBe("MAX_ATTEMPTS");
+    expect(capped.failure?.next.command).toBe(`relay run factory ${id} --max-attempts 3`);
     const atCap = getTask(db, id)!;
     expect(atCap.phase).toBe("implement");
     expect(atCap.attempt).toBe(2);
@@ -1265,6 +1292,8 @@ describe("ISH-1010: Factory repair convergence (VERIFY/REVIEW -> FIX)", () => {
     const r0 = runs.find((r) => r.attempt === 0)!;
     const r1 = runs.find((r) => r.attempt === 1)!;
     expect(r1.cwd).toBe(r0.cwd);
+    // ISH-1013: the cap report points at the LAST Run and is readable from it.
+    expect(findFactoryOutcomeForRun(db, r1)?.failure?.cause).toBe("MAX_ATTEMPTS");
     expect(r0.base_head_sha).toBe(baseSha);
     expect(r1.base_head_sha).toBe(r0.head_sha);
     expect(git(r1.cwd!, "merge-base", "--is-ancestor", r0.head_sha!, r1.head_sha!)).toBe("");
@@ -1430,6 +1459,10 @@ describe("ISH-1012: bounded IMPLEMENT recovery (fresh Run only for repairable fa
     expect(res.outcome).toBe("blocked");
     expect(res.reason).toContain("IMPLEMENT_RECOVERY/ENOSPC");
     expect(res.reason).toContain("No space left on device");
+    expect(res.failure?.class).toBe("infra_blocked");
+    expect(res.failure?.cause).toBe("ENOSPC");
+    expect(res.failure?.requiresUnblock).toBe(true);
+    expect(res.failure?.next.command).toBe(`relay unblock ${id}`);
     const task = getTask(db, id)!;
     expect(task.state).toBe("blocked_human");
     expect(task.phase).toBe("implement");
@@ -1441,6 +1474,51 @@ describe("ISH-1012: bounded IMPLEMENT recovery (fresh Run only for repairable fa
     const again = await runFactoryTask(db, id, factoryDeps(dsh, rev.spawner));
     expect(again.outcome).toBe("terminal");
     expect(listRuns(db, { taskId: id })).toHaveLength(1);
+    // ISH-1013: restart/re-entry re-derives the SAME cause and release condition
+    // from the durable rows; the block is never silently turned into a retry.
+    expect(again.failure?.class).toBe("infra_blocked");
+    expect(again.failure?.cause).toBe("ENOSPC");
+    expect(again.failure?.requiresUnblock).toBe(true);
+  });
+
+  test("ISH-1013: a resolved ENOSPC block resumes ONLY through an explicit unblock on a fresh attempt", async () => {
+    const enospc = fakeDsh("dsh-1013-enospc", ENOSPC_NOOP_DSH);
+    const id = newTask();
+    const rev = reviewerHarness(["pass"]);
+
+    const blocked = await runFactoryTask(db, id, factoryDeps(enospc, rev.spawner));
+    expect(blocked.outcome).toBe("blocked");
+    expect(blocked.failure?.class).toBe("infra_blocked");
+    expect(blocked.failure?.requiresUnblock).toBe(true);
+    expect(getTask(db, id)!.state).toBe("blocked_human");
+    expect(getTask(db, id)!.attempt).toBe(1); // the block advanced the attempt
+    const blockedRuns = listRuns(db, { taskId: id });
+    expect(blockedRuns).toHaveLength(1);
+
+    // Re-entry while parked launches nothing; the block is not auto-released.
+    const again = await runFactoryTask(db, id, factoryDeps(enospc, rev.spawner));
+    expect(again.outcome).toBe("terminal");
+    expect(again.failure?.cause).toBe("ENOSPC");
+    expect(listRuns(db, { taskId: id })).toHaveLength(1);
+
+    // The EXISTING unblock path is the only release; the fresh attempt is a NEW
+    // Run, never a relaunch of the closed ENOSPC attempt.
+    const released = unblockTask(db, id, "operator");
+    expect(released.state).toBe("queued");
+    expect(released.attempt).toBe(1);
+    const fixed = fakeDsh("dsh-1013-resume", COMMITTING_DSH);
+    const resumed = await runFactoryTask(db, id, factoryDeps(fixed, rev.spawner));
+    expect(resumed.outcome).toBe("merge_ready");
+    expect(resumed.failure).toBeNull();
+    // The later success supersedes the old failure projection for the Task, while
+    // the failed Run itself still points at its own historical report.
+    expect(latestFactoryOutcome(db, id)?.outcome).toBe("merge_ready");
+    expect(latestFactoryOutcome(db, id)?.failure).toBeNull();
+    expect(findFactoryOutcomeForRun(db, blockedRuns[0])?.failure?.cause).toBe("ENOSPC");
+    const runs = listRuns(db, { taskId: id });
+    expect(runs.map((r) => r.attempt).sort((a, b) => a - b)).toEqual([0, 1]);
+    expect(runs.filter((r) => r.attempt === 0)).toHaveLength(1);
+    expect(rev.calls).toHaveLength(1);
   });
 
   test("a provider credential failure is DENIED (AUTH), blocked and never self-retried", async () => {
@@ -1450,6 +1528,9 @@ describe("ISH-1012: bounded IMPLEMENT recovery (fresh Run only for repairable fa
     expect(res.outcome).toBe("blocked");
     expect(res.reason).toContain("IMPLEMENT_RECOVERY/AUTH");
     expect(res.reason).toContain("MISSING_CREDENTIAL");
+    expect(res.failure?.class).toBe("permission_or_human_decision");
+    expect(res.failure?.cause).toBe("AUTH");
+    expect(res.failure?.requiresUnblock).toBe(true);
     expect(getTask(db, id)!.state).toBe("blocked_human");
     expect(listRuns(db, { taskId: id })).toHaveLength(1);
   });
@@ -1805,6 +1886,9 @@ describe("Gateway is told only for judgment", () => {
     const blockId = newTask();
     const res = await runFactoryTask(db, blockId, { ...factoryDeps(dsh, reviewerHarness(["blocked"]).spawner), maxAttempts: 1 });
     expect(res.outcome).toBe("blocked");
+    expect(res.failure?.class).toBe("permission_or_human_decision");
+    expect(res.failure?.cause).toBe("REVIEW_BLOCKED");
+    expect(res.failure?.requiresUnblock).toBe(true);
     expect(getTask(db, blockId)!.state).toBe("blocked_human");
     const msgs = inboxFor(db, "gateway");
     expect(msgs.length).toBe(1);
@@ -2030,6 +2114,9 @@ describe("PR #10 finding 5: an all-optional check list is not a gate", () => {
     const res = await runFactoryTask(db, id, factoryDeps(dsh, reviewerHarness(["pass"]).spawner));
     expect(res.outcome).toBe("no_checks");
     expect(getTask(db, id)!.phase).toBe("verify");
+    expect(res.failure?.class).toBe("missing_or_inconclusive_evidence");
+    expect(res.failure?.cause).toBe("NO_REQUIRED_CHECK");
+    expect(res.failure?.next.command).toBe(`relay run factory ${id}`);
   });
 
   test("a task with at least one REQUIRED check still runs", async () => {

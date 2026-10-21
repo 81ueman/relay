@@ -51,6 +51,12 @@ import { applyLabCleanup, planLabCleanup, type LabCleanupPlan } from "./lab-clea
 import { providerDepsFromEnv, nativeReviewDepsFromEnv } from "./provider-adapters";
 import { checkMergeGate, formatMergeGateDecision } from "./merge-gate";
 import { runFactoryTask } from "./factory";
+import {
+  findFactoryOutcomeForRun,
+  formatFactoryFailureLines,
+  formatStoredFactoryOutcome,
+  latestFactoryOutcome,
+} from "./factory-failure";
 import { DEFAULT_REVIEW_MODEL } from "./reviewer-runner";
 import { bindTaskPr, formatPrBindingResult } from "./pr-binding";
 import {
@@ -189,6 +195,7 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
       "ISH-803/ISH-810 one-shot headless dsh Runs: 1 Run = 1 `dsh --profile headless --json` process = 1 coding attempt, in the Task's worktree, with NO Herdr pane/TUI/`dsh web`/wake/attach. Under <control-plane>/runs/<run-id>/: stdout.log (raw dsh JSONL), stderr.log (reasoning/errors), dsh.jsonl (the ORIGINAL dsh session/status/text/tool_call/tool_result/final events, per-Run evidence) and events.jsonl (Relay's own lifecycle log, kept distinct). A process `exit 0` or a terminal `final` does NOT complete anything — only `relay run submit` (a structured submission bound to the Run/Task/phase/attempt/branch/HEAD) advances the Task. `start` waits for the Run to reach a terminal state (there is no detached mode yet). Permissions are the worktree: $DSH_PERMISSION_MODE=workspace-write by default. " +
       "ISH-760 adds the Task lifecycle: `launch` owns ONE branch+worktree per Task, pins the task spec + verification steps + prior findings into the worktree BEFORE launch, and runs ONE disposable dsh Run per phase/attempt (a FIX is the SAME worktree + findings + a NEW Run). A second writer on the same worktree/branch is refused until the previous Run ends; different worktrees/branches may run in parallel. `worktree` creates/selects the worktree; `cleanup` reclaims it only when safe (real merge or --abort, no open PR, no active writer, no uncommitted changes, relay-owned) and retains the run logs. `relay run logs <run-id>` renders the read-only dsh session/status/text/tool_call/tool_result/final chronology from the per-Run dsh.jsonl (no TUI/Web UI needed). " +
       "ISH-762 adds `relay run factory <task-id>`: the whole factory for ONE Task with no hand-driven pane for the coding — a real headless dsh Run implements, Relay mechanically VERIFYs the recorded HEAD, an INDEPENDENT headless Claude reviewer (`claude -p --output-format json`) returns a structured FIX/PASS (FIX = the SAME worktree + findings + a FRESH Run), and a PASS reaches read-only MergeReady. It never pushes, merges, accepts or writes a provider." +
+      " ISH-1013: a non-ready Factory outcome is classified from the EXISTING rows (code rework exhausted / infra blocked / permission-or-human decision / missing-or-inconclusive evidence / stale head / unknown) with the last Run/attempt/HEAD, failing check/review/log references and a concrete next action. The same projection is stored as a durable `factory.outcome` event and shown by `relay run show` / `relay run logs` and `relay task show`; `relay run factory --json` carries it as `failure`." +
       " ISH-845: the same task-end `cleanup` (merged or --abort) also reclaims the Task's external Network Lab through the single trusted hook $RELAY_LAB_CLEANUP_CMD, invoked as `<cmd> <owner-id>` (the owner id Relay assigned to the Task, recorded when it launched the sandbox). With no hook, or no assigned owner, it is a no-op; an active Run, or a Task that has not ended, is refused. Reaching MergeReady alone never cleans anything.",
     usage: [
       "relay run start <task-id> [--cwd DIR] [--prompt TEXT] [--permission MODE] [--timeout 30m] [--json]",
@@ -217,7 +224,8 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
       "CODE-CHANGE TASKS ONLY: a task must have a workflow phase (created with `relay task intake --code-change`); a plain `relay task add` task is refused UP FRONT, before any worktree, with the re-intake instruction. " +
       "VERIFY needs at least ONE REQUIRED mechanical check recorded at intake (`--check name=command`); with none (or only optional checks) the outcome is `no_checks` — an unrun gate is never a PASS. " +
       "`--permission MODE` is forwarded to the headless dsh Run (default `workspace-write`). `--timeout` is the per-Run budget, `--max-attempts` the coding/review attempt cap (it also bounds a fresh IMPLEMENT Run issued for a repairable `NO_IMPLEMENTATION`/partial-commit failure; ENOSPC/resource/permission/auth/Sandbox/unknown failures are never auto-retried). " +
-      "The task branch is cut from the SOURCE repo's freshly fetched `origin/main` (or the task's `pr_base`), and a resolved base behind `origin/main` is warned about, never silently accepted.",
+      "The task branch is cut from the SOURCE repo's freshly fetched `origin/main` (or the task's `pr_base`), and a resolved base behind `origin/main` is warned about, never silently accepted. " +
+      "ISH-1013: every non-ready result carries a `failure` object: a minimal `class`, the concrete evidence-derived `cause`, the last Run/attempt/HEAD, bounded evidence references (`run show/logs`, check/review/evidence paths), and `next` (what to fix, what to read, the existing safe resume command, and the condition that permits resume). Classification never auto-unblocks: a HOLD, missing permission, live writer or stale/old HEAD stays blocked until an explicit `relay unblock` or a fresh HEAD-bound result.",
     usage: [
       "relay run factory <task-id> [--max-attempts N] [--dsh BIN] [--reviewer CMD] [--model M] [--permission MODE] [--timeout 30m] [--repo DIR] [--review-worktrees DIR] [--json]",
     ],
@@ -1152,16 +1160,22 @@ async function main(): Promise<void> {
           if (!t) throw new Error(`unknown task: ${id}`);
           const notes = getNotes(db, id);
           const deps = taskDependencies(db, id);
+          // ISH-1013: the latest Factory outcome (classification/evidence/next)
+          // is part of the existing Task document, not a new dashboard store.
+          const factory = latestFactoryOutcome(db, t.id);
           if (hasFlag(argv.slice(2), "--json")) {
             // One self-contained JSON document (task + notes + deps) for agents.
-            console.log(JSON.stringify({ ...t, depends_on: deps, notes }, null, 2));
+            console.log(JSON.stringify({ ...t, depends_on: deps, notes, ...(factory ? { factory } : {}) }, null, 2));
           } else {
             // stdout stays a single parseable JSON document; the human-readable
             // notes go to stderr so `relay task show <id> | jq` keeps working.
-            console.log(JSON.stringify({ ...t, depends_on: deps }, null, 2));
+            console.log(JSON.stringify({ ...t, depends_on: deps, ...(factory ? { factory } : {}) }, null, 2));
             if (deps.length) console.error(`  depends_on: ${deps.join(", ")}`);
             for (const n of notes) {
               console.error(`  [${n.kind}] ${n.worker_id ?? "?"}: ${n.body}`);
+            }
+            if (factory) {
+              for (const line of formatStoredFactoryOutcome(factory)) console.error(`  ${line}`);
             }
           }
         } else if (sub === "cancel") {
@@ -1674,12 +1688,22 @@ async function main(): Promise<void> {
           // ISH-1008: the liveness sweep stores `cause=<CLASS>` in `error`.
           // Project it explicitly so a died Run reads the same in text and JSON.
           const failureClass = parseRunFailureClass(r.error);
+          // ISH-1013: the durable Factory failure/next-action projection, when
+          // this Run is the one the Factory stopped on (read-only; no new store).
+          const factory = findFactoryOutcomeForRun(db, r);
           if (hasFlag(rest, "--json")) {
-            console.log(JSON.stringify(failureClass ? { ...r, failure_class: failureClass } : r, null, 2));
+            const out: Record<string, unknown> = { ...r };
+            if (failureClass) out.failure_class = failureClass;
+            if (factory) out.factory = factory;
+            console.log(JSON.stringify(out, null, 2));
             break;
           }
           for (const [k, v] of Object.entries(r)) console.log(`${k}: ${v ?? "-"}`);
           if (failureClass) console.log(`failure_class: ${failureClass}`);
+          if (factory) {
+            console.log("");
+            for (const line of formatStoredFactoryOutcome(factory)) console.log(line);
+          }
           break;
         }
         if (sub === "logs") {
@@ -1687,6 +1711,14 @@ async function main(): Promise<void> {
           if (!id) throw new Error("usage: relay run logs <run-id> [--tail N]");
           const r = getRun(db, id);
           if (!r) throw new Error(`unknown run: ${id}`);
+          // ISH-1013: put the Factory classification/next action BEFORE the raw
+          // logs, so a rotated/empty log still explains why the Run stopped.
+          const factory = findFactoryOutcomeForRun(db, r);
+          if (factory) {
+            console.log(`--- factory outcome (task ${r.task_id} ${r.phase}/${r.attempt}) ---`);
+            for (const line of formatStoredFactoryOutcome(factory)) console.log(line);
+            console.log("");
+          }
           const tailRaw = flag(rest, "--tail");
           const n = tailRaw ? Number(tailRaw) : 50;
           for (const [label, p] of [
@@ -1845,6 +1877,10 @@ async function main(): Promise<void> {
             }
             if (result.gate) console.log(`  merge gate: ${result.gate.status} (read-only; NOT merged)`);
             if (result.reason) console.log(`  reason: ${result.reason}`);
+            // ISH-1013: the same classification/next action `--json` carries.
+            if (result.failure) {
+              for (const line of formatFactoryFailureLines(result.failure)) console.log(`  ${line}`);
+            }
           }
           if (result.outcome !== "merge_ready") process.exitCode = 1;
           break;

@@ -115,6 +115,91 @@ An environment-class failure parks the Task `blocked_human` at `attempt+1`, so a
 explicit `unblock` starts a fresh attempt after the environment is fixed; it is
 not an automatic retry.
 
+## Repair exhaustion: classification and next action (ISH-1013)
+
+A non-ready Factory result now carries a `failure` projection derived **only**
+from the rows the Factory already wrote (the Task, its `runs`, `task_results`,
+`events` and retained log/review paths). It adds no state machine and no second
+evidence store, and it never mutates the Task.
+
+`relay run factory <task-id> --json` includes the projection:
+
+```json
+{
+  "outcome": "blocked",
+  "reason": "IMPLEMENT_RECOVERY/ENOSPC: ...",
+  "failure": {
+    "class": "infra_blocked",
+    "cause": "ENOSPC",
+    "resume": "after_environment_fix",
+    "requiresUnblock": true,
+    "taskId": "T1",
+    "attempt": 0,
+    "taskAttempt": 1,
+    "head": "<unchanged base SHA>",
+    "runId": "run-...",
+    "runState": "exited",
+    "runExitCode": 0,
+    "evidence": [
+      "run run-... (implement/0) state=failed ... logs=.../stderr.log, .../dsh.jsonl",
+      "event #44 factory.implement_retry_refused: ..."
+    ],
+    "next": {
+      "action": "The Run hit a full disk (ENOSPC); the Factory never auto-retries this. Free space on the Run volume, then `relay unblock T1` to start a fresh attempt.",
+      "read": "relay status",
+      "command": "relay unblock T1",
+      "resumeWhen": "the disk guard reports OK ... and no live writer holds the worktree"
+    }
+  }
+}
+```
+
+The minimal `class` is one of:
+
+| class | examples (`cause`) | resume |
+| -- | -- | -- |
+| `code_rework_exhausted` | `MAX_ATTEMPTS`, `REPEATED_FAILURE`, `NO_IMPLEMENTATION` | fix the remaining check/review finding, then re-run with a larger attempt budget |
+| `infra_blocked` | `ENOSPC`, `LOW_DISK`, `RESOURCE`, `SANDBOX`, `LAUNCH`, `TIMEOUT`, `ORPHAN`, `WORKSPACE`, `WRITER_ACTIVE` | fix the environment; a live writer must finish first; a parked Task still needs an explicit `unblock` |
+| `permission_or_human_decision` | `PERMISSION`, `AUTH`, `HUMAN_HOLD`, `REVIEW_BLOCKED` | restore the permission/credential or make the human decision, then explicitly unblock |
+| `missing_or_inconclusive_evidence` | `REVIEW_REFUSED`, `CHECK_NOT_RUN`, `NO_REQUIRED_CHECK`, `EVIDENCE_UNAVAILABLE` | re-run the review/check with readable evidence; an unrun gate never PASSes |
+| `stale_head` | `STALE_HEAD`, `STALE_EVIDENCE` | never reuse the old attempt/HEAD; re-run only with evidence naming the current HEAD |
+| `unknown` | `UNKNOWN` | read the Run logs; do not retry blindly or guess a cause |
+
+The same projection is written once per Factory result as a durable
+`factory.outcome` event (best effort; a full disk cannot turn a decided result
+into a new failure). A later success supersedes an older failure in `task show`,
+and the projection is read back without re-running anything:
+
+```sh
+relay run show <run-id>            # factory_outcome / classification / evidence / next
+relay run show <run-id> --json     # { ...run, "factory": { outcome, reason, failure } }
+relay run logs <run-id>            # factory header, then the raw Run logs
+relay task show <task-id> --json   # { ...task, "factory": { outcome, reason, failure } }
+```
+
+`relay run show/logs` uses the Run's own task/attempt (an exact `runId` match
+first), so an old Run never displays another attempt's diagnosis. The dashboard's
+existing `blocked_human` ATTENTION line keeps showing the Factory block reason;
+the detailed next action is on the surfaces above.
+
+**Safe resume rules.** The projection never auto-releases anything:
+
+- A resolved **infra** cause still resumes through the existing path: fix the
+  cause, then `relay unblock <task>` (the block already advanced the attempt, so
+  a fresh Run is issued) or re-run the Factory. There is no automatic retry.
+- A **HOLD**, missing permission, an unfinished writer or stale/old evidence
+  keeps the Task BLOCKED — `requiresUnblock` is true and the next command is the
+  explicit `relay unblock`, never an implicit release.
+- `max_attempts` is re-entered with a larger `--max-attempts`; the old attempt/
+  HEAD is never reused.
+- `review_refused` re-runs the review stage at the recorded HEAD; no structured
+  verdict is never a PASS.
+- The durable event and the existing Run/result/log files are retained across
+  restart. Re-entry creates no second Run for a closed attempt, no second review
+  and no old-SHA PASS.
+- An **unknown** cause has no resume command; the operator must read the evidence
+  and choose an explicit safe re-entry.
+
 ## PR check before review (ISH-880/885, read-only)
 
 A Sandbox-produced commit is bridged to a real GitHub PR **before the review
@@ -151,8 +236,9 @@ task's `pr_base`); a resolved base behind `origin/main` is reported as a warning
 and in the Factory `steps`, never silently accepted.
 
 `--json` prints the `FactoryResult`: `outcome`, `head`, per-attempt
-`runId`/`verifyOutcome`/`reviewVerdict`, the read-only `gate` decision, and the
-ordered `steps`. A non-`merge_ready` outcome exits non-zero.
+`runId`/`verifyOutcome`/`reviewVerdict`, the read-only `gate` decision, the
+ordered `steps`, and (ISH-1013) the `failure` classification/evidence/next-action
+projection. A non-`merge_ready` outcome exits non-zero.
 
 ## Fail-closed rules (a coding/review agent can never manufacture an advance)
 
