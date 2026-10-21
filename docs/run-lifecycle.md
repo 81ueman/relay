@@ -143,6 +143,13 @@ non-terminal Run. The durable throttle advances only after a **clean** pass, so
 a write failure (a full disk) retries on the next reconcile tick instead of
 waiting a whole interval.
 
+The **launcher** is checked before the dsh. The child can exit while the
+launching coroutine still runs `git rev-parse`/`git fetch` before its terminal
+write; the Run row records `launcher_pid`/`launcher_lstart`, and the sweep leaves
+the row (and the single-writer fence) alone while that launcher may still write.
+The lease is cleared in the launcher's `finally`, even when its terminal write
+failed, so the next sweep can retry the row.
+
 Local Runs reuse `identifyRunProcess`:
 
 | identity | outcome |
@@ -165,11 +172,13 @@ A sweep failure is never a success. It reads the tail of the Run's
 `stderr.log`/`dsh.jsonl`, classifies the cause (`ENOSPC`, `OOM`, `signal`,
 `unknown`), stores `cause=<CLASS>: <evidence>` in `runs.error`, emits `run.died`,
 shows the cause on the dashboard (`RUNS` and `ATTENTION`), and sends immediate
-`run_died` mail to the responsible owner. `relay run show <id>` projects the
-class as `failure_class`. Per-run errors are isolated so a failed write cannot
-crash the daemon or prevent the remaining Runs from being swept. The sweep does
-**not** add a pre-launch disk guard (ISH-1009) or stall detection for a live but
-silent dsh.
+`run_died` mail to the responsible owner. `stderr.log` is authoritative across
+all classes; `dsh.jsonl` contributes only its parsed terminal `error` events
+(never tool-call output or a success `final` summary), and the last matching line
+in a source wins. `relay run show <id>` projects the class as `failure_class`.
+Per-run errors are isolated so a failed write cannot crash the daemon or prevent
+the remaining Runs from being swept. The sweep does **not** add a pre-launch disk
+guard (ISH-1009) or stall detection for a live but silent dsh.
 
 ## FIX = same worktree + previous findings + a new Run
 

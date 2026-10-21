@@ -320,6 +320,15 @@ function migrate(db: Database): void {
   if (columnExists(db, "runs", "id") && !columnExists(db, "runs", "spawn_lstart")) {
     db.exec("ALTER TABLE runs ADD COLUMN spawn_lstart TEXT;");
   }
+  // ISH-1008 Runs: the launcher process identity. The liveness sweep consults it
+  // before declaring a Run orphaned, so a launcher that is still finishing its
+  // terminal write is never mistaken for a dead one.
+  if (columnExists(db, "runs", "id") && !columnExists(db, "runs", "launcher_pid")) {
+    db.exec("ALTER TABLE runs ADD COLUMN launcher_pid INTEGER;");
+  }
+  if (columnExists(db, "runs", "id") && !columnExists(db, "runs", "launcher_lstart")) {
+    db.exec("ALTER TABLE runs ADD COLUMN launcher_lstart TEXT;");
+  }
   // ISH-828 Runs: the Coding Sandbox a Run executed in (NULL for a worktree Run).
   if (columnExists(db, "runs", "id") && !columnExists(db, "runs", "sandbox_name")) {
     db.exec("ALTER TABLE runs ADD COLUMN sandbox_name TEXT;");

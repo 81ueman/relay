@@ -27,6 +27,12 @@ import {
 } from "./dsh-events";
 import { buildRunBrief, inheritFindings, taskBranchName, type RunFinding } from "./run-lifecycle";
 import { spawnIdentityToken } from "./proc-identity";
+import {
+  beginRunLaunch,
+  endRunLaunch,
+  launcherFields,
+  releaseRunLauncher,
+} from "./run-launcher";
 import { childEnv } from "./child-env";
 import { isPinnedDsh, PINNED_DSH_VERSION } from "./dsh-version";
 import { labOwnerId, LAB_OWNER_ASSIGNED_EVENT } from "./lab-cleanup";
@@ -453,6 +459,9 @@ interface InsertSandboxRunInput {
 }
 
 function insertSandboxRunIfNoWriter(db: Database, r: InsertSandboxRunInput): Run {
+  // ISH-1008: persist the launcher identity outside the write transaction (the
+  // `ps` token probe must not hold the BEGIN IMMEDIATE lock).
+  const launcher = launcherFields();
   return db
     .transaction(() => {
       assertNoActiveSandboxWriter(db, { sandboxName: r.sandboxName, branch: r.branch });
@@ -461,8 +470,8 @@ function insertSandboxRunIfNoWriter(db: Database, r: InsertSandboxRunInput): Run
         `INSERT INTO runs
            (id, task_id, phase, attempt, generation, cwd, branch, head_sha, base_head_sha, prompt,
             spec_path, output_dir, state, stdout_path, stderr_path, events_path, dsh_events_path,
-            sandbox_name, fast_exit, started_at, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, 'starting', ?, ?, ?, ?, ?, 0, ?, ?, ?)`
+            sandbox_name, launcher_pid, launcher_lstart, fast_exit, started_at, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, 'starting', ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`
       ).run(
         r.id,
         r.taskId,
@@ -480,6 +489,8 @@ function insertSandboxRunIfNoWriter(db: Database, r: InsertSandboxRunInput): Run
         r.eventsPath,
         r.dshEventsPath,
         r.sandboxName,
+        launcher.launcher_pid,
+        launcher.launcher_lstart,
         t,
         t,
         t
@@ -755,6 +766,7 @@ export async function launchTaskSandboxRun(
     }
   };
 
+  beginRunLaunch(runId);
   const done = (async (): Promise<Run> => {
     let exitCode: number | null = null;
     let failure: string | null = null;
@@ -871,7 +883,13 @@ export async function launchTaskSandboxRun(
       turnReason,
     });
     return finalRun;
-  })();
+  })().finally(() => {
+    // Done (terminal, stuck-non-terminal, or failed write): the launcher can no
+    // longer write, so release the durable lease and let the next sweep retry a
+    // terminal write that did not land.
+    endRunLaunch(runId);
+    releaseRunLauncher(db, runId);
+  });
 
   return {
     handle: {

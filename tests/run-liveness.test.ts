@@ -7,7 +7,7 @@ import { now, openDb } from "../src/db";
 import { addTask, getTask } from "../src/tasks";
 import { inboxFor } from "../src/messages";
 import { listEvents } from "../src/events";
-import { getRun } from "../src/dsh-runner";
+import { findActiveWriter, getRun } from "../src/dsh-runner";
 import { pidAlive } from "../src/factory";
 import { reconcile } from "../src/reconciler";
 import { MockRuntime } from "../src/runtime/runtime";
@@ -23,6 +23,7 @@ import {
   maybeSweepRunLiveness,
   sweepRunLiveness,
 } from "../src/run-liveness";
+import { beginRunLaunch, endRunLaunch } from "../src/run-launcher";
 
 // ISH-1008: a dead Run must be failed by the daemon's liveness sweep, with a
 // classified cause, without anyone touching the Task. Everything below is
@@ -71,6 +72,8 @@ interface InsertRunOptions {
   state?: string;
   pid?: number | null;
   spawnLstart?: string | null;
+  launcherPid?: number | null;
+  launcherLstart?: string | null;
   sandbox?: string | null;
   stderr?: string;
   dshJsonl?: string;
@@ -92,11 +95,11 @@ function insertRun(opts: InsertRunOptions): string {
   db.query(
     `INSERT INTO runs
        (id, task_id, phase, attempt, generation, cwd, branch, head_sha, base_head_sha, prompt,
-        spec_path, output_dir, state, pid, spawn_lstart, sandbox_name, error,
-        stdout_path, stderr_path, events_path, dsh_events_path, exit_code, signal,
+        spec_path, output_dir, state, pid, spawn_lstart, launcher_pid, launcher_lstart,
+        sandbox_name, error, stdout_path, stderr_path, events_path, dsh_events_path, exit_code, signal,
         fast_exit, started_at, ended_at, created_at, updated_at)
      VALUES (?, ?, 'implement', 0, 0, ?, NULL, NULL, NULL, '', NULL, ?, ?, ?, ?, ?, ?,
-             NULL, ?, NULL, ?, NULL, NULL, 0, ?, ?, ?, ?)`
+             ?, ?, NULL, ?, NULL, ?, NULL, NULL, 0, ?, ?, ?, ?)`
   ).run(
     id,
     opts.taskId,
@@ -105,6 +108,8 @@ function insertRun(opts: InsertRunOptions): string {
     opts.state ?? "running",
     opts.pid ?? null,
     opts.spawnLstart ?? null,
+    opts.launcherPid ?? null,
+    opts.launcherLstart ?? null,
     opts.sandbox ?? null,
     opts.error ?? null,
     stderrPath,
@@ -140,6 +145,43 @@ describe("classifyRunFailure (ISH-1008)", () => {
       dshJsonl: JSON.stringify({ type: "error", message: "ENOSPC: no space left on device" }) + "\n",
     });
     expect(c.class).toBe("ENOSPC");
+  });
+
+  test("dsh tool payloads and final summaries are not failure evidence", () => {
+    const c = classifyRunFailure({
+      stderr: "",
+      dshJsonl: [
+        JSON.stringify({ type: "tool_result", result: "ENOSPC: no space left on device" }),
+        JSON.stringify({ type: "text", text: "we handle SIGTERM and out of memory here" }),
+        JSON.stringify({ type: "final", text: "I fixed the ENOSPC path" }),
+      ].join("\n"),
+    });
+    expect(c.class).toBe("unknown");
+  });
+
+  test("stderr wins across classes over a dsh error event", () => {
+    const c = classifyRunFailure({
+      stderr: "FATAL ERROR: JavaScript heap out of memory\n",
+      dshJsonl: JSON.stringify({ type: "error", message: "ENOSPC: no space left on device" }) + "\n",
+    });
+    expect(c.class).toBe("OOM");
+    expect(c.detail).toContain("heap");
+  });
+
+  test("the last matching evidence line wins", () => {
+    const c = classifyRunFailure({
+      stderr: "ENOSPC: first failure\nordinary retry\nENOSPC: last failure\n",
+    });
+    expect(c.class).toBe("ENOSPC");
+    expect(c.detail).toBe("ENOSPC: last failure");
+  });
+
+  test("the last matching line's class decides (the tail is the evidence)", () => {
+    // A downstream signal line after the ENOSPC is the most recent evidence; the
+    // acceptance reads "stderr ENDS in ENOSPC" for the disk-full class.
+    const c = classifyRunFailure({ stderr: "ENOSPC: no space left on device\nKilled\n" });
+    expect(c.class).toBe("signal");
+    expect(c.detail).toBe("Killed");
   });
 
   test("an OOM signature is OOM, and a signal is a signal", () => {
@@ -248,6 +290,77 @@ describe("sweepRunLiveness (ISH-1008)", () => {
     expect(getRun(db, id)!.state).toBe("running");
   });
 
+  test("a dead child whose launcher may still write is not failed or announced", () => {
+    process.env.RELAY_HUMAN = "coord";
+    const taskId = newTask();
+    const id = insertRun({
+      taskId,
+      pid: DEAD_PID,
+      spawnLstart: "lstart-v1:Tue Jan  1 00:00:00 1980",
+      launcherPid: process.pid,
+      // An unreadable launcher token is undeterminable: hold the fence.
+      launcherLstart: null,
+      stderr: "ENOSPC: no space left on device\n",
+      startedAt: 0,
+    });
+
+    const res = sweepRunLiveness(db, { at: 1_000, startGraceMs: 0 });
+    expect(res.died).toEqual([]);
+    expect(res.live).toBe(1);
+    expect(getRun(db, id)!.state).toBe("running");
+    // The single-writer fence is still held while the launcher may write.
+    expect(findActiveWriter(db, { cwd: dir, branch: null })?.id).toBe(id);
+    expect(runDiedEvents(id)).toEqual([]);
+    expect(runDiedMail()).toEqual([]);
+  });
+
+  test("a dead launcher does not block the dead-child sweep", () => {
+    const taskId = newTask();
+    const id = insertRun({
+      taskId,
+      pid: DEAD_PID,
+      spawnLstart: "lstart-v1:Tue Jan  1 00:00:00 1980",
+      launcherPid: DEAD_PID,
+      launcherLstart: "lstart-v1:Tue Jan  1 00:00:00 1980",
+      stderr: "ENOSPC: no space left on device\n",
+      startedAt: 0,
+    });
+
+    const res = sweepRunLiveness(db, { at: 1_000, startGraceMs: 0 });
+    expect(res.died).toHaveLength(1);
+    expect(getRun(db, id)!.state).toBe("failed");
+    expect(getRun(db, id)!.error).toContain("cause=ENOSPC");
+  });
+
+  test("an in-process launcher holds the Run until its coroutine is done", () => {
+    const taskId = newTask();
+    const id = insertRun({
+      taskId,
+      pid: DEAD_PID,
+      launcherPid: process.pid,
+      launcherLstart: null,
+      stderr: "ENOSPC: no space left on device\n",
+      startedAt: 0,
+    });
+
+    beginRunLaunch(id);
+    try {
+      const during = sweepRunLiveness(db, { at: 1_000, startGraceMs: 0 });
+      expect(during.died).toEqual([]);
+      expect(getRun(db, id)!.state).toBe("running");
+      expect(runDiedEvents(id)).toEqual([]);
+    } finally {
+      endRunLaunch(id);
+    }
+
+    // The coroutine has returned without writing a terminal row (e.g. the write
+    // itself failed): the next sweep may finish what it could not.
+    const after = sweepRunLiveness(db, { at: 1_001, startGraceMs: 0 });
+    expect(after.died).toHaveLength(1);
+    expect(getRun(db, id)!.state).toBe("failed");
+    expect(getRun(db, id)!.error).toContain("cause=ENOSPC");
+  });
+
   test("a reused PID is treated as gone but never signalled", () => {
     const taskId = newTask();
     const id = insertRun({
@@ -319,6 +432,41 @@ describe("sweepRunLiveness (ISH-1008)", () => {
     expect(out).toContain("ENOSPC");
     const json = JSON.parse(renderDashboardJson(view));
     expect(json.runs.find((r: { id: string }) => r.id === id)?.cause).toBe("ENOSPC");
+  });
+
+  test("a sandbox Run is held while its launcher is alive, then swept once released", () => {
+    process.env.RELAY_HUMAN = "coord";
+    const taskId = newTask();
+    const id = insertRun({
+      taskId,
+      pid: DEAD_PID,
+      launcherPid: process.pid,
+      launcherLstart: null,
+      sandbox: "sbx-launcher",
+      stderr: "dsh: ENOSPC: no space left on device\n",
+      startedAt: 0,
+    });
+    const cli: SbxCli = {
+      run(args: string[]): SbxResult {
+        return args.join(" ").includes("pgrep")
+          ? { ok: true, code: 0, out: "GONE", err: "" }
+          : { ok: true, code: 0, out: "", err: "" };
+      },
+    };
+
+    const held = sweepRunLiveness(db, { at: 1_000, startGraceMs: 0, cli });
+    expect(held.died).toEqual([]);
+    expect(getRun(db, id)!.state).toBe("running");
+    expect(runDiedEvents(id)).toEqual([]);
+
+    // The launcher finished without a terminal write: releasing the lease is the
+    // same durable update `releaseRunLauncher` performs in the launcher's finally.
+    db.query(`UPDATE runs SET launcher_pid = NULL, launcher_lstart = NULL WHERE id = ?`).run(id);
+    const after = sweepRunLiveness(db, { at: 1_001, startGraceMs: 0, cli });
+    expect(after.died).toHaveLength(1);
+    expect(getRun(db, id)!.state).toBe("failed");
+    expect(getRun(db, id)!.error).toContain("cause=ENOSPC");
+    expect(runDiedEvents(id)).toHaveLength(1);
   });
 
   test("a still-alive in-VM dsh leaves the sandbox Run fenced", () => {

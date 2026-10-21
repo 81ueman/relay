@@ -5,6 +5,7 @@ import { getTask, resolveHumanInterface } from "./tasks";
 import { RELAY_TAG, sendMessage } from "./messages";
 import type { Run, RunState } from "./schema";
 import { identifyRunProcess, markRunOrphan, type OrphanIdentity } from "./factory";
+import { launcherMayStillWrite } from "./run-launcher";
 import { sweepOrphanedSandboxRuns } from "./sandbox-lifecycle";
 import type { SbxCli } from "./sandbox";
 import {
@@ -25,6 +26,11 @@ import {
  * but `reconcile()` never invoked it. This module is the periodic liveness pass.
  *
  * Safety rules (reused, never reimplemented):
+ *   - the LAUNCHER must be gone before anything is declared: the child process
+ *     can exit while the launching coroutine still runs `git rev-parse` or a
+ *     sandbox `git fetch` before its terminal write. `launcherMayStillWrite`
+ *     (PID + start token, plus an in-process active-launch registry) keeps the
+ *     row live and the fence held while that coroutine may still write;
  *   - a LOCAL Run is only failed after `identifyRunProcess` proves the recorded
  *     process is dead or a reused PID (the original dsh is gone). A live PID is
  *     never signalled here, and an `undeterminable` identity keeps the fence;
@@ -215,6 +221,11 @@ function sweepOne(
 ): RunDeath | null {
   const identify = opts.identify ?? identifyRunProcess;
   const age = opts.at - run.started_at;
+
+  // The child can be gone while the launcher is still finishing (git read/fetch
+  // before its terminal write). Only a launcher that can no longer write makes
+  // this row an orphan; otherwise leave it live and the fence held.
+  if (launcherMayStillWrite(run)) return null;
 
   if (run.sandbox_name) {
     // A sandbox launch records its host `sbx exec` pid right after the Run row;

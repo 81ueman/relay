@@ -393,6 +393,10 @@ describe("sandbox Run: one disposable dsh per attempt", () => {
 
     expect(run.state).toBe("exited");
     expect(run.exit_code).toBe(0);
+    // ISH-1008: the launcher lease is recorded at insert and released when the
+    // launch coroutine is done, so the liveness sweep can tell them apart.
+    expect(launched.run.launcher_pid).toBe(process.pid);
+    expect(getRun(db, run.id)!.launcher_pid).toBeNull();
     expect(run.sandbox_name).toBe(launched.sandbox.name);
     expect(run.session_id).toBe("session-abc");
     expect(run.head_sha).toBe(produced);

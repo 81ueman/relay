@@ -1,4 +1,5 @@
 import { closeSync, openSync, readSync, statSync } from "node:fs";
+import { parseDshLine } from "./dsh-events";
 import type { Run } from "./schema";
 
 /**
@@ -68,12 +69,74 @@ function oneLine(text: string, max = 240): string {
   return line.replace(/\s+/g, " ").slice(0, max);
 }
 
-function firstMatch(text: string | null | undefined, re: RegExp): string | null {
+/**
+ * The LAST line in `text` that matches ANY failure class: the tail is read
+ * precisely so the most recent evidence decides. If one line matches more than
+ * one pattern, ENOSPC wins over OOM, and OOM over a bare signal, because that is
+ * the most specific root cause on the same line.
+ */
+function lastClassMatch(
+  text: string | null | undefined,
+  classes: readonly { class: RunFailureClass; re: RegExp }[]
+): RunFailure | null {
   if (!text) return null;
-  for (const line of text.split(/\r?\n/)) {
-    if (re.test(line)) return oneLine(line);
+  const lines = text.split(/\r?\n/);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i].trim();
+    if (line === "") continue;
+    for (const { class: cls, re } of classes) {
+      if (re.test(line)) return { class: cls, detail: oneLine(lines[i]) };
+    }
   }
   return null;
+}
+
+/** The last element of `lines` matching any class (same "most recent wins"). */
+function lastClassMatchIn(
+  lines: readonly string[],
+  classes: readonly { class: RunFailureClass; re: RegExp }[]
+): RunFailure | null {
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i].trim();
+    if (line === "") continue;
+    for (const { class: cls, re } of classes) {
+      if (re.test(line)) return { class: cls, detail: oneLine(lines[i]) };
+    }
+  }
+  return null;
+}
+
+/**
+ * Extract only dsh ERROR events from `dsh.jsonl`. This file is per-Run evidence
+ * and also holds `text`/`thinking`/`tool_call`/`tool_result` payloads such as
+ * file reads, grep output and diffs. A Run that merely READ code or docs
+ * mentioning `ENOSPC`/`SIGTERM`/`out of memory` must not be classified from that
+ * content, so only a terminal `error` event is evidence of why the Run died.
+ * A `final` event is a SUCCESS summary and is deliberately excluded for the same
+ * reason (it can quote arbitrary tool output).
+ */
+function dshErrorEvidence(dshJsonl: string | null | undefined): string[] {
+  if (!dshJsonl) return [];
+  const out: string[] = [];
+  for (const raw of dshJsonl.split(/\r?\n/)) {
+    if (raw.trim() === "") continue;
+    const parsed = parseDshLine(raw);
+    if (parsed.kind !== "event" || parsed.event.type !== "error") continue;
+    const ev = parsed.event;
+    const value = ev.message ?? ev.error ?? ev.text;
+    if (typeof value === "string") {
+      out.push(value);
+    } else if (value !== undefined) {
+      try {
+        out.push(JSON.stringify(value));
+      } catch {
+        out.push(String(value));
+      }
+    } else {
+      out.push(parsed.raw);
+    }
+  }
+  return out;
 }
 
 function signalName(signalNumber: number): string {
@@ -92,20 +155,26 @@ function signalName(signalNumber: number): string {
 
 /** Classify a Run failure from its evidence tails and recorded process outcome. */
 export function classifyRunFailure(input: RunFailureInput): RunFailure {
-  // ENOSPC FIRST: the incident this closes was a full host disk, and the same
-  // stderr can also contain a downstream OOM/signal line written after it.
-  for (const text of [input.stderr, input.dshJsonl]) {
-    const line = firstMatch(text, ENOSPC_RE);
-    if (line) return { class: "ENOSPC", detail: line };
-  }
-  for (const text of [input.stderr, input.dshJsonl]) {
-    const line = firstMatch(text, OOM_RE);
-    if (line) return { class: "OOM", detail: line };
-  }
-  for (const text of [input.stderr, input.dshJsonl]) {
-    const line = firstMatch(text, SIGNAL_RE);
-    if (line) return { class: "signal", detail: line };
-  }
+  // STDERR IS THE AUTHORITATIVE SOURCE, ACROSS ALL CLASSES: it is the Run's own
+  // process error stream. Only after stderr is exhausted do we consult dsh's
+  // terminal error events, and those are parsed (never raw tool payloads). This
+  // ordering is what stops a dsh.jsonl ENOSPC mention from overriding real
+  // stderr evidence, and stops a tool result that READ the word "ENOSPC" from
+  // being treated as the cause at all.
+  //
+  // Within a source the LAST matching line wins: the tail's most recent evidence
+  // is what killed the Run. A class is only a tie-breaker for one line.
+  const stderr = input.stderr ?? null;
+  const dshErrors = dshErrorEvidence(input.dshJsonl);
+  const classes: { class: RunFailureClass; re: RegExp }[] = [
+    { class: "ENOSPC", re: ENOSPC_RE },
+    { class: "OOM", re: OOM_RE },
+    { class: "signal", re: SIGNAL_RE },
+  ];
+  const fromStderr = lastClassMatch(stderr, classes);
+  if (fromStderr) return fromStderr;
+  const fromDsh = lastClassMatchIn(dshErrors, classes);
+  if (fromDsh) return fromDsh;
   // `runs.signal` is Relay's CANCEL reason ("timeout", "cancelled", an operator
   // label), not a POSIX signal; only an explicit SIG* value is treated as one.
   if (input.signal && /^SIG[A-Z0-9]+$/i.test(input.signal)) {

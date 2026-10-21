@@ -495,6 +495,12 @@ durable row used to stay `starting`/`running` forever, holding the single-writer
 fence and alerting nobody. `reconcile()` now performs a **throttled liveness
 sweep** (`RELAY_RUN_LIVENESS_MS`, default 45s) over every non-terminal Run:
 
+- **launcher first** — the child can exit while the launching coroutine is still
+  finishing (`git rev-parse`, or a sandbox `git fetch` before its terminal
+  write). The Run row records the launcher PID + start-time token, and the sweep
+  leaves the Run alone while that launcher may still write. The lease is cleared
+  in the launcher's `finally`; only then may the sweep finish a row whose
+  terminal write did not land.
 - **local Run** — `identifyRunProcess` proves the recorded PID. A dead PID or a
   **reused** PID (the original dsh is gone) becomes `failed` with an
   `orphaned:` reason; a **live** PID is never touched and an **undeterminable**
@@ -512,11 +518,13 @@ A proven death is never a success. The sweep reads the tail of the Run's own
 `unknown`, stores `cause=<CLASS>: <evidence>` in `runs.error`, emits a `run.died`
 event, shows it on the dashboard (`RUNS` + `ATTENTION`), and sends immediate
 `run_died` coordinator mail to the responsible owner (`RELAY_HUMAN` or the
-nearest assigned ancestor). `relay run show <id>` projects `failure_class`. The
-sweep is failure-isolated: a DB-write error (e.g. a full disk) does not crash the
-daemon, leaves the throttle unadvanced, and the next reconcile tick retries. It
-does **not** implement a pre-launch disk guard (ISH-1009) or stall detection for
-a live-but-silent dsh.
+nearest assigned ancestor). `stderr.log` is authoritative across all classes;
+`dsh.jsonl` contributes only parsed terminal `error` events (never tool output or
+a success `final` summary), and the last matching line in a source wins.
+`relay run show <id>` projects `failure_class`. The sweep is failure-isolated: a
+DB-write error (e.g. a full disk) does not crash the daemon, leaves the throttle
+unadvanced, and the next reconcile tick retries. It does **not** implement a
+pre-launch disk guard (ISH-1009) or stall detection for a live-but-silent dsh.
 
 ### Task-owned Network Lab skill + cleanup hook (ISH-845)
 
