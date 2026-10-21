@@ -1,4 +1,5 @@
 import type { Database } from "bun:sqlite";
+import { resolve } from "node:path";
 import type { Run } from "./schema";
 
 /**
@@ -43,4 +44,35 @@ export function runOwnedError(run: Run, taskId: string): Error {
     `${RUN_OWNED}: run ${run.id} (${run.state}) owns ${taskId} ${run.phase}/${run.attempt}; ` +
       `a Run-driven phase advances ONLY via a Run-bound submission (acceptRunSubmission), not a worker claim/submit`
   );
+}
+
+/** The worktree/branch a candidate writer would hold (see `findActiveWriter`). */
+export interface ActiveWriterQuery {
+  /** The worktree the candidate writer would run in. */
+  cwd: string;
+  /** The branch the candidate writer would write (null when not a git checkout). */
+  branch?: string | null;
+  /** Ignore this Run (e.g. the row being re-checked). */
+  excludeRunId?: string;
+}
+
+/**
+ * The non-terminal Run that already holds a writer on the SAME worktree (by
+ * resolved cwd) or the SAME branch, or null. The single definition of the
+ * ISH-760 single-writer fence, kept here (types + node builtins only) so BOTH
+ * `src/dsh-runner.ts` (launch guard) and `src/workflow.ts` (phase transitions)
+ * can ask it without an import cycle.
+ */
+export function findActiveWriterRow(db: Database, q: ActiveWriterQuery): Run | null {
+  const cwd = resolve(q.cwd);
+  const rows = db
+    .query(`SELECT * FROM runs WHERE state IN ('starting','running') ORDER BY created_at DESC, rowid DESC`)
+    .all() as Run[];
+  for (const r of rows) {
+    if (q.excludeRunId && r.id === q.excludeRunId) continue;
+    const sameWorktree = resolve(r.cwd) === cwd;
+    const sameBranch = !!(q.branch && r.branch && q.branch === r.branch);
+    if (sameWorktree || sameBranch) return r;
+  }
+  return null;
 }
