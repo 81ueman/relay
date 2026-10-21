@@ -7,8 +7,9 @@ import { findRuntime, listRuntimes } from "../runtimes";
 import { getNotes, listTasks, taskCounts, unclaimableRunnableTasks } from "../tasks";
 import { toolHardCapMs, toolMaxMs, toolNoOutputMs, toolWarnMs, unresponsiveWindowMs } from "../scheduler";
 import { listWorkers, isHeadlessWorker, quietActive, type WorkerRow } from "../workers";
-import type { CodePhase, Task, WorkerRuntime } from "../schema";
+import type { CodePhase, Run, Task, WorkerRuntime } from "../schema";
 import { derivePhase } from "../workflow";
+import { parseRunFailureClass, type RunFailureClass } from "../run-failure";
 import { readPanes, relayWorkspaces, type PaneTelemetry } from "./herdr";
 import { buildAffinity, NO_AFFINITY, type WorkerAffinity, type WorkerCluster } from "./affinity";
 
@@ -97,10 +98,30 @@ export interface DashboardWorker {
 }
 
 export interface DashboardAttention {
-  kind: "worker" | "task";
+  kind: "worker" | "task" | "run";
   id: string;
   text: string;
   ageMs: number | null;
+}
+
+/**
+ * ISH-1008: a Run visible on the dashboard. Live Runs stay explicit (so a
+ * starting/running row is never invisible), and a died Run carries the
+ * classified cause the liveness sweep stored in `runs.error`.
+ */
+export interface DashboardRun {
+  id: string;
+  taskId: string;
+  phase: string;
+  attempt: number;
+  state: string;
+  /** ENOSPC / OOM / signal / unknown when the liveness sweep classified it. */
+  cause: RunFailureClass | null;
+  error: string | null;
+  pid: number | null;
+  sandbox: string | null;
+  ageMs: number | null;
+  endedAt: number | null;
 }
 
 export interface DashboardGit {
@@ -141,6 +162,8 @@ export interface DashboardView {
    * is last. Display only — no durable grouping exists.
    */
   workerClusters: WorkerCluster[];
+  /** ISH-1008: live + recently-died headless Runs and their classified cause. */
+  runs: DashboardRun[];
   attention: DashboardAttention[];
   git: DashboardGit;
   /** ISH-1009: current disk guard + the last refusal (read-only, never cached). */
@@ -257,8 +280,11 @@ export function buildDashboardView(db: Database, opts: BuildOptions): DashboardV
   });
   for (const w of workers) w.affinity = affinity.byWorker.get(w.id) ?? NO_AFFINITY;
 
+  // ---- Runs (ISH-1008): live + recently-died, with the classified cause ------
+  const runs = deriveRuns(db, at);
+
   // ---- attention (derived only; never written to the DB) --------------------
-  const attention = deriveAttention(db, workers, tasks, at);
+  const attention = deriveAttention(db, workers, tasks, runs, at);
 
   const counts = taskCounts(db);
   const containers = tasks.filter((t) => byId[t.id].isContainer);
@@ -280,6 +306,7 @@ export function buildDashboardView(db: Database, opts: BuildOptions): DashboardV
     tasksById: byId,
     workers,
     workerClusters: affinity.clusters,
+    runs,
     attention,
     git: readGit(root),
     disk: opts.disk ?? { status: currentDiskStatus(db), lastRefusal: latestLaunchRefusal(db) },
@@ -363,13 +390,62 @@ export function buildForest(tasks: Task[]): { forest: DashboardTaskNode[]; byId:
   return { forest, byId };
 }
 
+/** How long a died Run stays visible on the dashboard (default 24h). */
+function runDiedWindowMs(): number {
+  const v = Number(process.env.RELAY_RUN_DIED_WINDOW_MS ?? String(24 * 60 * 60_000));
+  return Number.isFinite(v) && v >= 0 ? v : 24 * 60 * 60_000;
+}
+
+/**
+ * ISH-1008: project the Runs an operator must see — every live Run (starting/
+ * running) plus a failed Run inside the visibility window. The classified cause
+ * is parsed from the durable `runs.error` written by the liveness sweep, never
+ * from process memory.
+ */
+function deriveRuns(db: Database, at: number): DashboardRun[] {
+  const since = at - runDiedWindowMs();
+  const rows = db
+    .query(
+      `SELECT * FROM runs
+        WHERE state IN ('starting','running')
+           OR (state = 'failed' AND ended_at IS NOT NULL AND ended_at >= ?)
+        ORDER BY CASE WHEN state IN ('starting','running') THEN 0 ELSE 1 END,
+                 CASE WHEN ended_at IS NOT NULL THEN ended_at ELSE created_at END DESC
+        LIMIT 12`
+    )
+    .all(since) as Run[];
+  return rows.map((r) => ({
+    id: r.id,
+    taskId: r.task_id,
+    phase: r.phase,
+    attempt: r.attempt,
+    state: r.state,
+    cause: parseRunFailureClass(r.error),
+    error: r.error,
+    pid: r.pid,
+    sandbox: r.sandbox_name,
+    ageMs: Math.max(0, at - (r.state === "starting" || r.state === "running" ? r.started_at : r.ended_at ?? r.started_at)),
+    endedAt: r.ended_at,
+  }));
+}
+
 function deriveAttention(
   db: Database,
   workers: DashboardWorker[],
   tasks: Task[],
+  runs: DashboardRun[],
   at: number
 ): DashboardAttention[] {
   const out: DashboardAttention[] = [];
+  for (const r of runs) {
+    if (r.state !== "failed" || !r.cause) continue;
+    out.push({
+      kind: "run",
+      id: r.id,
+      ageMs: r.ageMs,
+      text: `run died: task ${r.taskId} ${r.phase}/${r.attempt} cause=${r.cause}${r.sandbox ? ` sandbox=${r.sandbox}` : ""}`,
+    });
+  }
   for (const w of workers) {
     if (w.state === "dead" || w.state === "stalled") {
       out.push({ kind: "worker", id: w.id, text: `${w.state} generation=${w.generation}`, ageMs: null });

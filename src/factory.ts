@@ -422,13 +422,20 @@ export function identifyRunProcess(run: Pick<Run, "pid" | "spawn_lstart">): Orph
  * written the terminal state is lost, so nothing else releases the single-writer
  * fence. Never advances the Task. Callers must NOT call this while the process
  * may still be writing — that would free the fence for a second writer.
+ *
+ * ISH-1008: shared with the daemon's periodic Run liveness sweep. Returns true
+ * only when this call performed the transition, so the sweep can avoid
+ * announcing a death another writer already recorded.
  */
-function markRunOrphan(db: Database, runId: string, reason: string): void {
-  const t = now();
-  db.query(
-    `UPDATE runs SET state = 'failed', error = ?, ended_at = ?, updated_at = ? WHERE id = ? AND state IN ('running', 'starting')`
-  ).run(reason, t, t, runId);
+export function markRunOrphan(db: Database, runId: string, reason: string, at = now()): boolean {
+  const r = db
+    .query(
+      `UPDATE runs SET state = 'failed', error = ?, ended_at = ?, updated_at = ? WHERE id = ? AND state IN ('running', 'starting')`
+    )
+    .run(reason, at, at, runId);
+  if (r.changes === 0) return false;
   logEvent(db, { source: "factory", type: "factory.run_orphaned", payload: { runId, reason } });
+  return true;
 }
 
 /**

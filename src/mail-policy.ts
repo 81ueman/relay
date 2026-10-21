@@ -29,6 +29,12 @@ export const IMMEDIATE_MAIL_KINDS = [
    * new HEAD, then re-VERIFY/REVIEW). Push it promptly; do not wait a turn.
    */
   "integration_required",
+  /**
+   * ISH-1008: a Run died and the daemon classified the cause. The coordinator
+   * must hear about a lost writer promptly — the incident was found by hand
+   * only after six Runs had been dead for hours.
+   */
+  "run_died",
 ] as const;
 
 /**
