@@ -647,9 +647,18 @@ export async function launchTaskSandboxRun(
   const dshEventsPath = join(runDir, "dsh.jsonl");
   const specPath = join(runDir, "spec.md");
 
+  // The in-VM HEAD is the FIX base; read it BEFORE composing the brief so an
+  // inherited finding recorded at a different revision is not presented as this
+  // Run's instruction. The same value is recorded as the Run's base_head_sha.
+  const baseHead = sandboxHead(cli, binding.name, binding.workspace);
   const fresh = getTask(db, taskId)!;
   const findings = inheritFindings(db, fresh);
-  const brief = buildRunBrief(db, fresh, { worktree: binding.workspace, branch: binding.branch, findings });
+  const brief = buildRunBrief(db, fresh, {
+    worktree: binding.workspace,
+    branch: binding.branch,
+    findings,
+    baseHead,
+  });
   const briefText = [
     brief.text,
     "",
@@ -679,8 +688,6 @@ export async function launchTaskSandboxRun(
   const cp = cli.run(["cp", specPath, `${binding.name}:${briefDest}`]);
   if (cp.ok) briefPath = briefDest;
   else events({ t: "sandbox.brief_pin_failed", error: cp.err || cp.out });
-
-  const baseHead = sandboxHead(cli, binding.name, binding.workspace);
 
   const run = insertSandboxRunIfNoWriter(db, {
     id: runId,
@@ -740,7 +747,7 @@ export async function launchTaskSandboxRun(
     events({ t: "run.failed", error: message });
     const failed = patchRun(db, runId, { state: "failed", error: message, ended_at: now() });
     logSandbox(db, taskId, "sandbox.run.failed", { runId, error: message });
-    return { handle: { id: runId, wait: async () => failed, cancel: () => {} }, run: failed, sandbox: binding, briefPath, findings };
+    return { handle: { id: runId, wait: async () => failed, cancel: () => {} }, run: failed, sandbox: binding, briefPath, findings: brief.findings };
   }
 
   patchRun(db, runId, { state: "running", pid: proc.pid, spawn_lstart: spawnIdentityToken(proc.pid) });
@@ -936,7 +943,7 @@ export async function launchTaskSandboxRun(
     run,
     sandbox: binding,
     briefPath,
-    findings,
+    findings: brief.findings,
   };
 }
 

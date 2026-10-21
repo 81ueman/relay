@@ -329,13 +329,18 @@ function reviewerHarness(plan: ReviewPlan[]): ReviewerHarness {
 }
 
 function newTask(
-  extra: { checks?: { name: string; command: string; required?: boolean; timeoutMs?: number }[]; title?: string } = {}
+  extra: {
+    checks?: { name: string; command: string; required?: boolean; timeoutMs?: number }[];
+    title?: string;
+    acceptance?: string;
+  } = {}
 ) {
   return intakeTask(db, {
     provider: "test",
     issueId: `ISH-762-${issueSeq++}`,
     codeChange: true,
     title: extra.title ?? "implement the marker file",
+    acceptance: extra.acceptance,
     checks: extra.checks ?? [{ name: "noop", command: "true" }],
   }).id;
 }
@@ -653,13 +658,14 @@ describe("Factory E2E: real worktree, fake headless dsh + independent reviewer",
     const sbxName = sandboxNameForTask(task0);
     const branch = taskBranchName(task0);
     const baseSha = git(repo, "rev-parse", "HEAD");
-    // The clone HEAD tracks the Task's recorded head; attempt 0 has none yet.
-    const sbx = new FakeSbxCli(() => getTask(db, id)!.head_sha ?? baseSha);
+    // The clone HEAD tracks the latest published commit; attempt 0 starts at base.
+    let sandboxTip = baseSha;
+    const sbx = new FakeSbxCli(() => getTask(db, id)!.head_sha ?? sandboxTip);
     const spawner = new FakeSandboxSpawner();
     let published = 0;
     spawner.onSpawn = (p) => {
       // The in-VM dsh committed a NEW revision: publish it so `git fetch` finds it.
-      publishSandboxCommit(sbxName, branch, `sbx-change-${++published}`);
+      sandboxTip = publishSandboxCommit(sbxName, branch, `sbx-change-${++published}`);
       p.writeOut(JSON.stringify({ type: "session", sessionId: `sbx-${published}` }) + "\n");
       p.writeOut(JSON.stringify({ type: "final", text: "done" }) + "\n");
       p.finish(0);
@@ -1012,7 +1018,10 @@ describe("Factory E2E: real worktree, fake headless dsh + independent reviewer",
 describe("ISH-1010: Factory repair convergence (VERIFY/REVIEW -> FIX)", () => {
   test("VERIFY FAIL -> fresh FIX Run on the same worktree -> VERIFY PASS -> independent REVIEW PASS", async () => {
     const dsh = fakeDsh("dsh-verify-fix", VERIFY_FAIL_THEN_FIX_DSH);
-    const id = newTask({ checks: [{ name: "fixed-marker", command: "test -f fixed.txt" }] });
+    const id = newTask({
+      acceptance: "fixed.txt exists and the mechanical check passes",
+      checks: [{ name: "fixed-marker", command: 'test -f fixed.txt || { echo "missing fixed.txt" >&2; exit 7; }' }],
+    });
     const baseSha = git(repo, "rev-parse", "HEAD");
     const rev = reviewerHarness(["pass"]);
 
@@ -1055,20 +1064,26 @@ describe("ISH-1010: Factory repair convergence (VERIFY/REVIEW -> FIX)", () => {
     expect(reviews.map((r) => [r.attempt, r.passed, r.head_sha])).toEqual([[1, 1, r1.head_sha]]);
     expect(findPassingReview(db, id, 1)!.head_sha).toBe(r1.head_sha);
 
-    // The reviewer judged the POST-FIX head; the FIX brief carried the failed
-    // mechanical check as the finding to repair.
+    // The reviewer judged the POST-FIX head; the pinned brief of the FRESH FIX
+    // Run carried the actual failed check, its exit code, output tail, the
+    // verified HEAD/base and the original acceptance.
     expect(rev.calls).toHaveLength(1);
     expect(rev.calls[0].head).toBe(r1.head_sha);
     expect(rev.calls[0].cwd).toBe(r1.cwd!);
     const brief = readFileSync(join(r1.cwd!, ".relay", "run-brief.md"), "utf-8");
-    expect(brief).toContain("Prior findings");
-    expect(brief).toContain("fixed-marker");
-    expect(brief).toContain("fail");
+    expect(brief).toContain("## Prior findings @ attempt 0 — FIX these");
+    expect(brief).toContain("fixed.txt exists and the mechanical check passes");
+    expect(brief).toContain(`Base HEAD (this FIX Run starts here): \`${r0.head_sha}\``);
+    expect(brief).toContain(`Verified HEAD: \`${r0.head_sha}\``);
+    expect(brief).toContain("`fixed-marker`: fail, exit 7");
+    expect(brief).toContain("reproduce: `test -f fixed.txt");
+    expect(brief).toContain("missing fixed.txt");
+    expect(brief).not.toContain(`Verified HEAD: \`${r1.head_sha}\``);
   });
 
   test("REVIEW FIX -> fresh Run -> re-VERIFY -> review PASS; attempt/SHA bindings and a late old Run are refused", async () => {
     const dsh = fakeDsh("dsh-review-fix", COMMITTING_DSH);
-    const id = newTask();
+    const id = newTask({ acceptance: "the B marker must be present and checks must pass" });
     const baseSha = git(repo, "rev-parse", "HEAD");
     const rev = reviewerHarness(["fix", "pass"]);
 
@@ -1118,8 +1133,14 @@ describe("ISH-1010: Factory repair convergence (VERIFY/REVIEW -> FIX)", () => {
     expect(rev.calls[0].cwd).toBe(rev.calls[1].cwd);
     expect(rev.calls[0].brief).not.toContain("needs the B marker");
     const brief = readFileSync(join(r1.cwd!, ".relay", "run-brief.md"), "utf-8");
-    expect(brief).toContain("Prior findings");
-    expect(brief).toContain("needs the B marker");
+    expect(brief).toContain("## Prior findings @ attempt 0 — FIX these");
+    // The original acceptance and the head-pinned Claude findings (file:line and
+    // message) are in the brief the fresh FIX Run actually received.
+    expect(brief).toContain("the B marker must be present and checks must pass");
+    expect(brief).toContain(`Base HEAD (this FIX Run starts here): \`${r0.head_sha}\``);
+    expect(brief).toContain(`Reviewed HEAD: \`${r0.head_sha}\``);
+    expect(brief).toContain("[blocker] a.txt:1: needs the B marker");
+    expect(reviews[0].reason).toContain("[blocker] a.txt:1: needs the B marker");
 
     // A late attempt-0 Run can never submit into the converged attempt-1 task.
     expect(() => acceptRunSubmission(db, { runId: r0.id })).toThrow(/RUN_SUBMISSION_REJECTED/);
