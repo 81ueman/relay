@@ -21,10 +21,26 @@ submission. The ISH-880 `GitGhPrPublisher` / `PrPublisher` seam and the
 `relay pr bind --publish` / `ProviderAuthority.githubWrite` write path were
 **removed** by ISH-885 — they were Agent tools misfiled as Relay capabilities.
 
-`src/pr-binding.ts` composes existing pieces only: the read-only
-`GitHubReadOnly` reader and `linkTask` (whose HEAD fence already invalidates a
-Review/VERIFY at a moved HEAD). There is **no** second workflow engine, provider
-framework or credential grant.
+### Worker contract (ISH-1087)
+
+The **dsh coding worker**, not the Gateway, opens the PR. The Run brief Relay
+pins into the worktree (and passes as the dsh prompt) tells it to:
+
+1. commit, then **push the Task branch** (`git push origin HEAD:refs/heads/<branch>`;
+   never the default branch);
+2. **open the PR while the Run is still live**, before Relay accepts the Run, with
+   title **`ISH-<n>: <what changed>`** and a body that follows the target repo's
+   `.github/pull_request_template.md`, including a **`## Documentation Impact`**
+   section (`None` when there is no docs change);
+3. on a FIX, push the new commit to the **same** PR and update its body — never a
+   duplicate PR;
+4. never merge and never post a review (provenance: the reviewer Run posts the
+   verdict).
+
+The brief embeds the target repo's template when it can read it. If the Task
+records no `pr_repo`/`pr_url`, Relay resolves `owner/name` from the Task
+workspace's `origin` (or the Factory source checkout / `--pr-repo`), so the
+instruction is present on the live ishiul intake too.
 
 ## Identity is explicit
 
@@ -46,9 +62,15 @@ identity }` and, in order:
 2. **Crash-retry adoption** — with no recorded identity, an existing PR on the
    Task's **own repo + branch** is adopted *only when its head equals the
    produced commit* (repo AND head, so this is not branch-name-only inference).
-   No duplicate PR is created.
+   No duplicate PR is created. A PR that exists at a different head is
+   `HEAD_MOVED` (the Agent must push the produced commit to the same PR).
 3. **No identity and no adoptable PR** — `NO_PR_IDENTITY`, BLOCKED. Relay does
    **not** publish; the Coding Agent must push and create/update the PR first.
+
+The repo used for passes 1–3 is the Task's `pr_repo`/`pr_url` when recorded,
+else the Task workspace's `origin`, else the Factory source checkout. This is
+what makes a Task that records only a branch (the live `relay/ish-*` intake)
+bindable at all.
 
 Every pass re-reads GitHub and requires the remote head to equal the produced
 commit; the recorded `head_sha`/`pr_url` are only written through `linkTask`.
@@ -84,22 +106,56 @@ mismatch fails closed too — Relay never overwrites it.
 
 ## Factory integration
 
-`FactoryDeps.prBinding` enables the step. When set and the Task records a
-`pr_repo`/`pr_url`, the Factory binds **before the review stage** (at the top of
-the `review` phase); a BLOCKED bind returns the Factory outcome `blocked` and the
-reviewer never runs. Unset, the Factory behaves exactly as before (local-only,
-read-only).
+`FactoryDeps.prBinding` enables the step. When set, the Factory binds **before
+the review stage** (at the top of the `review` phase) for every code Task with a
+produced commit — including a Task that records only a branch. A BLOCKED bind
+returns the Factory outcome `blocked` and the reviewer never runs, so a Factory
+Task can no longer sit at MergeReady with `NO_PR`. The Factory records the
+resolved `pr_repo` at intake (`FactoryDeps.prRepo` / workspace `origin`).
+
+When a `prBinding` is configured, `requireNativeReview` defaults to **true**
+(production `relay run factory` also sets it explicitly): the reviewer must have
+`nativeReview` deps or the Factory stays BLOCKED, so a local-only structured PASS
+can never reach MergeReady. An explicit `requireNativeReview: false` is the
+fixture-only opt-out for a bind test. The reviewer posts the
+ISH-883 `COMMENT` review with the head-pinned marker and an
+`## Findings — attempt <n>` section (so the attempt-N finding text is readable
+from the PR); Relay reads the actual review back at the reviewed head before it
+records the PASS. `relay run factory` authorizes that review by default
+(`RELAY_GITHUB_REVIEW_WRITE=0` opts out and then blocks) and derives the expected
+author from the authenticated `gh` login (`RELAY_REVIEW_AUTHOR` overrides it).
+
+## Never credit a merge without a bound PR (ISH-1087)
+
+`confirmMerged` refuses a code Task with no explicit PR identity
+(`CODE_CHANGE_GATE: NO_PR`). This is an observation guard, not a merge executor:
+the live failure was a Factory Task with no PR at all being marked
+accepted+merged while the gate was `BLOCKED/NO_PR`. Run
+`relay pr bind <task-id>` (the real PR must be open/merged at the recorded head)
+before crediting the merge. Relay still never performs a merge.
 
 ## Operator contract
 
 ```sh
 # READ-ONLY: re-read + verify the PR the Agent created/updated, at the Task's
-# produced commit (task.head_sha). Needs the gh reader; never writes to GitHub.
+# produced commit (task.head_sha). Never writes to GitHub.
+relay pr bind <task-id>
+relay pr bind <task-id> --json
+
+# READ-ONLY HEAD-bound merge readiness (prints the bound PR).
+relay merge-check <task-id>
+relay merge-check <task-id> --json
+
+# Explicit reader configuration (optional on a machine where `gh auth status`
+# succeeds — the operator/Factory paths auto-detect it; `off` disables):
 RELAY_PROVIDER_GITHUB=gh relay pr bind <task-id>
-RELAY_PROVIDER_GITHUB=gh relay pr bind <task-id> --json
+RELAY_PROVIDER_GITHUB=off relay merge-check <task-id>
 ```
 
-There is no `--publish`: Relay has no GitHub write path.
+The operator/daemon paths auto-detect an authenticated `gh` when
+`RELAY_PROVIDER_GITHUB` is **unset**; `RELAY_PROVIDER_GITHUB=gh` forces the
+reader and `RELAY_PROVIDER_GITHUB=off` disables it. There is no `--publish`:
+Relay has no GitHub write path.
 
 ## Tests
 
@@ -110,7 +166,9 @@ closed / other-repo / fork / unreadable / no-identity failures, the
 exact-full-SHA head fence (prefix and different-SHA refusals), and the HEAD-evidence
 invalidation through the existing provider reconcile. `tests/factory.test.ts` adds
 the Factory gate: a matching PR head reaches MergeReady, a moved one BLOCKS with
-the reviewer never running. No network is used.
+the reviewer never running, a Task that records only a branch still adopts the
+worker's PR, and `requireNativeReview` blocks before a local-only PASS. No network
+is used.
 
 ## Real E2E (opt-in)
 

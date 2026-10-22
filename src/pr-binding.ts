@@ -3,6 +3,7 @@ import { logEvent } from "./events";
 import type { Task } from "./schema";
 import { getTask } from "./tasks";
 import { parsePrUrl, type GitHubReadOnly, type PrRef, type PrView } from "./providers";
+import { normalizeRepoSlug, resolveTaskPrTarget } from "./pr-target";
 import { linkTask } from "./workflow";
 
 /**
@@ -122,8 +123,15 @@ export interface PrBindingDeps {
   github?: GitHubReadOnly;
   /** The produced commit the PR head must equal (default `task.head_sha`). */
   expectedHead?: string | null;
-  /** The target repository (default `task.pr_repo`). */
+  /**
+   * The target repository as `owner/name`. Default: resolve from the task's
+   * recorded `pr_repo`/`pr_url`, else the Task workspace's `origin`. A live
+   * Factory Task often records neither, so this is what lets the read-only
+   * adoption pass see the PR the Coding Agent opened.
+   */
   repo?: string | null;
+  /** The Factory's source checkout (used only to resolve `repo`). */
+  sourceRepo?: string | null;
 }
 
 function short(sha: string | null | undefined): string {
@@ -159,7 +167,17 @@ export function bindTaskPr(db: Database, taskId: string, deps: PrBindingDeps = {
   // `expectedHead` may only RESTATE it (never override it), so a CLI `--head`
   // can never rewrite task.head_sha to a commit that was never produced.
   const expectedHead = task.head_sha ?? null;
-  const repo = deps.repo ?? task.pr_repo ?? null;
+  // The Task's own recorded identity wins; a live Factory Task that records only
+  // a branch still resolves its GitHub repo from the workspace/source origin, so
+  // the PR the Coding Agent opened is OBSERVED instead of reported as NO_PR.
+  const resolved = resolveTaskPrTarget(task, { repo: deps.sourceRepo ?? null });
+  // `repo` is normally `owner/name`; a caller that passes a source checkout path
+  // is resolved through its `origin` instead of being treated as a slug.
+  const repo =
+    normalizeRepoSlug(deps.repo) ??
+    (deps.repo ? resolveTaskPrTarget(task, { repo: deps.repo })?.repo ?? null : null) ??
+    resolved?.repo ??
+    null;
 
   const blocked = (
     code: PrBindBlockCode,
@@ -211,7 +229,13 @@ export function bindTaskPr(db: Database, taskId: string, deps: PrBindingDeps = {
    * mismatch is a HEAD_MOVED block (retry the Agent), not a Relay write.
    */
   const verifiable = (ref: PrRef): { view: PrView } | PrBindingResult => {
-    if (!deps.github) return blocked("PROVIDER_UNREADABLE", "no read-only GitHub reader is configured", ref);
+    if (!deps.github) {
+      return blocked(
+        "PROVIDER_UNREADABLE",
+        "no read-only GitHub reader is configured (set RELAY_PROVIDER_GITHUB=gh, or authenticate gh so the operator path can auto-detect it)",
+        ref
+      );
+    }
     const view = deps.github.getPullRequest(ref);
     if (!view) return blocked("PR_UNREADABLE", `PR ${ref.repo}#${ref.number} could not be re-read from GitHub`, ref);
     if (view.ref.repo !== ref.repo) {
@@ -255,7 +279,12 @@ export function bindTaskPr(db: Database, taskId: string, deps: PrBindingDeps = {
       `expected head ${short(deps.expectedHead)} != the produced commit ${short(expectedHead)} (a binding may only restate the produced commit)`
     );
   }
-  if (!deps.github) return blocked("PROVIDER_UNREADABLE", "no read-only GitHub reader is configured");
+  if (!deps.github) {
+    return blocked(
+      "PROVIDER_UNREADABLE",
+      "no read-only GitHub reader is configured (set RELAY_PROVIDER_GITHUB=gh, or authenticate gh so the operator path can auto-detect it)"
+    );
+  }
 
   // 1. Explicit identity wins: re-read + verify only.
   const existing = resolveTaskPrRef(task);
@@ -279,19 +308,28 @@ export function bindTaskPr(db: Database, taskId: string, deps: PrBindingDeps = {
         found.headSha
       );
     }
-    if (found.headSha && sameCommitSha(found.headSha, expectedHead)) {
-      if (found.state !== "open") {
-        return blocked("PR_NOT_OPEN", `adoptable PR ${found.ref.repo}#${found.ref.number} is ${found.state}`, found.ref, found.headSha);
-      }
-      return bound("adopted", found, "pr.adopted");
+    if (found.state !== "open") {
+      return blocked("PR_NOT_OPEN", `adoptable PR ${found.ref.repo}#${found.ref.number} is ${found.state}`, found.ref, found.headSha);
     }
+    if (!found.headSha || !sameCommitSha(found.headSha, expectedHead)) {
+      // The PR EXISTS but its live head is not the produced commit yet. Naming
+      // HEAD_MOVED (instead of the generic NO_PR_IDENTITY) tells the Coding
+      // Agent to push/update the SAME PR rather than open another one.
+      return blocked(
+        "HEAD_MOVED",
+        `PR ${found.ref.repo}#${found.ref.number} head ${short(found.headSha)} != the produced commit ${short(expectedHead)}; the Coding Agent must push the produced commit to the SAME PR before Relay can bind it`,
+        found.ref,
+        found.headSha
+      );
+    }
+    return bound("adopted", found, "pr.adopted");
   }
 
   // 3. No identity and no adoptable PR: Relay does NOT publish. The Coding Agent
   // owns the GitHub write and must create/update the PR first.
   return blocked(
     "NO_PR_IDENTITY",
-    "the task records no PR identity and no open PR for its (repo, branch) matches the produced commit; the Coding Agent must push and create/update the PR first (Relay never writes to GitHub)"
+    `the task records no PR identity and no open PR for ${repo ?? "(unknown repo)"}@${task.branch ?? "(no branch)"} matches the produced commit ${short(expectedHead)}; the Coding Agent must push and create/update the PR first (Relay never writes to GitHub)`
   );
 }
 
@@ -301,3 +339,16 @@ export function formatPrBindingResult(r: PrBindingResult): string {
   const line = `${r.taskId}  ${r.status.toUpperCase()}  pr=${ref}  head=${short(r.remoteHead)}  expected=${short(r.expectedHead)}`;
   return r.reason ? `${line}\n  ${r.reason}` : line;
 }
+
+// ISH-1087: the repo/base resolver lives in a small dependency-free module so
+// the Factory, merge gate and Run brief share ONE inference rule. Re-exported
+// here (the Task↔PR seam) for callers that already import this module.
+export {
+  gitOriginRepo,
+  issueKeyForTask,
+  normalizeRepoSlug,
+  repoFromPrUrl,
+  repoFromRemoteUrl,
+  resolveTaskPrTarget,
+} from "./pr-target";
+export type { PrTargetOptions, PrTargetSource, ResolvedPrTarget } from "./pr-target";

@@ -701,6 +701,34 @@ describe("FIX: same worktree + previous findings + a new Run (no session continu
     expect(brief.text).toContain("NEVER merge");
   });
 
+  // ISH-1087: the live ishiul intake records no pr_repo. The brief must still
+  // resolve the GitHub target from the source/workspace origin and make the PR a
+  // hard condition BEFORE review.
+  test("buildRunBrief resolves the GitHub target when the Task records no pr_repo (ISH-1087)", () => {
+    const id = newTask();
+    const b = ensureTaskWorktree(db, id, { repo });
+    // A slug stands in for the source checkout's GitHub `origin`; the template
+    // is read from the workspace (the same path the worker sees).
+    mkdirSync(join(b.worktree, ".github"), { recursive: true });
+    writeFileSync(
+      join(b.worktree, ".github", "pull_request_template.md"),
+      "## Summary\n\n## Testing\n\n## Documentation Impact\n\nNone\n"
+    );
+    const brief = buildRunBrief(db, getTask(db, id)!, {
+      worktree: b.worktree,
+      branch: b.branch,
+      repo: "81ueman/relay",
+    });
+    expect(brief.text).toContain("## Publish the Task branch as a GitHub PR");
+    expect(brief.text).toContain("BEFORE you finish");
+    expect(brief.text).toContain(`gh pr create --repo 81ueman/relay`);
+    expect(brief.text).toContain(`ISH-760: <what changed>`);
+    expect(brief.text).toContain(".github/pull_request_template.md");
+    expect(brief.text).toContain("Documentation Impact");
+    expect(brief.text).toContain("## Summary");
+    expect(brief.text).toContain("BEFORE the independent");
+  });
+
   test("buildRunBrief omits the PR instruction for a local-only Task", () => {
     const id = newTask();
     const b = ensureTaskWorktree(db, id, { repo });

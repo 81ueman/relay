@@ -11,6 +11,7 @@ import type { Task } from "./schema";
 import { isTerminalTaskState } from "./schema";
 import { getTask, resolveHumanInterface, taskDependencies } from "./tasks";
 import { taskComplete } from "./workflow";
+import { resolveTaskPrTarget } from "./pr-target";
 import {
   DRAFT_RETAIN_LABELS,
   hasHoldLabel,
@@ -144,6 +145,8 @@ export interface MergeGateDecision {
   attempt: number;
   status: MergeGateStatus;
   reasons: MergeGateReason[];
+  /** The re-fetched PR this decision judged (null when unbound/unreadable). */
+  pr: PrView | null;
   /** The routing the gate RECOMMENDS. Never executed by this module. */
   action: "merge" | "IntegrationRequired" | "none";
   /** Stable identity of this decision (task, head, attempt, status, reasons). */
@@ -162,7 +165,7 @@ function decide(input: MergeGateInput, status: MergeGateStatus, reasons: MergeGa
       ? "merge"
       : "none";
   const identity = `merge-gate:${input.taskId}:${input.head ?? "none"}:${input.attempt}:${status}:${codes.join("+") || "ok"}`;
-  return { taskId: input.taskId, head: input.head, attempt: input.attempt, status, reasons, action, identity };
+  return { taskId: input.taskId, head: input.head, attempt: input.attempt, status, reasons, pr: input.pr, action, identity };
 }
 
 /**
@@ -235,7 +238,7 @@ export function evaluateMergeGate(input: MergeGateInput): MergeGateDecision {
   if (input.prRead === "unbound") {
     push("NO_PR", "no pull request is bound; nothing to verify");
   } else if (input.prRead === "error" || !input.pr) {
-    push("PROVIDER_UNREADABLE", "GitHub state could not be read (unknown is BLOCKED, never ready)");
+    push("PROVIDER_UNREADABLE", "GitHub state could not be read (unknown is BLOCKED, never ready; set RELAY_PROVIDER_GITHUB=gh or authenticate gh)");
   } else {
     const pr = input.pr;
     if (pr.state !== "open") {
@@ -339,13 +342,24 @@ export interface MergeGateDeps {
   checks?: ChecksReadOnly;
   authorizedReviewers?: string[];
   authority?: ProviderAuthority;
+  /**
+   * ISH-1087: the Task's GitHub repo when the Task itself records no
+   * `pr_repo`/`pr_url` (a live Factory Task records only a branch). Resolution
+   * also falls back to the Task workspace/source `origin`.
+   */
+  repo?: string | null;
 }
 
 /** Resolve the bound PR ref from the task, or null when none is bound. */
-export function boundPrRef(task: Task, github?: GitHubReadOnly): PrRef | null {
+export function boundPrRef(task: Task, github?: GitHubReadOnly, repo?: string | null): PrRef | null {
   let ref = parsePrUrl(task.pr_url, task.pr_repo);
-  if (!ref && github && task.pr_repo && task.branch) {
-    ref = github.findPullRequestForBranch(task.pr_repo, task.branch)?.ref ?? null;
+  if (!ref && github) {
+    // The Task may record only a branch (the live Factory intake). Resolve the
+    // repo from the explicit gate/task value or the workspace origin, so the
+    // gate observes the PR instead of reporting NO_PR.
+    const resolved = resolveTaskPrTarget(task, { repo: repo ?? null })?.repo ?? null;
+    const lookupRepo = resolved ?? task.pr_repo ?? null;
+    if (lookupRepo && task.branch) ref = github.findPullRequestForBranch(lookupRepo, task.branch)?.ref ?? null;
   }
   return ref;
 }
@@ -365,7 +379,7 @@ export function gatherMergeGateInput(db: Database, taskId: string, deps: MergeGa
   let prRead: PrRead = "unbound";
   let merged = false;
   if (deps.github) {
-    const ref = boundPrRef(task, deps.github);
+    const ref = boundPrRef(task, deps.github, deps.repo);
     if (ref) {
       const view = deps.github.getPullRequest(ref);
       if (view) {
@@ -596,8 +610,9 @@ export function runMergeGates(db: Database, deps: MergeGateDeps = {}): MergeGate
 
 /** One-line summary + the concrete reasons, for `relay merge-check`. */
 export function formatMergeGateDecision(d: MergeGateDecision): string {
+  const pr = d.pr ? `${d.pr.ref.repo}#${d.pr.ref.number}@${short(d.pr.headSha)}` : "none";
   const lines = [
-    `${d.taskId}  ${d.status}  head=${short(d.head)}  attempt=${d.attempt}  action=${d.action}`,
+    `${d.taskId}  ${d.status}  head=${short(d.head)}  pr=${pr}  attempt=${d.attempt}  action=${d.action}`,
   ];
   for (const r of d.reasons) lines.push(`  - ${r.code}: ${r.message}`);
   return lines.join("\n");

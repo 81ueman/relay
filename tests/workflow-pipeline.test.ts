@@ -544,6 +544,14 @@ describe("finding 6: the merge gate is enforced where done is decided", () => {
     acceptTask(db, id, "integ");
   }
 
+  test("ISH-1087: a merge is NOT credited when no PR is bound (the gate would be NO_PR)", async () => {
+    const t = intakeTask(db, { provider: "github", issueId: "o/r#1087", codeChange: true, headSha: FULL, checks: [CHECK] });
+    await acceptCodeChild(t.id);
+    expect(() => confirmMerged(db, t.id, { headSha: FULL, repo: "o/r" })).toThrow(/NO_PR/);
+    expect(getTask(db, t.id)!.merged_at).toBeNull();
+    expect(findMergedResult(db, t.id)).toBeNull();
+  });
+
   test("children_ready waits for the real merge of a PR-bound child", async () => {
     process.env.RELAY_HUMAN = "gateway";
     registerWorker(db, "gateway", { role: "planner" });
