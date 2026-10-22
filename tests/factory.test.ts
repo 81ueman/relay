@@ -27,9 +27,9 @@ import { sandboxNameForTask, upsertSandbox, type SbxCli, type SbxResult } from "
 import { ensureTaskSandbox, launchTaskSandboxRun, ensureSandboxRelayExcluded } from "../src/sandbox-lifecycle";
 import { sandboxVerifyTarget, type SandboxExec } from "../src/sandbox-verify";
 import { processPgid, spawnIdentityToken } from "../src/proc-identity";
-import { DEFAULT_INTEGRATOR_WORKER, pidAlive, reviewBlockedReason, runFactoryTask, verifyChecksReason } from "../src/factory";
+import { DEFAULT_INTEGRATOR_WORKER, FACTORY_NATIVE_REVIEW_REQUIRED, pidAlive, reviewBlockedReason, runFactoryTask, verifyChecksReason } from "../src/factory";
 import { findFactoryOutcomeForRun, latestFactoryOutcome } from "../src/factory-failure";
-import type { GitHubReadOnly } from "../src/providers";
+import type { GitHubReadOnly, GitHubReviewReader, PrView, ReviewView } from "../src/providers";
 import {
   DEFAULT_REVIEWER_WORKER as REVIEWER_WORKER,
   REVIEW_NOT_INDEPENDENT,
@@ -2352,6 +2352,8 @@ describe("ISH-880: the produced commit is bound to its PR before review", () => 
     const res = await runFactoryTask(db, id, {
       ...factoryDeps(dsh, rev.spawner),
       prBinding: { github: dynamicGithub(() => getTask(db, id)!.head_sha) },
+      // This fixture exercises the read-only bind, not the GitHub review writer.
+      requireNativeReview: false,
     });
 
     expect(res.outcome).toBe("merge_ready");
@@ -2375,6 +2377,162 @@ describe("ISH-880: the produced commit is bound to its PR before review", () => 
     expect(res.outcome).toBe("blocked");
     expect(res.reason).toContain("HEAD_MOVED");
     expect(rev.calls).toHaveLength(0); // never a fake review_pass
+  });
+});
+
+describe("ISH-1087: a Task that records only a branch still binds the worker's PR", () => {
+  /** A read-only GitHub whose branch PR exists at the live Task head. */
+  function githubForTaskBranch(id: string): GitHubReadOnly {
+    const view = (head: string): import("../src/providers").PrView => ({
+      ref: { repo: "81ueman/relay", number: 7 },
+      url: "https://github.com/81ueman/relay/pull/7",
+      state: "open",
+      isDraft: false,
+      headRefName: getTask(db, id)!.branch ?? "relay/ish-1087",
+      headSha: head,
+      baseRef: "main",
+      baseSha: "0".repeat(40),
+      mergeable: "mergeable",
+      labels: [],
+      updatedAt: "2026-01-01T00:00:00Z",
+      isCrossRepository: false,
+      headRepo: "81ueman/relay",
+    });
+    return {
+      name: "task-branch-github",
+      readOnly: true as const,
+      getPullRequest(ref) {
+        const head = getTask(db, id)!.head_sha;
+        return head ? { ...view(head), ref } : null;
+      },
+      findPullRequestForBranch(repo, branch) {
+        const t = getTask(db, id)!;
+        if (repo !== "81ueman/relay" || !t.head_sha || t.branch !== branch) return null;
+        return view(t.head_sha);
+      },
+      listComments: () => [],
+    };
+  }
+
+  test("the Factory resolves the repo from --pr-repo, ADOPTS the PR at the produced commit, and reaches MergeReady", async () => {
+    const dsh = fakeDsh("dsh-pr3", COMMITTING_DSH);
+    const id = newTask();
+    const rev = reviewerHarness(["pass"]);
+    const res = await runFactoryTask(db, id, {
+      ...factoryDeps(dsh, rev.spawner),
+      prRepo: "81ueman/relay",
+      prBinding: { github: githubForTaskBranch(id) },
+      // This fixture exercises adoption from --pr-repo, not the review writer.
+      requireNativeReview: false,
+    });
+
+    expect(res.outcome).toBe("merge_ready");
+    expect(rev.calls).toHaveLength(1);
+    const t = getTask(db, id)!;
+    expect(t.pr_repo).toBe("81ueman/relay");
+    expect(t.pr_url).toBe("https://github.com/81ueman/relay/pull/7");
+    expect(res.steps.some((s) => s.startsWith("review:pr-adopted"))).toBe(true);
+  });
+
+  test("requireNativeReview BLOCKS before spending a review when no native GitHub review is configured", async () => {
+    const dsh = fakeDsh("dsh-pr4", COMMITTING_DSH);
+    const id = newTask();
+    const rev = reviewerHarness(["pass"]);
+    const res = await runFactoryTask(db, id, {
+      ...factoryDeps(dsh, rev.spawner),
+      prRepo: "81ueman/relay",
+      prBinding: { github: githubForTaskBranch(id) },
+      requireNativeReview: true,
+    });
+
+    expect(res.outcome).toBe("blocked");
+    expect(res.reason).toContain(FACTORY_NATIVE_REVIEW_REQUIRED);
+    expect(res.steps).toContain("review:native-review-required");
+    expect(rev.calls).toHaveLength(0); // never a local-only PASS
+  });
+
+  test("a native review posted by the reviewer is read back at the reviewed HEAD before MergeReady", async () => {
+    const dsh = fakeDsh("dsh-pr5", COMMITTING_DSH);
+    const id = newTask();
+
+    class FakeNativeGitHub implements GitHubReadOnly, GitHubReviewReader {
+      readonly name = "fake-native";
+      readonly readOnly = true as const;
+      reviews: ReviewView[] = [];
+      private view(): PrView | null {
+        const t = getTask(db, id)!;
+        if (!t.head_sha) return null;
+        return {
+          ref: { repo: "81ueman/relay", number: 8 },
+          url: "https://github.com/81ueman/relay/pull/8",
+          state: "open",
+          isDraft: false,
+          headRefName: t.branch ?? "relay/ish-1087",
+          headSha: t.head_sha,
+          baseRef: "main",
+          baseSha: "0".repeat(40),
+          mergeable: "mergeable",
+          labels: [],
+          updatedAt: "2026-01-01T00:00:00Z",
+          isCrossRepository: false,
+          headRepo: "81ueman/relay",
+        };
+      }
+      getPullRequest(ref: { repo: string; number: number }): PrView | null {
+        const v = this.view();
+        return v ? { ...v, ref } : null;
+      }
+      findPullRequestForBranch(repo: string, branch: string): PrView | null {
+        const v = this.view();
+        return v && repo === v.ref.repo && branch === v.headRefName ? v : null;
+      }
+      listComments(): [] {
+        return [];
+      }
+      listReviews(ref: { repo: string; number: number }): ReviewView[] {
+        return this.reviews.filter((r) => r.repo === ref.repo && r.prNumber === ref.number);
+      }
+      post(head: string): void {
+        this.reviews.push({
+          id: this.reviews.length + 1,
+          repo: "81ueman/relay",
+          prNumber: 8,
+          author: "claude",
+          headSha: head,
+          state: "COMMENTED",
+          body: `<!-- ishiul-review head=${head} verdict=OK reviewer=claude -->\n\n## Findings — attempt 0\nNo findings.`,
+          url: "https://github.com/81ueman/relay/pull/8#pullrequestreview-1",
+          createdAt: "2026-01-01T00:00:00Z",
+        });
+      }
+    }
+    const gh = new FakeNativeGitHub();
+    const spawner: ReviewerSpawner = {
+      async run(ctx) {
+        const head = gitHead(ctx.cwd)!;
+        gh.post(head);
+        return {
+          exitCode: 0,
+          signal: null,
+          stdout: JSON.stringify({ verdict: "pass", head, findings: [], summary: "looks correct" }),
+          stderr: "",
+        };
+      },
+    };
+
+    const res = await runFactoryTask(db, id, {
+      ...factoryDeps(dsh, spawner),
+      prRepo: "81ueman/relay",
+      prBinding: { github: gh },
+      nativeReview: { reader: gh, github: gh, author: "claude", allowedTools: "Read Grep Glob Bash" },
+      requireNativeReview: true,
+    });
+
+    expect(res.outcome).toBe("merge_ready");
+    expect(res.head).toBeTruthy();
+    expect(gh.reviews).toHaveLength(1);
+    expect(gh.reviews[0].headSha).toBe(res.head!);
+    expect(res.steps.some((s) => s.startsWith("review:pass"))).toBe(true);
   });
 });
 

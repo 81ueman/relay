@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   GhCliGitHub,
   LinearApiReadOnly,
+  factoryNativeReviewDepsFromEnv,
   parseJsonStream,
   providerDepsFromEnv,
   type Exec,
@@ -178,5 +179,46 @@ describe("providerDepsFromEnv (opt-in, deny-by-default)", () => {
   test("the Linear reader needs a token", () => {
     const deps = providerDepsFromEnv({ RELAY_PROVIDER_LINEAR: "api" });
     expect(deps.linear).toBeUndefined();
+  });
+});
+
+describe("ISH-1087 provider auto-detection (read-only, fail closed)", () => {
+  const ghAuthed = (seen: string[][] = []): Exec =>
+    scriptedExec((argv) => {
+      seen.push(argv);
+      if (argv[0] === "gh" && argv[1] === "auth") return ok("Logged in to github.com\n");
+      if (argv[0] === "gh" && argv[1] === "api" && argv[2] === "user") return ok("81ueman\n");
+      return ok("{}");
+    });
+
+  test("an unset RELAY_PROVIDER_GITHUB auto-detects an authenticated gh only when asked", () => {
+    const auto = providerDepsFromEnv({}, ghAuthed(), { autoGithub: true });
+    expect(auto.github?.name).toBe("gh-cli");
+    expect(auto.checks?.name).toBe("gh-cli");
+    // The library default stays explicit-only (no surprise subprocess).
+    expect(providerDepsFromEnv({}, ghAuthed()).github).toBeUndefined();
+  });
+
+  test("an explicit off disables auto-detection; a failed probe or unknown value has no reader", () => {
+    expect(providerDepsFromEnv({ RELAY_PROVIDER_GITHUB: "off" }, ghAuthed(), { autoGithub: true }).github).toBeUndefined();
+    expect(providerDepsFromEnv({ RELAY_PROVIDER_GITHUB: "typo" }, ghAuthed(), { autoGithub: true }).github).toBeUndefined();
+    const failing = scriptedExec(() => ({ ok: false, stdout: "", stderr: "not logged in" }));
+    expect(providerDepsFromEnv({}, failing, { autoGithub: true }).github).toBeUndefined();
+  });
+
+  test("the Factory's native-review deps default ON and derive the author from gh", () => {
+    const seen: string[][] = [];
+    const deps = factoryNativeReviewDepsFromEnv({}, ghAuthed(seen));
+    expect(deps?.author).toBe("81ueman");
+    expect(deps?.github?.name).toBe("gh-cli");
+    expect(deps?.allowedTools).toContain("Bash");
+    expect(seen.some((a) => a[0] === "gh" && a[1] === "auth")).toBe(true);
+    expect(seen.some((a) => a[0] === "gh" && a[1] === "api" && a[2] === "user")).toBe(true);
+    // The review WRITE grant is still an explicit opt-out: 0 disables it.
+    expect(factoryNativeReviewDepsFromEnv({ RELAY_GITHUB_REVIEW_WRITE: "0" }, ghAuthed())).toBeUndefined();
+    // An explicit author wins over the gh lookup.
+    expect(
+      factoryNativeReviewDepsFromEnv({ RELAY_REVIEW_AUTHOR: "reviewer-login" }, ghAuthed())?.author
+    ).toBe("reviewer-login");
   });
 });

@@ -368,19 +368,65 @@ export interface EnvLike {
   [key: string]: string | undefined;
 }
 
+/** True when an env opt-in explicitly DISABLES a reader. */
+function optOut(value: string | undefined): boolean {
+  return ["0", "off", "none", "false", "no"].includes((value ?? "").trim().toLowerCase());
+}
+
+/**
+ * ISH-1087: resolve the read-only GitHub reader.
+ *
+ * `RELAY_PROVIDER_GITHUB=gh` always enables it and an explicit `off` always
+ * disables it. When `auto` is requested (the Factory/operator path), an UNSET
+ * value is resolved by probing `gh auth status`: a read-only check, so a
+ * machine with an authenticated `gh` needs no extra relay env to bind the PR
+ * and evaluate the merge gate. Anything unreadable stays undefined (fail
+ * closed) — auto detection never invents a reader.
+ */
+export function githubReaderFromEnv(
+  env: EnvLike = process.env,
+  exec: Exec = defaultExec,
+  opts: { auto?: boolean } = {}
+): GhCliGitHub | undefined {
+  const mode = (env.RELAY_PROVIDER_GITHUB ?? "").trim().toLowerCase();
+  if (optOut(mode)) return undefined;
+  if (mode === "gh") return new GhCliGitHub(exec);
+  if (!opts.auto || (mode !== "" && mode !== "auto")) return undefined;
+  // "auto" or unset: only an AVAILABLE, AUTHENTICATED gh is a reader.
+  const probe = exec(["gh", "auth", "status"]);
+  return probe.ok ? new GhCliGitHub(exec) : undefined;
+}
+
+/** The `gh`-authenticated login, or null (read-only GET `api user`). */
+export function ghAuthenticatedLogin(exec: Exec = defaultExec): string | null {
+  const r = exec(["gh", "api", "user", "--jq", ".login"]);
+  if (!r.ok) return null;
+  const login = r.stdout.trim();
+  return /^[A-Za-z0-9-]+$/.test(login) ? login : null;
+}
+
 /**
  * Build the daemon's workflow deps from env. Provider readers are OPT-IN:
  *
  *   RELAY_PROVIDER_GITHUB=gh            enable the read-only gh CLI reader
+ *   RELAY_PROVIDER_GITHUB=off           never auto-detect the reader
  *   RELAY_PROVIDER_LINEAR=api          enable the read-only Linear reader
  *   LINEAR_API_TOKEN=<token>           required by the Linear reader
  *   RELAY_REVIEW_AUTHORIZED=a,b        authorized verdict-marker authors
  *
+ * `autoGithub` is used by the operator/Factory entrypoints (ISH-1087): with the
+ * value unset, an authenticated `gh` becomes the read-only reader. The default
+ * remains explicit-only so a library caller is never surprised by a subprocess.
+ *
  * Authority is always NO_AUTHORITY here: enabling a reader never grants a write
  * or a merge.
  */
-export function providerDepsFromEnv(env: EnvLike = process.env, exec: Exec = defaultExec) {
-  const github = env.RELAY_PROVIDER_GITHUB === "gh" ? new GhCliGitHub(exec) : undefined;
+export function providerDepsFromEnv(
+  env: EnvLike = process.env,
+  exec: Exec = defaultExec,
+  opts: { autoGithub?: boolean } = {}
+) {
+  const github = githubReaderFromEnv(env, exec, { auto: opts.autoGithub === true });
   const token = env.LINEAR_API_TOKEN;
   const linear =
     env.RELAY_PROVIDER_LINEAR === "api" && token ? new LinearApiReadOnly(token, exec) : undefined;
@@ -402,28 +448,51 @@ export function providerDepsFromEnv(env: EnvLike = process.env, exec: Exec = def
 }
 
 /**
+ * ISH-1087: the operator/daemon provider deps. Same as
+ * `providerDepsFromEnv`, but an UNSET `RELAY_PROVIDER_GITHUB` auto-detects the
+ * read-only `gh` reader (an explicit `off` still disables it).
+ */
+export function operatorProviderDepsFromEnv(env: EnvLike = process.env, exec: Exec = defaultExec) {
+  return providerDepsFromEnv(env, exec, { autoGithub: true });
+}
+
+/**
  * ISH-883: build the native-review deps for the headless reviewer. This is OFF
- * unless an operator gives BOTH an explicit owner authorization for the external
+ * unless an operator gives an explicit owner authorization for the external
  * GitHub write AND the identity the review is expected to be authored by:
  *
  *   RELAY_GITHUB_REVIEW_WRITE=1     explicit owner authorization (ISH-288)
+ *   RELAY_GITHUB_REVIEW_WRITE=0     explicit opt-out (never post a review)
  *   RELAY_REVIEW_AUTHOR=<login>     the gh-authenticated login the review posts as
  *   RELAY_PROVIDER_GITHUB=gh        the (read-only) gh CLI reader for read-back
  *
  * The reviewer is the POSTER (it runs `gh` in its disposable review checkout);
  * Relay only reads the review back. The reviewer gets a GitHub shell + a scoped
  * token env (`RELAY_REVIEW_GH_TOKEN` or an inherited `GH_TOKEN`) ONLY under this
- * explicit grant; `linearWrite` and `merge` are never granted. Absent the
- * authorization (or the reader/identity) this returns `undefined`, so the
- * reviewer keeps the local structured-verdict path and Relay requires no native
- * review.
+ * explicit grant; `linearWrite` and `merge` are never granted.
+ *
+ * ISH-1087 additions (all opt-in through `opts`, so existing callers keep the
+ * exact old semantics):
+ *   - `autoGithub` resolves the read-only reader through `githubReaderFromEnv`
+ *     (an unset `RELAY_PROVIDER_GITHUB` may auto-detect an authenticated gh);
+ *   - `autoAuthor` derives the expected author from `gh api user` when
+ *     `RELAY_REVIEW_AUTHOR` is omitted, instead of silently disabling the path;
+ *   - `defaultGrant` lets the Factory authorize the reviewer's COMMENT review
+ *     when `RELAY_GITHUB_REVIEW_WRITE` is unset (owner decision ISH-1087). An
+ *     explicit `0` still disables it.
  */
-export function nativeReviewDepsFromEnv(env: EnvLike = process.env, exec: Exec = defaultExec): NativeReviewDeps | undefined {
-  if (env.RELAY_GITHUB_REVIEW_WRITE !== "1") return undefined;
-  if (env.RELAY_PROVIDER_GITHUB !== "gh") return undefined;
-  const author = (env.RELAY_REVIEW_AUTHOR ?? "").trim();
+export function nativeReviewDepsFromEnv(
+  env: EnvLike = process.env,
+  exec: Exec = defaultExec,
+  opts: { autoGithub?: boolean; autoAuthor?: boolean; defaultGrant?: boolean } = {}
+): NativeReviewDeps | undefined {
+  const grant = (env.RELAY_GITHUB_REVIEW_WRITE ?? "").trim();
+  if (optOut(grant)) return undefined;
+  if (grant !== "1" && opts.defaultGrant !== true) return undefined;
+  const github = githubReaderFromEnv(env, exec, { auto: opts.autoGithub === true });
+  if (!github) return undefined;
+  const author = (env.RELAY_REVIEW_AUTHOR ?? "").trim() || (opts.autoAuthor ? ghAuthenticatedLogin(exec) : null);
   if (!author) return undefined;
-  const github = new GhCliGitHub(exec);
   const token = env.RELAY_REVIEW_GH_TOKEN ?? env.GH_TOKEN;
   return {
     reader: github,
@@ -435,4 +504,19 @@ export function nativeReviewDepsFromEnv(env: EnvLike = process.env, exec: Exec =
     // isolation from it).
     allowedTools: "Read Grep Glob Bash",
   };
+}
+
+/**
+ * ISH-1087: the Factory's native-review deps. The owner decision is that EVERY
+ * Factory-reviewed PR carries the independent reviewer's verdict on GitHub, so
+ * the Factory authorizes the reviewer's COMMENT review by default, resolves the
+ * author from the gh login, and auto-detects the read-only reader. An explicit
+ * `RELAY_GITHUB_REVIEW_WRITE=0` still turns it off (the Factory then refuses to
+ * reach MergeReady when `requireNativeReview` is set).
+ */
+export function factoryNativeReviewDepsFromEnv(
+  env: EnvLike = process.env,
+  exec: Exec = defaultExec
+): NativeReviewDeps | undefined {
+  return nativeReviewDepsFromEnv(env, exec, { autoGithub: true, autoAuthor: true, defaultGrant: true });
 }

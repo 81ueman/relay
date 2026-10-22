@@ -669,6 +669,9 @@ export async function launchTaskSandboxRun(
     branch: binding.branch,
     findings,
     baseHead,
+    // The in-VM path is not readable from the host; resolve the GitHub target
+    // from the durable host source checkout instead.
+    repo: binding.source,
   });
   const briefText = [
     brief.text,

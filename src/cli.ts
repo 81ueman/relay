@@ -48,8 +48,9 @@ import {
 } from "./sandbox-lifecycle";
 import { getSandbox as getTaskSandbox, listSandboxes } from "./sandbox";
 import { applyLabCleanup, planLabCleanup, type LabCleanupPlan } from "./lab-cleanup";
-import { providerDepsFromEnv, nativeReviewDepsFromEnv } from "./provider-adapters";
+import { factoryNativeReviewDepsFromEnv, operatorProviderDepsFromEnv } from "./provider-adapters";
 import { checkMergeGate, formatMergeGateDecision } from "./merge-gate";
+import { resolveTaskPrTarget } from "./pr-target";
 import { runFactoryTask } from "./factory";
 import {
   findFactoryOutcomeForRun,
@@ -355,7 +356,7 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
   },
   pr: {
     about:
-      "ISH-880/885 READ-ONLY Task↔PR check. Bridges a Sandbox-produced commit to a real GitHub PR and binds the PR's CURRENT remote HEAD to the SAME Task/attempt — by READING GitHub only. The head is ALWAYS the Task's produced commit (`task.head_sha`, a full 40-hex SHA) — there is no caller-supplied head. It re-reads an already-recorded PR (owner/repo#n) or adopts an existing PR for the task's (repo, branch), and requires its live head to equal the produced commit; a moved/unreadable PR, a different/fork repo, or no identity/adoptable PR is BLOCKED (never a fake pass). Relay NEVER writes to GitHub — no push, no create/update, no review; the Coding Agent performs those with normal `git`/`gh`, then Relay observes. Requires RELAY_PROVIDER_GITHUB=gh for the read-only reader.",
+      "ISH-880/885/1087 READ-ONLY Task↔PR check. Bridges a Sandbox-produced commit to a real GitHub PR and binds the PR's CURRENT remote HEAD to the SAME Task/attempt — by READING GitHub only. The head is ALWAYS the Task's produced commit (`task.head_sha`, a full 40-hex SHA) — there is no caller-supplied head. It re-reads an already-recorded PR (owner/repo#n) or adopts an existing PR for the task's (repo, branch), and requires its live head to equal the produced commit; a moved/unreadable PR, a different/fork repo, or no identity/adoptable PR is BLOCKED (never a fake pass). The repo is resolved from the Task's recorded identity, else the Task workspace's `origin`, so a Task that records only a branch still binds its PR. Relay NEVER writes to GitHub — no push, no create/update, no review; the Coding Agent performs those with normal `git`/`gh`, then Relay observes. The read-only `gh` reader is auto-detected when RELAY_PROVIDER_GITHUB is unset; `off` disables it.",
     usage: ["relay pr bind <task-id> [--repo R] [--json]"],
   },
   "task list": { about: "List tasks (id, state, priority, role, assignee, plan, depends, title).", usage: ["relay task list [--state <state>]"] },
@@ -1381,10 +1382,15 @@ async function main(): Promise<void> {
         const rest = argv.slice(1);
         const id = positionals(rest)[0];
         if (!id) throw new Error("usage: relay merge-check <task-id> [--json] [--authority merge]");
-        if (!getTask(db, id)) throw new Error(`unknown task: ${id}`);
-        const base = providerDepsFromEnv();
+        const task = getTask(db, id);
+        if (!task) throw new Error(`unknown task: ${id}`);
+        // ISH-1087: auto-detect the read-only gh reader for the operator path so
+        // `merge-check` sees the worker's PR without every shell exporting
+        // RELAY_PROVIDER_GITHUB=gh. An explicit `off` still disables it.
+        const base = operatorProviderDepsFromEnv();
         const authority = flag(rest, "--authority") === "merge" ? { ...base.authority, merge: true } : base.authority;
-        const decision = checkMergeGate(db, id, { ...base, authority });
+        const repo = resolveTaskPrTarget(task)?.repo ?? null;
+        const decision = checkMergeGate(db, id, { ...base, repo, authority });
         if (!decision) throw new Error(`unknown task: ${id}`);
         console.log(hasFlag(rest, "--json") ? JSON.stringify(decision, null, 2) : formatMergeGateDecision(decision));
         break;
@@ -1401,7 +1407,11 @@ async function main(): Promise<void> {
         const id = positionals(args)[0];
         if (!id) throw new Error("usage: relay pr bind <task-id> [--repo R] [--json]");
         if (!getTask(db, id)) throw new Error(`unknown task: ${id}`);
-        const base = providerDepsFromEnv();
+        // ISH-1087: the live operator observation was PROVIDER_UNREADABLE simply
+        // because the shell had not exported RELAY_PROVIDER_GITHUB=gh. Auto-detect
+        // an authenticated gh (read-only) and resolve the repo from the task
+        // workspace, so the existing PR is bound instead of reported as NO_PR.
+        const base = operatorProviderDepsFromEnv();
         const result = bindTaskPr(db, id, {
           github: base.github,
           repo: flag(args, "--repo") ?? undefined,
@@ -1836,14 +1846,20 @@ async function main(): Promise<void> {
           const id = positionals(rest)[0];
           if (!id) {
             throw new Error(
-              "usage: relay run factory <task-id> [--max-attempts N] [--dsh BIN] [--reviewer CMD] [--model M] [--permission MODE] [--timeout 30m] [--review-worktrees DIR] [--json]"
+              "usage: relay run factory <task-id> [--max-attempts N] [--dsh BIN] [--reviewer CMD] [--model M] [--permission MODE] [--timeout 30m] [--review-worktrees DIR] [--repo DIR] [--pr-repo OWNER/NAME] [--json]"
             );
           }
           const timeoutRaw = flag(rest, "--timeout");
           const maxRaw = flag(rest, "--max-attempts");
           const repoRoot = flag(rest, "--repo") ?? projectRoot();
+          // ISH-1087: the live Factory path uses the operator deps, so an
+          // authenticated gh is enough to read the PR and post/read back the
+          // native review. No PR = the review stage blocks (never MergeReady).
+          const providers = operatorProviderDepsFromEnv();
+          const nativeReview = factoryNativeReviewDepsFromEnv();
           const result = await runFactoryTask(db, id, {
             repo: flag(rest, "--repo") ?? undefined,
+            prRepo: flag(rest, "--pr-repo") ?? undefined,
             dshBin: flag(rest, "--dsh") ?? process.env.RELAY_DSH_BIN ?? undefined,
             reviewerCommand: flag(rest, "--reviewer") ?? process.env.RELAY_REVIEW_CMD ?? undefined,
             reviewerModel: flag(rest, "--model") ?? process.env.RELAY_REVIEW_MODEL ?? DEFAULT_REVIEW_MODEL,
@@ -1855,16 +1871,19 @@ async function main(): Promise<void> {
             // ISH-829: the independent reviewer reads a detached read-only
             // worktree at the fixed head, outside the writer's checkout.
             reviewWorktreeRoot: flag(rest, "--review-worktrees") ?? join(repoRoot, STATE_DIR, "review-worktrees"),
-            // ISH-883: post a native GitHub PR review + read it back, ONLY when
-            // the operator has granted the explicit external-write authorization.
-            nativeReview: nativeReviewDepsFromEnv(),
-            // ISH-885: the READ-ONLY Task↔PR check, when a GitHub reader is
-            // configured. Relay re-reads the PR the Coding Agent created/updated
-            // and binds its current remote HEAD; Relay never writes to GitHub.
-            prBinding: (() => {
-              const github = providerDepsFromEnv().github;
-              return github ? { github } : undefined;
-            })(),
+            // ISH-883/1087: the Factory authorizes the reviewer's COMMENT review
+            // (owner decision) and resolves the author from the gh login. An
+            // explicit RELAY_GITHUB_REVIEW_WRITE=0 disables it, and the Factory
+            // then refuses to reach MergeReady.
+            nativeReview,
+            requireNativeReview: true,
+            // ISH-885: the READ-ONLY Task↔PR check. Relay re-reads the PR the
+            // Coding Agent created/updated and binds its current remote HEAD;
+            // Relay never writes to GitHub.
+            prBinding: providers.github ? { github: providers.github } : undefined,
+            // ISH-761/1087: the same read-only readers evaluate the gate, so a
+            // bound PR is visible even when the caller supplied no explicit deps.
+            mergeGateDeps: providers,
           });
           if (hasFlag(rest, "--json")) {
             console.log(JSON.stringify(result, null, 2));
@@ -2320,7 +2339,7 @@ async function main(): Promise<void> {
         } else if (type === "session.error" && workerId) {
           const err = typeof payload === "object" && payload !== null ? JSON.stringify(payload) : String(payload);
           console.log(handleErrorSignal(db, workerId, err));
-          const { actions } = await reconcile(db, rt, undefined, providerDepsFromEnv());
+          const { actions } = await reconcile(db, rt, undefined, operatorProviderDepsFromEnv());
           console.log(`reconciled:${actions.join(",") || "noop"}`);
         } else if (type === "permission.asked" && workerId) {
           touchSeen(db, workerId);

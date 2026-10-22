@@ -15,6 +15,7 @@ import {
   REVIEW_NATIVE_MISSING,
   REVIEW_NATIVE_NO_PR,
   REVIEW_NATIVE_UNVERIFIED,
+  buildReviewBrief,
   runHeadlessReview,
   type ReviewFinding,
   type ReviewerProcess,
@@ -200,6 +201,24 @@ function driveToReview(head: string, prSlug = "o/r"): string {
 function nativeDeps(gh: FakeNativeGitHub): NativeReviewDeps {
   return { reader: gh, github: gh, author: gh.author, allowedTools: "Read Grep Glob Bash", spawnEnv: { GH_TOKEN: "t" } };
 }
+
+describe("ISH-1087: the native review body carries the attempt-N findings", () => {
+  test("the brief requires a self-contained body with the marker, findings and summary", () => {
+    const head = HEAD();
+    const id = driveToReview(head);
+    const task = getTask(db, id)!;
+    const brief = buildReviewBrief(db, task, {
+      head,
+      worktree: repo,
+      native: { ref: { repo: "o/r", number: 7 }, author: "ishiul-reviewer" },
+    });
+    expect(brief).toContain(`## Findings — attempt ${task.attempt}`);
+    expect(brief).toContain("No findings.");
+    expect(brief).toContain("self-contained");
+    expect(brief).toContain("cannot open Relay's local `.relay/` evidence files");
+    expect(brief).toContain(`<!-- ishiul-review head=${head} verdict=OK|NG|HOLD reviewer=ishiul-reviewer -->`);
+  });
+});
 
 describe("runHeadlessReview verifies the reviewer's native GitHub review (ISH-883)", () => {
   test("accepts a PASS only after reading the native review back at the HEAD", async () => {

@@ -296,18 +296,19 @@ implement --TaskSubmitted--> verify --VerificationResult--> review
   **label**, and a self-claimed comment are **not** an approval. Repeated
   `merge_not_credited` / `marker_not_applied` events are logged once per
   (task, head / marker).
-- **Providers are opt-in GET-only readers.** `RELAY_PROVIDER_GITHUB=gh` uses the
-  `gh` CLI (read verbs only), `RELAY_PROVIDER_LINEAR=api` + `LINEAR_API_TOKEN`
-  uses a read-only GraphQL query (the token rides **stdin**, never argv), and
-  `RELAY_REVIEW_AUTHORIZED=a,b` sets the authorized marker authors. Default OFF
-  (no provider, fail-closed). Each task is polled at most once per
-  `RELAY_PROVIDER_POLL_MS` (default 60s) and comments are fetched only when the PR
-  `updatedAt`/head moved; the "comments scanned" watermark advances only when a
-  scan **succeeded**, so neither a marker posted before the task reached `review`
-  nor a transient `gh api` failure (which reports an incomplete read as `null`,
-  never a partial list) loses the marker. Any real provider write (comment/label),
-  Linear write, or merge requires an explicit point-of-use `ProviderAuthority`
-  grant (ISH-288); the default is deny.
+- **Providers are GET-only readers.** `RELAY_PROVIDER_GITHUB=gh` uses the `gh`
+  CLI (read verbs only), `RELAY_PROVIDER_LINEAR=api` + `LINEAR_API_TOKEN` uses a
+  read-only GraphQL query (the token rides **stdin**, never argv), and
+  `RELAY_REVIEW_AUTHORIZED=a,b` sets the authorized marker authors. The
+  operator/Factory/daemon paths auto-detect an authenticated `gh` when the flag is
+  **unset**; `RELAY_PROVIDER_GITHUB=off` disables it (fail closed). Each task is
+  polled at most once per `RELAY_PROVIDER_POLL_MS` (default 60s) and comments are
+  fetched only when the PR `updatedAt`/head moved; the "comments scanned"
+  watermark advances only when a scan **succeeded**, so neither a marker posted
+  before the task reached `review` nor a transient `gh api` failure (which reports
+  an incomplete read as `null`, never a partial list) loses the marker. Any real
+  provider write (comment/label), Linear write, or merge requires an explicit
+  point-of-use `ProviderAuthority` grant (ISH-288); the default is deny.
 - **Gateway is notified only for judgment.** `ChildrenReady` (all direct children
   truly complete) and `ChildBlocked` (a blocked child) reach the fixed Gateway
   worker; ordinary FIX/PASS never wake it. The Gateway is never a per-phase
@@ -372,6 +373,13 @@ It is sequencing only — every transition reuses the ordinary durable results
 `submitPhase`), so a `dsh` exit 0 / `final`, a missing/malformed reviewer result,
 a foreign/stale HEAD, or a non-independent reviewer **cannot advance** the Task.
 The Factory never pushes, merges, accepts, or writes a provider/Linear.
+**ISH-1087:** the dsh worker opens the PR (title `ISH-<n>: <what>`, body from the
+target repo's `.github/pull_request_template.md` with a `## Documentation Impact`)
+before its Run ends; the Factory records the repo at intake, **always** binds the
+PR head before review (a Task that records only a branch included), and
+`relay run factory` requires the ISH-883 native review at that head. No PR →
+`blocked`, never `merge_ready`; the merge gate reports the bound PR
+(`pr=owner/name#n@sha`). A merge with no bound PR is never credited by Relay.
 A non-ready result (`max_attempts`, `review_refused`, `blocked`, …) also carries
 the **ISH-1013 failure projection**: a minimal class (code rework exhausted /
 infra blocked / permission-or-human decision / missing-or-inconclusive evidence /
@@ -402,28 +410,41 @@ verdict — a newer contradicting review is **REFUSED**, never shadowed by an ol
 matching one. A missing review, a foreign author, a mismatched HEAD/PR, a moved
 HEAD, a stale same-HEAD review, a contradicting newest review, or an unreadable
 read is **REFUSED** (fail closed — the Task never advances); the verified review
-id/url is retained in the local evidence next to the structured verdict.
-Mechanical VERIFY and the merge gate are unchanged.
+id/url is retained in the local evidence next to the structured verdict. The
+review body must also carry `## Findings — attempt <n>` (or `No findings.`) so the
+attempt-N finding text is readable from the PR itself, not only in Relay's local
+`.relay/` evidence. Mechanical VERIFY and the merge gate are unchanged.
 
-This external write is **deny-by-default** (ISH-288): the reviewer is given the
-`gh` shell + a scoped token (`RELAY_REVIEW_GH_TOKEN`, else `GH_TOKEN`) ONLY when
-an operator grants `RELAY_GITHUB_REVIEW_WRITE=1` **and** names the
-gh-authenticated login the review posts as (`RELAY_REVIEW_AUTHOR=<login>`) with
-`RELAY_PROVIDER_GITHUB=gh`. Without the grant the reviewer keeps the local
-structured-verdict path and Relay requires no native review. `--allowedTools` is
-an approval allowlist, **not** an OS sandbox — Relay does not claim process
+This external write is **deny-by-default** (ISH-288) for a direct reviewer call:
+the reviewer is given the `gh` shell + a scoped token (`RELAY_REVIEW_GH_TOKEN`,
+else `GH_TOKEN`) ONLY when an operator grants `RELAY_GITHUB_REVIEW_WRITE=1`
+**and** names the gh-authenticated login the review posts as
+(`RELAY_REVIEW_AUTHOR=<login>`) with `RELAY_PROVIDER_GITHUB=gh`. The **Factory**
+(ISH-1087 owner decision) authorizes the reviewer's `COMMENT` review by default,
+derives the author from `gh api user` unless `RELAY_REVIEW_AUTHOR` is set, and
+auto-detects the reader; `RELAY_GITHUB_REVIEW_WRITE=0` opts out, after which
+`relay run factory` refuses to reach MergeReady. Without the grant the plain
+reviewer keeps the local structured-verdict path and Relay requires no native
+review. `--allowedTools` is an approval allowlist, **not** an OS sandbox — Relay
+does not claim process
 isolation from it. The reviewer model is configurable (`RELAY_REVIEW_MODEL` /
 `--model`, default `opus`).
 
-**PR check (ISH-880/885, read-only):** a Sandbox-produced commit can be bridged to
-a real GitHub PR **before the review stage** (`FactoryDeps.prBinding`, opt-in). The
-Factory re-reads the PR and requires its live `headSha` to equal the produced
-commit; a moved/unreadable/other-repo PR — or no identity/adoptable PR — **blocks**
-before the reviewer runs. `relay pr bind <task-id>` re-reads/verifies a recorded
-PR. The **Coding Agent** owns the GitHub write (`git push` + `gh pr create`/update)
-and the Claude reviewer posts the native review; **Relay never writes to GitHub**
-(the ISH-880 `--publish`/`githubWrite` write path was removed). See
-[`docs/pr-binding.md`](docs/pr-binding.md).
+**PR check (ISH-880/885/1087, read-only):** a Sandbox-produced commit is bridged
+to a real GitHub PR **before the review stage** (`FactoryDeps.prBinding`). The
+Factory records `pr_repo` at intake from the Task identity or the workspace/source
+`origin` (`--pr-repo` overrides), re-reads the PR and requires its live `headSha`
+to equal the produced commit; a moved/unreadable/other-repo PR — or no
+identity/adoptable PR — **blocks** before the reviewer runs. A Task that records
+only a branch is therefore still bindable. `relay pr bind <task-id>` re-reads and
+verifies the PR (an authenticated `gh` is auto-detected; `RELAY_PROVIDER_GITHUB=off`
+disables it), and `relay merge-check <task-id>` prints the bound PR. The **Coding
+Agent** owns the GitHub write (`git push` + `gh pr create`/update) and the Claude
+reviewer posts the native review; **Relay never writes to GitHub** (the ISH-880
+`--publish`/`githubWrite` write path was removed). A merge with no bound PR is
+never credited (`CODE_CHANGE_GATE: NO_PR`). See
+[`docs/pr-binding.md`](docs/pr-binding.md) and
+[`docs/ish-1087-factory-pr-contract.md`](docs/ish-1087-factory-pr-contract.md).
 
 ### Headless dsh Runs (no Herdr)
 

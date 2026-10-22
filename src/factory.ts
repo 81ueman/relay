@@ -9,7 +9,7 @@ import type { Run, RunState, Task, TaskState } from "./schema";
 import { isCanonicalToken, processPgid, spawnIdentityToken } from "./proc-identity";
 import { defaultRunner, type CheckSpec, type CommandRunner } from "./verify";
 import { defaultVerifyTarget, type VerifyTarget } from "./sandbox-verify";
-import { runMechanicalVerification, submitPhase, taskChecks, blockImplementFailure, recordImplementRecovery } from "./workflow";
+import { runMechanicalVerification, submitPhase, taskChecks, blockImplementFailure, recordImplementRecovery, linkTask } from "./workflow";
 import { findTaskResult, isResultWriteError, markTaskBlockedInternal } from "./results";
 import { acceptRunSubmission, getRun, type DshSpawner } from "./dsh-runner";
 import { launchTaskRun, type LaunchRunOptions } from "./run-lifecycle";
@@ -38,8 +38,9 @@ import {
 } from "./reviewer-runner";
 import { checkMergeGate, type MergeGateDecision, type MergeGateDeps } from "./merge-gate";
 import { importHeadIntoSource, prepareReadOnlyReviewWorktree, removeReviewWorktree } from "./review-workspace";
-import type { NativeReviewDeps } from "./providers";
+import type { ChecksReadOnly, NativeReviewDeps } from "./providers";
 import { bindTaskPr, type PrBindingDeps } from "./pr-binding";
+import { resolveTaskPrTarget } from "./pr-target";
 import { recordFactoryOutcome, type FactoryFailureReport } from "./factory-failure";
 
 /**
@@ -72,6 +73,12 @@ export const NO_IMPLEMENTATION = "NO_IMPLEMENTATION";
 export const CODING_FAILED = "CODING_FAILED";
 export const SUBMIT_REFUSED = "RUN_SUBMISSION_REFUSED";
 export const FACTORY_NO_CHECKS = "FACTORY_NO_CHECKS";
+/**
+ * ISH-1087: the Factory requires a GitHub PR verdict when it is driving a
+ * PR-bound Task. Without it a local PASS could reach MergeReady and be merged
+ * with no independent verdict on the PR at all.
+ */
+export const FACTORY_NATIVE_REVIEW_REQUIRED = "FACTORY_NATIVE_REVIEW_REQUIRED";
 
 /** The integrator principal a Factory integration submission is made as. */
 export const DEFAULT_INTEGRATOR_WORKER = "factory-integrator";
@@ -79,6 +86,12 @@ export const DEFAULT_INTEGRATOR_WORKER = "factory-integrator";
 export interface FactoryDeps {
   /** The main checkout the Task worktree is created from. */
   repo?: string;
+  /**
+   * ISH-1087: the GitHub repo (`owner/name`) the Task's PR belongs to, when the
+   * Task itself records neither `pr_repo` nor `pr_url`. Resolution otherwise
+   * falls back to the Task workspace/source `origin`.
+   */
+  prRepo?: string | null;
   worktreesRoot?: string;
   /** Real dsh binary (default `dsh`); a fake path in tests. */
   dshBin?: string;
@@ -133,10 +146,19 @@ export interface FactoryDeps {
    */
   nativeReview?: NativeReviewDeps;
   /**
-   * ISH-880: bind the produced commit to a GitHub PR before the Task enters the
-   * review stage. Opt-in — unset keeps the read-only behaviour. When set, a Task
-   * with a recorded `pr_repo`/`pr_url` must have its PR's live remote head equal
-   * the produced commit before the reviewer runs; otherwise the Factory BLOCKS.
+   * ISH-1087: refuse to run the reviewer (and therefore to reach MergeReady)
+   * unless a native GitHub review is configured. Defaults to `true` whenever a
+   * `prBinding` is configured (a GitHub PR workflow without a GitHub verdict is
+   * exactly the failure this closes); an explicit `false` keeps the old
+   * local-only binding fixtures possible.
+   */
+  requireNativeReview?: boolean;
+  /**
+   * ISH-880/1087: bind the produced commit to a GitHub PR before the Task enters
+   * the review stage. When set, EVERY code Task with a produced head is bound:
+   * the repo is resolved from the Task's identity, the workspace/source `origin`
+   * or `prRepo`, so a Task that records only a branch still binds. A missing,
+   * moved, unreadable or fork PR BLOCKS and the reviewer never runs.
    */
   prBinding?: PrBindingDeps;
   /**
@@ -867,6 +889,10 @@ async function runFactoryTaskInner(
   const maxAttempts = Math.max(1, deps.maxAttempts ?? 4);
   const reviewerWorker = deps.reviewerWorker ?? DEFAULT_REVIEWER_WORKER;
   const integratorWorker = deps.integratorWorker ?? DEFAULT_INTEGRATOR_WORKER;
+  // ISH-1087: when a GitHub PR workflow is configured, the Task's repo may live
+  // only in the Factory's source checkout (a Sandbox-backed Task has no host
+  // worktree yet). Resolve it there; a purely local Factory keeps no fallback.
+  const prSourceRepo = deps.repo ?? (deps.prBinding ? projectRoot() : null);
   // ISH-904: refuse a NON-code-change / phase-less Task UP FRONT — before any
   // worktree is created — with the one actionable instruction. The old path fell
   // through to `unhandled phase null` and only then created nothing useful.
@@ -875,6 +901,24 @@ async function runFactoryTaskInner(
   const notCodeChange = factoryNotCodeChangeReason(initial);
   if (notCodeChange) {
     return { taskId, outcome: "blocked", head: initial.head_sha, attempts: [], gate: null, reason: notCodeChange, steps: [] };
+  }
+  // ISH-1087: record the GitHub PR target at Factory intake, derived from the
+  // Task's explicit identity or from the workspace/source `origin`. The live
+  // ishiul intake records only a branch, so without this the later read-only
+  // bind (and `relay merge-check`) could never see the PR the worker opens.
+  // Only `pr_repo` is seeded: the actual base is recorded from the PR view at
+  // bind time, so seeding a guessed base cannot invalidate the review.
+  const intakeTarget = resolveTaskPrTarget(initial, { repo: deps.prRepo ?? prSourceRepo });
+  if (intakeTarget && initial.pr_repo !== intakeTarget.repo) {
+    const seeded = linkTask(db, taskId, { prRepo: intakeTarget.repo });
+    if (seeded.pr_repo === intakeTarget.repo) {
+      logEvent(db, {
+        source: "factory",
+        taskId,
+        type: "factory.pr_target",
+        payload: { repo: intakeTarget.repo, source: intakeTarget.source, from: initial.pr_repo, to: seeded.pr_repo },
+      });
+    }
   }
   // ISH-829: default to the durable-Coding-Sandbox VERIFY target. It returns null
   // for a Task with no sandbox row, so a worktree Task is unchanged; a
@@ -1075,14 +1119,22 @@ async function runFactoryTaskInner(
         continue;
       }
       case "review": {
-        // ISH-880: BEFORE the review stage, bind the produced commit to a real
-        // GitHub PR and require the PR's CURRENT remote head to equal it. This is
-        // the only place a Sandbox-produced commit becomes a PR; if the PR cannot
-        // be read, is unreadable/moved/unauthorized, the Factory BLOCKS and the
-        // reviewer never runs (never a fake review_pass).
+        // ISH-880/1087: BEFORE the review stage, bind the produced commit to a
+        // real GitHub PR and require the PR's CURRENT remote head to equal it.
+        // This is the only place a Sandbox-produced commit becomes a PR; if the
+        // PR cannot be read, is unreadable/moved/unauthorized, or does not exist
+        // yet, the Factory BLOCKS and the reviewer never runs (never a fake
+        // review_pass). The target repo is resolved from the live Task, so a
+        // Task that records only a branch still binds the worker's PR.
         const reviewHead = task.head_sha;
-        if (deps.prBinding && reviewHead && (task.pr_repo || task.pr_url)) {
-          const bind = bindTaskPr(db, taskId, { ...deps.prBinding, expectedHead: reviewHead });
+        if (deps.prBinding && reviewHead) {
+          const live = getTask(db, taskId)!;
+          const target = resolveTaskPrTarget(live, { repo: deps.prRepo ?? prSourceRepo });
+          const bind = bindTaskPr(db, taskId, {
+            ...deps.prBinding,
+            expectedHead: reviewHead,
+            repo: deps.prBinding.repo ?? target?.repo ?? null,
+          });
           if (bind.status === "blocked") {
             push(`review:pr-binding-blocked ${bind.reason ?? ""}`);
             return {
@@ -1096,6 +1148,20 @@ async function runFactoryTaskInner(
             };
           }
           push(`review:pr-${bind.status} ${bind.ref?.repo ?? "-"}#${bind.ref?.number ?? "-"}@${(bind.remoteHead ?? "none").slice(0, 10)}`);
+        }
+        // ISH-1087: when the Factory is configured to require a PR verdict, the
+        // reviewer MUST be able to post+read back a native GitHub review. Blocking
+        // here (before spending a review process) prevents a local-only PASS from
+        // reaching MergeReady and being merged with no verdict on the PR. A
+        // configured `prBinding` implies GitHub mode; only an explicit `false`
+        // opts a binding-only fixture out.
+        if ((deps.requireNativeReview ?? deps.prBinding !== undefined) && !deps.nativeReview) {
+          const reason =
+            `${FACTORY_NATIVE_REVIEW_REQUIRED}: native GitHub review is required but not configured; ` +
+            `set RELAY_PROVIDER_GITHUB=gh and authenticate gh (RELAY_GITHUB_REVIEW_WRITE=0 disables the Factory's default grant)`;
+          push(`review:native-review-required`);
+          logEvent(db, { source: "factory", taskId, type: "factory.native_review_required", payload: { head: reviewHead, reason } });
+          return { taskId, outcome: "blocked", head: reviewHead, attempts, gate: null, reason, steps };
         }
         // ISH-829: the independent reviewer reads a DETACHED read-only checkout
         // at the fixed head (when configured), never the writer's live worktree.
@@ -1178,7 +1244,25 @@ async function runFactoryTaskInner(
         continue;
       }
       case "merge_ready": {
-        const gate = checkMergeGate(db, taskId, deps.mergeGateDeps ?? {});
+        // ISH-1087: a Factory caller that configured a PR binding but no explicit
+        // merge-gate deps must still see the bound PR (otherwise the gate reports
+        // NO_PR/PROVIDER_UNREADABLE for a Task whose PR exists). Both readers are
+        // the same read-only `gh` adapter; checks are only used when it implements
+        // the HEAD-pinned check reader.
+        const live = getTask(db, taskId)!;
+        const gateDeps: MergeGateDeps =
+          deps.mergeGateDeps ??
+          (() => {
+            const github = deps.prBinding?.github;
+            if (!github) return {};
+            const checks =
+              typeof (github as Partial<ChecksReadOnly>).listChecks === "function"
+                ? (github as unknown as ChecksReadOnly)
+                : undefined;
+            const repo = resolveTaskPrTarget(live, { repo: deps.prRepo ?? prSourceRepo })?.repo ?? null;
+            return { github, ...(checks ? { checks } : {}), repo };
+          })();
+        const gate = checkMergeGate(db, taskId, gateDeps);
         push(`merge_ready:gate=${gate?.status ?? "unknown"}`);
         return { taskId, outcome: "merge_ready", head: getTask(db, taskId)!.head_sha, attempts, gate, reason: null, steps };
       }

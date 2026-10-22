@@ -21,6 +21,7 @@ import { taskChecks } from "./workflow";
 import type { CheckSpec } from "./verify";
 import { redactSecrets } from "./lab";
 import { readEvidenceTail, terminalImplementRunSignature } from "./implement-recovery";
+import { issueKeyForTask, resolveTaskPrTarget } from "./pr-target";
 
 /**
  * ISH-760 — Task Worktree + disposable dsh Run lifecycle, single-writer.
@@ -944,6 +945,42 @@ export interface BuildBriefOptions {
    * not a host checkout. `null` means unknown (skip HEAD filtering).
    */
   baseHead?: string | null;
+  /**
+   * ISH-1087: the source checkout (a path) or an explicit `owner/name`, used to
+   * resolve the Task's GitHub PR target when the Task itself records no
+   * `pr_repo`/`pr_url`. A Sandbox caller passes the HOST source because the
+   * in-VM workspace path is not readable here.
+   */
+  repo?: string | null;
+}
+
+/** Candidate pull-request template paths, in GitHub's own precedence order. */
+const PR_TEMPLATE_CANDIDATES = [
+  ".github/pull_request_template.md",
+  ".github/PULL_REQUEST_TEMPLATE.md",
+  ".github/PULL_REQUEST_TEMPLATE.md",
+  "docs/pull_request_template.md",
+  "PULL_REQUEST_TEMPLATE.md",
+] as const;
+
+/** Read the target repo's PR template (bounded), or null when it has none. */
+function readPullRequestTemplate(
+  roots: (string | null | undefined)[]
+): { path: string; text: string } | null {
+  for (const root of roots) {
+    if (!root) continue;
+    for (const rel of PR_TEMPLATE_CANDIDATES) {
+      const p = join(root, rel);
+      try {
+        if (!existsSync(p)) continue;
+        const text = readFileSync(p, "utf-8").trim();
+        if (text) return { path: rel, text: text.slice(0, 8_000) };
+      } catch {
+        /* an unreadable template is not a reason to omit the contract */
+      }
+    }
+  }
+  return null;
 }
 
 /** Compose the Run brief: ISH-803's task prompt + worktree + checks + findings. */
@@ -991,23 +1028,53 @@ export function buildRunBrief(db: Database, task: Task, opts: BuildBriefOptions)
       for (const f of blocked) lines.push(...renderRunFinding(f));
     }
   }
-  // ISH-885: a PR-bound Task's GitHub write is the Coding Agent's job — Relay is
-  // read-only and only OBSERVES the PR afterwards. Without this instruction the
-  // Factory's read-only Task↔PR gate would block every real Run (NO_PR_IDENTITY
-  // on the first attempt, HEAD_MOVED on a FIX).
-  if (task.pr_repo || task.pr_url) {
-    const repo = task.pr_repo ?? "(the PR's repository)";
-    const base = task.pr_base ?? "<the PR's base branch>";
+  // ISH-1087: a code-change Task's GitHub write is the Coding Agent's job —
+  // Relay is read-only and only OBSERVES the PR afterwards. The live ishiul
+  // intake records no `pr_repo`, so the old `task.pr_repo || task.pr_url` guard
+  // silently omitted this section and the worker never opened a PR. Resolve the
+  // target from the workspace/source `origin` instead, and make the PR a hard
+  // condition BEFORE the review stage (Relay binds it before reviewing).
+  const prTarget = resolveTaskPrTarget(task, { repo: opts.repo ?? null, worktree: opts.worktree });
+  const prRepo = prTarget?.repo ?? null;
+  if (prRepo) {
+    const base = task.pr_base ?? prTarget?.base ?? "main";
+    const issueKey = issueKeyForTask(task);
+    const template = readPullRequestTemplate([opts.repo, task.worktree, opts.worktree]);
     lines.push(
       "",
-      "## Publish the Task branch as a GitHub PR (this is YOUR GitHub write)",
+      "## Publish the Task branch as a GitHub PR — BEFORE you finish (this is YOUR GitHub write)",
       "Relay is read-only: it never pushes, creates/updates a PR, or posts a review. You own the push and the PR.",
+      "The PR MUST exist while this Run is still live: Relay binds its head to your produced commit BEFORE the independent",
+      "review and refuses to advance the Task otherwise (no PR = blocked, never MergeReady). This is the state before your",
+      "structured submit — you do not submit anything yourself; Relay accepts the Run after your process exits.",
       `- push your commit to the Task branch — NEVER the default branch: \`git push origin HEAD:refs/heads/${opts.branch}\`` +
         " (`origin` is the source repo's origin URL; the workspace is a self-contained clone, so the whole push is writable under `workspace-write`)",
-      `- if the branch has NO PR yet, create one: \`gh pr create --repo ${repo} --head ${opts.branch} --base ${base} --title <title> --body <body>\``,
-      "- if a PR already exists for this branch (e.g. a FIX), just push the new commit to the SAME PR — do NOT open a duplicate",
+      `- if the branch has NO PR yet, create it with the required title (the issue key is mandatory):`,
+      `  \`gh pr create --repo ${prRepo} --head ${opts.branch} --base ${base} --title "${issueKey}: <what changed>" --body-file .relay/pr-body.md\``,
+      `  (write the body to \`.relay/pr-body.md\` first; use \`--body\` instead if you prefer. If \`${base}\` is not the repo's`,
+      "  default branch, use the actual default from `gh repo view --json defaultBranchRef -q .defaultBranchRef.name`)",
+      `- the PR title MUST be \`${issueKey}: <what>\` (issue prefix + a one-line description of the change)`,
+      "- the PR body MUST follow the target repo's `.github/pull_request_template.md` and MUST include a",
+      "  `## Documentation Impact` section (write `None` when no docs change; never omit the section)",
+      "- if a PR already exists for this branch (e.g. a FIX), push the new commit to the SAME PR and update its body —",
+      "  do NOT open a duplicate",
       "- NEVER merge, and NEVER post a review (the independent reviewer posts reviews; Relay only reads them back)"
     );
+    if (template) {
+      lines.push(
+        "",
+        `### PR body template (${template.path} — fill every section, keep Documentation Impact)`,
+        "````markdown",
+        template.text,
+        "````"
+      );
+    } else {
+      lines.push(
+        "",
+        "### PR body (the target repo has no PR template at `.github/pull_request_template.md`)",
+        "Include at least `## Summary`, `## Testing` and `## Documentation Impact` sections."
+      );
+    }
   }
   lines.push(
     "",
@@ -1100,7 +1167,7 @@ export async function launchTaskRun(db: Database, taskId: string, opts: LaunchRu
 
   const fresh = getTask(db, taskId)!;
   const findings = inheritFindings(db, fresh);
-  const brief = buildRunBrief(db, fresh, { worktree: binding.worktree, branch: binding.branch, findings });
+  const brief = buildRunBrief(db, fresh, { worktree: binding.worktree, branch: binding.branch, findings, repo: opts.repo ?? null });
   const briefPath = pinRunBrief(binding.worktree, brief.text);
 
   const handle = await startDshRun(db, {

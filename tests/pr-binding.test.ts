@@ -1,5 +1,6 @@
 import { describe, expect, test, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Database } from "bun:sqlite";
@@ -143,16 +144,46 @@ describe("bindTaskPr: re-read and bind the produced commit (read-only)", () => {
     expect(getTask(db, id)!.pr_url).toBe(`https://github.com/${REPO}/pull/7`);
   });
 
-  test("no recorded identity and no adoptable PR is NO_PR_IDENTITY (Relay never publishes)", () => {
+  test("no recorded identity and NO PR at all is NO_PR_IDENTITY (Relay never publishes)", () => {
     const id = newTask({ prRepo: REPO });
     linkTask(db, id, { branch: BRANCH, headSha: A });
-    const gh = new FakeGitHub().putPullRequest(prView(B)); // a PR on the branch at another head
 
-    const r = bindTaskPr(db, id, { github: gh });
+    const r = bindTaskPr(db, id, { github: new FakeGitHub() });
 
     expect(r.status).toBe("blocked");
     expect(r.reason).toContain("NO_PR_IDENTITY");
     expect(getTask(db, id)!.pr_url).toBeNull();
+  });
+
+  test("a branch PR at another head is HEAD_MOVED (never adopted, never a duplicate)", () => {
+    const id = newTask({ prRepo: REPO });
+    linkTask(db, id, { branch: BRANCH, headSha: A });
+    const gh = new FakeGitHub().putPullRequest(prView(B)); // the worker has not pushed A yet
+
+    const r = bindTaskPr(db, id, { github: gh });
+
+    expect(r.status).toBe("blocked");
+    expect(r.reason).toContain(`${PR_BINDING_ERROR}: HEAD_MOVED`);
+    expect(r.ref).toEqual({ repo: REPO, number: 7 });
+    expect(getTask(db, id)!.pr_url).toBeNull();
+  });
+
+  test("with no recorded pr_repo, the Task workspace's GitHub origin resolves the repo and the PR is adopted (ISH-1087)", () => {
+    const wt = join(dir, "workspace");
+    mkdirSync(wt, { recursive: true });
+    execFileSync("git", ["-C", wt, "init", "-q"]);
+    execFileSync("git", ["-C", wt, "remote", "add", "origin", "git@github.com:81ueman/relay.git"]);
+    const id = newTask();
+    linkTask(db, id, { branch: BRANCH, headSha: A });
+    db.query(`UPDATE tasks SET worktree = ? WHERE id = ?`).run(wt, id);
+    const gh = new FakeGitHub().putPullRequest(prView(A));
+
+    const r = bindTaskPr(db, id, { github: gh });
+
+    expect(r.status).toBe("adopted");
+    expect(r.ref).toEqual({ repo: REPO, number: 7 });
+    expect(getTask(db, id)!.pr_repo).toBe(REPO);
+    expect(getTask(db, id)!.pr_url).toBe(`https://github.com/${REPO}/pull/7`);
   });
 });
 

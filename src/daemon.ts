@@ -6,7 +6,7 @@ import { buildRuntime } from "./runtime/herdr";
 import type { Runtime } from "./runtime/runtime";
 import { reconcile } from "./reconciler";
 import { reconcileRequestToken } from "./workflow";
-import { providerDepsFromEnv } from "./provider-adapters";
+import { operatorProviderDepsFromEnv } from "./provider-adapters";
 import type { WorkflowDeps } from "./workflow-driver";
 import { startSocketServer, type SocketContext, type SocketHandle } from "./socket";
 import {
@@ -58,9 +58,11 @@ export async function runDaemon(opts: DaemonOptions = {}): Promise<void> {
   const rt = opts.runtime ?? buildRuntime();
   const sockPath = opts.sockPath ?? defaultSockPath();
   const guard = !opts.bypassSingleton;
-  // ISH-759: read-only provider readers + authorized-reviewer config, opt-in via
-  // env. Default OFF, so provider reconciliation is a no-op unless enabled.
-  const workflowDeps: WorkflowDeps = providerDepsFromEnv();
+  // ISH-759/1087: read-only provider readers + authorized-reviewer config. An
+  // explicit RELAY_PROVIDER_GITHUB=off disables GitHub; otherwise an
+  // authenticated gh is auto-detected so the merge gate can see a bound PR
+  // without every daemon deployment exporting the reader flag.
+  const workflowDeps: WorkflowDeps = operatorProviderDepsFromEnv();
 
   let lock: SupervisorLock | null = null;
   let sock: SocketHandle | null = null;

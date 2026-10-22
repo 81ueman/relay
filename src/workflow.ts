@@ -1573,6 +1573,19 @@ export interface MergedOptions {
 }
 
 /**
+ * True when the Task has an explicit PR identity (`owner/repo#n`, a GitHub PR
+ * URL, or `#n`/`n` with a `pr_repo`). A branch name is never an identity — only
+ * a re-read/bound PR (or an intake URL) can make a merge creditable.
+ */
+function hasBoundPr(task: Pick<Task, "pr_url" | "pr_repo">): boolean {
+  if (!task.pr_url) return false;
+  if (/github\.com\/[^/\s]+\/[^/\s]+\/pull\/\d+/i.test(task.pr_url)) return true;
+  if (/^[^#\s]+\/[^#\s]+#\d+$/.test(task.pr_url)) return true;
+  if (/#\d+$/.test(task.pr_url) || /^\d+$/.test(task.pr_url)) return !!task.pr_repo;
+  return false;
+}
+
+/**
  * ISH-759: confirm the bound PR was actually MERGED on the provider. This is the
  * ONLY signal that a code-change task is "truly done" for the issue; a review
  * PASS or an internal TaskAccepted is explicitly NOT a merge.
@@ -1609,6 +1622,17 @@ export function confirmMerged(db: Database, taskId: string, opts: MergedOptions 
     );
   }
   if (findMergedResult(db, taskId)) return task; // exactly once
+  // ISH-1087: a merge is credited ONLY against an explicitly bound PR. The live
+  // failure was a Factory Task with NO PR at all being marked accepted+merged:
+  // the merge gate was BLOCKED/NO_PR, so crediting the merge hid the bypass.
+  // This is an observation guard, not a merge executor: `relay pr bind` the real
+  // PR first, then credit its merge at the recorded head.
+  if (!hasBoundPr(task)) {
+    throw new Error(
+      `${GATE_ERROR}: NO_PR: cannot confirm a merge for ${taskId}; no PR is bound ` +
+        `(the merge gate would be BLOCKED). Run \`relay pr bind ${taskId}\` first; Relay never invents a merge.`
+    );
+  }
   const t = now();
   const updated = db.transaction(() => {
     insertTaskResult(db, {
