@@ -332,7 +332,12 @@ required SQLite evidence, and prints ONE structured decision — `READY`,
   alone is not), and mergeability is
   judged. A `conflicting` PR raises
   **`IntegrationRequired`** to the Gateway (a routing decision: fix the new HEAD,
-  then re-VERIFY/REVIEW) — it never rebases. An **unrelated** merge of another PR
+  then re-VERIFY/REVIEW) — it never rebases. The coordinator can execute that
+  routing decision with `relay result rebase <task> --reason "<why>"` (ISH-1122):
+  the Task returns to `implement` at attempt+1 with the reason as the FIX brief,
+  **no ReviewResult is recorded**, an unresolved reviewer NG/HOLD or owner HOLD is
+  refused, and the prior PASS stays as history only — the new HEAD needs a fresh
+  VERIFY and a fresh independent review. An **unrelated** merge of another PR
   that only moves the base does **not** force a rebase/review loop (no
   unconditional ancestor requirement); a **changed HEAD** does require a fresh
   independent review at the new HEAD.

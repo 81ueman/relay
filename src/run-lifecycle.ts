@@ -625,7 +625,7 @@ export interface RunCheckFinding {
 
 export interface RunFinding {
   attempt: number;
-  kind: string; // "ReviewResult" | "VerificationResult" | "ImplementRun"
+  kind: string; // "ReviewResult" | "VerificationResult" | "ImplementRun" | "RebaseRequested"
   reason: string | null;
   evidence: string | null;
   headSha: string | null;
@@ -758,7 +758,56 @@ export function inheritFindings(
   // Factory classified — into the brief.
   const runFinding = implementRunFinding(db, task);
   if (runFinding) findings.unshift(runFinding);
+  // ISH-1122: a coordinator REBASE FIX is a routing event, not a ReviewResult (it
+  // must never clear/override a reviewer decision). Carry its durable reason into
+  // the next implement brief the same way a failed result is carried.
+  const rebase = rebaseFinding(db, task);
+  if (rebase) findings.unshift(rebase);
   return findings.slice(0, RUN_FINDING_MAX_RESULTS);
+}
+
+/**
+ * ISH-1122: the durable `workflow.rebase_requested` reason for the attempt that
+ * is about to start. The transition writes it as an event (NOT a review verdict),
+ * so the FIX brief reads the same evidence record the phase move was audited by.
+ */
+function rebaseFinding(
+  db: Database,
+  task: Pick<Task, "id" | "attempt">
+): RunFinding | null {
+  if (task.attempt <= 0) return null;
+  const rows = db
+    .query(
+      `SELECT payload_json FROM events
+        WHERE task_id = ? AND type = 'workflow.rebase_requested'
+        ORDER BY id DESC LIMIT 20`
+    )
+    .all(task.id) as { payload_json: string }[];
+  for (const row of rows) {
+    let payload: unknown;
+    try {
+      payload = JSON.parse(row.payload_json);
+    } catch {
+      continue; // a malformed event is not a finding
+    }
+    if (!isRecord(payload) || payload.toAttempt !== task.attempt) continue;
+    const reason = typeof payload.reason === "string" ? payload.reason.trim() : "";
+    if (!reason) continue;
+    const fromHead = typeof payload.fromHead === "string" ? payload.fromHead : null;
+    const fromAttempt =
+      typeof payload.fromAttempt === "number" && Number.isFinite(payload.fromAttempt)
+        ? payload.fromAttempt
+        : task.attempt - 1;
+    return {
+      attempt: fromAttempt,
+      kind: "RebaseRequested",
+      reason,
+      evidence: fromHead ? `the PR conflicts with its base at ${fromHead}` : "the PR conflicts with its base",
+      headSha: fromHead,
+      defect: true,
+    };
+  }
+  return null;
 }
 
 /** The declared check commands for a Task, for reproduction in a brief. */
@@ -892,7 +941,8 @@ function renderRunFinding(f: RunFinding): string[] {
   const label = defect ? (f.kind === "ReviewResult" ? "FIX" : "FAIL") : "BLOCKED";
   out.push("", `### ${f.kind} — ${label} (attempt ${f.attempt})`);
   if (f.headSha) {
-    const what = f.kind === "ReviewResult" ? "Reviewed HEAD" : "Verified HEAD";
+    const what =
+      f.kind === "ReviewResult" ? "Reviewed HEAD" : f.kind === "RebaseRequested" ? "Conflicted HEAD" : "Verified HEAD";
     out.push(`- ${what}: \`${f.headSha}\``);
   }
   if (f.evidence) out.push(`- Evidence: ${f.evidence}`);

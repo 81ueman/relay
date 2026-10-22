@@ -26,6 +26,7 @@ import {
   unclaimableRunnableTasks, addNote, setTaskPlan, waitTask,
 } from "./tasks";
 import { acceptTask, confirmMerged, intakeTask, recordReview, recordVerification, runMechanicalVerification, submitPhase, taskChecks } from "./workflow";
+import { requestRebase } from "./rebase";
 import { defaultRunner, type CheckSpec } from "./verify";
 import { sandboxVerifyTarget } from "./sandbox-verify";
 import { acceptRunSubmission, getRun, listRuns, startDshRun } from "./dsh-runner";
@@ -111,6 +112,7 @@ Usage:
   relay result submit <task-id> [--evidence E] [--head SHA] [--lease N] [--worker <id>]
   relay result verify <task-id> --pass|--fail [--evidence E] [--head SHA] [--worker <id>]
   relay result review <task-id> --pass|--fail|--blocked [--head SHA] [--profile P] [--reason R] [--supersedes <result-id>] [--reviewer <id>] [--worker <id>]
+  relay result rebase <task-id> --reason "<why>" [--head SHA] [--worker <id>]   # integrator/gateway: merge_ready + CONFLICTING PR -> implement attempt+1 (no review verdict)
   relay result merged <task-id> [--head SHA] [--repo R] [--reason R]
   relay result accept <task-id> [--worker <id>]
   relay verify <task-id> [--cwd <dir>] [--head SHA]   # mechanical verify (Relay runs the commands)
@@ -335,14 +337,20 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
   },
   result: {
     about:
-      "Record a STRUCTURED workflow result and advance the task's phase (the source of truth — `relay send` prose is never parsed for a verdict). submit advances implement/integration; verify and review record an outcome; review --blocked parks the task for a human; merged confirms a real GitHub merge (the only 'truly done' signal for a task with a PR); accept is the only way a code-change task becomes terminal internally (it must be at merge_ready). Duplicate/stale results are refused, and an unresolved NG at the same HEAD is never cleared by a later OK alone. A merge_ready task whose PR is NOT mergeable can return to implement at attempt+1 (with the reason as the FIX brief): `relay result review <id> --fail --reason \"<why>\"`, optionally naming the PASS being replaced with `--supersedes <result-id>`; the replacement verdict is recorded at the same attempt instead of hitting DUPLICATE_DISPATCH.",
+      "Record a STRUCTURED workflow result and advance the task's phase (the source of truth — `relay send` prose is never parsed for a verdict). submit advances implement/integration; verify and review record an outcome; review --blocked parks the task for a human; merged confirms a real GitHub merge (the only 'truly done' signal for a task with a PR); accept is the only way a code-change task becomes terminal internally (it must be at merge_ready). Duplicate/stale results are refused, and an unresolved NG at the same HEAD is never cleared by a later OK alone. A merge_ready task whose bound PR is CONFLICTING can be returned to implement at attempt+1 by the coordinator: `relay result rebase <id> --reason \"<why>\"` (integrator or Gateway/human authority). That route records NO review verdict, refuses an unresolved reviewer NG/HOLD, and the new HEAD needs a fresh VERIFY + independent review. A reviewer may instead return it with `relay result review <id> --fail --reason \"<why>\"`, optionally naming the PASS being replaced with `--supersedes <result-id>`.",
     usage: [
       "relay result submit <task-id> [--evidence E] [--head SHA] [--lease N] [--worker <id>]",
       "relay result verify <task-id> --pass|--fail [--evidence E] [--head SHA] [--worker <id>]",
       "relay result review <task-id> --pass|--fail|--blocked [--head SHA] [--profile P] [--reason R] [--supersedes <result-id>] [--reviewer <id>] [--worker <id>]",
+      "relay result rebase <task-id> --reason <text> [--head SHA] [--worker <id>]",
       "relay result merged <task-id> [--head SHA] [--repo R] [--reason R]",
       "relay result accept <task-id> [--worker <id>]",
     ],
+  },
+  "result rebase": {
+    about:
+      "ISH-1122: return a merge_ready code-change Task to implement at attempt+1 when its bound/observed PR is CONFLICTING at the recorded HEAD (a sibling lane merged first). The reason becomes the FIX brief; the prior PASS stays as history but no longer authorises a merge, so the produced HEAD needs a fresh VERIFY and a fresh independent review. Refused unless the PR is observed CONFLICTING (a mergeable PR, unknown mergeability, or an unreadable PR is never assumed), and refused when an unresolved reviewer NG/HOLD or owner HOLD exists. It never records a review verdict and never pushes, rebases, merges or writes a provider. Authority: an integrator identity or the Task's Gateway/human. Requires the read-only GitHub reader (RELAY_PROVIDER_GITHUB=gh).",
+    usage: ["relay result rebase <task-id> --reason <text> [--head SHA] [--worker <id>]"],
   },
   verify: {
     about:
@@ -1284,10 +1292,23 @@ async function main(): Promise<void> {
         const id = argv[2];
         const rest = argv.slice(2);
         const usage =
-          "usage: relay result submit|verify|review|accept <task-id> [--pass|--fail] [--head SHA] [--worker <id>] ...";
+          "usage: relay result submit|verify|review|rebase|accept <task-id> [--pass|--fail] [--head SHA] [--worker <id>] ...";
         if (!sub || !id) throw new Error(usage);
         const workerId = resolveWorkerId(db, flag(argv, "--worker"));
-        if (sub === "submit") {
+        if (sub === "rebase") {
+          // ISH-1122: the coordinator's merge_ready + CONFLICTING-PR route back to
+          // implement at attempt+1. It is NOT a review verdict: recordReview is
+          // deliberately not called, and an unresolved NG/HOLD refuses.
+          const t = requestRebase(db, id, workerId, {
+            reason: flag(rest, "--reason") ?? "",
+            headSha: flag(rest, "--head") ?? undefined,
+            deps: providerDepsFromEnv(),
+          });
+          console.log(
+            `${t.id} -> phase=${t.phase} state=${t.state} attempt=${t.attempt} ` +
+            `(rebase requested; the prior PASS no longer authorises a merge)`
+          );
+        } else if (sub === "submit") {
           const t = submitPhase(db, id, workerId, {
             evidence: flag(rest, "--evidence") ?? undefined,
             headSha: flag(rest, "--head") ?? undefined,
