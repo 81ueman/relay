@@ -231,16 +231,17 @@ Unset, the Factory is unchanged and read-only.
 ## Commands
 
 ```sh
-# the library/smoke entrypoints
-bun run smoke:factory                       # fixture: fake dsh + fake reviewer (deterministic)
-RELAY_REAL_SMOKE=1 bun run smoke:factory:real   # real dsh 0.2.1-rc.2 + real Claude
-bun test tests/factory.test.ts              # the fixture suite
+# the fixture suite
+bun test tests/factory.test.ts              # fixture: fake dsh + fake reviewer (deterministic)
 
 # the pilot entrypoint (one Task, real dsh + real Claude by default)
 relay run factory <task-id> [--repo DIR] [--dsh BIN] [--reviewer CMD] [--model M] \
   [--max-attempts N] [--permission MODE] [--timeout 30m] [--json]
 # overrides also via RELAY_DSH_BIN / RELAY_REVIEW_CMD / RELAY_REVIEW_MODEL
 ```
+
+The one-off ISH-762 smoke scripts were removed in ISH-1100; their recorded
+output is preserved under [Evidence](#evidence).
 
 The factory runs **code-change tasks only** (`relay task intake --code-change`); a
 plain `relay task add` task is refused up front, before any worktree is created,
@@ -337,6 +338,10 @@ projection. A non-`merge_ready` outcome exits non-zero.
 
 ## Evidence
 
+The transcripts below are the output recorded by the one-off ISH-762 smoke
+scripts, which were removed in ISH-1100 (the raw runs remain in git history and
+the original PRs).
+
 ### Fixture smoke (deterministic)
 
 ```
@@ -426,8 +431,8 @@ unchanged by this issue.
 ## Pilot cutover conditions
 
 1. `bun run typecheck` and `bun test` are green.
-2. The fixture smoke (`bun run smoke:factory`) and a real smoke
-   (`RELAY_REAL_SMOKE=1 bun run smoke:factory:real`) both complete.
+2. The fixture suite (`bun test tests/factory.test.ts`) is green, and the real
+   smoke recorded under [Evidence](#evidence) completed.
 3. The Gateway (OpenCode + DeepSeek) is attached as the human interface
    (`RELAY_HUMAN`/ancestor assignee); ordinary FIX/PASS stay silent, and only
    `ChildBlocked`/`IntegrationRequired` reach it.

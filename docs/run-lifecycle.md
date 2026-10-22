@@ -314,22 +314,18 @@ copied back into the source repo under `refs/relay-kept/<branch>/*` and
 is the custody the linked worktree used to provide. If the copy fails, removal is
 refused. `--force` skips this and really discards the commits.
 
-## One-command fixture smoke
+## Fixture coverage
 
-```sh
-bun run smoke:run-lifecycle
-```
-
-Builds a throwaway git repo + control plane and drives the whole lifecycle with a
-**fake** `dsh` binary (no network, no real dsh, no Herdr): worktree create/select
-→ launch (pin brief) → duplicate writer refused → submit → verify PASS → review
-FIX → a new Run on the same worktree that inherits the findings → submit → review
-PASS → observed merge → safe cleanup with retained evidence. `tests/run-lifecycle.test.ts`
-covers the same ground with a fake process and asserts every rejection case.
+`tests/run-lifecycle.test.ts` builds a throwaway git repo + control plane and
+drives the whole lifecycle with a **fake** `dsh` binary (no network, no real dsh,
+no Herdr): worktree create/select → launch (pin brief) → duplicate writer refused
+→ submit → verify PASS → review FIX → a new Run on the same worktree that inherits
+the findings → submit → review PASS → observed merge → safe cleanup with retained
+evidence, and asserts every rejection case.
 
 ## Verified / not verified
 
-- **Verified** (`bun test`, `bun run smoke:run-lifecycle`): worktree create/select/
+- **Verified** (`bun test`): worktree create/select/
   own; brief pinning; single-writer rejection (same worktree/branch) vs parallel
   different worktrees — including a real **cross-process** race (two concurrent
   launch processes admit exactly one writer) and that a **refused** launch leaves
