@@ -511,10 +511,11 @@ export function mergeGateDecisionLogged(db: Database, identity: string): boolean
   const row = db
     .query(
       `SELECT 1 AS x FROM events
-        WHERE type LIKE 'workflow.merge_gate.%' AND payload_json LIKE ?
+        WHERE type >= 'workflow.merge_gate.' AND type < 'workflow.merge_gate/'
+          AND json_extract(payload_json, '$.identity') = ?
         LIMIT 1`
     )
-    .get(`%"identity":"${identity}"%`);
+    .get(identity);
   return !!row;
 }
 

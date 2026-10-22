@@ -701,6 +701,10 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS idx_events_id ON events(id);
 CREATE INDEX IF NOT EXISTS idx_events_worker_time ON events(worker_id, timestamp);
+-- The reconcile pass looks events up by type and by (task, type) every tick;
+-- without these each lookup is a full scan of the whole history.
+CREATE INDEX IF NOT EXISTS idx_events_type ON events(type, id);
+CREATE INDEX IF NOT EXISTS idx_events_task_type ON events(task_id, type);
 
 CREATE TABLE IF NOT EXISTS task_notes (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
