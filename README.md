@@ -355,8 +355,8 @@ required SQLite evidence, and prints ONE structured decision — `READY`,
 
 The decision is a PURE function of observable facts (`evaluateMergeGate`), so the
 whole table is unit-tested; the daemon pass (`runMergeGates`) is idempotent and
-logs each new decision identity once. One-command real-PR dry run:
-`bun run smoke:merge-gate 81ueman/relay#7` (or `relay merge-check <task> --json`).
+logs each new decision identity once. Real-PR dry run:
+`relay merge-check <task> --json`.
 
 ### Factory E2E: dsh → VERIFY → Claude review → MergeReady (ISH-762)
 
@@ -387,9 +387,7 @@ stale head / unknown), the evidence-derived cause, the last Run/attempt/HEAD,
 references to the failing check/review/log, and the concrete next action + resume
 condition. The same projection is a durable `factory.outcome` event and is shown
 by `relay run show` / `relay run logs` / `relay task show`; it never auto-unblocks
-a HOLD, a missing permission, a live writer or stale evidence. One-shot:
-`bun run smoke:factory` (fixture) and `RELAY_REAL_SMOKE=1 bun run
-smoke:factory:real` (real dsh 0.2.1-rc.2 + real Claude) — see
+a HOLD, a missing permission, a live writer or stale evidence. See
 [`docs/factory-e2e.md`](docs/factory-e2e.md).
 
 ### Native GitHub PR Review, HEAD-bound (ISH-883)
@@ -493,8 +491,7 @@ submit` is the only thing that advances the Task, and it refuses a stale/late/
 superseded Run (by Task/phase/attempt/**generation**/branch/HEAD). `relay run
 cleanup` reclaims a worktree only when it is **safe** (a real merge or `--abort`,
 no open PR, no active writer, no uncommitted changes, relay-owned) and always
-**retains the run logs** as evidence. One-command fixture smoke:
-`bun run smoke:run-lifecycle`. See
+**retains the run logs** as evidence. See
 [`docs/run-lifecycle.md`](docs/run-lifecycle.md).
 
 **Pre-launch disk guard (ISH-1009).** Before a Run row is created, and before a
@@ -593,8 +590,7 @@ owner name (`netlab-<owner>`), never by suffix, and fails closed if its workspac
 purge does not succeed. Relay forwards a narrow, named `LABCTL_*` set
 (`LABCTL_ENV_ALLOWLIST`) to the **hook only** (never to the dsh Run), so the hook
 can authenticate without leaking host secrets into the sandbox. Image and
-Shared-Lab VM management stay out of Relay. See
-[`docs/ish845-network-lab-skill.md`](docs/ish845-network-lab-skill.md).
+Shared-Lab VM management stay out of Relay.
 
 ### Historical cleanup: `relay gc`
 

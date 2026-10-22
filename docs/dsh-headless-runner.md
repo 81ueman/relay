@@ -236,9 +236,7 @@ Session lives under `$DSH_HOME`). An unknown id is an error. Relay never passes
   provider configuration** (provider-key forwarding to the host Run is deferred
   under ISH-869). With no key the real process exits **non-zero**
   (`MISSING_CREDENTIAL`) and the Run is recorded `failed` — never a silent
-  `exited`. See
-  [`ish869-dsh-0.2.1-rc.2.md`](ish869-dsh-0.2.1-rc.2.md) for what was and was not
-  run.
+  `exited`. The ISH-869 change records what was and was not run.
 - NOT verified here: anything beyond **one** Run's launch/observe/terminate. Task
   worktree creation, multi-writer control and FIX re-entry are ISH-760 — see
   [`run-lifecycle.md`](run-lifecycle.md). The real Factory E2E (ISH-762) is not

@@ -1,2 +1,0 @@
-    host-name srl1
-    host-name srl2
