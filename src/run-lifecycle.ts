@@ -1048,7 +1048,12 @@ export function buildRunBrief(db: Database, task: Task, opts: BuildBriefOptions)
   // presented as this FIX's instruction (an unreadable/null head is admissible:
   // there is nothing to disprove it).
   const checkoutHead = opts.baseHead === undefined ? gitHeadOf(opts.worktree) : opts.baseHead;
-  const applicable = findings.filter((f) => !checkoutHead || !f.headSha || f.headSha === checkoutHead);
+  // ISH-1122: a `RebaseRequested` finding is a ROUTING directive (the PR conflicts
+  // with its base), not a code finding bound to one revision. It must reach the
+  // FIX brief even if the worktree was already moved/rebase-retargeted.
+  const applicable = findings.filter(
+    (f) => f.kind === "RebaseRequested" || !checkoutHead || !f.headSha || f.headSha === checkoutHead
+  );
   const defects = applicable.filter((f) => f.defect !== false);
   const blocked = applicable.filter((f) => f.defect === false);
   if (applicable.length > 0) {

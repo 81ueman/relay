@@ -14,7 +14,7 @@ import {
   submitPhase,
 } from "../src/workflow";
 import { insertTaskResult } from "../src/results";
-import { inheritFindings } from "../src/run-lifecycle";
+import { buildRunBrief, inheritFindings } from "../src/run-lifecycle";
 import { requestRebase } from "../src/rebase";
 import { checkMergeGate } from "../src/merge-gate";
 import { FakeGitHub, type PrView, type ProviderAuthority } from "../src/providers";
@@ -125,6 +125,15 @@ describe("ISH-1122: coordinator rebase route for a merge_ready + CONFLICTING PR"
     const rebase = findings.find((f) => f.kind === "RebaseRequested");
     expect(rebase?.reason).toBe(REASON);
     expect(rebase?.headSha).toBe(HEAD);
+    // A rebase directive is not filtered out when the worktree base has already
+    // moved (unlike a code finding pinned to a stale revision).
+    const brief = buildRunBrief(db, updated, {
+      worktree: join(dir, "worktree"),
+      branch: "feat/x",
+      baseHead: "f".repeat(40),
+      findings,
+    });
+    expect(brief.text).toContain(REASON);
 
     // The old PASS no longer authorises a merge at the new attempt/phase.
     const gate = checkMergeGate(db, t.id, { github: gh, checks: gh, authority: GRANT })!;
