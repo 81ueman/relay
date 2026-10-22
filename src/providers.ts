@@ -605,10 +605,11 @@ function mergeNotCreditedLogged(db: Database, taskId: string, head: string): boo
   const row = db
     .query(
       `SELECT 1 AS x FROM events
-        WHERE task_id = ? AND type = 'workflow.merge_not_credited' AND payload_json LIKE ?
+        WHERE task_id = ? AND type = 'workflow.merge_not_credited'
+          AND json_extract(payload_json, '$.head') = ?
         LIMIT 1`
     )
-    .get(taskId, `%"head":"${head}"%`);
+    .get(taskId, head);
   return !!row;
 }
 
@@ -654,10 +655,11 @@ function markerNotAppliedLogged(db: Database, taskId: string, markerKey: string)
   const row = db
     .query(
       `SELECT 1 AS x FROM events
-        WHERE task_id = ? AND type = 'workflow.marker_not_applied' AND payload_json LIKE ?
+        WHERE task_id = ? AND type = 'workflow.marker_not_applied'
+          AND json_extract(payload_json, '$.markerKey') = ?
         LIMIT 1`
     )
-    .get(taskId, `%"markerKey":"${markerKey}"%`);
+    .get(taskId, markerKey);
   return !!row;
 }
 

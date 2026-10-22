@@ -229,6 +229,30 @@ function cleanupFailureLogWindowMs(): number {
   return Number.isFinite(v) && v >= 0 ? v : 60000;
 }
 
+/** Re-log an unchanged `supervisor.no_idle_worker` view at most once per window. */
+function noIdleWorkerLogWindowMs(): number {
+  const v = Number(process.env.RELAY_NO_IDLE_LOG_WINDOW_MS ?? String(10 * 60_000));
+  return Number.isFinite(v) && v >= 0 ? v : 10 * 60_000;
+}
+
+/**
+ * The no-idle-worker branch is hit on EVERY tick while the fleet is saturated,
+ * so logging unconditionally grew the event log by one row per tick (live:
+ * ~73K rows, 61% of all events). Log when the supervisor view changes, and
+ * re-log an unchanged view only once per window so a long stall stays visible.
+ */
+function shouldLogNoIdleWorker(db: Database, view: ReturnType<typeof supervisorView>, at: number): boolean {
+  const last = db
+    .query(
+      `SELECT timestamp AS t, payload_json AS p FROM events
+        WHERE type = 'supervisor.no_idle_worker' ORDER BY id DESC LIMIT 1`
+    )
+    .get() as { t: number; p: string } | null;
+  if (!last) return true;
+  if (last.p !== JSON.stringify({ view })) return true;
+  return at - last.t >= noIdleWorkerLogWindowMs();
+}
+
 function recentlyEvent(db: Database, workerId: string, type: string, at: number, windowMs: number): boolean {
   if (windowMs === 0) return false;
   const r = db
@@ -424,8 +448,11 @@ function detectUnresponsiveIdle(db: Database, w: WorkerRow, at: number): boolean
  */
 function lastWakeAt(db: Database, workerId: string, reason: string): number {
   const r = db
-    .query(`SELECT MAX(timestamp) AS t FROM events WHERE worker_id = ? AND type = 'worker.woken' AND payload_json LIKE ?`)
-    .get(workerId, `%"reason":"${reason}"%`) as { t: number | null };
+    .query(
+      `SELECT MAX(timestamp) AS t FROM events
+        WHERE worker_id = ? AND type = 'worker.woken' AND json_extract(payload_json, '$.reason') = ?`
+    )
+    .get(workerId, reason) as { t: number | null };
   return r.t ?? 0;
 }
 
@@ -1835,7 +1862,9 @@ export async function reconcile(db: Database, rt: Runtime, at = now(), deps: Wor
       } else if (operationalWorkers(db).some((x) => x.state === "starting")) {
         actions.push("awaiting-start");
       } else {
-        logEvent(db, { source: "supervisor", type: "supervisor.no_idle_worker", payload: { view } });
+        if (shouldLogNoIdleWorker(db, view, at)) {
+          logEvent(db, { source: "supervisor", type: "supervisor.no_idle_worker", payload: { view } });
+        }
         actions.push("no-idle-worker");
       }
     }
