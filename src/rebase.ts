@@ -70,7 +70,12 @@ export function requestRebase(
   if (input.pr.state !== "open") {
     throw new Error(`${REBASE_ERROR}: ${taskId}'s PR is ${input.pr.state}, not open; a rebase route needs an open PR`);
   }
-  if (input.pr.headSha && input.pr.headSha !== input.head) {
+  if (!input.pr.headSha) {
+    throw new Error(
+      `${REBASE_ERROR}: the PR read for ${taskId} reported no head; the conflict cannot be bound to the recorded revision`
+    );
+  }
+  if (input.pr.headSha !== input.head) {
     throw new Error(
       `${HEAD_MISMATCH}: the PR head ${input.pr.headSha} != recorded head ${input.head} for ${taskId}; ` +
       `the observed conflict is not of this work`

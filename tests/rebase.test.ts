@@ -207,6 +207,10 @@ describe("ISH-1122: coordinator rebase route for a merge_ready + CONFLICTING PR"
     expect(() => requestRebase(db, t.id, "integ", { reason: REASON, deps: { github: unreadable } })).toThrow(
       /no pull request bound|not be read/
     );
+    const noHead = new FakeGitHub().putPullRequest(view({ headSha: "" }));
+    expect(() => requestRebase(db, t.id, "integ", { reason: REASON, deps: { github: noHead } })).toThrow(
+      /reported no head/
+    );
     const after = getTask(db, t.id)!;
     expect(after.phase).toBe("merge_ready");
     expect(after.attempt).toBe(before.attempt);
