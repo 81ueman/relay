@@ -27,7 +27,7 @@ merged, NOT Linear Done).
   for, and to say which it ran. The Gateway and reviewer deliberately use
   different models/harnesses.
 
-## Repo rubric and focused execution (ISH-1135)
+## Repo rubric and focused execution (ISH-1135, ISH-1143)
 
 The reviewer brief tells the reviewer to **read the repository's own rubric at
 the reviewed HEAD** before judging (`src/reviewer-runner.ts`
@@ -37,8 +37,11 @@ layout, `.agents/skills/independent-pr-review/references/rubric.md` plus
 `RELAY_REVIEW_RUBRICS` (a JSON object keyed by `owner/name`, bare repo name or
 `default`), with `RELAY_REVIEW_RUBRIC` / `RELAY_REVIEW_OUTPUT_CONTRACT`, or with
 `--review-rubric` / `--review-output-contract` for one `relay run factory`
-invocation. The file is checked in the **reviewed commit** (not the mutable
-working tree); when it is missing at that HEAD the brief says so explicitly and
+invocation. **ISH-1143:** the two flags are a pair: `--review-output-contract`
+without `--review-rubric` is refused, never silently ignored. The file is checked
+in the **reviewed commit** (not the mutable working tree) and the brief points the
+reviewer at `git show <head>:<path>`, so a dirty checkout cannot substitute a
+different rubric; when it is missing at that HEAD the brief says so explicitly and
 tells the reviewer not to substitute another revision's rubric.
 
 Relay's structured verdict JSON remains the machine contract. The rubric's
