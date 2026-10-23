@@ -1023,8 +1023,8 @@ describe("ISH-1128: an amended + force-pushed own head is not stale", () => {
   });
 });
 
-describe("integration-phase Run with a moved head re-reviews (round-3)", () => {
-  test("a committing integration Run lands in review at attempt+1, NOT merge_ready", async () => {
+describe("integration-phase Run with a moved head re-verifies then re-reviews (round-3)", () => {
+  test("a committing integration Run lands in verify at attempt+1, NOT merge_ready", async () => {
     for (const [wid, role] of [
       ["w-impl", "worker"],
       ["w-ver", "worker"],
@@ -1079,10 +1079,12 @@ describe("integration-phase Run with a moved head re-reviews (round-3)", () => {
     const submitted = acceptRunSubmission(db, { runId: run.id });
     expect(submitted.state).toBe("submitted");
 
-    // It must NOT land in merge_ready with an unreviewed head.
+    // It must NOT land in merge_ready with an unreviewed head. ISH-1140: the
+    // moved head also invalidates the VERIFY, so it re-enters verify first.
     const after = getTask(db, id)!;
-    expect(after.phase).toBe("review");
-    expect(after.state).toBe("review");
+    expect(after.phase).toBe("verify");
+    expect(after.state).toBe("queued");
+    expect(after.claim_role).toBeNull(); // no mechanical checks: a worker verifies
     expect(after.attempt).toBe(before.attempt + 1);
     expect(after.head_sha).toBe(produced);
     expect(after.phase).not.toBe("merge_ready");

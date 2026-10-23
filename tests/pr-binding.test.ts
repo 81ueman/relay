@@ -274,7 +274,7 @@ describe("ISH-885: a legitimate FIX is observed read-only (the Agent pushes B fi
     expect(getTask(db, id)!.head_sha).toBe(B); // Relay did not move anything
   });
 
-  test("A's PASS never authorizes B: a new-head bind re-opens review at attempt+1", async () => {
+  test("A's PASS never authorizes B: a new-head bind re-opens verify at attempt+1", async () => {
     const id = newTask();
     await driveToReviewed(id, A); // a PASS at A
     expect(getTask(db, id)!.attempt).toBe(0);
@@ -288,7 +288,10 @@ describe("ISH-885: a legitimate FIX is observed read-only (the Agent pushes B fi
     expect(r.status).toBe("bound");
     const t = getTask(db, id)!;
     expect(t.head_sha).toBe(B);
-    expect(t.phase).toBe("review");
+    // ISH-1140: a moved HEAD invalidates the VERIFY too, so the Task re-enters
+    // verify (Relay runs the mechanical checks) before it is reviewed again.
+    expect(t.phase).toBe("verify");
+    expect(t.claim_role).toBe("relay");
     expect(t.attempt).toBe(1); // A's PASS was invalidated
     expect(findPassingReview(db, id, 0)).not.toBeNull(); // A's evidence is retained, not reused
     expect(findPassingReview(db, id, 1)).toBeNull(); // B has no PASS yet
@@ -315,7 +318,7 @@ describe("bindTaskPr: HEAD evidence is preserved", async () => {
     expect(findPassingReview(db, id, 0)).not.toBeNull();
   });
 
-  test("a moved bound PR head re-opens review at a new attempt (VERIFY/Review invalidated)", async () => {
+  test("a moved bound PR head re-enters verify at a new attempt (VERIFY/Review invalidated)", async () => {
     const id = newTask({ prRepo: REPO, prUrl: `${REPO}#7` });
     await driveToReviewed(id, A);
     expect(getTask(db, id)!.attempt).toBe(0);
@@ -326,7 +329,8 @@ describe("bindTaskPr: HEAD evidence is preserved", async () => {
 
     const t = getTask(db, id)!;
     expect(t.head_sha).toBe(B);
-    expect(t.phase).toBe("review");
+    expect(t.phase).toBe("verify");
+    expect(t.claim_role).toBe("relay");
     expect(t.attempt).toBe(1); // the old PASS no longer applies
     expect(findPassingReview(db, id, 1)).toBeNull();
   });

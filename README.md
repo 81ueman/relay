@@ -279,7 +279,10 @@ implement --TaskSubmitted--> verify --VerificationResult--> review
   reviewer must hold `REVIEWER_ROLE` (or the review claim) and may not be the
   worker that submitted the attempt; a reviewer has **no write/merge** authority.
 - **HEAD is the review identity.** A PASS must name the current `head_sha`; a
-  moved head sends the task back to review. The same PR+HEAD+profile is reviewed
+  moved head invalidates the PASS **and** the VERIFY that backed it, so the task
+  re-enters `verify` at the new head (Relay re-runs the mechanical checks) before
+  it is reviewed again. A base-branch retarget keeps the same head, so only the
+  review re-opens. The same PR+HEAD+profile is reviewed
   once, and an **unresolved NG at the same HEAD is never cleared by a later OK
   alone** (it must `--supersedes <result-id>` explicitly).
 - **Provider reconciliation is read-only / fail-closed.** With a bound PR, Relay

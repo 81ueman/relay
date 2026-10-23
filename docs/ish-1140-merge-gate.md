@@ -29,6 +29,23 @@ has no hosted CI (previously `BLOCKED — CHECKS_NOT_RUN` on every PR).
 5. a point-of-use **merge authority** (`NO_PERMISSION` otherwise — the gate never
    merges).
 
+## A post-review HEAD move re-enters VERIFY
+
+Because (1) is HEAD-pinned, a moved HEAD must earn a new VERIFY or the Task would
+dead-end at `merge_ready`. Every post-review head change goes through
+`invalidateReview` (`src/workflow.ts:256-288`): an integration submit or Run that
+names a new head (`src/workflow.ts:634-638`, `src/workflow.ts:789-794`) and a
+provider-poll PR re-push (`src/workflow.ts:563-566`). On a HEAD change it now
+sends the Task back to **`verify`** at the new head and `attempt+1` — with
+`claim_role=relay` when the Task has mechanical checks, so
+`runPendingMechanicalVerifications` re-runs them; with the Task's own role
+otherwise — instead of skipping straight to `review`. A **base-branch** change
+keeps the same HEAD, so its VERIFY still applies and only the review re-opens.
+
+`tests/merge-gate.test.ts` covers both paths end to end: integration submit at a
+new head -> VERIFY -> review PASS -> integration -> `merge_ready` -> gate
+`READY`, and a PR-link head move at `merge_ready` through the same route.
+
 ## Hosted CI is informational
 
 Check runs are still read, HEAD-pinned, when a reader is configured
@@ -121,7 +138,11 @@ skill in its own PR.
 - a rate-limited hosted-CI read is informational too (`not verified`, never a
   block);
 - a failed VERIFY, a missing/stale VERIFY, a missing/stale review, a moved head and
-  a HOLD still `BLOCKED`.
+  a HOLD still `BLOCKED`;
+- a post-review head move re-enters `verify`: an integration submit with a new
+  head, and a PR-link head move at `merge_ready`, both re-run the mechanical
+  checks, take a fresh review PASS at the new head, and produce a `READY` gate
+  with `hosted_ci: not verified`.
 
 `tests/provider-poll-rate-limit.test.ts` keeps the typed rate-limit behaviour and
 asserts the informational `hosted_ci: not verified` when the check read is skipped.

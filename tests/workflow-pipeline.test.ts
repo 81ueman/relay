@@ -334,7 +334,7 @@ describe("provider reconciliation binds state without writing", async () => {
     expect(getTask(db, t.id)!.phase).toBe("integration");
   });
 
-  test("the live PR head is bound; a move sends the task back to review", async () => {
+  test("the live PR head is bound; a move sends the task back to verify", async () => {
     const t = intakeTask(db, { provider: "github", issueId: "o/r#14", codeChange: true, headSha: FULL, checks: [CHECK], prUrl: "https://github.com/o/r/pull/1", prRepo: "o/r" });
     await toReview(t.id);
     claimNext(db, "rev");
@@ -349,7 +349,12 @@ describe("provider reconciliation binds state without writing", async () => {
     expect(actions.some((a) => a.kind === "pr-head-bound")).toBe(true);
     const live = getTask(db, t.id)!;
     expect(live.head_sha).toBe(MOVED);
-    expect(live.phase).toBe("review"); // re-review required
+    // ISH-1140: the moved head invalidates the VERIFY as well; Relay re-runs the
+    // mechanical checks at MOVED (claim_role=relay) before re-review.
+    expect(live.phase).toBe("verify");
+    expect(live.state).toBe("queued");
+    expect(live.claim_role).toBe("relay");
+    expect(live.attempt).toBe(1);
   });
 
   test("a merged PR at the recorded head confirms the merge (read-only)", async () => {
@@ -621,7 +626,9 @@ describe("finding 6: marker application uses the live head and dedupes", async (
     claimNext(db, "rev");
     recordReview(db, t.id, "rev", { verdict: "fix", headSha: FULL });
     // Back to review at the same head: a stale OK marker cannot apply (duplicate).
-    db.query(`UPDATE tasks SET phase='review', state='review', claim_role='reviewer', assignee=NULL WHERE id = ?`).run(t.id);
+    // Restore the head explicitly: the fix review cleared it, and ISH-1140 routes
+    // a head change to verify, which would skip the marker scan this test covers.
+    db.query(`UPDATE tasks SET phase='review', state='review', head_sha=?, claim_role='reviewer', assignee=NULL WHERE id = ?`).run(FULL, t.id);
     const gh = new FakeGitHub();
     gh.putPullRequest({
       ref: { repo: "o/r", number: 5 }, url: "https://github.com/o/r/pull/5", state: "open", isDraft: false,

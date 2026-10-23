@@ -103,9 +103,10 @@ mismatch fails closed too — Relay never overwrites it.
   can rewrite `task.head_sha` to a commit that was never produced.
 - Nothing here pushes, creates/updates a PR, posts a review, merges, approves,
   deletes a branch, or writes Linear.
-- A new PR HEAD is review-invalidating: `reconcileTaskFromProvider`/`linkTask`
-  re-open the review at a new attempt when the live PR head moves, so old
-  Review/VERIFY evidence at the previous HEAD never carries forward.
+- A new PR HEAD is VERIFY- and review-invalidating: `reconcileTaskFromProvider`/
+  `linkTask` re-enter `verify` at a new attempt when the live PR head moves, so
+  old VERIFY/Review evidence at the previous HEAD never carries forward. A
+  base-branch retarget keeps the same HEAD and re-opens only the review.
 
 ## Factory integration
 

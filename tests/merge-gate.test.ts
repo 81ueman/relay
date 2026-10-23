@@ -6,7 +6,7 @@ import type { Database } from "bun:sqlite";
 import { openDb } from "../src/db";
 import { claimTask, getTask } from "../src/tasks";
 import { registerWorker } from "../src/workers";
-import { intakeTask, recordReview, recordVerification, submitPhase } from "../src/workflow";
+import { intakeTask, linkTask, recordReview, recordVerification, runMechanicalVerification, submitPhase, taskChecks } from "../src/workflow";
 import {
   DEFAULT_REVIEW_OWNER,
   FakeGitHub,
@@ -17,6 +17,7 @@ import {
   type ProviderAuthority,
 } from "../src/providers";
 import { GhCliGitHub, mapCheckRunBucket, mapCommitStatusBucket, type Exec } from "../src/provider-adapters";
+import type { CommandRunner } from "../src/verify";
 import { processWorkflow } from "../src/workflow-driver";
 import {
   boundPrRef,
@@ -841,5 +842,127 @@ describe("merge gate: gathering the facts + the daemon pass (read-only)", async 
     submitPhase(db, t.id, "integ");
     expect(getTask(db, t.id)!.phase).toBe("merge_ready");
     expect((await checkMergeGate(db, t.id, { github: gh, checks: gh, authority: GRANT }))!.status).toBe("READY");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ISH-1140 (FIX): a post-review HEAD move must re-run Relay VERIFY at the new
+// HEAD. Without it the new VERIFY gate would leave a rebased Task stuck at
+// merge_ready with VERIFY_MISSING forever (`relay verify` only runs in the
+// verify phase). These are end-to-end: real phase transitions, a real
+// VerificationResult row at the moved head, then the merge gate must be READY.
+// ---------------------------------------------------------------------------
+
+const VERIFY_CHECK = { name: "typecheck", command: "bun run typecheck", required: true };
+
+function passingRunner(): CommandRunner {
+  return {
+    async run(spec) {
+      return { name: spec.name, required: true, outcome: "pass", exitCode: 0, output: "ok", durationMs: 0 };
+    },
+  };
+}
+
+/** Drive implement -> mechanical verify -> review PASS at `head`, leaving integration. */
+async function reviewedIntegration(head: string, issueId: string): Promise<string> {
+  const t = intakeTask(db, {
+    provider: "github",
+    issueId,
+    codeChange: true,
+    headSha: head,
+    prUrl: "https://github.com/o/r/pull/1",
+    prRepo: "o/r",
+    branch: "feat/x",
+    checks: [VERIFY_CHECK],
+  });
+  claimTask(db, t.id, "impl");
+  submitPhase(db, t.id, "impl", { headSha: head });
+  const v = await runMechanicalVerification(db, t.id, {
+    checks: taskChecks(getTask(db, t.id)!),
+    runner: passingRunner(),
+    cwd: "/work",
+    headProbe: () => head,
+  });
+  expect(v.outcome).toBe("pass");
+  expect(getTask(db, t.id)!.phase).toBe("review");
+  recordReview(db, t.id, "rev", { verdict: "pass", headSha: head });
+  expect(getTask(db, t.id)!.phase).toBe("integration");
+  return t.id;
+}
+
+describe("merge gate: a post-review HEAD move re-runs VERIFY and reaches READY (ISH-1140 fix)", async () => {
+  test("integration submit at a NEW head -> verify -> review PASS -> merge_ready -> READY", async () => {
+    const id = await reviewedIntegration(HEAD, "o/r#fix-1");
+    claimTask(db, id, "integ");
+
+    // The integrator rebases / merges main and submits the NEW head H2.
+    const rebased = submitPhase(db, id, "integ", { headSha: MOVED });
+    expect(rebased.phase).toBe("verify");
+    expect(rebased.state).toBe("queued");
+    expect(rebased.claim_role).toBe("relay");
+    expect(rebased.attempt).toBe(1);
+    expect(rebased.head_sha).toBe(MOVED);
+
+    // Relay re-runs the required mechanical checks at H2.
+    const v = await runMechanicalVerification(db, id, {
+      checks: taskChecks(getTask(db, id)!),
+      runner: passingRunner(),
+      cwd: "/work",
+      headProbe: () => MOVED,
+    });
+    expect(v.outcome).toBe("pass");
+    expect(getTask(db, id)!.phase).toBe("review");
+
+    // The independent reviewer PASSes the same H2, then integration accepts it.
+    recordReview(db, id, "rev", { verdict: "pass", headSha: MOVED });
+    claimTask(db, id, "integ");
+    submitPhase(db, id, "integ", { headSha: MOVED });
+    expect(getTask(db, id)!.phase).toBe("merge_ready");
+
+    const gh = new FakeGitHub();
+    gh.putPullRequest(view({ headSha: MOVED }));
+    const input = (await gatherMergeGateInput(db, id, { github: gh, authority: GRANT }))!;
+    expect(input.head).toBe(MOVED);
+    expect(input.verify).toEqual({ passed: true, head: MOVED });
+    expect(input.review?.head).toBe(MOVED);
+    // No hosted CI at all: `not verified` is informational, never a block.
+    expect(input.checks).toBeNull();
+    const d = evaluateMergeGate(input);
+    expect(d.status).toBe("READY");
+    expect(d.reasons).toEqual([]);
+    expect(d.hosted_ci).toBe("not verified");
+  });
+
+  test("a PR head move at merge_ready (provider poll / re-push) -> verify -> READY", async () => {
+    const id = await reviewedIntegration(HEAD, "o/r#fix-2");
+    claimTask(db, id, "integ");
+    submitPhase(db, id, "integ", { headSha: HEAD });
+    expect(getTask(db, id)!.phase).toBe("merge_ready");
+
+    // The poll observes a re-pushed PR head H2.
+    const moved = linkTask(db, id, { headSha: MOVED });
+    expect(moved.phase).toBe("verify");
+    expect(moved.state).toBe("queued");
+    expect(moved.claim_role).toBe("relay");
+    expect(moved.attempt).toBe(1);
+
+    const v = await runMechanicalVerification(db, id, {
+      checks: taskChecks(getTask(db, id)!),
+      runner: passingRunner(),
+      cwd: "/work",
+      headProbe: () => MOVED,
+    });
+    expect(v.outcome).toBe("pass");
+    recordReview(db, id, "rev", { verdict: "pass", headSha: MOVED });
+    claimTask(db, id, "integ");
+    submitPhase(db, id, "integ", { headSha: MOVED });
+    expect(getTask(db, id)!.phase).toBe("merge_ready");
+
+    const gh = new FakeGitHub();
+    gh.putPullRequest(view({ headSha: MOVED }));
+    const d = (await checkMergeGate(db, id, { github: gh, authority: GRANT }))!;
+    expect(d.status).toBe("READY");
+    expect(d.reasons).toEqual([]);
+    expect(d.hosted_ci).toBe("not verified");
   });
 });

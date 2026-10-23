@@ -265,15 +265,19 @@ describe("phase skipping and stale/duplicate results are refused", () => {
     recordVerification(db, t.id, "ver", { passed: true });
     claimNext(db, "rev");
     expect(() => recordReview(db, t.id, "rev", { verdict: "pass", headSha: "aaa" })).toThrow(/DUPLICATE_DISPATCH/);
-    // A genuinely new head is reviewable: the PR moved to bbb.
+    // A genuinely new head is reviewable: the PR moved to bbb. ISH-1140: the
+    // moved head re-enters verify first, so the new head is verified then reviewed.
     linkTask(db, t.id, { headSha: "bbb" });
+    expect(getTask(db, t.id)!.phase).toBe("verify");
+    claimTask(db, t.id, "ver");
+    recordVerification(db, t.id, "ver", { passed: true, headSha: "bbb" });
     const ok = recordReview(db, t.id, "rev", { verdict: "pass", headSha: "bbb" });
     expect(ok.phase).toBe("integration");
   });
 });
 
 describe("HEAD change invalidates a review PASS (finding 1)", () => {
-  test("an integration submit naming a different HEAD sends the task back to review", () => {
+  test("an integration submit naming a different HEAD sends the task back to verify", () => {
     const t = intakeTask(db, { provider: "linear", issueId: "ISH-30", codeChange: true, headSha: "aaa" });
     claimTask(db, t.id, "impl");
     submitPhase(db, t.id, "impl", { headSha: "aaa" });
@@ -285,21 +289,24 @@ describe("HEAD change invalidates a review PASS (finding 1)", () => {
 
     claimTask(db, t.id, "integ");
     const after = submitPhase(db, t.id, "integ", { headSha: "bbb" });
-    expect(after.phase).toBe("review");
-    expect(after.state).toBe("review");
+    // ISH-1140: a moved HEAD invalidates the VERIFY too, so Relay re-runs the
+    // required checks at the new head before a reviewer judges it again.
+    expect(after.phase).toBe("verify");
+    expect(after.state).toBe("queued");
     expect(after.head_sha).toBe("bbb");
     expect(after.attempt).toBe(1);
     // No passing review for the new attempt/head -> accept is refused.
     expect(() => acceptTask(db, t.id, "integ")).toThrow(/merge_ready|passing review/i);
   });
 
-  test("an intake replay / linkTask HEAD change at merge_ready sends it back to review", () => {
+  test("an intake replay / linkTask HEAD change at merge_ready sends it back to verify", () => {
     const t = intakeTask(db, { provider: "linear", issueId: "ISH-31", codeChange: true, headSha: "ccc" });
     toMergeReady(t.id);
     expect(getTask(db, t.id)!.phase).toBe("merge_ready");
     const replayed = intakeTask(db, { provider: "linear", issueId: "ISH-31", codeChange: true, headSha: "ddd" });
     expect(replayed.id).toBe(t.id);
-    expect(replayed.phase).toBe("review");
+    expect(replayed.phase).toBe("verify");
+    expect(replayed.state).toBe("queued");
     expect(replayed.head_sha).toBe("ddd");
   });
 
