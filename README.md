@@ -465,7 +465,11 @@ Cancel/timeout kill the whole process group. Permissions stay in the worktree
 event is **not** a submission — only a structured `relay run submit` bound to the
 current Run/Task/phase/attempt/branch/HEAD advances the Task (a task with no
 linked branch/HEAD yet adopts the Run's; the recorded head is the produced one);
-a non-zero/cancelled/stale Run never does. `relay run logs <run-id>` renders the
+the HEAD fence also accepts a commit on the Run's **own** history — its base, its
+produced head, or an intermediate push the provider poll bound between them
+(proved with `git merge-base --is-ancestor`) — so a worker that pushes and opens
+its PR before the Run ends is not refused as stale, while a foreign head is.
+A non-zero/cancelled/stale Run never advances the Task. `relay run logs <run-id>` renders the
 read-only session id + ordered `tool_call`/`tool_result` chronology (no TUI/Web UI
 needed). This covers one Run's launch/observe/terminate only; the Task worktree
 (create/select/own), single-writer control and FIX re-entry are ISH-760 — see

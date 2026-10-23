@@ -783,6 +783,83 @@ describe("ISH-1125: a mid-Run provider poll cannot make the Run's own submit sta
     expect(task.head_sha).toBe(h1);
     expect(findTaskResult(db, id, "implement", 1, "TaskSubmitted")!.head_sha).toBe(h1);
   });
+
+  test("(d) a Run that pushes TWICE inside one poll window: the poll binds the first head, submit accepts the final head", async () => {
+    const { id, cwd, outputRoot, baseHead, branch } = newPrTargetTask();
+    const gh = new FakeGitHub();
+    let firstPush = "";
+    const spawner = new FakeSpawner();
+    spawner.onSpawn = (p) => {
+      // First push + PR, observed by the poll while the Run is still live.
+      writeFileSync(join(cwd, "first-push.txt"), "first push\n");
+      git(cwd, "add", "first-push.txt");
+      git(cwd, "commit", "-q", "-m", "first push");
+      firstPush = git(cwd, "rev-parse", "HEAD");
+      gh.putPullRequest(polledPr(firstPush, branch));
+      p.writeOut("pushed the first commit and opened the PR\n");
+      // NOT finished: the poll below must see a LIVE Run.
+    };
+    const h = await startDshRun(db, { taskId: id, spawner, outputRoot, cwd, fastExitMs: 0 });
+    expect(firstPush).not.toBe(baseHead);
+    expect(getTask(db, id)!.head_sha).toBeNull();
+
+    // The provider poll binds the FIRST push.
+    const actions = reconcileProviderBound(db, { github: gh });
+    expect(actions).toContain(`pr-head-bound:${id}`);
+    expect(getTask(db, id)!.head_sha).toBe(firstPush);
+
+    // The worker makes its FINAL push before exiting. No further poll runs, so
+    // task.head_sha stays on the Run's own intermediate commit (the reported
+    // ISH-1125 case from 2026-10-23).
+    writeFileSync(join(cwd, "final-push.txt"), "final push\n");
+    git(cwd, "add", "final-push.txt");
+    git(cwd, "commit", "-q", "-m", "final push");
+    const finalPush = git(cwd, "rev-parse", "HEAD");
+    expect(finalPush).not.toBe(firstPush);
+    spawner.procs[0].finish(0);
+
+    const run = await h.wait();
+    expect(run.base_head_sha).toBe(baseHead);
+    expect(run.head_sha).toBe(finalPush);
+    expect(getTask(db, id)!.head_sha).toBe(firstPush);
+
+    // The bound head is on THIS Run's own history (base -> X -> Y), so the
+    // submit is accepted and the Task advances to the Run's final head.
+    const accepted = acceptRunSubmission(db, { runId: run.id });
+    expect(accepted.state).toBe("submitted");
+    const task = getTask(db, id)!;
+    expect(task.phase).toBe("verify");
+    expect(task.head_sha).toBe(finalPush);
+    expect(findTaskResult(db, id, "implement", 0, "TaskSubmitted")!.head_sha).toBe(finalPush);
+  });
+
+  test("(e) a foreign head AHEAD of the Run's produced head is still refused", async () => {
+    const { id, cwd, outputRoot, branch } = newPrTargetTask();
+    let produced = "";
+    const spawner = new FakeSpawner();
+    spawner.onSpawn = (p) => {
+      writeFileSync(join(cwd, "own.txt"), "own\n");
+      git(cwd, "add", "own.txt");
+      git(cwd, "commit", "-q", "-m", "own");
+      produced = git(cwd, "rev-parse", "HEAD");
+    };
+    const h = await startDshRun(db, { taskId: id, spawner, outputRoot, cwd, fastExitMs: 0 });
+    spawner.procs[0].finish(0);
+    const run = await h.wait();
+    expect(run.head_sha).toBe(produced);
+
+    // A different writer commits ON TOP of the Run's produced head (without
+    // moving the Run's worktree). The Task now points forward, so this Run's
+    // submit must not rewind it.
+    const tree = git(cwd, "rev-parse", `${produced}^{tree}`);
+    const foreignAhead = git(cwd, "commit-tree", tree, "-p", produced, "-m", "foreign ahead");
+    expect(foreignAhead).not.toBe(produced);
+    linkTask(db, id, { branch, headSha: foreignAhead });
+
+    expect(() => acceptRunSubmission(db, { runId: run.id })).toThrow(/stale: task head/);
+    expect(getTask(db, id)!.phase).toBe("implement");
+    expect(getTask(db, id)!.head_sha).toBe(foreignAhead);
+  });
 });
 
 describe("integration-phase Run with a moved head re-reviews (round-3)", () => {

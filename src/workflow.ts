@@ -26,6 +26,7 @@ import {
 import {
   findLiveRunFor,
   findActiveWriterRow,
+  runHeadFenceRepos,
   runOwnedError,
   taskHeadOvertakenByOtherWriter,
 } from "./run-owner";
@@ -715,16 +716,24 @@ export function submitImplementationFromRun(db: Database, taskId: string, impl: 
     );
   }
   // HEAD fence vs produced head: the Run started at `baseHeadSha`; a task bound
-  // to any OTHER revision than that base or the Run's own produced head has moved
-  // since the Run began. The produced head is legitimate because the daemon's
-  // provider poll may bind this Run's own pushed PR head mid-Run (ISH-1087/1125).
+  // to any OTHER revision than that base or a commit on the Run's own history
+  // has moved since the Run began. The Run's own history includes its produced
+  // head and any intermediate push the daemon's provider poll may have bound
+  // mid-Run (ISH-1087/1125); the lineage is checked in the Run's own repo so a
+  // foreign head is still refused.
+  //
+  // `baseHeadSha === undefined` (a direct caller, not `acceptRunSubmission`)
+  // falls back to `headSha`, so BOTH fence heads are the produced head and only
+  // that exact head (or NULL) can be accepted.
   const baseHead = impl.baseHeadSha !== undefined ? impl.baseHeadSha : impl.headSha;
   const producedHead = impl.headSha ?? null;
+  const sourceRun = db.query(`SELECT * FROM runs WHERE id = ?`).get(impl.runId) as Run | null;
   if (
-    taskHeadOvertakenByOtherWriter(task.head_sha, {
-      base_head_sha: baseHead ?? null,
-      head_sha: producedHead,
-    })
+    taskHeadOvertakenByOtherWriter(
+      task.head_sha,
+      { base_head_sha: baseHead ?? null, head_sha: producedHead },
+      sourceRun ? runHeadFenceRepos(db, sourceRun) : []
+    )
   ) {
     throw new Error(
       `${HEAD_MISMATCH}: run ${impl.runId} started at head ${baseHead ?? "none"} and produced ` +

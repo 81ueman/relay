@@ -20,6 +20,7 @@ import { gitHead } from "./verify";
 import { submitImplementationFromRun, type RunImplementation } from "./workflow";
 import {
   findActiveWriterRow,
+  runHeadFenceRepos,
   taskHeadOvertakenByOtherWriter,
   type ActiveWriterQuery as ActiveWriterRowQuery,
 } from "./run-owner";
@@ -811,12 +812,14 @@ export function acceptRunSubmission(db: Database, sub: RunSubmission): Run {
     );
   }
   // HEAD fence: the Run started at `run.base_head_sha`. A task bound to any
-  // revision OTHER than that base or the Run's own produced head has moved under
-  // the Run, so the Run can never advance the current attempt. The produced head
-  // is accepted because the daemon's provider poll may bind this Run's own pushed
-  // PR head mid-Run (ISH-1087/ISH-1125). A NULL task head is "not yet bound" and
-  // adopts the Run's produced head.
-  if (taskHeadOvertakenByOtherWriter(task.head_sha, run)) {
+  // revision OTHER than that base, the Run's own produced head, or an
+  // intermediate commit this Run pushed has moved under the Run, so the Run can
+  // never advance the current attempt. The Run's own heads are accepted because
+  // the daemon's provider poll may bind its pushed PR head mid-Run
+  // (ISH-1087/ISH-1125), and a Run may push more than once between polls. The
+  // lineage is checked in the Run's own repo so a foreign head is still refused.
+  // A NULL task head is "not yet bound" and adopts the Run's produced head.
+  if (taskHeadOvertakenByOtherWriter(task.head_sha, run, runHeadFenceRepos(db, run))) {
     rejectSubmission(
       `run ${run.id} is stale: task head is ${task.head_sha}, run started at ${run.base_head_sha ?? "none"} ` +
         `and produced ${run.head_sha ?? "none"}`

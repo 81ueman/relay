@@ -986,7 +986,7 @@ export function sandboxSubmitterError(run: Run, task: Task, sandbox: Sandbox | n
   if (task.branch !== null && run.branch !== task.branch) {
     return `run ${run.id} produced branch ${run.branch ?? "none"}, task is ${task.branch}`;
   }
-  if (taskHeadOvertakenByOtherWriter(task.head_sha, run)) {
+  if (taskHeadOvertakenByOtherWriter(task.head_sha, run, sandbox.source ? [sandbox.source] : [])) {
     return (
       `run ${run.id} started at head ${run.base_head_sha ?? "none"} and produced ` +
       `${run.head_sha ?? "none"}, task is bound to ${task.head_sha}`
