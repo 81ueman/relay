@@ -1070,7 +1070,7 @@ export function buildRunBrief(db: Database, task: Task, opts: BuildBriefOptions)
       );
       if (defects.some((f) => f.kind === "ImplementRun")) {
         lines.push(
-          "- The previous IMPLEMENT Run ended WITHOUT an accepted submission. Continue the SAME Task on this worktree and commit a NEW revision; do NOT re-run `relay` mutations."
+          "- The previous IMPLEMENT Run ended WITHOUT an accepted submission. Continue the SAME Task on this worktree and commit a NEW revision; do not invoke `relay` mutations yourself."
         );
       }
       for (const f of defects) lines.push(...renderRunFinding(f));

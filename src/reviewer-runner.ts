@@ -9,6 +9,7 @@ import { findSubmissionForAttempt, isResultWriteError } from "./results";
 import { REVIEWER_ROLE } from "./schema";
 import type { Task } from "./schema";
 import { gitHead } from "./verify";
+import { hostGit } from "./review-workspace";
 import { recordReview, taskChecks } from "./workflow";
 import { ensureHeadlessWorker, getWorker, HEADLESS_AGENT_KIND } from "./workers";
 import {
@@ -127,8 +128,9 @@ export interface ReviewerVerdict {
 /**
  * ISH-830e: the mechanical VERIFY result Relay ALREADY produced for the reviewed
  * HEAD. It is passed to the host reviewer as CONTEXT (with the raw check output
- * tail) so the reviewer can judge the change WITHOUT re-running the lab, and
- * without having to take the check's own word for it.
+ * tail) so the reviewer need not re-run the required checks wholesale, and does
+ * not have to take the check's own word for it. ISH-1135: the brief still asks
+ * for the focused executions the diff's blast radius and the rubric call for.
  */
 export interface ReviewVerifyEvidence {
   head: string | null;
@@ -142,6 +144,94 @@ export interface ReviewVerifyEvidence {
     /** The command output (the brief includes a bounded tail). */
     output?: string;
   }[];
+}
+
+/**
+ * ISH-1135: the repo-owned review rubric. Paths are RELATIVE to the reviewed
+ * checkout and are checked in the commit at the reviewed HEAD (never read from a
+ * mutable working tree). The default is the ishiul `independent-pr-review`
+ * skill layout; another repository can override it (see `reviewRubricFor`).
+ */
+export interface ReviewRubric {
+  /** Repo-relative path to the rubric at the reviewed HEAD. */
+  rubric: string;
+  /** Repo-relative path to the companion output contract, when the repo has one. */
+  outputContract?: string;
+}
+
+/** The ishiul repo-owned rubric the Factory's canonical target ships at HEAD. */
+export const DEFAULT_REVIEW_RUBRIC: ReviewRubric = {
+  rubric: ".agents/skills/independent-pr-review/references/rubric.md",
+  outputContract: ".agents/skills/independent-pr-review/references/output-contract.md",
+};
+
+/** Parse one `{rubric, outputContract?}` entry; null when it is not usable. */
+function normalizeReviewRubric(value: unknown): ReviewRubric | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const v = value as Record<string, unknown>;
+  const rubric = typeof v.rubric === "string" ? v.rubric.trim() : "";
+  if (!rubric) return null;
+  const outputContract = typeof v.outputContract === "string" ? v.outputContract.trim() : "";
+  return outputContract ? { rubric, outputContract } : { rubric };
+}
+
+/**
+ * ISH-1135: resolve the repo-owned rubric path for the repository being
+ * reviewed, so the Factory prompt is not tied to one repository's skill layout:
+ *
+ *   1. `RELAY_REVIEW_RUBRICS` — a JSON object keyed by `owner/name`, bare repo
+ *      name, or `default` (one Relay process can carry every repo's layout);
+ *   2. `RELAY_REVIEW_RUBRIC` (+ `RELAY_REVIEW_OUTPUT_CONTRACT`) — the paths for
+ *      the one repository this `relay run factory` invocation drives;
+ *   3. `DEFAULT_REVIEW_RUBRIC` (the ishiul skill layout).
+ *
+ * A malformed map / empty path is ignored (falls through), never a silent read
+ * of the wrong file. Missing files at HEAD are reported in the brief itself by
+ * `buildReviewBrief`.
+ */
+export function reviewRubricFor(repo: string | null | undefined, env: NodeJS.ProcessEnv = process.env): ReviewRubric {
+  const full = (repo ?? "").trim().replace(/\.git$/i, "").toLowerCase();
+  const bare = full.includes("/") ? full.slice(full.lastIndexOf("/") + 1) : full;
+  const rawMap = env.RELAY_REVIEW_RUBRICS;
+  if (rawMap) {
+    try {
+      const parsed: unknown = JSON.parse(rawMap);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        const map = parsed as Record<string, unknown>;
+        const byKey = new Map<string, unknown>();
+        for (const [k, v] of Object.entries(map)) byKey.set(k.toLowerCase(), v);
+        for (const key of [full, bare, "default"]) {
+          if (!key) continue;
+          const found = normalizeReviewRubric(byKey.get(key));
+          if (found) return found;
+        }
+      }
+    } catch {
+      /* malformed map: use the flat/default configuration */
+    }
+  }
+  const flat = (env.RELAY_REVIEW_RUBRIC ?? "").trim();
+  if (flat) {
+    const outputContract = (env.RELAY_REVIEW_OUTPUT_CONTRACT ?? "").trim();
+    return outputContract ? { rubric: flat, outputContract } : { rubric: flat };
+  }
+  return DEFAULT_REVIEW_RUBRIC;
+}
+
+/** A repo-relative path that can be read from a commit without escaping it. */
+function isRepoRelativePath(path: string): boolean {
+  const p = path.trim();
+  return !!p && !p.startsWith("/") && !p.split("/").some((part) => part === "..") && !p.includes("\0");
+}
+
+/**
+ * ISH-1135: whether `path` exists in the commit at `head` in `worktree`. Reading
+ * from the COMMIT (not the working tree) keeps the brief tied to the reviewed
+ * revision even if something left an uncommitted file in the checkout.
+ */
+export function rubricFileAtHead(worktree: string, head: string, path: string): boolean {
+  if (!isRepoRelativePath(path)) return false;
+  return hostGit(worktree, ["cat-file", "-e", `${head}:${path}`]).ok;
 }
 
 export interface ReviewerSpawnContext {
@@ -188,10 +278,17 @@ export interface HeadlessReviewDeps {
   /**
    * ISH-830e: the mechanical VERIFY result for this attempt's HEAD. Rendered into
    * the brief as context so the host reviewer can judge the change without
-   * re-running the lab. Omitted -> no VERIFY section (the reviewer sees only the
-   * declared checks).
+   * taking the lab's word for it. Omitted -> no VERIFY section (the reviewer sees
+   * only the declared checks). ISH-1135: the brief still asks for the FOCUSED
+   * executions the blast radius calls for, and says which ran.
    */
   verifyEvidence?: ReviewVerifyEvidence;
+  /**
+   * ISH-1135: the repo-owned review rubric read at the reviewed HEAD. Omitted ->
+   * `reviewRubricFor` resolves it from the repository (`RELAY_REVIEW_RUBRICS` /
+   * `RELAY_REVIEW_RUBRIC`) or the default ishiul skill layout.
+   */
+  reviewRubric?: ReviewRubric;
   /**
    * ISH-883: post a NATIVE GitHub Pull Request Review and read it back. When
    * omitted (the default), the reviewer keeps the local structured-verdict path
@@ -239,15 +336,29 @@ export function reviewEvidencePath(worktree: string, attempt: number, head: stri
 export function buildReviewBrief(
   db: Database,
   task: Task,
-  opts: { head: string; worktree: string; native?: { ref: PrRef; author: string }; verify?: ReviewVerifyEvidence }
+  opts: {
+    head: string;
+    worktree: string;
+    native?: { ref: PrRef; author: string };
+    verify?: ReviewVerifyEvidence;
+    /** ISH-1135: the repo-owned rubric to read at the reviewed HEAD. */
+    rubric?: ReviewRubric;
+  }
 ): string {
   const checks = taskChecks(task);
   const findings = inheritFindingsForBrief(db, task);
+  const rubric = opts.rubric ?? DEFAULT_REVIEW_RUBRIC;
+  const rubricPath = rubric.rubric;
+  const contractPath = rubric.outputContract;
+  const rubricPresent = rubricFileAtHead(opts.worktree, opts.head, rubricPath);
+  const contractPresent = contractPath ? rubricFileAtHead(opts.worktree, opts.head, contractPath) : false;
   const lines: string[] = [
     `# Independent review — Task ${task.id} (attempt ${task.attempt})`,
     "",
     "You are an INDEPENDENT code reviewer. You did NOT write this change. Treat this",
-    "checkout as READ-ONLY: do not modify the code, do not commit, push or merge.",
+    "checkout as READ-ONLY: do not modify tracked files, do not commit, push or merge.",
+    "Running read-only commands and focused tests in this DISPOSABLE checkout is",
+    "allowed (and expected — see `## Focused execution` below).",
     ...(opts.native
       ? [
           "You MAY run `git`/`gh` in this DISPOSABLE checkout (never in the coding",
@@ -256,6 +367,43 @@ export function buildReviewBrief(
       : []),
     "",
     `Judge ONLY the revision at HEAD \`${opts.head}\` in \`${opts.worktree}\`.`,
+    "",
+    "## Repo review rubric — READ THIS FIRST",
+    "",
+    "This repository OWNS its review rubric. Before judging, read it from THIS",
+    `checkout at the reviewed HEAD \`${opts.head}\` (use your file-reading tool;`,
+    "reading is always allowed):",
+    "",
+    `- \`${rubricPath}\` — ${
+      rubricPresent
+        ? "present at the reviewed HEAD. Read it NOW, before the diff."
+        : `MISSING at the reviewed HEAD \`${opts.head}\`.`
+    }`,
+    ...(contractPath
+      ? [
+          `- \`${contractPath}\` — ${
+            contractPresent
+              ? "present at the reviewed HEAD. Read it after the rubric."
+              : `MISSING at the reviewed HEAD \`${opts.head}\` (Relay's output contract below still applies).`
+          }`,
+        ]
+      : []),
+    "",
+    ...(rubricPresent
+      ? [
+          "Apply the rubric's axes to this diff: judge only the axes the diff can",
+          "touch, and say which axes you skipped and why. A blocking claim needs a",
+          "repro (a command, a fixture, or an unambiguous code trace).",
+        ]
+      : [
+          "The configured rubric file is MISSING at the reviewed HEAD. Do NOT silently",
+          "fall back to a rubric from another revision or another repository, and do",
+          "not invent one: say in your `summary` that the repo rubric was unavailable",
+          "and judge against the Acceptance above plus the diff.",
+        ]),
+    ...(contractPath && rubricPresent && !contractPresent
+      ? ["The companion output contract is missing at this HEAD; use Relay's JSON contract below."]
+      : []),
     "",
     `Title: ${task.title}`,
   ];
@@ -269,8 +417,9 @@ export function buildReviewBrief(
     const v = opts.verify;
     lines.push(
       "",
-      `## Mechanical VERIFY — ALREADY RUN at \`${v.head ?? opts.head}\` (context; do NOT re-run)`,
+      `## Mechanical VERIFY — ALREADY RUN at \`${v.head ?? opts.head}\` (context)`,
       "",
+      "The required checks below already passed; do not re-run them wholesale.",
       "Relay ran the REQUIRED checks above at this exact HEAD. This is the RESULT,",
       "recorded before the review:",
       "",
@@ -286,11 +435,24 @@ export function buildReviewBrief(
     }
     lines.push(
       "",
-      "Use this as EVIDENCE that the mechanical check passed at the reviewed HEAD; you",
-      "are NOT asked to (and should not) re-run the lab yourself. Judge the CODE and",
-      "the acceptance against the diff."
+      "Use this as EVIDENCE that the mechanical check passed at the reviewed HEAD.",
+      "It does NOT excuse you from the focused execution below."
     );
   }
+  lines.push(
+    "",
+    "## Focused execution — expected, not optional",
+    "",
+    "You are expected to execute the focused tests, commands or variants that the",
+    "diff's blast radius and the rubric call for (other address family, sibling",
+    "vendor, deleted path re-sweep), and to say which you ran. Running commands and",
+    "focused tests in this DISPOSABLE checkout is allowed; do not edit tracked files,",
+    "commit, push or merge.",
+    "",
+    "In the structured `summary`, name the focused commands you ran (or write an",
+    "explicit `no execution needed because <concrete reason>`) — silence is not enough.",
+    "A blocking claim should carry the repro command/output, or an unambiguous code trace."
+  );
   if (findings.length > 0) {
     lines.push("", `## Prior findings @ attempt ${token(task)} (context — verify they are actually fixed)`);
     for (const f of findings) lines.push(`- ${f}`);
@@ -334,7 +496,18 @@ export function buildReviewBrief(
     "- `fix`: it needs changes — list concrete findings a coding agent can act on.",
     "- `blocked`: you cannot judge (missing/incoherent context); say why in `summary`.",
     `- \`head\` MUST be exactly \`${opts.head}\`. A pass naming any other head is refused.`,
-    "- Do not approve a change you have not read; do not invent findings."
+    "- Do not approve a change you have not read; do not invent findings.",
+    "",
+    "Severity mapping from the repo rubric (Relay's JSON stays the machine contract):",
+    "- rubric `Act on` -> `blocker` (merge/release blocking) or `major`;",
+    "- rubric `Consider` / `Noted` -> NON-BLOCKING `minor`;",
+    "- rubric `Dismissed` -> NON-BLOCKING `nit`.",
+    "Keep every non-blocking finding in `findings` with its `minor`/`nit` severity —",
+    "do NOT drop it and do NOT promote it into a FIX (ISH-1086 reads these).",
+    "- `pass` may carry `minor`/`nit` findings; `fix` requires at least one",
+    "  `blocker`/`major` finding.",
+    "- If `output-contract.md` describes a different GitHub comment/marker shape, the",
+    "  native-review section above and this JSON schema take precedence for Relay."
   );
   return lines.join("\n");
 }
@@ -794,9 +967,15 @@ export async function runHeadlessReview(
   // post to; Relay reads the ACTUAL GitHub review back afterwards.
   const native = deps.nativeReview;
   const nativeRef = native ? await resolveBoundPr(task, native.github) : null;
+  // ISH-1135: the rubric is resolved per reviewed REPOSITORY (explicit dep, the
+  // bound PR's repo, or the Task's recorded pr_repo), so the prompt is not tied
+  // to one repo's skill layout. A missing file at HEAD is reported in the brief.
+  const rubricRepo = nativeRef?.repo ?? task.pr_repo ?? null;
+  const reviewRubric = deps.reviewRubric ?? reviewRubricFor(rubricRepo, process.env);
   const brief = buildReviewBrief(db, task, {
     head,
     worktree,
+    rubric: reviewRubric,
     ...(native && nativeRef ? { native: { ref: nativeRef, author: native.author } } : {}),
     ...(deps.verifyEvidence ? { verify: deps.verifyEvidence } : {}),
   });

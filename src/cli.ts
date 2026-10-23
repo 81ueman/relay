@@ -120,7 +120,7 @@ Usage:
 
   relay run start <task-id> [--cwd DIR] [--prompt TEXT] [--permission MODE] [--timeout 30m] [--json]
   relay run launch <task-id> [--timeout 30m] [--permission MODE] [--json]   # ensure worktree + pin brief + ONE dsh Run
-  relay run factory <task-id> [--max-attempts N] [--dsh BIN] [--reviewer CMD] [--model M] [--permission MODE] [--timeout 30m] [--json]  # code-change tasks only; dsh -> VERIFY -> Claude review -> MergeReady
+  relay run factory <task-id> [--max-attempts N] [--dsh BIN] [--reviewer CMD] [--model M] [--permission MODE] [--timeout 30m] [--review-rubric PATH] [--json]  # code-change tasks only; dsh -> VERIFY -> Claude review -> MergeReady
   relay run worktree <task-id> [--branch B] [--base REF] [--path DIR] [--json]
   relay run cleanup <task-id> [--abort REASON] [--apply] [--force] [--json]
   relay run list [--task <id>] [--json]
@@ -182,7 +182,7 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
     usage: [
       "relay run start <task-id> [--cwd DIR] [--prompt TEXT] [--permission MODE] [--timeout 30m] [--json]",
       "relay run launch <task-id> [--timeout 30m] [--permission MODE] [--json]",
-      "relay run factory <task-id> [--max-attempts N] [--dsh BIN] [--reviewer CMD] [--model M] [--permission MODE] [--timeout 30m] [--json]",
+      "relay run factory <task-id> [--max-attempts N] [--dsh BIN] [--reviewer CMD] [--model M] [--permission MODE] [--timeout 30m] [--review-rubric PATH] [--review-output-contract PATH] [--json]",
       "relay run worktree <task-id> [--branch B] [--base REF] [--path DIR] [--json]",
       "relay run cleanup <task-id> [--abort REASON] [--apply] [--force] [--json]",
       "relay run list [--task <id>] [--limit N] [--json]",
@@ -202,7 +202,7 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
       "ISH-1013: every non-ready result carries a `failure` object: a minimal `class`, the concrete evidence-derived `cause`, the last Run/attempt/HEAD, bounded evidence references (`run show/logs`, check/review/evidence paths), and `next` (what to fix, what to read, the existing safe resume command, and the condition that permits resume). Classification never auto-unblocks: a HOLD, missing permission, live writer or stale/old HEAD stays blocked until an explicit `relay unblock` or a fresh HEAD-bound result. " +
       "ISH-1128: a Task already parked by the OLD stale-HEAD refusal (a Run that amended and force-pushed its own head) is resumed at the parked Run's produced head WITHOUT re-implementing: `relay unblock <task-id>`, `relay claim <task-id> --worker <coordinator>`, then `relay result submit <task-id> --head <parked-run-produced-head> --evidence \"recovered from parked run <run-id>\" --worker <coordinator>` (see docs/run-lifecycle.md).",
     usage: [
-      "relay run factory <task-id> [--max-attempts N] [--dsh BIN] [--reviewer CMD] [--model M] [--permission MODE] [--timeout 30m] [--repo DIR] [--review-worktrees DIR] [--json]",
+      "relay run factory <task-id> [--max-attempts N] [--dsh BIN] [--reviewer CMD] [--model M] [--permission MODE] [--timeout 30m] [--repo DIR] [--review-worktrees DIR] [--review-rubric PATH] [--review-output-contract PATH] [--json]",
     ],
   },
   db: {
@@ -1835,12 +1835,20 @@ async function main(): Promise<void> {
           // native review. No PR = the review stage blocks (never MergeReady).
           const providers = await operatorProviderDepsFromEnv();
           const nativeReview = await factoryNativeReviewDepsFromEnv();
+          // ISH-1135: the repo-owned rubric the reviewer must read at the
+          // reviewed HEAD. This flag overrides the per-repo resolver
+          // (RELAY_REVIEW_RUBRICS / RELAY_REVIEW_RUBRIC).
+          const rubricFlag = flag(rest, "--review-rubric");
+          const contractFlag = flag(rest, "--review-output-contract");
           const result = await runFactoryTask(db, id, {
             repo: flag(rest, "--repo") ?? undefined,
             prRepo: flag(rest, "--pr-repo") ?? undefined,
             dshBin: flag(rest, "--dsh") ?? process.env.RELAY_DSH_BIN ?? undefined,
             reviewerCommand: flag(rest, "--reviewer") ?? process.env.RELAY_REVIEW_CMD ?? undefined,
             reviewerModel: flag(rest, "--model") ?? process.env.RELAY_REVIEW_MODEL ?? DEFAULT_REVIEW_MODEL,
+            ...(rubricFlag
+              ? { reviewRubric: contractFlag ? { rubric: rubricFlag, outputContract: contractFlag } : { rubric: rubricFlag } }
+              : {}),
             timeoutMs: timeoutRaw ? parseDuration(timeoutRaw) : undefined,
             permissionMode: flag(rest, "--permission") ?? undefined,
             maxAttempts: maxRaw ? Number(maxRaw) : undefined,
