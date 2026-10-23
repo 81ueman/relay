@@ -19,7 +19,7 @@ import {
 } from "./dsh-runner";
 import { taskChecks } from "./workflow";
 import type { CheckSpec } from "./verify";
-import { redactSecrets } from "./lab";
+import { redactSecrets } from "./redact";
 import { readEvidenceTail, terminalImplementRunSignature } from "./implement-recovery";
 import { issueKeyForTask, resolveTaskPrTarget } from "./pr-target";
 import { taskHeadOvertakenByOtherWriter } from "./run-owner";

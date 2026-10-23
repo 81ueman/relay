@@ -11,22 +11,24 @@ existing one from the repo. `labctl` is a thin client for the shared Lab's
 `clab-api-server`; it starts NOS containers on the shared Lab VM. The NOS image
 cache already lives on the Lab — never copy an image yourself.
 
-## Owner identifier (required)
+## Lab name and namespace (required)
 
-Every lab you deploy belongs to **this task**. Relay exports a stable owner id:
+Every lab you deploy belongs to **this task**, so use a task-scoped namespace.
+Relay exports the Task id to every Run:
 
 ```sh
-: "${RELAY_LAB_OWNER:?RELAY_LAB_OWNER is not set — you are not running as a Relay task}"
+OWNER="${RELAY_TASK_ID:?RELAY_TASK_ID is not set — you are not running as a Relay task}"
 ```
 
 `labctl` reads the containerlab `name:` **verbatim** — it does not expand shell
-variables when it resolves the lab name — so **write the owner id into the
-topology before deploying**. Do not leave a literal `$RELAY_LAB_OWNER` in the
-file (the API rejects it: `400 Invalid characters in lab name`):
+variables when it resolves the lab name — so **write the resolved lab name
+(`netlab-$OWNER`) into the topology before deploying**. Do not leave a literal
+`$OWNER`/`$RELAY_TASK_ID` in the file (the API rejects it: `400 Invalid
+characters in lab name`):
 
 ```yaml
-# mylab/mylab.clab.yml — the name is the resolved owner id, e.g. netlab-T17
-name: netlab-agent845
+# mylab/mylab.clab.yml — the name is resolved for this task, e.g. netlab-T17
+name: netlab-T17
 topology:
   nodes:
     srl1:
@@ -38,14 +40,14 @@ topology:
 Resolve it in a scripted step, e.g.:
 
 ```sh
-sed -i "s/@OWNER@/$RELAY_LAB_OWNER/g" mylab/mylab.clab.yml   # or: envsubst < tmpl > mylab/mylab.clab.yml
+sed -i "s/@OWNER@/$OWNER/g" mylab/mylab.clab.yml   # or: envsubst < tmpl > mylab/mylab.clab.yml
 ```
 
 Use the **same** owner value as `--namespace`, so the lab directory
 (`<owner>/netlab-<owner>`) and the lab identity are both task-scoped:
 
 ```sh
-labctl deploy -t mylab/mylab.clab.yml --namespace "$RELAY_LAB_OWNER"
+labctl deploy -t mylab/mylab.clab.yml --namespace "$OWNER"
 ```
 
 Never reuse another task's namespace, and never use a fixed lab name: two tasks
@@ -62,12 +64,12 @@ never hard-code a secret):
 : "${LABCTL_PASSWORD:?}"            # or a --password-file
 API="${LABCTL_API:?}"               # e.g. https://host.docker.internal:49170
 
-labctl deploy  -t mylab/mylab.clab.yml --namespace "$RELAY_LAB_OWNER" \
+labctl deploy  -t mylab/mylab.clab.yml --namespace "$OWNER" \
                --api "$API" --insecure --json
-labctl inspect "netlab-$RELAY_LAB_OWNER" --json --reach-host host.docker.internal \
+labctl inspect "netlab-$OWNER" --json --reach-host host.docker.internal \
                --api "$API" --insecure
-labctl exec    --api "$API" --insecure "netlab-$RELAY_LAB_OWNER/srl1" -- sr_cli show version
-labctl destroy --name "netlab-$RELAY_LAB_OWNER" --api "$API" --insecure --json
+labctl exec    --api "$API" --insecure "netlab-$OWNER/srl1" -- sr_cli show version
+labctl destroy --name "netlab-$OWNER" --api "$API" --insecure --json
 ```
 
 `--api`, `--user`, `--password-file`, `--insecure`, `--ca-cert`, `--timeout`
@@ -116,7 +118,7 @@ verification step can see what was actually observed.
 ## Destroy and failure reporting
 
 - **Always destroy your lab when done** (unless a later step keeps using it):
-  `labctl destroy --name "netlab-$RELAY_LAB_OWNER" …`.
+  `labctl destroy --name "netlab-$OWNER" …`.
 - `destroy` never removes NOS images — the shared image cache is reused across
   tasks. Do **not** manage images: no `docker pull`, no manual image copy into
   the Lab, no host Docker access.
@@ -125,9 +127,9 @@ verification step can see what was actually observed.
   already exists, `7` client timeout, `8` partial create. Never treat a
   non-zero exit as success.
 - If a deploy timed out and left a workspace directory with no lab, remove it
-  with `labctl purge "netlab-$RELAY_LAB_OWNER" --namespace "$RELAY_LAB_OWNER" …`.
+  with `labctl purge "netlab-$OWNER" --namespace "$OWNER" …`.
 - If you cannot reach the Lab at all, say so and stop — do not fabricate
   endpoints or observations.
 
-Relay cleans up labs owned by this task when the task ends; keeping the owner id
-above is what makes that cleanup precise (only this task's lab is destroyed).
+Relay does not track or clean up labs: you own the full lifecycle, so destroy
+your lab yourself when the work is done.
