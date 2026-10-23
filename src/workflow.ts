@@ -30,6 +30,7 @@ import {
   runOwnedError,
   taskHeadOvertakenByOtherWriter,
 } from "./run-owner";
+import { runObservedOwnHeads } from "./run-heads";
 import { clearCurrentTask, getWorker, normalizeWorkerAfterTaskRelease, touchProgress } from "./workers";
 import {
   gitHead,
@@ -726,9 +727,10 @@ export function submitImplementationFromRun(db: Database, taskId: string, impl: 
   // HEAD fence vs produced head: the Run started at `baseHeadSha`; a task bound
   // to any OTHER revision than that base or a commit on the Run's own history
   // has moved since the Run began. The Run's own history includes its produced
-  // head and any intermediate push the daemon's provider poll may have bound
-  // mid-Run (ISH-1087/1125); the lineage is checked in the Run's own repo so a
-  // foreign head is still refused.
+  // head, any intermediate push the daemon's provider poll may have bound
+  // mid-Run (ISH-1087/1125), and an own head the worker amended/force-pushed
+  // away (observed by the poll; ISH-1128). The lineage is checked in the Run's
+  // own repo so a foreign head is still refused.
   //
   // `baseHeadSha === undefined` (a direct caller, not `acceptRunSubmission`)
   // falls back to `headSha`, so BOTH fence heads are the produced head and only
@@ -740,7 +742,8 @@ export function submitImplementationFromRun(db: Database, taskId: string, impl: 
     taskHeadOvertakenByOtherWriter(
       task.head_sha,
       { base_head_sha: baseHead ?? null, head_sha: producedHead },
-      sourceRun ? runHeadFenceRepos(sourceRun) : []
+      sourceRun ? runHeadFenceRepos(sourceRun) : [],
+      sourceRun ? runObservedOwnHeads(db, sourceRun.id) : []
     )
   ) {
     throw new Error(

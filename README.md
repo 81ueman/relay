@@ -471,9 +471,15 @@ event is **not** a submission — only a structured `relay run submit` bound to 
 current Run/Task/phase/attempt/branch/HEAD advances the Task (a task with no
 linked branch/HEAD yet adopts the Run's; the recorded head is the produced one);
 the HEAD fence also accepts a commit on the Run's **own** history — its base, its
-produced head, or an intermediate push the provider poll bound between them
-(proved with `git merge-base --is-ancestor`) — so a worker that pushes and opens
-its PR before the Run ends is not refused as stale, while a foreign head is.
+produced head, an intermediate push the provider poll bound between them (proved
+with `git merge-base --is-ancestor`), or an own head the worker pushed then
+amended/rebased and force-pushed away (recorded by the poll while the Run was
+live and the head was in the Run's own worktree) — so a worker that pushes and
+opens its PR before the Run ends, then amends its own commit, is not refused as
+stale, while a foreign head is. A Task already parked by the pre-ISH-1128 stale
+refusal is recovered at the parked Run's produced head **without re-implementing**
+(`relay unblock` + `relay result submit --head <parked-run-produced-head>`); the
+exact sequence is in [`docs/run-lifecycle.md`](docs/run-lifecycle.md#recovering-a-task-parked-by-the-stale-head-fence-ish-1128).
 A non-zero/cancelled/stale Run never advances the Task. `relay run logs <run-id>` renders the
 read-only session id + ordered `tool_call`/`tool_result` chronology (no TUI/Web UI
 needed). This covers one Run's launch/observe/terminate only; the Task worktree

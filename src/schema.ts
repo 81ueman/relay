@@ -773,6 +773,21 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 CREATE INDEX IF NOT EXISTS idx_runs_task ON runs(task_id, phase, attempt);
 CREATE INDEX IF NOT EXISTS idx_runs_state ON runs(state);
+-- ISH-1128: heads the read-only provider poll bound onto the Task while a Run
+-- was LIVE and the Run's own worktree provably held that commit (HEAD or HEAD
+-- reflog). An amended/rebased own head is NOT an ancestor of the produced head,
+-- so the submit fence needs this durable observation to tell the Run's OWN
+-- earlier push from a foreign writer's head. Additive table: new DBs and
+-- existing DBs both get it from SCHEMA (no column migration needed).
+CREATE TABLE IF NOT EXISTS run_observed_heads (
+  run_id TEXT NOT NULL,
+  task_id TEXT NOT NULL,
+  branch TEXT,
+  head_sha TEXT NOT NULL,
+  observed_at INTEGER NOT NULL,
+  PRIMARY KEY (run_id, head_sha)
+);
+CREATE INDEX IF NOT EXISTS idx_run_observed_heads_head ON run_observed_heads(head_sha);
 -- NOTE: idx_runs_sandbox (runs.sandbox_name) is created by migrate(), NOT here.
 -- SCHEMA runs before migrate() (see openDb), and a pre-ISH-1098 runs table has
 -- no sandbox_name column yet, so an index on it here would break opening every

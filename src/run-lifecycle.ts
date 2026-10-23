@@ -1273,8 +1273,16 @@ export async function launchTaskRun(db: Database, taskId: string, opts: LaunchRu
  * phase/attempt/generation, or null when it is correctly bound. This mirrors (and
  * makes explicit) the fences `acceptRunSubmission` already applies; callers use
  * it to report before attempting the submission.
+ *
+ * ISH-1128: `observedOwnHeads` are the poll-attributed heads of THIS Run (see
+ * `runObservedOwnHeads`). Callers with a DB should pass them so an own head the
+ * worker amended/force-pushed away is not reported as a foreign move.
  */
-export function runSubmitterError(run: Run, task: Task): string | null {
+export function runSubmitterError(
+  run: Run,
+  task: Task,
+  observedOwnHeads: readonly string[] = []
+): string | null {
   if (run.task_id !== task.id) return `run ${run.id} belongs to task ${run.task_id}, not ${task.id}`;
   if (run.phase !== task.phase) return `run ${run.id} started in phase '${run.phase}', task is '${task.phase ?? "none"}'`;
   if (run.attempt !== task.attempt) return `run ${run.id} started at attempt ${run.attempt}, task is attempt ${task.attempt}`;
@@ -1282,7 +1290,7 @@ export function runSubmitterError(run: Run, task: Task): string | null {
   if (task.branch !== null && run.branch !== task.branch) {
     return `run ${run.id} produced branch ${run.branch ?? "none"}, task is ${task.branch}`;
   }
-  if (taskHeadOvertakenByOtherWriter(task.head_sha, run, run.cwd ? [run.cwd] : [])) {
+  if (taskHeadOvertakenByOtherWriter(task.head_sha, run, run.cwd ? [run.cwd] : [], observedOwnHeads)) {
     return (
       `run ${run.id} started at head ${run.base_head_sha ?? "none"} and produced ` +
       `${run.head_sha ?? "none"}, task is bound to ${task.head_sha}`

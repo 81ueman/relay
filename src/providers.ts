@@ -1,5 +1,6 @@
 import type { Database } from "bun:sqlite";
 import { logEvent } from "./events";
+import { recordRunOwnPolledHead } from "./run-heads";
 import type { Task } from "./schema";
 import { isTerminalTaskState } from "./schema";
 import { getTask } from "./tasks";
@@ -502,6 +503,14 @@ export function reconcileTaskFromProvider(db: Database, taskId: string, deps: Pr
     if (ref) {
       const view = deps.github.getPullRequest(ref);
       if (view) {
+        // ISH-1128: while a Run is LIVE, remember a PR head that is provably
+        // one of that Run's own pushes. An amend/force-push replaces such a
+        // head with one that is NOT on the produced lineage, so the submit
+        // fence needs this durable observation to tell the Run's own earlier
+        // push from a foreign writer's head.
+        if (view.headSha) {
+          recordRunOwnPolledHead(db, taskId, view.headSha, view.headRefName || null);
+        }
         const before = getTask(db, taskId)!;
         const linked = linkTask(db, taskId, {
           prUrl: view.url,

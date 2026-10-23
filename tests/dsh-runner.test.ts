@@ -6,13 +6,15 @@ import { join } from "node:path";
 import type { Database } from "bun:sqlite";
 import { openDb } from "../src/db";
 import {
+  blockImplementFailure,
   findTaskResult,
   intakeTask,
   linkTask,
   recordReview,
   recordVerification,
+  submitPhase,
 } from "../src/workflow";
-import { claimNext, claimTask, cancelTask, getTask } from "../src/tasks";
+import { claimNext, claimTask, cancelTask, getTask, unblockTask } from "../src/tasks";
 import { registerWorker } from "../src/workers";
 import {
   acceptRunSubmission,
@@ -25,6 +27,8 @@ import {
   type DshProcess,
   type DshSpawner,
 } from "../src/dsh-runner";
+import { isAncestorCommit } from "../src/run-owner";
+import { runObservedOwnHeads } from "../src/run-heads";
 import { PINNED_DSH_VERSION } from "../src/dsh-version";
 import { FakeGitHub, type PrView } from "../src/providers";
 import { reconcileProviderBound } from "../src/workflow-driver";
@@ -859,6 +863,163 @@ describe("ISH-1125: a mid-Run provider poll cannot make the Run's own submit sta
     expect(() => acceptRunSubmission(db, { runId: run.id })).toThrow(/stale: task head/);
     expect(getTask(db, id)!.phase).toBe("implement");
     expect(getTask(db, id)!.head_sha).toBe(foreignAhead);
+  });
+});
+
+// ISH-1128: a worker may push H1, let the provider poll bind it onto the Task,
+// then AMEND H1 into H2 and force-push H2. H1 is not an ancestor of H2, so the
+// ISH-1125 lineage rule alone cannot tell it from a foreign head; the poll
+// records it while the Run is live and the submit fence accepts it.
+function foreignWriterCommit(baseRepo: string, base: string, name: string): string {
+  const other = join(dir, `foreign-writer-${name}`);
+  git(dir, "clone", "-q", baseRepo, other);
+  git(other, "config", "user.email", "other@test");
+  git(other, "config", "user.name", "other-writer");
+  git(other, "checkout", "-q", base);
+  writeFileSync(join(other, "foreign.txt"), "a different writer's change\n");
+  git(other, "add", "foreign.txt");
+  git(other, "commit", "-q", "-m", "foreign writer change");
+  return git(other, "rev-parse", "HEAD");
+}
+
+describe("ISH-1128: an amended + force-pushed own head is not stale", () => {
+  test("(a) push -> poll binds the own head -> amend + force-push -> submit accepted", async () => {
+    const { id, cwd, outputRoot, baseHead, branch } = newPrTargetTask();
+    const gh = new FakeGitHub();
+    let firstPush = "";
+    let produced = "";
+    const spawner = new FakeSpawner();
+    spawner.onSpawn = (p) => {
+      writeFileSync(join(cwd, "change.txt"), "the change\n");
+      git(cwd, "add", "change.txt");
+      git(cwd, "commit", "-q", "-m", "ISH-1128: the change");
+      firstPush = git(cwd, "rev-parse", "HEAD");
+      gh.putPullRequest(polledPr(firstPush, branch));
+      p.writeOut("pushed the first head\n");
+      // NOT finished: the poll below must see a LIVE Run.
+    };
+    const h = await startDshRun(db, { taskId: id, spawner, outputRoot, cwd, fastExitMs: 0 });
+
+    // The daemon's provider poll binds the FIRST push while the Run is live and
+    // records it as an own head of THIS Run.
+    expect(reconcileProviderBound(db, { github: gh })).toContain(`pr-head-bound:${id}`);
+    expect(getTask(db, id)!.head_sha).toBe(firstPush);
+    expect(runObservedOwnHeads(db, h.id)).toEqual([firstPush]);
+
+    // The worker amends the same change to a NEW commit and force-pushes it. No
+    // second poll runs, so task.head_sha stays on the superseded first push.
+    writeFileSync(join(cwd, "change.txt"), "the change\namended\n");
+    git(cwd, "add", "change.txt");
+    git(cwd, "commit", "-q", "--amend", "-m", "ISH-1128: the change");
+    produced = git(cwd, "rev-parse", "HEAD");
+    gh.putPullRequest(polledPr(produced, branch));
+    spawner.procs[0].finish(0);
+
+    const run = await h.wait();
+    expect(run.base_head_sha).toBe(baseHead);
+    expect(run.head_sha).toBe(produced);
+    expect(getTask(db, id)!.head_sha).toBe(firstPush);
+    // The reported T253 shape: the bound head is NOT on the produced lineage.
+    expect(isAncestorCommit(cwd, baseHead, produced)).toBe(true);
+    expect(isAncestorCommit(cwd, firstPush, produced)).toBe(false);
+
+    const accepted = acceptRunSubmission(db, { runId: run.id });
+    expect(accepted.state).toBe("submitted");
+    const task = getTask(db, id)!;
+    expect(task.phase).toBe("verify");
+    expect(task.head_sha).toBe(produced);
+    expect(findTaskResult(db, id, "implement", 0, "TaskSubmitted")!.head_sha).toBe(produced);
+  });
+
+  test("(b) a DIFFERENT writer force-pushes mid-Run: still refused", async () => {
+    const { id, cwd, outputRoot, baseHead, branch } = newPrTargetTask();
+    const gh = new FakeGitHub();
+    let produced = "";
+    let foreign = "";
+    const spawner = new FakeSpawner();
+    spawner.onSpawn = (p) => {
+      writeFileSync(join(cwd, "own.txt"), "own\n");
+      git(cwd, "add", "own.txt");
+      git(cwd, "commit", "-q", "-m", "own change");
+      produced = git(cwd, "rev-parse", "HEAD");
+      // Another writer's commit, made in a SEPARATE clone from the same base:
+      // the Run's own worktree neither holds it nor has it in its reflog.
+      foreign = foreignWriterCommit(cwd, baseHead, "ish1128-b");
+      gh.putPullRequest(polledPr(foreign, branch));
+    };
+    const h = await startDshRun(db, { taskId: id, spawner, outputRoot, cwd, fastExitMs: 0 });
+
+    reconcileProviderBound(db, { github: gh });
+    expect(getTask(db, id)!.head_sha).toBe(foreign);
+    expect(runObservedOwnHeads(db, h.id)).not.toContain(foreign);
+
+    spawner.procs[0].finish(0);
+    const run = await h.wait();
+    expect(run.head_sha).toBe(produced);
+    expect(produced).not.toBe(foreign);
+
+    expect(() => acceptRunSubmission(db, { runId: run.id })).toThrow(/stale: task head/);
+    const task = getTask(db, id)!;
+    expect(task.phase).toBe("implement");
+    expect(task.head_sha).toBe(foreign);
+    expect(findTaskResult(db, id, "implement", 0, "TaskSubmitted")).toBeNull();
+  });
+
+  // ISH-1128 recovery fixture (T253): a Task already parked by the PRE-FIX
+  // stale fence is resumed at the parked Run's PRODUCED head without launching
+  // another coding Run. This is the command sequence documented in
+  // docs/run-lifecycle.md ("Recovering a Task parked by the stale-HEAD fence").
+  test("recovery: unblock -> claim -> result submit at the parked Run's produced head", async () => {
+    const { id, cwd, outputRoot, branch } = newPrTargetTask();
+    const gh = new FakeGitHub();
+    let firstPush = "";
+    let produced = "";
+    const spawner = new FakeSpawner();
+    spawner.onSpawn = (p) => {
+      writeFileSync(join(cwd, "change.txt"), "the change\n");
+      git(cwd, "add", "change.txt");
+      git(cwd, "commit", "-q", "-m", "ISH-1128: the change");
+      firstPush = git(cwd, "rev-parse", "HEAD");
+      gh.putPullRequest(polledPr(firstPush, branch));
+    };
+    const h = await startDshRun(db, { taskId: id, spawner, outputRoot, cwd, fastExitMs: 0 });
+    reconcileProviderBound(db, { github: gh });
+    expect(getTask(db, id)!.head_sha).toBe(firstPush);
+
+    // Amend + force-push, then the Run exits cleanly; no second poll runs.
+    writeFileSync(join(cwd, "change.txt"), "the change\namended\n");
+    git(cwd, "add", "change.txt");
+    git(cwd, "commit", "-q", "--amend", "-m", "ISH-1128: the change");
+    produced = git(cwd, "rev-parse", "HEAD");
+    spawner.procs[0].finish(0);
+    const parkedRun = await h.wait();
+    expect(parkedRun.head_sha).toBe(produced);
+    expect(getTask(db, id)!.head_sha).toBe(firstPush);
+
+    // Reproduce what the pre-ISH-1128 Factory left behind: the implement
+    // attempt was advanced and the Task parked blocked_human (T253 attempt 2).
+    const parked = blockImplementFailure(db, id, "RUN_SUBMISSION_REJECTED: stale: task head", "factory");
+    expect(parked.state).toBe("blocked_human");
+    expect(parked.attempt).toBe(1);
+    expect(parked.head_sha).toBe(firstPush);
+    const runsBefore = listRuns(db, { taskId: id }).length;
+
+    // The documented recovery sequence. `--head` is the PARKED RUN's produced
+    // head, not the stale bound head; `--evidence` names the Run it came from.
+    registerWorker(db, "ish1128-recovery", { role: "worker" });
+    unblockTask(db, id, "ish1128-recovery");
+    claimTask(db, id, "ish1128-recovery");
+    const recovered = submitPhase(db, id, "ish1128-recovery", {
+      headSha: produced,
+      evidence: `recovered from parked run ${parkedRun.id}`,
+    });
+    expect(recovered.phase).toBe("verify");
+    expect(recovered.attempt).toBe(1);
+    expect(recovered.head_sha).toBe(produced);
+    expect(findTaskResult(db, id, "implement", 1, "TaskSubmitted")!.head_sha).toBe(produced);
+    expect(runObservedOwnHeads(db, parkedRun.id)).toContain(firstPush);
+    // No re-implementation: the parked Run is still the ONLY Run for the Task.
+    expect(listRuns(db, { taskId: id }).length).toBe(runsBefore);
   });
 });
 

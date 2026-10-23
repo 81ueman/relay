@@ -161,17 +161,29 @@ relay run submit <run-id> [--evidence E] [--summary S]
 when the submission names a different task/phase/attempt than the Run recorded,
 or when the **live** Task has moved: its branch is bound to a different branch,
 or its head is bound to a revision other than the Run's **start** head
-(`base_head_sha`), **the Run's own produced head** (`head_sha`), or an
+(`base_head_sha`), **the Run's own produced head** (`head_sha`), an
 **intermediate commit on the Run's own history** (the base is its ancestor and it
 is an ancestor of the produced head, proved with `git merge-base --is-ancestor`
-in the Run's worktree). The Run's own heads are accepted because the daemon's
-provider poll may bind the Run's pushed PR head onto the Task mid-Run
-(ISH-1087/ISH-1125), and a Run may push more than once between polls; a head
-bound by anyone else — before the base, off the produced history, or ahead of it
-— is still refused. A task with no linked branch/head **yet** (the normal
+in the Run's worktree), or **an own head the worker amended/rebased and
+force-pushed away** (ISH-1128). The Run's own heads are accepted because the
+daemon's provider poll may bind the Run's pushed PR head onto the Task mid-Run
+(ISH-1087/ISH-1125), a Run may push more than once between polls, and a worker
+may amend its own commit before submitting. The amended-away head is not on the
+base→produced lineage; the poll records it in `run_observed_heads` only while the
+Run is LIVE and only when the Run's own worktree held that commit (HEAD or HEAD
+reflog) on the Run's own branch, so a head bound by anyone else — before the base,
+off the produced history, ahead of it, or pushed by a different writer — is still
+refused. A task with no linked branch/head **yet** (the normal
 implement phase — the branch is not linked until a PR exists) **adopts** the
 Run's produced branch and HEAD, so a clean Run from a real git worktree with no
 linked branch/HEAD is submittable.
+
+A Task already parked by the pre-ISH-1128 stale refusal is recovered at the
+parked Run's produced head without another coding Run: `relay unblock`, then
+`relay result submit <task> --head <parked-run-produced-head> --evidence
+"recovered from parked run <run-id>"`. The exact command sequence (including the
+`relay claim` step and the guard conditions) is in
+[`run-lifecycle.md`](run-lifecycle.md#recovering-a-task-parked-by-the-stale-head-fence-ish-1128).
 
 A terminal `error` event that contradicts a 0 exit fails **closed** (`failed`): a
 parse/truncation problem is surfaced and can never manufacture a success.
