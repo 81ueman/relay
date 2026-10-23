@@ -950,7 +950,7 @@ async function runFactoryTaskInner(
         if (deps.prBinding && reviewHead) {
           const live = getTask(db, taskId)!;
           const target = resolveTaskPrTarget(live, { repo: deps.prRepo ?? prSourceRepo });
-          const bind = bindTaskPr(db, taskId, {
+          const bind = await bindTaskPr(db, taskId, {
             ...deps.prBinding,
             expectedHead: reviewHead,
             repo: deps.prBinding.repo ?? target?.repo ?? null,
@@ -1077,7 +1077,7 @@ async function runFactoryTaskInner(
             const repo = resolveTaskPrTarget(live, { repo: deps.prRepo ?? prSourceRepo })?.repo ?? null;
             return { github, ...(checks ? { checks } : {}), repo };
           })();
-        const gate = checkMergeGate(db, taskId, gateDeps);
+        const gate = await checkMergeGate(db, taskId, gateDeps);
         push(`merge_ready:gate=${gate?.status ?? "unknown"}`);
         return { taskId, outcome: "merge_ready", head: getTask(db, taskId)!.head_sha, attempts, gate, reason: null, steps };
       }

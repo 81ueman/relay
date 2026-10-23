@@ -37,13 +37,13 @@ export interface RebaseRequestOptions {
  * closed PR, a moved PR HEAD, a mergeable PR or an unresolved NG/HOLD all refuse
  * without touching the Task.
  */
-export function requestRebase(
+export async function requestRebase(
   db: Database,
   taskId: string,
   actor: string,
   opts: RebaseRequestOptions
-): Task {
-  const input = gatherMergeGateInput(db, taskId, opts.deps);
+): Promise<Task> {
+  const input = await gatherMergeGateInput(db, taskId, opts.deps);
   if (!input) throw new Error(`unknown task: ${taskId}`);
   if (!opts.deps?.github) {
     throw new Error(

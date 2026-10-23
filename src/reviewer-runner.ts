@@ -629,11 +629,11 @@ export function markerVerdictFor(verdict: ReviewerVerdict["verdict"]): MarkerVer
 }
 
 /** The bound PR ref for a task (url, then repo+branch), or null when none. */
-function resolveBoundPr(task: Task, github?: GitHubReadOnly): PrRef | null {
+async function resolveBoundPr(task: Task, github?: GitHubReadOnly): Promise<PrRef | null> {
   const ref = parsePrUrl(task.pr_url, task.pr_repo);
   if (ref) return ref;
   if (github && task.pr_repo && task.branch) {
-    return github.findPullRequestForBranch(task.pr_repo, task.branch)?.ref ?? null;
+    return (await github.findPullRequestForBranch(task.pr_repo, task.branch))?.ref ?? null;
   }
   return null;
 }
@@ -654,19 +654,19 @@ export interface NativeReviewOutcome {
  * verdict contradicts the structured one, or a failed read is `ok:false` — the
  * caller records NOTHING. Relay never trusts the reviewer's own URL/JSON.
  */
-export function verifyNativeReview(
+export async function verifyNativeReview(
   db: Database,
   task: Task,
   verdict: ReviewerVerdict,
   head: string,
   native: NativeReviewDeps
-): NativeReviewOutcome {
+): Promise<NativeReviewOutcome> {
   const fail = (error: string): NativeReviewOutcome => ({ ok: false, review: null, error });
-  const ref = resolveBoundPr(task, native.github);
+  const ref = await resolveBoundPr(task, native.github);
   if (!ref) return fail(`${REVIEW_NATIVE_NO_PR}: ${task.id} has no bound PR to read a native review from`);
 
   const marker = markerVerdictFor(verdict.verdict);
-  const reviews = native.reader.listReviews(ref);
+  const reviews = await native.reader.listReviews(ref);
   if (reviews === null) {
     return fail(`${REVIEW_NATIVE_UNVERIFIED}: could not read reviews for ${ref.repo}#${ref.number} (failed read)`);
   }
@@ -713,7 +713,7 @@ export function verifyNativeReview(
   // A moved PR HEAD invalidates the review even when the read-back review is
   // pinned: GitHub's CURRENT head must still be the reviewed commit.
   if (native.github) {
-    const pr = native.github.getPullRequest(ref);
+    const pr = await native.github.getPullRequest(ref);
     if (!pr) {
       return fail(`${REVIEW_NATIVE_UNVERIFIED}: could not re-read ${ref.repo}#${ref.number} to confirm the current HEAD`);
     }
@@ -793,7 +793,7 @@ export async function runHeadlessReview(
   // ISH-883: when native posting is enabled, the reviewer is told which PR to
   // post to; Relay reads the ACTUAL GitHub review back afterwards.
   const native = deps.nativeReview;
-  const nativeRef = native ? resolveBoundPr(task, native.github) : null;
+  const nativeRef = native ? await resolveBoundPr(task, native.github) : null;
   const brief = buildReviewBrief(db, task, {
     head,
     worktree,
@@ -947,7 +947,7 @@ export async function runHeadlessReview(
   // Task never advances on the reviewer's own URL/JSON alone.
   let nativeReview: ReviewView | null = null;
   if (deps.nativeReview) {
-    const nr = verifyNativeReview(db, task, verdict, head, deps.nativeReview);
+    const nr = await verifyNativeReview(db, task, verdict, head, deps.nativeReview);
     if (!nr.ok) {
       logEvent(db, {
         source: "factory",

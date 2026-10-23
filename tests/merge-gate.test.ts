@@ -87,8 +87,8 @@ function base(over: Partial<MergeGateInput> = {}): MergeGateInput {
 const codes = (i: Partial<MergeGateInput>): string[] =>
   evaluateMergeGate(base(i)).reasons.map((r) => r.code).sort();
 
-describe("merge gate: the READY / BLOCKED decision table (pure)", () => {
-  test("an independent PASS at the current HEAD + evidence + permission -> READY", () => {
+describe("merge gate: the READY / BLOCKED decision table (pure)", async () => {
+  test("an independent PASS at the current HEAD + evidence + permission -> READY", async () => {
     const d = evaluateMergeGate(base());
     expect(d.status).toBe("READY");
     expect(d.reasons).toEqual([]);
@@ -96,25 +96,25 @@ describe("merge gate: the READY / BLOCKED decision table (pure)", () => {
     expect(d.identity).toContain(`:${HEAD}:0:READY:ok`);
   });
 
-  test("an old HEAD -> BLOCKED HEAD_MOVED (a PASS cannot survive a moved HEAD)", () => {
+  test("an old HEAD -> BLOCKED HEAD_MOVED (a PASS cannot survive a moved HEAD)", async () => {
     const d = evaluateMergeGate(base({ head: HEAD, pr: view({ headSha: MOVED }) }));
     expect(d.status).toBe("BLOCKED");
     expect(d.reasons.map((r) => r.code)).toContain("HEAD_MOVED");
   });
 
-  test("a same-HEAD unresolved NG -> BLOCKED UNRESOLVED_NG (a later OK alone does not clear it)", () => {
+  test("a same-HEAD unresolved NG -> BLOCKED UNRESOLVED_NG (a later OK alone does not clear it)", async () => {
     expect(codes({ unresolvedNgId: 7 })).toContain("UNRESOLVED_NG");
   });
 
-  test("a no-PR task -> BLOCKED NO_PR", () => {
+  test("a no-PR task -> BLOCKED NO_PR", async () => {
     expect(codes({ pr: null, prRead: "unbound" })).toContain("NO_PR");
   });
 
-  test("an unreadable provider -> BLOCKED PROVIDER_UNREADABLE (unknown != ready)", () => {
+  test("an unreadable provider -> BLOCKED PROVIDER_UNREADABLE (unknown != ready)", async () => {
     expect(codes({ pr: null, prRead: "error" })).toContain("PROVIDER_UNREADABLE");
   });
 
-  test("a draft -> BLOCKED PR_DRAFT; an owner-retained draft reports it as intentional", () => {
+  test("a draft -> BLOCKED PR_DRAFT; an owner-retained draft reports it as intentional", async () => {
     const plain = evaluateMergeGate(base({ pr: view({ isDraft: true }) }));
     expect(plain.reasons.map((r) => r.code)).toContain("PR_DRAFT");
     expect(plain.action).toBe("none");
@@ -122,42 +122,42 @@ describe("merge gate: the READY / BLOCKED decision table (pure)", () => {
     expect(retained.reasons.find((r) => r.code === "PR_DRAFT")?.message).toContain("retain");
   });
 
-  test("a closed PR -> BLOCKED PR_NOT_OPEN", () => {
+  test("a closed PR -> BLOCKED PR_NOT_OPEN", async () => {
     expect(codes({ pr: view({ state: "closed" }) })).toContain("PR_NOT_OPEN");
   });
 
-  test("a missing review -> BLOCKED REVIEW_MISSING", () => {
+  test("a missing review -> BLOCKED REVIEW_MISSING", async () => {
     expect(codes({ review: null })).toContain("REVIEW_MISSING");
   });
 
-  test("a review at another head -> BLOCKED REVIEW_STALE", () => {
+  test("a review at another head -> BLOCKED REVIEW_STALE", async () => {
     expect(codes({ review: { workerId: "rev", head: MOVED, reviewer: "claude" } })).toContain("REVIEW_STALE");
   });
 
-  test("a reviewer that authored the attempt -> BLOCKED REVIEW_NOT_INDEPENDENT", () => {
+  test("a reviewer that authored the attempt -> BLOCKED REVIEW_NOT_INDEPENDENT", async () => {
     expect(codes({ submitter: "rev" })).toContain("REVIEW_NOT_INDEPENDENT");
   });
 
-  test("an owner HOLD (Linear or a PR label) -> BLOCKED HOLD", () => {
+  test("an owner HOLD (Linear or a PR label) -> BLOCKED HOLD", async () => {
     expect(codes({ hold: "linear:Hold [hold]" })).toContain("HOLD");
     expect(codes({ hold: "github-label:do-not-merge" })).toContain("HOLD");
   });
 
-  test("an unrun required gate -> BLOCKED CHECKS_NOT_RUN (and it is never a PASS)", () => {
+  test("an unrun required gate -> BLOCKED CHECKS_NOT_RUN (and it is never a PASS)", async () => {
     expect(codes({ checks: null })).toContain("CHECKS_NOT_RUN");
     expect(codes({ checks: { total: 0, passed: 0, pending: [], failing: [], skipped: [], requiredPassed: false } })).toContain(
       "CHECKS_NOT_RUN"
     );
   });
 
-  test("a failing / pending required check -> BLOCKED CHECKS_NOT_PASSED", () => {
+  test("a failing / pending required check -> BLOCKED CHECKS_NOT_PASSED", async () => {
     const fail = { total: 1, passed: 0, pending: [], failing: ["test"], skipped: [], requiredPassed: false };
     const pending = { total: 1, passed: 0, pending: ["test"], failing: [], skipped: [], requiredPassed: false };
     expect(codes({ checks: fail })).toContain("CHECKS_NOT_PASSED");
     expect(codes({ checks: pending })).toContain("CHECKS_NOT_PASSED");
   });
 
-  test("#2 an all-skipped roll-up -> BLOCKED CHECKS_NOT_RUN (no gate actually ran); a pass+skip mix stays READY", () => {
+  test("#2 an all-skipped roll-up -> BLOCKED CHECKS_NOT_RUN (no gate actually ran); a pass+skip mix stays READY", async () => {
     const allSkipped = { total: 1, passed: 0, pending: [], failing: [], skipped: ["ci"], requiredPassed: false };
     const d = evaluateMergeGate(base({ checks: allSkipped }));
     expect(d.status).toBe("BLOCKED");
@@ -166,7 +166,7 @@ describe("merge gate: the READY / BLOCKED decision table (pure)", () => {
     expect(evaluateMergeGate(base({ checks: mixed })).status).toBe("READY");
   });
 
-  test("a conflict -> BLOCKED CONFLICT and action IntegrationRequired (a Gateway routing decision)", () => {
+  test("a conflict -> BLOCKED CONFLICT and action IntegrationRequired (a Gateway routing decision)", async () => {
     const d = evaluateMergeGate(base({ pr: view({ mergeable: "conflicting" }) }));
     expect(d.status).toBe("BLOCKED");
     expect(d.reasons.map((r) => r.code)).toContain("CONFLICT");
@@ -174,35 +174,35 @@ describe("merge gate: the READY / BLOCKED decision table (pure)", () => {
     expect(d.action).toBe("IntegrationRequired");
   });
 
-  test("an unresolved mergeability -> BLOCKED MERGEABILITY_UNKNOWN (never assumed mergeable)", () => {
+  test("an unresolved mergeability -> BLOCKED MERGEABILITY_UNKNOWN (never assumed mergeable)", async () => {
     expect(codes({ pr: view({ mergeable: "unknown" }) })).toContain("MERGEABILITY_UNKNOWN");
   });
 
-  test("an unmet dependency -> BLOCKED DEPENDENCY_UNMET", () => {
+  test("an unmet dependency -> BLOCKED DEPENDENCY_UNMET", async () => {
     expect(codes({ unmetDependencies: ["T0"] })).toContain("DEPENDENCY_UNMET");
   });
 
-  test("lack of point-of-use permission -> BLOCKED NO_PERMISSION (never merge-ready by mistake)", () => {
+  test("lack of point-of-use permission -> BLOCKED NO_PERMISSION (never merge-ready by mistake)", async () => {
     const d = evaluateMergeGate(base({ authority: { linearWrite: false, merge: false } }));
     expect(d.status).toBe("BLOCKED");
     expect(d.reasons.map((r) => r.code)).toContain("NO_PERMISSION");
   });
 
-  test("an unrelated merge of another PR (base moved, still mergeable) does NOT force a rebase/review loop", () => {
+  test("an unrelated merge of another PR (base moved, still mergeable) does NOT force a rebase/review loop", async () => {
     // The base SHA differs from any ancestor the review saw, but GitHub reports
     // the PR as mergeable: that alone must NOT block (no unconditional rebase).
     const d = evaluateMergeGate(base({ pr: view({ baseSha: "c".repeat(40), mergeable: "mergeable" }) }));
     expect(d.status).toBe("READY");
   });
 
-  test("a re-fetched merge at the recorded head -> MERGED; at another head -> BLOCKED", () => {
+  test("a re-fetched merge at the recorded head -> MERGED; at another head -> BLOCKED", async () => {
     expect(evaluateMergeGate(base({ merged: true })).status).toBe("MERGED");
     expect(evaluateMergeGate(base({ merged: true, pr: view({ state: "merged", headSha: MOVED }) })).status).toBe("BLOCKED");
   });
 
   // --- round-2 findings ---------------------------------------------------
 
-  test("#4 a merge Relay will not credit (pre-review / non-code / cancelled) -> BLOCKED MERGE_NOT_CREDITED", () => {
+  test("#4 a merge Relay will not credit (pre-review / non-code / cancelled) -> BLOCKED MERGE_NOT_CREDITED", async () => {
     // Mirrors confirmMerged's postReview guard: implement/review is not credited.
     const early = evaluateMergeGate(base({ merged: true, phase: "implement", state: "queued" }));
     expect(early.status).toBe("BLOCKED");
@@ -216,7 +216,7 @@ describe("merge gate: the READY / BLOCKED decision table (pure)", () => {
     expect(evaluateMergeGate(base({ merged: true, state: "done" })).status).toBe("MERGED");
   });
 
-  test("#2 a task with no recorded HEAD -> BLOCKED HEAD_UNKNOWN (never bound to head=none)", () => {
+  test("#2 a task with no recorded HEAD -> BLOCKED HEAD_UNKNOWN (never bound to head=none)", async () => {
     const d = evaluateMergeGate(base({ head: null, review: { workerId: "rev", head: null, reviewer: "rev" } }));
     expect(d.status).toBe("BLOCKED");
     expect(d.reasons.map((r) => r.code)).toContain("HEAD_UNKNOWN");
@@ -226,7 +226,7 @@ describe("merge gate: the READY / BLOCKED decision table (pure)", () => {
     );
   });
 
-  test("#5 a retargeted base branch -> BLOCKED BASE_CHANGED; a base-SHA move alone is not a block", () => {
+  test("#5 a retargeted base branch -> BLOCKED BASE_CHANGED; a base-SHA move alone is not a block", async () => {
     const retargeted = evaluateMergeGate(base({ pr: view({ baseRef: "release-1" }) }));
     expect(retargeted.reasons.map((r) => r.code)).toContain("BASE_CHANGED");
     // Same base branch, moved base SHA + still mergeable -> READY (no rebase loop).
@@ -235,18 +235,18 @@ describe("merge gate: the READY / BLOCKED decision table (pure)", () => {
     expect(evaluateMergeGate(base({ prBase: null, pr: view({ baseRef: "release-1" }) })).status).toBe("READY");
   });
 
-  test("a done-but-unmerged task is distinguished from Done -> BLOCKED NOT_MERGED (and TERMINAL for failed/cancelled)", () => {
+  test("a done-but-unmerged task is distinguished from Done -> BLOCKED NOT_MERGED (and TERMINAL for failed/cancelled)", async () => {
     expect(codes({ state: "done" })).toContain("NOT_MERGED");
     expect(codes({ state: "cancelled" })).toContain("TERMINAL");
     expect(codes({ state: "failed" })).toContain("TERMINAL");
   });
 
-  test("a non-merge-ready phase or a non-code task -> BLOCKED", () => {
+  test("a non-merge-ready phase or a non-code task -> BLOCKED", async () => {
     expect(codes({ phase: "review" })).toContain("NOT_MERGE_READY");
     expect(codes({ codeChange: false })).toContain("NOT_CODE_TASK");
   });
 
-  test("the structured identity changes with the HEAD and the status", () => {
+  test("the structured identity changes with the HEAD and the status", async () => {
     const a = evaluateMergeGate(base());
     const b = evaluateMergeGate(base({ head: MOVED, pr: view({ headSha: MOVED }) }));
     expect(a.identity).not.toBe(b.identity);
@@ -255,8 +255,8 @@ describe("merge gate: the READY / BLOCKED decision table (pure)", () => {
   });
 });
 
-describe("check roll-up + the gh adapter mapping", () => {
-  test("requiredPassed requires at least one check and no pending/failing", () => {
+describe("check roll-up + the gh adapter mapping", async () => {
+  test("requiredPassed requires at least one check and no pending/failing", async () => {
     expect(rollupChecks([]).requiredPassed).toBe(false);
     expect(rollupChecks([{ name: "a", bucket: "pass" }]).requiredPassed).toBe(true);
     expect(rollupChecks([{ name: "a", bucket: "pending" }]).requiredPassed).toBe(false);
@@ -269,7 +269,7 @@ describe("check roll-up + the gh adapter mapping", () => {
     expect(rollupChecks([{ name: "a", bucket: "skipping" }, { name: "b", bucket: "skipping" }]).requiredPassed).toBe(false);
   });
 
-  test("check-run + commit-status buckets map to the gh vocabulary", () => {
+  test("check-run + commit-status buckets map to the gh vocabulary", async () => {
     expect(mapCheckRunBucket("completed", "success")).toBe("pass");
     expect(mapCheckRunBucket("completed", "neutral")).toBe("pass");
     expect(mapCheckRunBucket("in_progress", "")).toBe("pending");
@@ -281,7 +281,7 @@ describe("check roll-up + the gh adapter mapping", () => {
     expect(mapCommitStatusBucket("error")).toBe("fail");
   });
 
-  test("GhCliGitHub.listChecks is HEAD-pinned, merges check-runs + statuses, and returns null on failure", () => {
+  test("GhCliGitHub.listChecks is HEAD-pinned, merges check-runs + statuses, and returns null on failure", async () => {
     const calls: string[][] = [];
     const exec: Exec = (argv) => {
       calls.push(argv);
@@ -303,7 +303,7 @@ describe("check roll-up + the gh adapter mapping", () => {
       return { ok: false, stdout: "", stderr: "boom" };
     };
     const gh = new GhCliGitHub(exec);
-    const checks = gh.listChecks({ repo: "o/r", number: 1 }, HEAD);
+    const checks = await gh.listChecks({ repo: "o/r", number: 1 }, HEAD);
     expect(checks).not.toBeNull();
     expect(checks!.map((c) => c.name)).toEqual(["typecheck", "lint", "ci/legacy"]);
     expect(checks!.find((c) => c.name === "lint")!.bucket).toBe("pending");
@@ -311,33 +311,33 @@ describe("check roll-up + the gh adapter mapping", () => {
     expect(calls.every((argv) => argv.some((a) => a.includes(HEAD)))).toBe(true);
 
     const failing: Exec = () => ({ ok: false, stdout: "", stderr: "rate limited" });
-    expect(new GhCliGitHub(failing).listChecks({ repo: "o/r", number: 1 }, HEAD)).toBeNull();
+    expect(await new GhCliGitHub(failing).listChecks({ repo: "o/r", number: 1 }, HEAD)).toBeNull();
     // An empty head can never be bound.
-    expect(gh.listChecks({ repo: "o/r", number: 1 }, "")).toBeNull();
+    expect(await gh.listChecks({ repo: "o/r", number: 1 }, "")).toBeNull();
   });
 
-  test("#1 a one-sided read failure is NOT_RUN, never the other read as the whole picture", () => {
+  test("#1 a one-sided read failure is NOT_RUN, never the other read as the whole picture", async () => {
     const runsOnly: Exec = (argv) =>
       argv.some((a) => a.endsWith("/check-runs"))
         ? { ok: false, stdout: "", stderr: "rate limited" }
         : { ok: true, stdout: JSON.stringify({ statuses: [{ context: "ci/legacy", state: "success" }] }), stderr: "" };
-    expect(new GhCliGitHub(runsOnly).listChecks({ repo: "o/r", number: 1 }, HEAD)).toBeNull();
+    expect(await new GhCliGitHub(runsOnly).listChecks({ repo: "o/r", number: 1 }, HEAD)).toBeNull();
 
     const statusesFail: Exec = (argv) =>
       argv.some((a) => a.endsWith("/check-runs"))
         ? { ok: true, stdout: JSON.stringify({ check_runs: [{ name: "test", status: "completed", conclusion: "success" }] }), stderr: "" }
         : { ok: false, stdout: "", stderr: "rate limited" };
-    expect(new GhCliGitHub(statusesFail).listChecks({ repo: "o/r", number: 1 }, HEAD)).toBeNull();
+    expect(await new GhCliGitHub(statusesFail).listChecks({ repo: "o/r", number: 1 }, HEAD)).toBeNull();
 
     // An UNPARSEABLE read is also NOT_RUN.
     const badJson: Exec = (argv) =>
       argv.some((a) => a.endsWith("/check-runs"))
         ? { ok: true, stdout: "not json at all", stderr: "" }
         : { ok: true, stdout: JSON.stringify({ statuses: [] }), stderr: "" };
-    expect(new GhCliGitHub(badJson).listChecks({ repo: "o/r", number: 1 }, HEAD)).toBeNull();
+    expect(await new GhCliGitHub(badJson).listChecks({ repo: "o/r", number: 1 }, HEAD)).toBeNull();
   });
 
-  test("#1 check runs are paginated: every page is read and a short read is NOT_RUN", () => {
+  test("#1 check runs are paginated: every page is read and a short read is NOT_RUN", async () => {
     const pages: string[][] = [];
     const exec: Exec = (argv) => {
       if (argv.some((a) => a.endsWith("/check-runs"))) {
@@ -353,7 +353,7 @@ describe("check roll-up + the gh adapter mapping", () => {
       }
       return { ok: true, stdout: JSON.stringify({ statuses: [] }), stderr: "" };
     };
-    const checks = new GhCliGitHub(exec).listChecks({ repo: "o/r", number: 1 }, HEAD);
+    const checks = await new GhCliGitHub(exec).listChecks({ repo: "o/r", number: 1 }, HEAD);
     // The failing run on the second page is seen, and --paginate was requested.
     expect(checks!.map((c) => c.name)).toEqual(["a", "b"]);
     expect(checks!.find((c) => c.name === "b")!.bucket).toBe("fail");
@@ -364,7 +364,7 @@ describe("check roll-up + the gh adapter mapping", () => {
       argv.some((a) => a.endsWith("/check-runs"))
         ? { ok: true, stdout: JSON.stringify({ total_count: 31, check_runs: [{ name: "a", status: "completed", conclusion: "success" }] }), stderr: "" }
         : { ok: true, stdout: JSON.stringify({ statuses: [] }), stderr: "" };
-    expect(new GhCliGitHub(short).listChecks({ repo: "o/r", number: 1 }, HEAD)).toBeNull();
+    expect(await new GhCliGitHub(short).listChecks({ repo: "o/r", number: 1 }, HEAD)).toBeNull();
   });
 });
 
@@ -413,76 +413,76 @@ function intake(id: string, over: { prUrl?: string } = {}) {
   });
 }
 
-describe("merge gate: gathering the facts + the daemon pass (read-only)", () => {
-  test("gather resolves the bound PR, the passing review and the HEAD-pinned checks", () => {
+describe("merge gate: gathering the facts + the daemon pass (read-only)", async () => {
+  test("gather resolves the bound PR, the passing review and the HEAD-pinned checks", async () => {
     const gh = new FakeGitHub();
     gh.putPullRequest(view());
     gh.putChecks({ repo: "o/r", number: 1 }, HEAD, CHECKS);
     const t = intake("o/r#1");
     toMergeReady(t.id);
 
-    const input = gatherMergeGateInput(db, t.id, { github: gh, checks: gh, authority: GRANT })!;
+    const input = (await gatherMergeGateInput(db, t.id, { github: gh, checks: gh, authority: GRANT }))!;
     expect(input.prRead).toBe("ok");
     expect(input.head).toBe(HEAD);
     expect(input.review?.head).toBe(HEAD);
     expect(input.checks?.requiredPassed).toBe(true);
     expect(evaluateMergeGate(input).status).toBe("READY");
-    expect(checkMergeGate(db, t.id, { github: gh, checks: gh, authority: GRANT })!.status).toBe("READY");
+    expect((await checkMergeGate(db, t.id, { github: gh, checks: gh, authority: GRANT }))!.status).toBe("READY");
   });
 
-  test("without a check reader the checks are NOT_RUN (BLOCKED, never assumed green)", () => {
+  test("without a check reader the checks are NOT_RUN (BLOCKED, never assumed green)", async () => {
     const gh = new FakeGitHub();
     gh.putPullRequest(view());
     const t = intake("o/r#2");
     toMergeReady(t.id);
-    const d = checkMergeGate(db, t.id, { github: gh, authority: GRANT })!;
+    const d = (await checkMergeGate(db, t.id, { github: gh, authority: GRANT }))!;
     expect(d.status).toBe("BLOCKED");
     expect(d.reasons.map((r) => r.code)).toContain("CHECKS_NOT_RUN");
   });
 
-  test("a Linear HOLD is a structured block", () => {
+  test("a Linear HOLD is a structured block", async () => {
     const gh = new FakeGitHub();
     gh.putPullRequest(view());
     gh.putChecks({ repo: "o/r", number: 1 }, HEAD, CHECKS);
     const t = intakeTask(db, { provider: "linear", issueId: "ISH-1", codeChange: true, headSha: HEAD, prUrl: "https://github.com/o/r/pull/1", prRepo: "o/r", branch: "feat/x" });
     toMergeReady(t.id);
     const lin = { name: "fake", readOnly: true as const, getIssue: () => ({ id: "ISH-1", state: "In Progress", labels: ["hold"], updatedAt: "" }) };
-    const d = checkMergeGate(db, t.id, { github: gh, checks: gh, linear: lin, authority: GRANT })!;
+    const d = (await checkMergeGate(db, t.id, { github: gh, checks: gh, linear: lin, authority: GRANT }))!;
     expect(d.reasons.map((r) => r.code)).toContain("HOLD");
   });
 
-  test("a conflict raises IntegrationRequired ONCE per (task, head), never merging", () => {
+  test("a conflict raises IntegrationRequired ONCE per (task, head), never merging", async () => {
     const gh = new FakeGitHub();
     gh.putPullRequest(view({ mergeable: "conflicting" }));
     gh.putChecks({ repo: "o/r", number: 1 }, HEAD, CHECKS);
     const t = intake("o/r#3");
     toMergeReady(t.id);
 
-    const first = runMergeGates(db, { github: gh, checks: gh, authority: GRANT }).find((r) => r.decision.taskId === t.id)!;
+    const first = (await runMergeGates(db, { github: gh, checks: gh, authority: GRANT })).find((r) => r.decision.taskId === t.id)!;
     expect(first.decision.action).toBe("IntegrationRequired");
     expect(first.integrationRaised).toBe(true);
     expect(first.logged).toBe(true);
     // The task itself is untouched by the gate (a routing decision, not a mutation).
     expect(getTask(db, t.id)!.phase).toBe("merge_ready");
 
-    const second = runMergeGates(db, { github: gh, checks: gh, authority: GRANT }).find((r) => r.decision.taskId === t.id)!;
+    const second = (await runMergeGates(db, { github: gh, checks: gh, authority: GRANT })).find((r) => r.decision.taskId === t.id)!;
     expect(second.integrationRaised).toBe(false);
     expect(second.logged).toBe(false);
     expect(mergeGateDecisionLogged(db, first.decision.identity)).toBe(true);
   });
 
-  test("a real merge is re-fetched at the recorded head -> MERGED", () => {
+  test("a real merge is re-fetched at the recorded head -> MERGED", async () => {
     const gh = new FakeGitHub();
     gh.putPullRequest(view({ state: "merged", mergeable: "unknown" }));
     gh.putChecks({ repo: "o/r", number: 1 }, HEAD, CHECKS);
     const t = intake("o/r#4");
     toMergeReady(t.id);
-    const d = checkMergeGate(db, t.id, { github: gh, checks: gh, authority: GRANT })!;
+    const d = (await checkMergeGate(db, t.id, { github: gh, checks: gh, authority: GRANT }))!;
     expect(d.status).toBe("MERGED");
     expect(d.action).toBe("none");
   });
 
-  test("mergeGateCandidates includes merge_ready and a done-but-unmerged PR task", () => {
+  test("mergeGateCandidates includes merge_ready and a done-but-unmerged PR task", async () => {
     const t = intake("o/r#5");
     toMergeReady(t.id);
     expect(mergeGateCandidates(db).map((x) => x.id)).toContain(t.id);
@@ -491,14 +491,14 @@ describe("merge gate: gathering the facts + the daemon pass (read-only)", () => 
     expect(mergeGateCandidates(db).map((x) => x.id)).toContain(t.id);
   });
 
-  test("boundPrRef falls back to a PR found by branch", () => {
+  test("boundPrRef falls back to a PR found by branch", async () => {
     const gh = new FakeGitHub();
     gh.putPullRequest(view({ headRefName: "feat/x" }));
     const t = intakeTask(db, { provider: "github", issueId: "o/r#6", codeChange: true, branch: "feat/x", prRepo: "o/r" });
-    expect(boundPrRef(getTask(db, t.id)!, gh)).toEqual({ repo: "o/r", number: 1 });
+    expect(await boundPrRef(getTask(db, t.id)!, gh)).toEqual({ repo: "o/r", number: 1 });
   });
 
-  test("raiseIntegrationRequired is idempotent and read-only w.r.t. the task", () => {
+  test("raiseIntegrationRequired is idempotent and read-only w.r.t. the task", async () => {
     const t = intake("o/r#7");
     toMergeReady(t.id);
     const live = getTask(db, t.id)!;
@@ -510,7 +510,7 @@ describe("merge gate: gathering the facts + the daemon pass (read-only)", () => 
     expect(getTask(db, t.id)!.phase).toBe(live.phase);
   });
 
-  test("#3 IntegrationRequired is deduped for a NULL head too (no per-tick spam)", () => {
+  test("#3 IntegrationRequired is deduped for a NULL head too (no per-tick spam)", async () => {
     const t = intake("o/r#8");
     toMergeReady(t.id);
     // Simulate a task with no recorded head (the #2 trigger).
@@ -525,7 +525,7 @@ describe("merge gate: gathering the facts + the daemon pass (read-only)", () => 
     expect(events.n).toBe(1);
   });
 
-  test("#2 a null-head task never reaches READY and its checks stay NOT_RUN", () => {
+  test("#2 a null-head task never reaches READY and its checks stay NOT_RUN", async () => {
     const gh = new FakeGitHub();
     gh.putPullRequest(view());
     gh.putChecks({ repo: "o/r", number: 1 }, HEAD, CHECKS);
@@ -546,7 +546,7 @@ describe("merge gate: gathering the facts + the daemon pass (read-only)", () => 
     claimTask(db, t.id, "integ");
     submitPhase(db, t.id, "integ");
 
-    const input = gatherMergeGateInput(db, t.id, { github: gh, checks: gh, authority: GRANT })!;
+    const input = (await gatherMergeGateInput(db, t.id, { github: gh, checks: gh, authority: GRANT }))!;
     expect(input.head).toBeNull();
     // Checks are NOT pinned to the live PR head when the recorded head is missing.
     expect(input.checks).toBeNull();
@@ -577,7 +577,7 @@ describe("merge gate: gathering the facts + the daemon pass (read-only)", () => 
     expect(getTask(db, t.id)!.pr_base).toBe("main");
 
     // Before any daemon pass the gate already blocks on the retargeted base.
-    const before = checkMergeGate(db, t.id, { github: gh, checks: gh, authority: GRANT })!;
+    const before = (await checkMergeGate(db, t.id, { github: gh, checks: gh, authority: GRANT }))!;
     expect(before.status).toBe("BLOCKED");
     expect(before.reasons.map((r) => r.code)).toContain("BASE_CHANGED");
 
@@ -590,7 +590,7 @@ describe("merge gate: gathering the facts + the daemon pass (read-only)", () => 
     expect(getTask(db, t.id)!.state).toBe("review");
     expect(actions.some((a) => a.startsWith("merge-gate-ready:"))).toBe(false);
     // And afterwards the gate is definitively not READY.
-    expect(checkMergeGate(db, t.id, { github: gh, checks: gh, authority: GRANT })!.status).toBe("BLOCKED");
+    expect((await checkMergeGate(db, t.id, { github: gh, checks: gh, authority: GRANT }))!.status).toBe("BLOCKED");
   });
 
   test("#1 (round-3) a base retarget accepts a FRESH PASS at the same head but not the stale marker", async () => {
@@ -631,7 +631,7 @@ describe("merge gate: gathering the facts + the daemon pass (read-only)", () => 
 
     // The STALE pre-retarget marker alone must NOT re-apply: the task stays in
     // review (without the createdAt filter it would jump back to integration).
-    expect(checkMergeGate(db, t.id, { github: gh, checks: gh, authority: GRANT })!.status).not.toBe("READY");
+    expect((await checkMergeGate(db, t.id, { github: gh, checks: gh, authority: GRANT }))!.status).not.toBe("READY");
 
     // A FRESH independent PASS at the SAME head is ACCEPTED (no deadlock)...
     const fresh = recordReview(db, t.id, "rev", { verdict: "pass", headSha: HEAD });
@@ -640,7 +640,7 @@ describe("merge gate: gathering the facts + the daemon pass (read-only)", () => 
     submitPhase(db, t.id, "integ");
     expect(getTask(db, t.id)!.phase).toBe("merge_ready");
     // ...and the gate is READY again for the retargeted base.
-    expect(checkMergeGate(db, t.id, { github: gh, checks: gh, authority: GRANT })!.status).toBe("READY");
+    expect((await checkMergeGate(db, t.id, { github: gh, checks: gh, authority: GRANT }))!.status).toBe("READY");
   });
 
   test("#1 (round-4a) main -> release-1 -> main: every retarget accepts a fresh PASS at the same head", async () => {
@@ -676,11 +676,11 @@ describe("merge gate: gathering the facts + the daemon pass (read-only)", () => 
     expect(getTask(db, t.id)!.phase).toBe("review");
     expect(getTask(db, t.id)!.attempt).toBe(1);
     // the stale main-era marker stayed unapplied (the task is still in review)
-    expect(checkMergeGate(db, t.id, { github: gh, checks: gh, authority: GRANT })!.status).not.toBe("READY");
+    expect((await checkMergeGate(db, t.id, { github: gh, checks: gh, authority: GRANT }))!.status).not.toBe("READY");
     recordReview(db, t.id, "rev", { verdict: "pass", headSha: HEAD });
     claimTask(db, t.id, "integ");
     submitPhase(db, t.id, "integ");
-    expect(checkMergeGate(db, t.id, { github: gh, checks: gh, authority: GRANT })!.status).toBe("READY");
+    expect((await checkMergeGate(db, t.id, { github: gh, checks: gh, authority: GRANT }))!.status).toBe("READY");
 
     // revert release-1 -> main: the FIRST base-main PASS must NOT match the new epoch.
     gh.putPullRequest(view({ baseRef: "main" }));
@@ -691,7 +691,7 @@ describe("merge gate: gathering the facts + the daemon pass (read-only)", () => 
     claimTask(db, t.id, "integ");
     submitPhase(db, t.id, "integ");
     expect(getTask(db, t.id)!.phase).toBe("merge_ready");
-    expect(checkMergeGate(db, t.id, { github: gh, checks: gh, authority: GRANT })!.status).toBe("READY");
+    expect((await checkMergeGate(db, t.id, { github: gh, checks: gh, authority: GRANT }))!.status).toBe("READY");
   });
 
   test("#1 (round-4b) a null-base PASS then link then retarget accepts a fresh PASS at the same head", async () => {
@@ -719,7 +719,7 @@ describe("merge gate: gathering the facts + the daemon pass (read-only)", () => 
     await processWorkflow(db, { github: gh, checks: gh, authority: GRANT });
     expect(getTask(db, t.id)!.pr_base).toBe("main");
     expect(getTask(db, t.id)!.phase).toBe("merge_ready");
-    expect(checkMergeGate(db, t.id, { github: gh, checks: gh, authority: GRANT })!.status).toBe("READY");
+    expect((await checkMergeGate(db, t.id, { github: gh, checks: gh, authority: GRANT }))!.status).toBe("READY");
 
     // Retarget to release-1: the null-base PASS must not deadlock the fresh review.
     gh.putPullRequest(view({ baseRef: "release-1" }));
@@ -730,6 +730,6 @@ describe("merge gate: gathering the facts + the daemon pass (read-only)", () => 
     claimTask(db, t.id, "integ");
     submitPhase(db, t.id, "integ");
     expect(getTask(db, t.id)!.phase).toBe("merge_ready");
-    expect(checkMergeGate(db, t.id, { github: gh, checks: gh, authority: GRANT })!.status).toBe("READY");
+    expect((await checkMergeGate(db, t.id, { github: gh, checks: gh, authority: GRANT }))!.status).toBe("READY");
   });
 });

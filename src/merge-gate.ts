@@ -348,10 +348,24 @@ export interface MergeGateDeps {
    * also falls back to the Task workspace/source `origin`.
    */
   repo?: string | null;
+  /**
+   * ISH-1129: daemon shutdown. Checked between Tasks so a bound-PR walk stops
+   * promptly; the readers' abortable exec cancels an in-flight command.
+   */
+  signal?: AbortSignal;
+}
+
+/** True when shutdown already started: stop before the next provider read. */
+function stopped(signal?: AbortSignal): boolean {
+  return signal?.aborted === true;
 }
 
 /** Resolve the bound PR ref from the task, or null when none is bound. */
-export function boundPrRef(task: Task, github?: GitHubReadOnly, repo?: string | null): PrRef | null {
+export async function boundPrRef(
+  task: Task,
+  github?: GitHubReadOnly,
+  repo?: string | null
+): Promise<PrRef | null> {
   let ref = parsePrUrl(task.pr_url, task.pr_repo);
   if (!ref && github) {
     // The Task may record only a branch (the live Factory intake). Resolve the
@@ -359,7 +373,7 @@ export function boundPrRef(task: Task, github?: GitHubReadOnly, repo?: string | 
     // gate observes the PR instead of reporting NO_PR.
     const resolved = resolveTaskPrTarget(task, { repo: repo ?? null })?.repo ?? null;
     const lookupRepo = resolved ?? task.pr_repo ?? null;
-    if (lookupRepo && task.branch) ref = github.findPullRequestForBranch(lookupRepo, task.branch)?.ref ?? null;
+    if (lookupRepo && task.branch) ref = (await github.findPullRequestForBranch(lookupRepo, task.branch))?.ref ?? null;
   }
   return ref;
 }
@@ -369,7 +383,11 @@ export function boundPrRef(task: Task, github?: GitHubReadOnly, repo?: string | 
  * read-only provider interfaces; it writes NOTHING and never calls a mutating
  * provider verb.
  */
-export function gatherMergeGateInput(db: Database, taskId: string, deps: MergeGateDeps = {}): MergeGateInput | null {
+export async function gatherMergeGateInput(
+  db: Database,
+  taskId: string,
+  deps: MergeGateDeps = {}
+): Promise<MergeGateInput | null> {
   const task = getTask(db, taskId);
   if (!task) return null;
   const head = task.head_sha ?? null;
@@ -379,9 +397,9 @@ export function gatherMergeGateInput(db: Database, taskId: string, deps: MergeGa
   let prRead: PrRead = "unbound";
   let merged = false;
   if (deps.github) {
-    const ref = boundPrRef(task, deps.github, deps.repo);
+    const ref = await boundPrRef(task, deps.github, deps.repo);
     if (ref) {
-      const view = deps.github.getPullRequest(ref);
+      const view = await deps.github.getPullRequest(ref);
       if (view) {
         pr = view;
         prRead = "ok";
@@ -410,7 +428,7 @@ export function gatherMergeGateInput(db: Database, taskId: string, deps: MergeGa
   // reach merge_ready.
   let hold: string | null = null;
   if (deps.linear && task.provider === "linear" && task.issue_id) {
-    const issue = deps.linear.getIssue(task.issue_id);
+    const issue = await deps.linear.getIssue(task.issue_id);
     if (issue && linearHolds(issue)) {
       hold = `linear:${issue.state}${issue.labels.length ? ` [${issue.labels.join(",")}]` : ""}`;
     }
@@ -424,7 +442,7 @@ export function gatherMergeGateInput(db: Database, taskId: string, deps: MergeGa
   // Checks are pinned to the RECORDED head. With no recorded head there is no
   // head to pin to, so the roll-up stays NOT_RUN (never the live PR head).
   if (deps.checks && pr && head) {
-    const raw = deps.checks.listChecks(pr.ref, head);
+    const raw = await deps.checks.listChecks(pr.ref, head);
     checks = raw === null ? null : rollupChecks(raw);
   }
 
@@ -467,8 +485,12 @@ function reviewPayloadReviewer(payloadJson: string | null | undefined): string |
 }
 
 /** Gather + evaluate one task. Read-only. */
-export function checkMergeGate(db: Database, taskId: string, deps: MergeGateDeps = {}): MergeGateDecision | null {
-  const input = gatherMergeGateInput(db, taskId, deps);
+export async function checkMergeGate(
+  db: Database,
+  taskId: string,
+  deps: MergeGateDeps = {}
+): Promise<MergeGateDecision | null> {
+  const input = await gatherMergeGateInput(db, taskId, deps);
   return input ? evaluateMergeGate(input) : null;
 }
 
@@ -570,10 +592,12 @@ export interface MergeGateRun {
  * and raise IntegrationRequired on a real conflict. Never mutates the task,
  * never touches a provider. Safe to call every tick.
  */
-export function runMergeGates(db: Database, deps: MergeGateDeps = {}): MergeGateRun[] {
+export async function runMergeGates(db: Database, deps: MergeGateDeps = {}): Promise<MergeGateRun[]> {
   const out: MergeGateRun[] = [];
   for (const t of mergeGateCandidates(db)) {
-    const decision = checkMergeGate(db, t.id, deps);
+    // ISH-1129: shutdown interrupts a long candidate walk between Tasks.
+    if (stopped(deps.signal)) break;
+    const decision = await checkMergeGate(db, t.id, deps);
     if (!decision) continue;
     let logged = false;
     if (!mergeGateDecisionLogged(db, decision.identity)) {

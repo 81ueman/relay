@@ -84,17 +84,24 @@ export interface CommentView {
   body: string;
 }
 
+/**
+ * A provider read MAY be synchronous (an in-memory/test fake) or asynchronous
+ * (the real abortable `gh`/`curl` executor, ISH-1129). Every caller awaits it,
+ * so a sync fake keeps working without an event-loop hop.
+ */
+export type ProviderRead<T> = T | Promise<T>;
+
 export interface GitHubReadOnly {
   readonly name: string;
   readonly readOnly: true;
-  getPullRequest(ref: PrRef): PrView | null;
-  findPullRequestForBranch(repo: string, branch: string): PrView | null;
+  getPullRequest(ref: PrRef): ProviderRead<PrView | null>;
+  findPullRequestForBranch(repo: string, branch: string): ProviderRead<PrView | null>;
   /**
    * Issue comments + review bodies + inline review comments, one stream.
    * Returns `null` when the read FAILED (any endpoint), so a caller never treats
    * a transient provider error as "no comments".
    */
-  listComments(ref: PrRef): CommentView[] | null;
+  listComments(ref: PrRef): ProviderRead<CommentView[] | null>;
 }
 
 // ---------------------------------------------------------------------------
@@ -130,7 +137,7 @@ export interface ReviewView {
  */
 export interface GitHubReviewReader {
   readonly name: string;
-  listReviews(ref: PrRef): ReviewView[] | null;
+  listReviews(ref: PrRef): ProviderRead<ReviewView[] | null>;
 }
 
 /**
@@ -163,7 +170,7 @@ export interface IssueView {
 export interface LinearReadOnly {
   readonly name: string;
   readonly readOnly: true;
-  getIssue(id: string): IssueView | null;
+  getIssue(id: string): ProviderRead<IssueView | null>;
 }
 
 // ---------------------------------------------------------------------------
@@ -188,7 +195,7 @@ export interface CheckRunView {
 export interface ChecksReadOnly {
   readonly name: string;
   readonly readOnly: true;
-  listChecks(ref: PrRef, headSha: string): CheckRunView[] | null;
+  listChecks(ref: PrRef, headSha: string): ProviderRead<CheckRunView[] | null>;
 }
 
 /** The roll-up the merge gate judges: required checks all concluded green. */
@@ -435,6 +442,8 @@ export interface ProviderDeps {
   /** GitHub logins (or `reviewer=` ids) allowed to author a verdict marker. */
   authorizedReviewers?: string[];
   authority?: ProviderAuthority;
+  /** ISH-1129: stop before the next provider read after daemon shutdown. */
+  signal?: AbortSignal;
 }
 
 export interface ProviderAction {
@@ -486,7 +495,11 @@ export function linearHolds(issue: IssueView): boolean {
  * Reconcile ONE task from its bound provider(s). Never mutates the provider.
  * Returns the actions taken. Safe to call every tick; each effect is idempotent.
  */
-export function reconcileTaskFromProvider(db: Database, taskId: string, deps: ProviderDeps): ProviderAction[] {
+export async function reconcileTaskFromProvider(
+  db: Database,
+  taskId: string,
+  deps: ProviderDeps
+): Promise<ProviderAction[]> {
   const task = getTask(db, taskId);
   if (!task || !isCodeTask(task)) return [];
   const actions: ProviderAction[] = [];
@@ -497,11 +510,13 @@ export function reconcileTaskFromProvider(db: Database, taskId: string, deps: Pr
   if (deps.github && (task.pr_url || (task.pr_repo && task.branch))) {
     let ref = parsePrUrl(task.pr_url, task.pr_repo);
     if (!ref && task.branch && task.pr_repo) {
-      const byBranch = deps.github.findPullRequestForBranch(task.pr_repo, task.branch);
+      const byBranch = await deps.github.findPullRequestForBranch(task.pr_repo, task.branch);
       if (byBranch) ref = byBranch.ref;
     }
     if (ref) {
-      const view = deps.github.getPullRequest(ref);
+      const view = await deps.github.getPullRequest(ref);
+      // ISH-1129: never start a write from a poll that shutdown interrupted.
+      if (deps.signal?.aborted) return actions;
       if (view) {
         // ISH-1128: while a Run is LIVE, remember a PR head that is provably
         // one of that Run's own pushes. An amend/force-push replaces such a
@@ -546,7 +561,8 @@ export function reconcileTaskFromProvider(db: Database, taskId: string, deps: Pr
           // Only record the watermark when the scan SUCCEEDED. A failed read
           // returns null; leaving the watermark untouched makes the next poll
           // retry the scan instead of losing a marker to a transient error.
-          const comments = deps.github.listComments(ref);
+          const comments = await deps.github.listComments(ref);
+          if (deps.signal?.aborted) return actions;
           if (comments !== null) {
             db.query(`UPDATE tasks SET pr_updated_at = ? WHERE id = ?`).run(view.updatedAt ?? "", taskId);
             // A marker posted BEFORE the review was invalidated judged the OLD diff
@@ -566,8 +582,10 @@ export function reconcileTaskFromProvider(db: Database, taskId: string, deps: Pr
     }
   }
 
+  if (deps.signal?.aborted) return actions;
   if (task.provider === "linear" && deps.linear && task.issue_id) {
-    const issue = deps.linear.getIssue(task.issue_id);
+    const issue = await deps.linear.getIssue(task.issue_id);
+    if (deps.signal?.aborted) return actions;
     if (issue) {
       const live = getTask(db, taskId)!;
       if (linearHolds(issue) && live.state !== "blocked_human" && !isTerminalTaskState(live.state)) {

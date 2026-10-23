@@ -31,35 +31,142 @@ export interface ExecResult {
   stdout: string;
   stderr: string;
 }
-export type Exec = (argv: string[], opts?: { stdin?: Uint8Array }) => ExecResult;
+
+export interface ExecOptions {
+  /** Bytes written to the child's stdin (the Linear token travels this way). */
+  stdin?: Uint8Array;
+  /**
+   * ISH-1129: daemon shutdown. Aborting kills the in-flight provider command
+   * (whole process group) instead of waiting out its timeout.
+   */
+  signal?: AbortSignal;
+}
+
+/**
+ * A provider command executor. It MAY be synchronous (injected test fakes) or
+ * asynchronous (the real `defaultExec`), so every provider read awaits it.
+ */
+export type Exec = (argv: string[], opts?: ExecOptions) => ExecResult | Promise<ExecResult>;
 
 /**
  * ISH-1125: how long one read-only provider command (`gh`/`curl`) may run before
  * it is killed. The default is deliberately generous for a slow network, but
- * BOUNDED: the daemon reconciles providers synchronously, so an un-timed `gh`
- * call blocks the whole supervisor loop — including SIGTERM shutdown — for as
- * long as the command hangs. `0`/a non-number falls back to the default.
+ * BOUNDED: a hung command must never block the supervisor forever.
+ *
+ * ISH-1129: the DEFAULT executor is asynchronous and honours the daemon's
+ * shutdown signal, so SIGTERM aborts an in-flight command immediately instead of
+ * waiting for this timeout. The timeout remains the per-command ceiling.
+ * `0`/a non-number falls back to the default.
  */
 export function providerExecTimeoutMs(env: EnvLike = process.env): number {
   const v = Number(env.RELAY_PROVIDER_EXEC_TIMEOUT_MS ?? "");
   return Number.isFinite(v) && v > 0 ? v : 5000;
 }
 
-export const defaultExec: Exec = (argv, opts) => {
+/** Kill a provider command's WHOLE process group (it runs `detached`). */
+function killProviderGroup(proc: { pid: number; kill: (signal?: NodeJS.Signals) => void }): void {
   try {
-    const p = Bun.spawnSync(argv, {
+    process.kill(-proc.pid, "SIGKILL");
+  } catch {
+    try {
+      proc.kill("SIGKILL");
+    } catch {
+      /* already gone */
+    }
+  }
+}
+
+/**
+ * ISH-1129: the real executor. ASYNC on purpose: `Bun.spawnSync` blocks the JS
+ * event loop, so neither a SIGTERM handler nor an AbortSignal can run/kill a
+ * hung `gh` call. `Bun.spawn` keeps the loop responsive; the daemon's SIGTERM
+ * handler aborts `opts.signal`, which kills the child's process group and lets
+ * the supervisor exit bounded regardless of how many Tasks are bound.
+ *
+ * Each command runs in its own process group (`detached`) so a timeout/shutdown
+ * kills descendants too. Output is collected concurrently with `exited`; on a
+ * timeout we stop awaiting the pipes (a grandchild holding them open must not
+ * keep the daemon alive).
+ */
+export const defaultExec: Exec = async (argv, opts) => {
+  const signal = opts?.signal;
+  if (signal?.aborted) {
+    return { ok: false, stdout: "", stderr: "provider command aborted by daemon shutdown" };
+  }
+  let proc: ReturnType<typeof Bun.spawn>;
+  try {
+    proc = Bun.spawn(argv, {
       stdout: "pipe",
       stderr: "pipe",
-      stdin: opts?.stdin ?? "ignore",
-      timeout: providerExecTimeoutMs(),
-      // SIGKILL (not the default SIGTERM) so a child that ignores a polite signal
-      // can never keep the supervisor's single-threaded reconcile blocked.
-      killSignal: "SIGKILL",
+      stdin: opts?.stdin ? "pipe" : "ignore",
+      detached: true,
     });
-    return { ok: p.exitCode === 0, stdout: p.stdout.toString(), stderr: p.stderr.toString() };
   } catch (e) {
     return { ok: false, stdout: "", stderr: String(e) };
   }
+
+  const sink = proc.stdin;
+  if (opts?.stdin && sink && typeof sink === "object") {
+    try {
+      sink.write(opts.stdin);
+      sink.end();
+    } catch {
+      /* the child may have exited before reading its stdin */
+    }
+  }
+
+  const timeoutMs = providerExecTimeoutMs();
+  let aborted = false;
+  const onAbort = () => {
+    aborted = true;
+    killProviderGroup(proc);
+  };
+  signal?.addEventListener("abort", onAbort, { once: true });
+  // Close the check/add race: an abort between the probe above and the listener
+  // registration would otherwise leave the child running to its timeout.
+  if (signal?.aborted) onAbort();
+
+  const collector = (async () => {
+    const [stdout, stderr] = await Promise.all([
+      new Response(proc.stdout as ReadableStream).text(),
+      new Response(proc.stderr as ReadableStream).text(),
+    ]);
+    const code = await proc.exited;
+    return { stdout, stderr, code };
+  })();
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<"timeout">((resolve) => {
+    timer = setTimeout(() => {
+      killProviderGroup(proc);
+      resolve("timeout");
+    }, timeoutMs);
+  });
+  let winner: Awaited<typeof collector> | "timeout";
+  try {
+    winner = await Promise.race([collector, timeout]);
+  } catch (e) {
+    // A killed child can reject its pipe read (EPIPE/EIO). This executor is a
+    // FAIL-CLOSED reader: it reports an unreadable result, never throws into the
+    // reconcile pass during shutdown.
+    if (timer) clearTimeout(timer);
+    signal?.removeEventListener("abort", onAbort);
+    void collector.catch(() => {});
+    return { ok: false, stdout: "", stderr: String(e) };
+  }
+  if (timer) clearTimeout(timer);
+  signal?.removeEventListener("abort", onAbort);
+
+  if (winner === "timeout") {
+    // Do NOT await the pipes: a stuck read must not block shutdown/reconcile.
+    void collector.catch(() => {});
+    return { ok: false, stdout: "", stderr: `timed out after ${timeoutMs}ms (process group killed)` };
+  }
+  if (aborted) {
+    void collector.catch(() => {});
+    return { ok: false, stdout: "", stderr: "provider command aborted by daemon shutdown" };
+  }
+  return { ok: winner.code === 0, stdout: winner.stdout, stderr: winner.stderr };
 };
 
 function mapPrState(state: string): PrState {
@@ -141,8 +248,8 @@ export class GhCliGitHub implements GitHubReadOnly, ChecksReadOnly, GitHubReview
 
   constructor(private exec: Exec = defaultExec) {}
 
-  getPullRequest(ref: PrRef): PrView | null {
-    const r = this.exec(["gh", "pr", "view", String(ref.number), "--repo", ref.repo, "--json", PR_FIELDS]);
+  async getPullRequest(ref: PrRef): Promise<PrView | null> {
+    const r = await this.exec(["gh", "pr", "view", String(ref.number), "--repo", ref.repo, "--json", PR_FIELDS]);
     if (!r.ok) return null;
     try {
       const j = JSON.parse(r.stdout) as GhPrJson;
@@ -152,8 +259,8 @@ export class GhCliGitHub implements GitHubReadOnly, ChecksReadOnly, GitHubReview
     }
   }
 
-  findPullRequestForBranch(repo: string, branch: string): PrView | null {
-    const r = this.exec([
+  async findPullRequestForBranch(repo: string, branch: string): Promise<PrView | null> {
+    const r = await this.exec([
       "gh", "pr", "list", "--repo", repo, "--head", branch, "--state", "all",
       "--limit", "1", "--json", PR_FIELDS,
     ]);
@@ -168,7 +275,7 @@ export class GhCliGitHub implements GitHubReadOnly, ChecksReadOnly, GitHubReview
     }
   }
 
-  listComments(ref: PrRef): CommentView[] | null {
+  async listComments(ref: PrRef): Promise<CommentView[] | null> {
     const out: CommentView[] = [];
     const paths = [
       `repos/${ref.repo}/issues/${ref.number}/comments`,
@@ -176,7 +283,7 @@ export class GhCliGitHub implements GitHubReadOnly, ChecksReadOnly, GitHubReview
       `repos/${ref.repo}/pulls/${ref.number}/comments`,
     ];
     for (const path of paths) {
-      const r = this.exec(["gh", "api", path, "--paginate"]);
+      const r = await this.exec(["gh", "api", path, "--paginate"]);
       // ANY endpoint failing means the stream is incomplete: report failure
       // (null) rather than a partial list, so the caller does not treat a
       // transient 5xx / rate-limit as "no comments" and consume the watermark.
@@ -200,8 +307,8 @@ export class GhCliGitHub implements GitHubReadOnly, ChecksReadOnly, GitHubReview
    * FAILED read returns `null` (never an empty list), so Relay can distinguish
    * "no review" from "could not verify".
    */
-  listReviews(ref: PrRef): ReviewView[] | null {
-    const r = this.exec(["gh", "api", "--paginate", `repos/${ref.repo}/pulls/${ref.number}/reviews`]);
+  async listReviews(ref: PrRef): Promise<ReviewView[] | null> {
+    const r = await this.exec(["gh", "api", "--paginate", `repos/${ref.repo}/pulls/${ref.number}/reviews`]);
     if (!r.ok) return null;
     const out: ReviewView[] = [];
     for (const page of parseJsonStream(r.stdout)) {
@@ -221,14 +328,14 @@ export class GhCliGitHub implements GitHubReadOnly, ChecksReadOnly, GitHubReview
    * `Link` header so EVERY page of check runs is read, not just the first 30. An
    * empty array means the commit genuinely reported no checks. Never mutates.
    */
-  listChecks(ref: PrRef, headSha: string): CheckRunView[] | null {
+  async listChecks(ref: PrRef, headSha: string): Promise<CheckRunView[] | null> {
     if (!headSha) return null;
-    const runs = this.exec([
+    const runs = await this.exec([
       "gh", "api", `repos/${ref.repo}/commits/${headSha}/check-runs`, "--paginate",
       "-H", "Accept: application/vnd.github+json",
     ]);
     if (!runs.ok) return null;
-    const statuses = this.exec(["gh", "api", `repos/${ref.repo}/commits/${headSha}/status`]);
+    const statuses = await this.exec(["gh", "api", `repos/${ref.repo}/commits/${headSha}/status`]);
     if (!statuses.ok) return null;
 
     const runPages = parseJsonStream(runs.stdout) as {
@@ -348,12 +455,12 @@ export class LinearApiReadOnly implements LinearReadOnly {
     private endpoint = "https://api.linear.app/graphql"
   ) {}
 
-  getIssue(id: string): IssueView | null {
+  async getIssue(id: string): Promise<IssueView | null> {
     const query = "query($id:String!){issue(id:$id){id state{name} labels{nodes{name}}}}";
     const payload = JSON.stringify({ query, variables: { id } });
     // The token travels on STDIN (`-H @-`), never on argv, so it is not visible
     // to other local users via `ps`.
-    const r = this.exec(
+    const r = await this.exec(
       [
         "curl", "-s", "-X", "POST", this.endpoint,
         "-H", "@-",
@@ -398,23 +505,23 @@ function optOut(value: string | undefined): boolean {
  * and evaluate the merge gate. Anything unreadable stays undefined (fail
  * closed) — auto detection never invents a reader.
  */
-export function githubReaderFromEnv(
+export async function githubReaderFromEnv(
   env: EnvLike = process.env,
   exec: Exec = defaultExec,
   opts: { auto?: boolean } = {}
-): GhCliGitHub | undefined {
+): Promise<GhCliGitHub | undefined> {
   const mode = (env.RELAY_PROVIDER_GITHUB ?? "").trim().toLowerCase();
   if (optOut(mode)) return undefined;
   if (mode === "gh") return new GhCliGitHub(exec);
   if (!opts.auto || (mode !== "" && mode !== "auto")) return undefined;
   // "auto" or unset: only an AVAILABLE, AUTHENTICATED gh is a reader.
-  const probe = exec(["gh", "auth", "status"]);
+  const probe = await exec(["gh", "auth", "status"]);
   return probe.ok ? new GhCliGitHub(exec) : undefined;
 }
 
 /** The `gh`-authenticated login, or null (read-only GET `api user`). */
-export function ghAuthenticatedLogin(exec: Exec = defaultExec): string | null {
-  const r = exec(["gh", "api", "user", "--jq", ".login"]);
+export async function ghAuthenticatedLogin(exec: Exec = defaultExec): Promise<string | null> {
+  const r = await exec(["gh", "api", "user", "--jq", ".login"]);
   if (!r.ok) return null;
   const login = r.stdout.trim();
   return /^[A-Za-z0-9-]+$/.test(login) ? login : null;
@@ -436,12 +543,12 @@ export function ghAuthenticatedLogin(exec: Exec = defaultExec): string | null {
  * Authority is always NO_AUTHORITY here: enabling a reader never grants a write
  * or a merge.
  */
-export function providerDepsFromEnv(
+export async function providerDepsFromEnv(
   env: EnvLike = process.env,
   exec: Exec = defaultExec,
   opts: { autoGithub?: boolean } = {}
 ) {
-  const github = githubReaderFromEnv(env, exec, { auto: opts.autoGithub === true });
+  const github = await githubReaderFromEnv(env, exec, { auto: opts.autoGithub === true });
   const token = env.LINEAR_API_TOKEN;
   const linear =
     env.RELAY_PROVIDER_LINEAR === "api" && token ? new LinearApiReadOnly(token, exec) : undefined;
@@ -463,7 +570,7 @@ export function providerDepsFromEnv(
  * `providerDepsFromEnv`, but an UNSET `RELAY_PROVIDER_GITHUB` auto-detects the
  * read-only `gh` reader (an explicit `off` still disables it).
  */
-export function operatorProviderDepsFromEnv(env: EnvLike = process.env, exec: Exec = defaultExec) {
+export async function operatorProviderDepsFromEnv(env: EnvLike = process.env, exec: Exec = defaultExec) {
   return providerDepsFromEnv(env, exec, { autoGithub: true });
 }
 
@@ -492,17 +599,17 @@ export function operatorProviderDepsFromEnv(env: EnvLike = process.env, exec: Ex
  *     when `RELAY_GITHUB_REVIEW_WRITE` is unset (owner decision ISH-1087). An
  *     explicit `0` still disables it.
  */
-export function nativeReviewDepsFromEnv(
+export async function nativeReviewDepsFromEnv(
   env: EnvLike = process.env,
   exec: Exec = defaultExec,
   opts: { autoGithub?: boolean; autoAuthor?: boolean; defaultGrant?: boolean } = {}
-): NativeReviewDeps | undefined {
+): Promise<NativeReviewDeps | undefined> {
   const grant = (env.RELAY_GITHUB_REVIEW_WRITE ?? "").trim();
   if (optOut(grant)) return undefined;
   if (grant !== "1" && opts.defaultGrant !== true) return undefined;
-  const github = githubReaderFromEnv(env, exec, { auto: opts.autoGithub === true });
+  const github = await githubReaderFromEnv(env, exec, { auto: opts.autoGithub === true });
   if (!github) return undefined;
-  const author = (env.RELAY_REVIEW_AUTHOR ?? "").trim() || (opts.autoAuthor ? ghAuthenticatedLogin(exec) : null);
+  const author = (env.RELAY_REVIEW_AUTHOR ?? "").trim() || (opts.autoAuthor ? await ghAuthenticatedLogin(exec) : null);
   if (!author) return undefined;
   const token = env.RELAY_REVIEW_GH_TOKEN ?? env.GH_TOKEN;
   return {
@@ -525,9 +632,9 @@ export function nativeReviewDepsFromEnv(
  * `RELAY_GITHUB_REVIEW_WRITE=0` still turns it off (the Factory then refuses to
  * reach MergeReady when `requireNativeReview` is set).
  */
-export function factoryNativeReviewDepsFromEnv(
+export async function factoryNativeReviewDepsFromEnv(
   env: EnvLike = process.env,
   exec: Exec = defaultExec
-): NativeReviewDeps | undefined {
+): Promise<NativeReviewDeps | undefined> {
   return nativeReviewDepsFromEnv(env, exec, { autoGithub: true, autoAuthor: true, defaultGrant: true });
 }

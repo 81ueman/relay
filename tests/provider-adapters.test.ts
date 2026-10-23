@@ -35,7 +35,7 @@ describe("parseJsonStream", () => {
 });
 
 describe("GhCliGitHub (GET-only)", () => {
-  test("maps gh pr view JSON to a PrView and never passes a write verb", () => {
+  test("maps gh pr view JSON to a PrView and never passes a write verb", async () => {
     const seen: string[][] = [];
     const gh = new GhCliGitHub(
       scriptedExec((argv) => {
@@ -57,7 +57,7 @@ describe("GhCliGitHub (GET-only)", () => {
         );
       })
     );
-    const v = gh.getPullRequest({ repo: "o/r", number: 7 })!;
+    const v = (await gh.getPullRequest({ repo: "o/r", number: 7 }))!;
     expect(gh.readOnly).toBe(true);
     expect(v.state).toBe("merged");
     expect(v.headSha).toBe("cafe");
@@ -71,7 +71,7 @@ describe("GhCliGitHub (GET-only)", () => {
     expect(seen[0].slice(0, 4)).toEqual(["gh", "pr", "view", "7"]);
   });
 
-  test("maps gh pr list for a branch and returns null without it", () => {
+  test("maps gh pr list for a branch and returns null without it", async () => {
     const gh = new GhCliGitHub(
       scriptedExec((argv) =>
         argv[2] === "list"
@@ -79,12 +79,12 @@ describe("GhCliGitHub (GET-only)", () => {
           : ok("[]")
       )
     );
-    expect(gh.findPullRequestForBranch("o/r", "b")?.ref.number).toBe(9);
+    expect((await gh.findPullRequestForBranch("o/r", "b"))?.ref.number).toBe(9);
     const none = new GhCliGitHub(scriptedExec(() => ok("[]")));
-    expect(none.findPullRequestForBranch("o/r", "missing")).toBeNull();
+    expect(await none.findPullRequestForBranch("o/r", "missing")).toBeNull();
   });
 
-  test("collects comments from all three read endpoints", () => {
+  test("collects comments from all three read endpoints", async () => {
     const gh = new GhCliGitHub(
       scriptedExec((argv) => {
         const path = argv[2] ?? "";
@@ -93,17 +93,17 @@ describe("GhCliGitHub (GET-only)", () => {
         return ok(JSON.stringify([{ user: { login: "other" }, created_at: "t3", body: "inline" }]));
       })
     );
-    const comments = gh.listComments({ repo: "o/r", number: 7 });
+    const comments = await gh.listComments({ repo: "o/r", number: 7 });
     expect(comments?.map((c) => c.body)).toEqual(["issue", "review", "inline"]);
   });
 
-  test("a failed read returns null / empty (fail closed)", () => {
+  test("a failed read returns null / empty (fail closed)", async () => {
     const gh = new GhCliGitHub(scriptedExec(() => ({ ok: false, stdout: "", stderr: "no gh" })));
-    expect(gh.getPullRequest({ repo: "o/r", number: 1 })).toBeNull();
-    expect(gh.listComments({ repo: "o/r", number: 1 })).toBeNull();
+    expect(await gh.getPullRequest({ repo: "o/r", number: 1 })).toBeNull();
+    expect(await gh.listComments({ repo: "o/r", number: 1 })).toBeNull();
   });
 
-  test("a partial endpoint failure is a FAILED read (null), never a partial list", () => {
+  test("a partial endpoint failure is a FAILED read (null), never a partial list", async () => {
     // The issue-comments endpoint succeeds, the reviews endpoint fails: the
     // stream is incomplete, so the whole read must report failure.
     const gh = new GhCliGitHub(
@@ -113,12 +113,12 @@ describe("GhCliGitHub (GET-only)", () => {
         return ok(JSON.stringify([{ user: { login: "claude" }, created_at: "t", body: "x" }]));
       })
     );
-    expect(gh.listComments({ repo: "o/r", number: 1 })).toBeNull();
+    expect(await gh.listComments({ repo: "o/r", number: 1 })).toBeNull();
   });
 });
 
 describe("LinearApiReadOnly (GET-only GraphQL query)", () => {
-  test("maps an issue and only ever POSTs a query; the token rides stdin, never argv", () => {
+  test("maps an issue and only ever POSTs a query; the token rides stdin, never argv", async () => {
     let argv: string[] = [];
     let stdin = "";
     const lin = new LinearApiReadOnly(
@@ -131,7 +131,7 @@ describe("LinearApiReadOnly (GET-only GraphQL query)", () => {
         );
       })
     );
-    const issue = lin.getIssue("ISH-1")!;
+    const issue = (await lin.getIssue("ISH-1"))!;
     expect(lin.readOnly).toBe(true);
     expect(issue.state).toBe("In Progress");
     expect(issue.labels).toEqual(["hold"]);
@@ -144,23 +144,23 @@ describe("LinearApiReadOnly (GET-only GraphQL query)", () => {
     expect(stdin).toContain("Authorization: tok");
   });
 
-  test("fails closed on a bad body", () => {
+  test("fails closed on a bad body", async () => {
     const lin = new LinearApiReadOnly("tok", scriptedExec(() => ok("not json")));
-    expect(lin.getIssue("ISH-1")).toBeNull();
+    expect(await lin.getIssue("ISH-1")).toBeNull();
   });
 });
 
 describe("providerDepsFromEnv (opt-in, deny-by-default)", () => {
-  test("default: no providers, authority denied, default reviewer", () => {
-    const deps = providerDepsFromEnv({});
+  test("default: no providers, authority denied, default reviewer", async () => {
+    const deps = await providerDepsFromEnv({});
     expect(deps.github).toBeUndefined();
     expect(deps.linear).toBeUndefined();
     expect(deps.authority).toEqual({ linearWrite: false, merge: false });
     expect(deps.authorizedReviewers).toEqual(["claude"]);
   });
 
-  test("opt-in enables the read-only readers and the authorized reviewer list", () => {
-    const deps = providerDepsFromEnv(
+  test("opt-in enables the read-only readers and the authorized reviewer list", async () => {
+    const deps = await providerDepsFromEnv(
       {
         RELAY_PROVIDER_GITHUB: "gh",
         RELAY_PROVIDER_LINEAR: "api",
@@ -178,8 +178,8 @@ describe("providerDepsFromEnv (opt-in, deny-by-default)", () => {
     expect(deps.authority.linearWrite).toBe(false);
   });
 
-  test("the Linear reader needs a token", () => {
-    const deps = providerDepsFromEnv({ RELAY_PROVIDER_LINEAR: "api" });
+  test("the Linear reader needs a token", async () => {
+    const deps = await providerDepsFromEnv({ RELAY_PROVIDER_LINEAR: "api" });
     expect(deps.linear).toBeUndefined();
   });
 });
@@ -193,34 +193,34 @@ describe("ISH-1087 provider auto-detection (read-only, fail closed)", () => {
       return ok("{}");
     });
 
-  test("an unset RELAY_PROVIDER_GITHUB auto-detects an authenticated gh only when asked", () => {
-    const auto = providerDepsFromEnv({}, ghAuthed(), { autoGithub: true });
+  test("an unset RELAY_PROVIDER_GITHUB auto-detects an authenticated gh only when asked", async () => {
+    const auto = await providerDepsFromEnv({}, ghAuthed(), { autoGithub: true });
     expect(auto.github?.name).toBe("gh-cli");
     expect(auto.checks?.name).toBe("gh-cli");
     // The library default stays explicit-only (no surprise subprocess).
-    expect(providerDepsFromEnv({}, ghAuthed()).github).toBeUndefined();
+    expect((await providerDepsFromEnv({}, ghAuthed())).github).toBeUndefined();
   });
 
-  test("an explicit off disables auto-detection; a failed probe or unknown value has no reader", () => {
-    expect(providerDepsFromEnv({ RELAY_PROVIDER_GITHUB: "off" }, ghAuthed(), { autoGithub: true }).github).toBeUndefined();
-    expect(providerDepsFromEnv({ RELAY_PROVIDER_GITHUB: "typo" }, ghAuthed(), { autoGithub: true }).github).toBeUndefined();
+  test("an explicit off disables auto-detection; a failed probe or unknown value has no reader", async () => {
+    expect((await providerDepsFromEnv({ RELAY_PROVIDER_GITHUB: "off" }, ghAuthed(), { autoGithub: true })).github).toBeUndefined();
+    expect((await providerDepsFromEnv({ RELAY_PROVIDER_GITHUB: "typo" }, ghAuthed(), { autoGithub: true })).github).toBeUndefined();
     const failing = scriptedExec(() => ({ ok: false, stdout: "", stderr: "not logged in" }));
-    expect(providerDepsFromEnv({}, failing, { autoGithub: true }).github).toBeUndefined();
+    expect((await providerDepsFromEnv({}, failing, { autoGithub: true })).github).toBeUndefined();
   });
 
-  test("the Factory's native-review deps default ON and derive the author from gh", () => {
+  test("the Factory's native-review deps default ON and derive the author from gh", async () => {
     const seen: string[][] = [];
-    const deps = factoryNativeReviewDepsFromEnv({}, ghAuthed(seen));
+    const deps = await factoryNativeReviewDepsFromEnv({}, ghAuthed(seen));
     expect(deps?.author).toBe("81ueman");
     expect(deps?.github?.name).toBe("gh-cli");
     expect(deps?.allowedTools).toContain("Bash");
     expect(seen.some((a) => a[0] === "gh" && a[1] === "auth")).toBe(true);
     expect(seen.some((a) => a[0] === "gh" && a[1] === "api" && a[2] === "user")).toBe(true);
     // The review WRITE grant is still an explicit opt-out: 0 disables it.
-    expect(factoryNativeReviewDepsFromEnv({ RELAY_GITHUB_REVIEW_WRITE: "0" }, ghAuthed())).toBeUndefined();
+    expect(await factoryNativeReviewDepsFromEnv({ RELAY_GITHUB_REVIEW_WRITE: "0" }, ghAuthed())).toBeUndefined();
     // An explicit author wins over the gh lookup.
     expect(
-      factoryNativeReviewDepsFromEnv({ RELAY_REVIEW_AUTHOR: "reviewer-login" }, ghAuthed())?.author
+      (await factoryNativeReviewDepsFromEnv({ RELAY_REVIEW_AUTHOR: "reviewer-login" }, ghAuthed()))?.author
     ).toBe("reviewer-login");
   });
 });
@@ -234,19 +234,58 @@ describe("ISH-1125: a provider command is time-bounded", () => {
     expect(providerExecTimeoutMs({ RELAY_PROVIDER_EXEC_TIMEOUT_MS: "nope" })).toBe(5000);
   });
 
-  test("defaultExec kills a hung command instead of blocking the caller forever", () => {
+  test("defaultExec kills a hung command instead of blocking the caller forever", async () => {
     const prev = process.env.RELAY_PROVIDER_EXEC_TIMEOUT_MS;
     process.env.RELAY_PROVIDER_EXEC_TIMEOUT_MS = "150";
     try {
       const started = Date.now();
-      const hung = defaultExec(["sh", "-c", "sleep 5"]);
+      const hung = await defaultExec(["sh", "-c", "sleep 5"]);
       expect(hung.ok).toBe(false);
       expect(Date.now() - started).toBeLessThan(3000);
       // A fast command still succeeds unchanged.
-      expect(defaultExec(["sh", "-c", "printf ok"]).stdout).toBe("ok");
+      expect((await defaultExec(["sh", "-c", "printf ok"])).stdout).toBe("ok");
     } finally {
       if (prev === undefined) delete process.env.RELAY_PROVIDER_EXEC_TIMEOUT_MS;
       else process.env.RELAY_PROVIDER_EXEC_TIMEOUT_MS = prev;
     }
+  });
+});
+
+describe("ISH-1129: daemon shutdown aborts an in-flight provider command", () => {
+  test("aborting the signal kills a hung command without waiting for the timeout", async () => {
+    const prev = process.env.RELAY_PROVIDER_EXEC_TIMEOUT_MS;
+    // A LONG timeout: the abort, not the per-command budget, must release it.
+    process.env.RELAY_PROVIDER_EXEC_TIMEOUT_MS = "30000";
+    try {
+      const ac = new AbortController();
+      const started = Date.now();
+      const pending = defaultExec(["sh", "-c", "sleep 30"], { signal: ac.signal });
+      setTimeout(() => ac.abort(), 100);
+      const r = await pending;
+      expect(r.ok).toBe(false);
+      expect(r.stderr).toContain("aborted");
+      expect(Date.now() - started).toBeLessThan(3000);
+    } finally {
+      if (prev === undefined) delete process.env.RELAY_PROVIDER_EXEC_TIMEOUT_MS;
+      else process.env.RELAY_PROVIDER_EXEC_TIMEOUT_MS = prev;
+    }
+  });
+
+  test("stdin bytes are delivered to the child (the Linear token path)", async () => {
+    const r = await defaultExec(["sh", "-c", "cat"], {
+      stdin: new TextEncoder().encode("Authorization: tok\n"),
+    });
+    expect(r.ok).toBe(true);
+    expect(r.stdout).toBe("Authorization: tok\n");
+  });
+
+  test("an already-aborted signal never spawns the command", async () => {
+    const ac = new AbortController();
+    ac.abort();
+    const started = Date.now();
+    const r = await defaultExec(["sh", "-c", "sleep 30"], { signal: ac.signal });
+    expect(r.ok).toBe(false);
+    expect(r.stderr).toContain("aborted");
+    expect(Date.now() - started).toBeLessThan(1000);
   });
 });

@@ -1814,6 +1814,10 @@ export async function reconcile(db: Database, rt: Runtime, at = now(), deps: Wor
   //     the Relay task. Runs BEFORE the wake sections so a task that just moved
   //     to review is dispatched to a reviewer in the same pass.
   actions.push(...(await processWorkflow(db, deps)));
+  // ISH-1129: once shutdown begins, do not start NEW supervisor work (wakes,
+  // rotations, cleanup) after the provider walk was interrupted; the daemon
+  // loop exits as soon as this pass returns.
+  if (deps.signal?.aborted) return { view: supervisorView(db), actions };
 
   // 4. Runnable work exists => make sure every idle worker that could take some
   //    is nudged. The old gate required `working === 0`; with a parallel fleet

@@ -1455,7 +1455,7 @@ describe("ISH-904: factory defects (phase-null, worker state, merge_ready rework
       updatedAt: "2026-01-01T00:00:00Z",
     } satisfies PrView);
     const reason = "sibling lane merged first: rebase onto the new trunk, then re-run checks";
-    const rebased = requestRebase(db, id, "integ", { reason, deps: { github: gh } });
+    const rebased = await requestRebase(db, id, "integ", { reason, deps: { github: gh } });
     expect(rebased.phase).toBe("implement");
     expect(rebased.state).toBe("queued");
     expect(rebased.attempt).toBe(before.attempt + 1);
