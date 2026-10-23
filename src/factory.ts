@@ -32,6 +32,13 @@ import type { ChecksReadOnly, NativeReviewDeps } from "./providers";
 import { bindTaskPr, type PrBindingDeps } from "./pr-binding";
 import { resolveTaskPrTarget } from "./pr-target";
 import { recordFactoryOutcome, type FactoryFailureReport } from "./factory-failure";
+import {
+  PROVIDER_RATE_LIMITED,
+  logProviderRateLimitOnce,
+  providerRateLimitBackoffMs,
+  providerRateLimitedReason,
+  type ProviderRateLimitState,
+} from "./provider-rate-limit";
 
 /**
  * ISH-762 Factory driver.
@@ -169,6 +176,7 @@ export type FactoryOutcome =
   | "review_refused"
   | "no_checks"
   | "max_attempts"
+  | "provider_rate_limited"
   | "terminal";
 
 export interface FactoryResult {
@@ -204,6 +212,40 @@ function latestRun(db: Database, taskId: string, phase: string, attempt: number)
 
 function isLive(run: Run | null): boolean {
   return !!run && (run.state === "running" || run.state === "starting");
+}
+
+/**
+ * ISH-1132: the active provider rate-limit backoff across the Factory's readers.
+ * `nativeReview.rateLimited` is set when env detection could not finish because
+ * of the exhausted budget; the reader checks catch a limit hit later.
+ */
+function factoryProviderRateLimit(deps: FactoryDeps): ProviderRateLimitState | null {
+  const state =
+    deps.nativeReview?.rateLimited ??
+    deps.nativeReview?.github?.rateLimit?.() ??
+    deps.prBinding?.github?.rateLimit?.() ??
+    deps.mergeGateDeps?.github?.rateLimit?.() ??
+    deps.mergeGateDeps?.checks?.rateLimit?.() ??
+    null;
+  // A stale env-detection observation that has already passed its reset no
+  // longer blocks: the reader will retry normally on the next call.
+  return state && state.resetAt > Date.now() ? state : null;
+}
+
+/** A typed, retryable PROVIDER_RATE_LIMITED Factory stop (the Task is untouched). */
+function providerRateLimitedResult(
+  db: Database,
+  taskId: string,
+  head: string | null,
+  attempts: FactoryAttempt[],
+  steps: string[],
+  state: ProviderRateLimitState,
+  gate: MergeGateDecision | null = null
+): RawFactoryResult {
+  const reason = providerRateLimitedReason(state);
+  steps.push(`provider-rate-limited:${state.provider}`);
+  logProviderRateLimitOnce(db, state, { source: "factory", taskId });
+  return { taskId, outcome: "provider_rate_limited", head, attempts, gate, reason, steps };
 }
 
 /**
@@ -947,6 +989,13 @@ async function runFactoryTaskInner(
         // review_pass). The target repo is resolved from the live Task, so a
         // Task that records only a branch still binds the worker's PR.
         const reviewHead = task.head_sha;
+        // ISH-1132: an exhausted GitHub budget is NOT "native review not
+        // configured". Stop BEFORE the binding read (which would otherwise look
+        // like PR_UNREADABLE) with a typed, retryable PROVIDER_RATE_LIMITED.
+        const providerLimit = factoryProviderRateLimit(deps);
+        if (providerLimit) {
+          return providerRateLimitedResult(db, taskId, reviewHead, attempts, steps, providerLimit);
+        }
         if (deps.prBinding && reviewHead) {
           const live = getTask(db, taskId)!;
           const target = resolveTaskPrTarget(live, { repo: deps.prRepo ?? prSourceRepo });
@@ -957,6 +1006,16 @@ async function runFactoryTaskInner(
           });
           if (bind.status === "blocked") {
             push(`review:pr-binding-blocked ${bind.reason ?? ""}`);
+            if (bind.code === "PROVIDER_RATE_LIMITED") {
+              const limited =
+                factoryProviderRateLimit(deps) ?? {
+                  provider: "github",
+                  reason: bind.reason ?? "GitHub API rate limit",
+                  observedAt: Date.now(),
+                  resetAt: Date.now() + providerRateLimitBackoffMs(),
+                };
+              return providerRateLimitedResult(db, taskId, reviewHead, attempts, steps, limited);
+            }
             return {
               taskId,
               outcome: "blocked",
@@ -979,6 +1038,17 @@ async function runFactoryTaskInner(
           const reason =
             `${FACTORY_NATIVE_REVIEW_REQUIRED}: native GitHub review is required but not configured; ` +
             `set RELAY_PROVIDER_GITHUB=gh and authenticate gh (RELAY_GITHUB_REVIEW_WRITE=0 disables the Factory's default grant)`;
+          push(`review:native-review-required`);
+          logEvent(db, { source: "factory", taskId, type: "factory.native_review_required", payload: { head: reviewHead, reason } });
+          return { taskId, outcome: "blocked", head: reviewHead, attempts, gate: null, reason, steps };
+        }
+        // A rate-limited DETECTION may leave the expected author unresolved. If
+        // the reset has passed, the reader is usable but the identity is still
+        // unknown: never run a native review with an empty expected author.
+        if ((deps.requireNativeReview ?? deps.prBinding !== undefined) && deps.nativeReview && !deps.nativeReview.author) {
+          const reason =
+            `${FACTORY_NATIVE_REVIEW_REQUIRED}: native GitHub review is required but the expected reviewer login could not be resolved; ` +
+            `set RELAY_REVIEW_AUTHOR or re-run after the GitHub rate-limit reset`;
           push(`review:native-review-required`);
           logEvent(db, { source: "factory", taskId, type: "factory.native_review_required", payload: { head: reviewHead, reason } });
           return { taskId, outcome: "blocked", head: reviewHead, attempts, gate: null, reason, steps };
@@ -1079,6 +1149,19 @@ async function runFactoryTaskInner(
           })();
         const gate = await checkMergeGate(db, taskId, gateDeps);
         push(`merge_ready:gate=${gate?.status ?? "unknown"}`);
+        // ISH-1132: MergeReady must not be reported when the only thing blocking
+        // the gate is an exhausted provider budget; that is retryable, typed, and
+        // not an accepted/verified state.
+        if (gate?.reasons.some((r) => r.code === "PROVIDER_RATE_LIMITED")) {
+          const limited =
+            factoryProviderRateLimit(deps) ?? {
+              provider: "github",
+              reason: "GitHub API rate limit",
+              observedAt: Date.now(),
+              resetAt: Date.now() + providerRateLimitBackoffMs(),
+            };
+          return providerRateLimitedResult(db, taskId, getTask(db, taskId)!.head_sha, attempts, steps, limited, gate);
+        }
         return { taskId, outcome: "merge_ready", head: getTask(db, taskId)!.head_sha, attempts, gate, reason: null, steps };
       }
       default: {

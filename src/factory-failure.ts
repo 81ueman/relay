@@ -56,6 +56,7 @@ export const FACTORY_FAILURE_CAUSES = [
   "ORPHAN",
   "WORKSPACE",
   "WRITER_ACTIVE",
+  "PROVIDER_RATE_LIMITED",
   "PERMISSION",
   "AUTH",
   "HUMAN_HOLD",
@@ -357,6 +358,12 @@ const ORPHAN_RE = /\bORPHAN\b|orphaned|adopted run|recorded pid was reused|could
 const TIMEOUT_RE = /\bTIMEOUT\b|timed out|\btimeout\b/i;
 const RESOURCE_RE =
   /\bENOMEM\b|\bEAGAIN\b|\bEMFILE\b|\bENFILE\b|out of memory|oom[- ]?kill(?:ed)?|resource (?:exhausted|exhaustion)|too many open files|rate limit(?:ed)?|too many requests/i;
+/**
+ * ISH-1132: a provider-budget exhaustion is its own retryable cause. It is ALSO
+ * matched by RESOURCE_RE, so it must be decided before that generic bucket.
+ */
+const PROVIDER_RATE_LIMITED_RE =
+  /PROVIDER_RATE_LIMITED|api rate limit exceeded|secondary[- ]?rate[- ]?limit|github api rate limit/i;
 const REVIEW_REFUSED_RE =
   /REVIEW_NO_STRUCTURED_RESULT|REVIEW_PROCESS_FAILED|REVIEW_ERROR|no structured verdict|reviewer (?:exited|returned)/i;
 const EVIDENCE_UNAVAILABLE_RE =
@@ -390,6 +397,11 @@ function detectCause(
   // permission, auth or stale marker. It is also the same evidence a later
   // re-entry reads back from the parked Task.
   if (collected.verifyNotRun) return "CHECK_NOT_RUN";
+  // A typed provider exhaustion is retryable and must not be bucketed as a
+  // generic RESOURCE/AUTH/PERMISSION cause.
+  if (input.outcome === "provider_rate_limited" || PROVIDER_RATE_LIMITED_RE.test(text)) {
+    return "PROVIDER_RATE_LIMITED";
+  }
   if (STALE_HEAD_RE.test(text)) return "STALE_HEAD";
   if (ENOSPC_RE.test(text)) return "ENOSPC";
   if (LOW_DISK_RE.test(text)) return "LOW_DISK";
@@ -439,6 +451,7 @@ function classFor(cause: FactoryFailureCause): FactoryFailureClass {
     case "ORPHAN":
     case "WORKSPACE":
     case "WRITER_ACTIVE":
+    case "PROVIDER_RATE_LIMITED":
       return "infra_blocked";
     case "PERMISSION":
     case "AUTH":
@@ -468,6 +481,7 @@ function resumeFor(cause: FactoryFailureCause): FactoryFailureResume {
     case "TIMEOUT":
     case "ORPHAN":
     case "WORKSPACE":
+    case "PROVIDER_RATE_LIMITED":
       return "after_environment_fix";
     case "WRITER_ACTIVE":
       return "after_writer_finishes";
@@ -535,6 +549,15 @@ function nextFor(
         read: "relay status",
         command: report.requiresUnblock ? unblock : factory,
         resumeWhen: "the disk guard reports OK and no live writer holds the worktree",
+      };
+    case "PROVIDER_RATE_LIMITED":
+      return {
+        action:
+          "The GitHub/Linear provider is rate-limited; no Task state changed. Wait for the reported reset, then re-run the Factory. " +
+          "This is retryable and never requires an unblock.",
+        read,
+        command: factory,
+        resumeWhen: "the provider's reported rate-limit reset has passed and the provider probe succeeds",
       };
     case "RESOURCE":
       return {

@@ -285,12 +285,15 @@ implement --TaskSubmitted--> verify --VerificationResult--> review
 - **Provider reconciliation is read-only / fail-closed.** With a bound PR, Relay
   polls open/synchronize/merged: a head move invalidates the review, and a
   `merged` PR at the recorded head records `TaskMerged`. A merge is credited
-  whenever it is observed after the review passed — in `integration`,
-  `merge_ready`, or **after** accept (a done, unmerged task is still polled) — and
-  for **any** intake provider (a Linear issue with a GitHub PR is polled too). A
-  real merge is the **only** "truly done" for a task with a PR: an internal accept
-  does not satisfy `ChildrenReady`, and a dependent task is not runnable until a
-  PR-bound prerequisite is merged. Review verdicts are absorbed from `lane.sh`'s
+  whenever it is observed after the review passed — in `integration` or
+  `merge_ready` — and for **any** intake provider (a Linear issue with a GitHub PR
+  is polled too). A real merge is the **only** "truly done" for a task with a PR:
+  an internal accept does not satisfy `ChildrenReady`, and a dependent task is not
+  runnable until a PR-bound prerequisite is merged. The daemon poll only considers
+  a Task that can still change: one with a **live Run**, or in
+  `review`/`merge_ready`/`integration`. Terminal Tasks (`done`/`failed`/
+  `cancelled`) are never polled, so a DB full of already-merged PRs spends zero
+  GitHub calls. Review verdicts are absorbed from `lane.sh`'s
   `<!-- ishiul-review head=<sha> verdict=OK|NG|HOLD reviewer=<id> -->` markers, but
   only from an authorized reviewer identity — a reviewer's TurnEnded, a GitHub
   **label**, and a self-claimed comment are **not** an approval. Repeated
@@ -305,11 +308,20 @@ implement --TaskSubmitted--> verify --VerificationResult--> review
   command is killed after `RELAY_PROVIDER_EXEC_TIMEOUT_MS` (default 5s), so a hung
   `gh`/`curl` read can never block the daemon's synchronous reconcile — including
   its SIGTERM shutdown — indefinitely. Each task is
-  polled at most once per `RELAY_PROVIDER_POLL_MS` (default 60s) and comments are
+  polled at most once per `RELAY_PROVIDER_POLL_MS` (default 60s); the SAME
+  `provider_polled_at` budget covers the daemon's HEAD-pinned `check-runs` read,
+  so the merge-gate pass cannot re-poll it every tick. Comments are
   fetched only when the PR `updatedAt`/head moved; the "comments scanned"
   watermark advances only when a scan **succeeded**, so neither a marker posted
   before the task reached `review` nor a transient `gh api` failure (which reports
-  an incomplete read as `null`, never a partial list) loses the marker. Any real
+  an incomplete read as `null`, never a partial list) loses the marker. A
+  `403`/`429`/secondary-limit response is a typed, retryable
+  **`PROVIDER_RATE_LIMITED`**: the reader refuses further calls until the
+  reported `x-ratelimit-reset`/`retry-after` (or
+  `RELAY_PROVIDER_RATE_LIMIT_BACKOFF_MS`, default 1h, when unreported), one
+  `workflow.provider_rate_limited` event is logged per episode, and the
+  Factory/PR-binding/merge-gate paths surface it instead of mistaking the
+  exhausted budget for a missing `gh` configuration. Any real
   provider write (comment/label), Linear write, or merge requires an explicit
   point-of-use `ProviderAuthority` grant (ISH-288); the default is deny.
 - **Gateway is notified only for judgment.** `ChildrenReady` (all direct children

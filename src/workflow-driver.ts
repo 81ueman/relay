@@ -4,7 +4,7 @@ import type { Task } from "./schema";
 import { TERMINAL_TASK_STATES } from "./schema";
 import { getTask } from "./tasks";
 import { defaultRunner, type CommandRunner } from "./verify";
-import { runMechanicalVerification, taskChecks } from "./workflow";
+import { confirmMerged, runMechanicalVerification, taskChecks } from "./workflow";
 import { runMergeGates } from "./merge-gate";
 import {
   NO_AUTHORITY,
@@ -14,6 +14,16 @@ import {
   type LinearReadOnly,
   type ProviderAuthority,
 } from "./providers";
+import {
+  PROVIDER_POLL_PHASES,
+  currentProviderRateLimit,
+  markProviderPolled,
+  providerPollDue,
+  providerPollMs,
+} from "./provider-poll";
+import { logProviderRateLimitOnce } from "./provider-rate-limit";
+
+export { providerPollDue, providerPollMs } from "./provider-poll";
 
 /** Terminal task states as an SQL `IN`/`NOT IN` list (done/failed/cancelled). */
 const TERMINAL_STATE_SQL = TERMINAL_TASK_STATES.map((s) => `'${s}'`).join(",");
@@ -71,28 +81,31 @@ export function pendingMechanicalVerifications(db: Database): Task[] {
 
 /**
  * Code tasks with a provider binding that may need reconciling this pass.
- * A task bound to a PR is still polled after it is `done` until the merge is
- * confirmed (`merged_at` set), so an accept-then-merge flow still credits.
+ *
+ * ISH-1132: a terminal Task is NEVER polled. `done` used to be an exception
+ * while an internal accept was waiting for the PR merge, which meant every
+ * already-merged/accepted Task kept spending `gh pr view`/`gh pr list`/
+ * `check-runs` calls forever. The poll now admits only a Task that can still
+ * change: one with a LIVE Run (mid-implementation PR/head binding) or one in
+ * review/merge_ready/integration.
  */
 export function providerBoundTasks(db: Database): Task[] {
   return db
     .query(
-      `SELECT * FROM tasks
-        WHERE code_change = 1 AND provider IS NOT NULL
-          AND (pr_url IS NOT NULL OR issue_id IS NOT NULL)
+      `SELECT * FROM tasks t
+        WHERE t.code_change = 1 AND t.provider IS NOT NULL
+          AND (t.pr_url IS NOT NULL OR t.issue_id IS NOT NULL)
+          AND t.state NOT IN (${TERMINAL_STATE_SQL})
           AND (
-            state NOT IN (${TERMINAL_STATE_SQL})
-            OR (state = 'done' AND pr_url IS NOT NULL AND merged_at IS NULL)
+            t.phase IN (${PROVIDER_POLL_PHASES.map((p) => `'${p}'`).join(",")})
+            OR EXISTS (
+              SELECT 1 FROM runs r
+               WHERE r.task_id = t.id AND r.state IN ('starting', 'running')
+            )
           )
-        ORDER BY priority DESC, created_at ASC`
+        ORDER BY t.priority DESC, t.created_at ASC`
     )
     .all() as Task[];
-}
-
-/** Minimum spacing between provider polls of one task (default 60s). */
-export function providerPollMs(): number {
-  const v = Number(process.env.RELAY_PROVIDER_POLL_MS ?? "60000");
-  return Number.isFinite(v) && v >= 0 ? v : 60000;
 }
 
 /**
@@ -144,9 +157,16 @@ export async function reconcileProviderBound(db: Database, deps: WorkflowDeps): 
     // command. Without this, N Tasks x one slow `gh` call delayed shutdown by
     // N times the per-command timeout.
     if (deps.signal?.aborted) break;
+    // ISH-1132: one rate-limit episode backs off the whole pass. Check before
+    // and after every Task so a 403 in the first call does not spend N more.
+    const limited = currentProviderRateLimit(deps);
+    if (limited) {
+      logProviderRateLimitOnce(db, limited);
+      break;
+    }
     // Throttle: a provider poll makes real, rate-limited API calls, so skip a
     // task polled within the interval. `0` disables the throttle (tests).
-    if (pollMs > 0 && t.provider_polled_at !== null && nowMs - t.provider_polled_at < pollMs) continue;
+    if (!providerPollDue(t, nowMs, pollMs)) continue;
     const taken = await reconcileTaskFromProvider(db, t.id, {
       github: deps.github,
       linear: deps.linear,
@@ -157,7 +177,18 @@ export async function reconcileProviderBound(db: Database, deps: WorkflowDeps): 
     // ISH-1129: an aborted read is NOT a poll. Do not advance the throttle (and
     // do not attribute a partial observation): the next daemon retries it.
     if (deps.signal?.aborted) break;
-    db.query(`UPDATE tasks SET provider_polled_at = ? WHERE id = ?`).run(nowMs, t.id);
+    // ISH-1132: a rate-limited read is NOT a completed poll. Do not advance the
+    // throttle; the reader refuses calls until the reported reset anyway.
+    const after = currentProviderRateLimit(deps);
+    if (after) {
+      logProviderRateLimitOnce(db, after);
+      break;
+    }
+    // A merge_ready Task is read by BOTH this pass (PR link/retarget/marker) and
+    // the merge-gate pass (the SAME PR + HEAD-pinned check-runs) in one tick.
+    // The gate owns the durable timestamp here, so the two reads stay one
+    // interval's budget instead of starving the gate on the next tick.
+    if (t.phase !== "merge_ready") markProviderPolled(db, t.id, nowMs);
     for (const a of taken) actions.push(`${a.kind}:${a.taskId}`);
   }
   return actions;
@@ -182,6 +213,25 @@ export async function reconcileMergeGates(db: Database, deps: WorkflowDeps): Pro
   for (const r of runs) {
     if (r.logged) actions.push(`merge-gate-${r.decision.status.toLowerCase()}:${r.decision.taskId}`);
     if (r.integrationRaised) actions.push(`integration-required:${r.decision.taskId}`);
+    // ISH-1132: merge_ready Tasks are no longer polled by the PR pass (the gate
+    // reads the same PR under the same interval). A merge observed by the gate
+    // is still credited exactly like the provider pass did before.
+    if (r.decision.status === "MERGED" && r.decision.pr) {
+      const live = getTask(db, r.decision.taskId);
+      if (live && live.merged_at === null) {
+        try {
+          confirmMerged(db, live.id, {
+            headSha: r.decision.pr.headSha,
+            repo: r.decision.pr.ref.repo,
+            actor: "provider:github",
+          });
+          actions.push(`merged:${live.id}`);
+        } catch {
+          // confirmMerged's refusal is recorded by the gate decision (and the
+          // provider pass logs merge_not_credited); never crash the pass here.
+        }
+      }
+    }
   }
   return actions;
 }

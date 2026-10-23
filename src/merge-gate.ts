@@ -8,10 +8,12 @@ import {
   notifyGatewayTo,
 } from "./results";
 import type { Task } from "./schema";
-import { isTerminalTaskState } from "./schema";
+import { TERMINAL_TASK_STATES, isTerminalTaskState } from "./schema";
 import { getTask, resolveHumanInterface, taskDependencies } from "./tasks";
 import { taskComplete } from "./workflow";
 import { resolveTaskPrTarget } from "./pr-target";
+import { currentProviderRateLimit, markProviderPolled, providerPollDue, providerPollMs } from "./provider-poll";
+import { activeProviderRateLimit, logProviderRateLimitOnce } from "./provider-rate-limit";
 import {
   DRAFT_RETAIN_LABELS,
   hasHoldLabel,
@@ -68,6 +70,7 @@ export type MergeBlockCode =
   | "NOT_MERGED"
   | "NO_PR"
   | "PROVIDER_UNREADABLE"
+  | "PROVIDER_RATE_LIMITED"
   | "PR_NOT_OPEN"
   | "PR_DRAFT"
   | "HEAD_MOVED"
@@ -100,7 +103,7 @@ export interface MergeGateReason {
 export type MergeGateStatus = "READY" | "BLOCKED" | "MERGED";
 
 /** How the bound PR was resolved this pass. `unbound` = no PR on the task. */
-export type PrRead = "ok" | "unbound" | "error";
+export type PrRead = "ok" | "unbound" | "error" | "rate_limited";
 
 /**
  * The fully-resolved facts one gate decision is made from. Deliberately
@@ -131,6 +134,11 @@ export interface MergeGateInput {
   hold: string | null;
   /** The required-check roll-up; null = the read FAILED (NOT_RUN). */
   checks: CheckRollup | null;
+  /**
+   * ISH-1132: the check read itself hit the provider's rate-limit backoff. This
+   * is NOT "checks not run"; it is a retryable `PROVIDER_RATE_LIMITED` block.
+   */
+  checksRateLimited?: boolean;
   /** Declared prerequisites that are not complete (merged, for a PR-bound dep). */
   unmetDependencies: string[];
   /** Point-of-use merge authority (ISH-288). Default DENY. */
@@ -211,6 +219,14 @@ export function evaluateMergeGate(input: MergeGateInput): MergeGateDecision {
       return decide(input, "BLOCKED", reasons);
     }
     return decide(input, "MERGED", reasons);
+  }
+
+  // ISH-1132: a rate-limited read is a TRANSIENT provider condition, not "no PR"
+  // and not "checks did not run". Keep it typed so the Factory/operator can wait
+  // for the reported reset instead of treating the Task as unconfigured.
+  if (input.prRead === "rate_limited") {
+    push("PROVIDER_RATE_LIMITED", "the GitHub API is rate-limited; no PR/check state was read this pass (retry after the reset)");
+    return decide(input, "BLOCKED", reasons);
   }
 
   if (!input.codeChange) {
@@ -297,7 +313,9 @@ export function evaluateMergeGate(input: MergeGateInput): MergeGateDecision {
   }
 
   // --- Required check results ---------------------------------------------
-  if (!input.checks) {
+  if (input.checksRateLimited) {
+    push("PROVIDER_RATE_LIMITED", "required check results could not be read because the GitHub API is rate-limited (retry after the reset)");
+  } else if (!input.checks) {
     push("CHECKS_NOT_RUN", "required check results are unavailable (NOT_RUN; a CI outage or an unreadable read)");
   } else if (input.checks.total === 0) {
     push("CHECKS_NOT_RUN", "no check results were reported for this HEAD");
@@ -397,15 +415,23 @@ export async function gatherMergeGateInput(
   let prRead: PrRead = "unbound";
   let merged = false;
   if (deps.github) {
-    const ref = await boundPrRef(task, deps.github, deps.repo);
-    if (ref) {
-      const view = await deps.github.getPullRequest(ref);
-      if (view) {
-        pr = view;
-        prRead = "ok";
-        merged = view.state === "merged";
-      } else {
-        prRead = "error";
+    // ISH-1132: never spend a call while the reader is backing off, and never
+    // report the backoff as a generic unreadable PR.
+    if (activeProviderRateLimit(deps.github.rateLimit?.())) {
+      prRead = "rate_limited";
+    } else {
+      const ref = await boundPrRef(task, deps.github, deps.repo);
+      if (ref) {
+        const view = await deps.github.getPullRequest(ref);
+        if (view) {
+          pr = view;
+          prRead = "ok";
+          merged = view.state === "merged";
+        } else if (activeProviderRateLimit(deps.github.rateLimit?.())) {
+          prRead = "rate_limited";
+        } else {
+          prRead = "error";
+        }
       }
     }
   }
@@ -439,11 +465,17 @@ export async function gatherMergeGateInput(
   }
 
   let checks: CheckRollup | null = null;
+  let checksRateLimited = false;
   // Checks are pinned to the RECORDED head. With no recorded head there is no
   // head to pin to, so the roll-up stays NOT_RUN (never the live PR head).
   if (deps.checks && pr && head) {
-    const raw = await deps.checks.listChecks(pr.ref, head);
-    checks = raw === null ? null : rollupChecks(raw);
+    if (activeProviderRateLimit(deps.checks.rateLimit?.())) {
+      checksRateLimited = true;
+    } else {
+      const raw = await deps.checks.listChecks(pr.ref, head);
+      if (raw === null && activeProviderRateLimit(deps.checks.rateLimit?.())) checksRateLimited = true;
+      else checks = raw === null ? null : rollupChecks(raw);
+    }
   }
 
   const unmetDependencies: string[] = [];
@@ -468,6 +500,7 @@ export async function gatherMergeGateInput(
     prBase: task.pr_base ?? null,
     hold,
     checks,
+    checksRateLimited,
     unmetDependencies,
     authority: deps.authority ?? NO_AUTHORITY,
     draftRetained: !!pr && pr.isDraft && pr.labels.some((l) => DRAFT_RETAIN_LABELS.includes((l ?? "").toLowerCase())),
@@ -560,20 +593,19 @@ export function mergeGateDecisionLogged(db: Database, identity: string): boolean
 // ---------------------------------------------------------------------------
 
 /**
- * Merge candidates this pass: every code task parked at `merge_ready`, plus a
- * done-but-unmerged PR-bound task (so a merge observed after an internal accept
- * is still verified). Terminal failed/cancelled tasks are excluded.
+ * Merge candidates this pass: every NON-TERMINAL code task parked at
+ * `merge_ready`. ISH-1132 removed the done-but-unmerged candidate: a `done`
+ * Task is terminal, and polling it forever was one of the sources of the
+ * exhausted GitHub budget. A merge observed while the Task is still
+ * integration/merge_ready is credited; accept-after-merge is the live flow.
  */
 export function mergeGateCandidates(db: Database): Task[] {
   return db
     .query(
       `SELECT * FROM tasks
         WHERE code_change = 1
-          AND state NOT IN ('failed', 'cancelled')
-          AND (
-            phase = 'merge_ready'
-            OR (state = 'done' AND pr_url IS NOT NULL AND merged_at IS NULL)
-          )
+          AND state NOT IN (${TERMINAL_TASK_STATES.map((s) => `'${s}'`).join(",")})
+          AND phase = 'merge_ready'
         ORDER BY priority DESC, created_at ASC`
     )
     .all() as Task[];
@@ -594,11 +626,33 @@ export interface MergeGateRun {
  */
 export async function runMergeGates(db: Database, deps: MergeGateDeps = {}): Promise<MergeGateRun[]> {
   const out: MergeGateRun[] = [];
+  const nowMs = Date.now();
+  const pollMs = providerPollMs();
   for (const t of mergeGateCandidates(db)) {
     // ISH-1129: shutdown interrupts a long candidate walk between Tasks.
     if (stopped(deps.signal)) break;
+    // ISH-1132: the gate reads `gh pr view` AND `check-runs`; it obeys the SAME
+    // per-Task interval as the PR poll and stops on a provider rate limit.
+    const limited = currentProviderRateLimit(deps);
+    const preLimited = limited !== null;
+    if (limited) {
+      // One typed decision is still produced (with ZERO provider calls) so the
+      // operator sees PROVIDER_RATE_LIMITED instead of a silent empty pass.
+      logProviderRateLimitOnce(db, limited);
+    } else if (!providerPollDue(t, nowMs, pollMs)) {
+      continue;
+    }
     const decision = await checkMergeGate(db, t.id, deps);
-    if (!decision) continue;
+    if (stopped(deps.signal)) break;
+    const after = currentProviderRateLimit(deps);
+    if (!decision) {
+      if (after) logProviderRateLimitOnce(db, after);
+      if (after || preLimited) break;
+      continue;
+    }
+    // A completed evaluation (even a BLOCKED one) spent the Task's poll budget —
+    // unless the pass was already backing off, in which case no call was spent.
+    if (!preLimited && !after) markProviderPolled(db, t.id, nowMs);
     let logged = false;
     if (!mergeGateDecisionLogged(db, decision.identity)) {
       logEvent(db, {
@@ -624,6 +678,11 @@ export async function runMergeGates(db: Database, deps: MergeGateDeps = {}): Pro
       integrationRaised = raiseIntegrationRequired(db, t, decision.head, reason).raised;
     }
     out.push({ decision, logged, integrationRaised });
+    if (after) {
+      logProviderRateLimitOnce(db, after);
+      break;
+    }
+    if (preLimited) break; // one typed decision is enough per backoff pass
   }
   return out;
 }

@@ -55,6 +55,9 @@ describe("ISH-1129: daemon shutdown is bounded by Task count", () => {
           prUrl: `https://github.com/${REPO}/pull/${1000 + i}`,
         });
       }
+      // ISH-1132: the poll only considers a live Run or review/merge_ready/
+      // integration. These fixtures have no Run, so put them in review.
+      db.query(`UPDATE tasks SET phase = 'review', state = 'review' WHERE provider = 'test'`).run();
       db.close();
       db = null;
 

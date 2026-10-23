@@ -4,6 +4,7 @@ import type { Task } from "./schema";
 import { getTask } from "./tasks";
 import { parsePrUrl, type GitHubReadOnly, type PrRef, type PrView } from "./providers";
 import { normalizeRepoSlug, resolveTaskPrTarget } from "./pr-target";
+import { activeProviderRateLimit, providerRateLimitedReason } from "./provider-rate-limit";
 import { linkTask } from "./workflow";
 
 /**
@@ -51,6 +52,7 @@ export type PrBindBlockCode =
   | "NO_PRODUCED_HEAD"
   | "HEAD_MISMATCH"
   | "PROVIDER_UNREADABLE"
+  | "PROVIDER_RATE_LIMITED"
   | "PR_UNREADABLE"
   | "PR_NOT_OPEN"
   | "HEAD_MOVED"
@@ -69,6 +71,8 @@ export interface PrBindingResult {
   /** The PR's observed remote head (null when unreadable). */
   remoteHead: string | null;
   reason: string | null;
+  /** ISH-1132: the structured block reason (null when bound). */
+  code: PrBindBlockCode | null;
   /** Stable identity of this binding decision (task, head, status, ref). */
   identity: string;
 }
@@ -203,6 +207,7 @@ export async function bindTaskPr(
       expectedHead,
       remoteHead,
       reason: `${PR_BINDING_ERROR}: ${code}: ${message}`,
+      code,
       identity,
     };
   };
@@ -223,7 +228,7 @@ export async function bindTaskPr(
       type: event,
       payload: { repo: ref.repo, number: ref.number, head: view.headSha, expectedHead },
     });
-    return { taskId, status, ref, expectedHead, remoteHead: view.headSha, reason: null, identity };
+    return { taskId, status, ref, expectedHead, remoteHead: view.headSha, reason: null, code: null, identity };
   };
 
   /**
@@ -241,7 +246,13 @@ export async function bindTaskPr(
       );
     }
     const view = await deps.github.getPullRequest(ref);
-    if (!view) return blocked("PR_UNREADABLE", `PR ${ref.repo}#${ref.number} could not be re-read from GitHub`, ref);
+    if (!view) {
+      // ISH-1132: an exhausted API budget is retryable and typed, not a
+      // "PR unreadable"/"provider not configured" verdict.
+      const limited = activeProviderRateLimit(deps.github.rateLimit?.());
+      if (limited) return blocked("PROVIDER_RATE_LIMITED", providerRateLimitedReason(limited), ref);
+      return blocked("PR_UNREADABLE", `PR ${ref.repo}#${ref.number} could not be re-read from GitHub`, ref);
+    }
     if (view.ref.repo !== ref.repo) {
       return blocked("REPO_CHANGED", `PR ${ref.repo}#${ref.number} resolved to repo ${view.ref.repo}`, ref);
     }
@@ -289,6 +300,10 @@ export async function bindTaskPr(
       "no read-only GitHub reader is configured (set RELAY_PROVIDER_GITHUB=gh, or authenticate gh so the operator path can auto-detect it)"
     );
   }
+  const activeLimit = activeProviderRateLimit(deps.github.rateLimit?.());
+  if (activeLimit) {
+    return blocked("PROVIDER_RATE_LIMITED", providerRateLimitedReason(activeLimit));
+  }
 
   // 1. Explicit identity wins: re-read + verify only.
   const existing = resolveTaskPrRef(task);
@@ -303,6 +318,10 @@ export async function bindTaskPr(
   // branch-name-only identity inference. A FORK PR (same branch name + SHA) is
   // rejected instead of adopted.
   const found = repo && task.branch ? await deps.github.findPullRequestForBranch(repo, task.branch) : null;
+  if (!found) {
+    const limited = activeProviderRateLimit(deps.github.rateLimit?.());
+    if (limited) return blocked("PROVIDER_RATE_LIMITED", providerRateLimitedReason(limited));
+  }
   if (found) {
     if (!prHeadRepoSafe(found, repo)) {
       return blocked(
