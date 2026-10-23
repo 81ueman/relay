@@ -598,8 +598,9 @@ export function mergeGateDecisionLogged(db: Database, identity: string): boolean
  * pass: a `done` Task is terminal, and polling it here forever was one of the
  * sources of the exhausted GitHub budget. ISH-1138 gives that one case to the
  * PR poll (`providerBoundTasks`) instead, which credits `merged_at` and stops
- * after a merge or a closed PR. A merge observed while the Task is still
- * integration/merge_ready is credited; accept-after-merge is the live flow.
+ * once the PR is observed merged or closed. A merge observed while the Task is
+ * still integration/merge_ready is credited; accept-after-merge is the live
+ * flow.
  */
 export function mergeGateCandidates(db: Database): Task[] {
   return db

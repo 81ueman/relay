@@ -292,12 +292,16 @@ implement --TaskSubmitted--> verify --VerificationResult--> review
   runnable until a PR-bound prerequisite is merged. The daemon poll only considers
   a Task that can still change: one with a **live Run**, one in
   `review`/`merge_ready`/`integration`, or (ISH-1138) a `done` Task accepted
-  before its bound PR merged (`merged_at IS NULL`, PR not observed closed). That
+  before its bound PR merged (`merged_at IS NULL`, PR not observed settled). That
   last case is the one terminal poll candidate; it is bounded by the same
   per-Task interval and leaves the poll set for good once `merged_at` or
-  `pr_closed_at` is recorded. Every other terminal Task (`failed`/`cancelled`,
-  or `done` with a merged/closed/unbound PR) is never polled, so a DB full of
-  settled Tasks spends zero GitHub calls. Review verdicts are absorbed from
+  `pr_settled_at` is recorded. `pr_settled_at` is a final observation: the PR was
+  **closed**, or GitHub reports it **merged at a head the Task did not record**
+  (an uncreditable `HEAD_MISMATCH` that no retry can change). Every other
+  terminal Task (`failed`/`cancelled`, or `done` with a credited merge, a settled
+  tombstone, or no bound PR) is never polled, so a DB full of settled Tasks
+  spends zero GitHub calls.
+  Review verdicts are absorbed from
   `lane.sh`'s
   `<!-- ishiul-review head=<sha> verdict=OK|NG|HOLD reviewer=<id> -->` markers, but
   only from an authorized reviewer identity — a reviewer's TurnEnded, a GitHub

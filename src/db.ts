@@ -241,9 +241,10 @@ function migrate(db: Database): void {
       ["provider_polled_at", "INTEGER"],
       ["pr_updated_at", "TEXT"],
       ["merged_at", "INTEGER"],
-      // ISH-1138: durable "the bound PR was observed closed" tombstone for the
-      // done-but-unmerged poll candidate.
-      ["pr_closed_at", "INTEGER"],
+      // ISH-1138: durable "the bound PR needs no more polling" tombstone for the
+      // done-but-unmerged candidate (PR closed, or merged at a head that can
+      // never be credited).
+      ["pr_settled_at", "INTEGER"],
       ["result_ref", "TEXT"],
       ["review_profile", "TEXT"],
       ["accepted_at", "INTEGER"],

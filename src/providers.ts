@@ -562,11 +562,25 @@ export async function reconcileTaskFromProvider(
 
         if (view.state === "merged") {
           actions.push(...confirmMergeFromView(db, getTask(db, taskId)!, view));
+          // ISH-1138: a `done` Task accepted before its PR merged can never
+          // credit a merge at a head it did not record. Once GitHub reports
+          // MERGED there is nothing left for a retry to change, so tombstone the
+          // observation and leave the poll set instead of re-reading (and
+          // re-logging link_ignored_terminal) every interval forever.
+          const afterMerge = getTask(db, taskId)!;
+          if (afterMerge.state === "done" && afterMerge.merged_at === null) {
+            actions.push(...settlePrPoll(db, afterMerge, view, "merged-uncreditable"));
+          }
         }
         // ISH-1138: a closed PR is a durable observation, not "still open". It
-        // is what removes a done-but-unmerged Task from the poll for good.
+        // removes an accepted done-but-unmerged Task from the poll for good. A
+        // review/merge_ready PR can be reopened, so it is not tombstoned there:
+        // a stale tombstone would hide the merge of a Task accepted later.
         if (view.state === "closed") {
-          actions.push(...recordClosedPr(db, getTask(db, taskId)!, view));
+          const afterClose = getTask(db, taskId)!;
+          if (afterClose.state === "done") {
+            actions.push(...settlePrPoll(db, afterClose, view, "closed"));
+          }
         }
 
         // Comments cost three `gh api` calls, so fetch them only when the PR
@@ -626,22 +640,40 @@ export async function reconcileTaskFromProvider(
 }
 
 /**
- * ISH-1138: record that the bound PR was observed CLOSED (not merged). A `done`
- * Task accepted before its merge is the one terminal poll candidate; this
- * tombstone is what removes it for good once the PR will never merge. Idempotent
- * and logged once per Task.
+ * ISH-1138: write the durable tombstone that removes a `done` Task accepted
+ * before its PR merged from the provider poll. Two observations are final:
+ *
+ *   - `closed`: the PR will never merge. Written only for an accepted (`done`)
+ *     Task, because a review/merge_ready PR can be reopened and then merged; a
+ *     tombstone from that phase would hide the later, creditable merge.
+ *   - `merged-uncreditable`: GitHub reports MERGED at a head this Task did not
+ *     record, so `confirmMerged` can never credit it. Retrying only re-reads the
+ *     same final state and re-logs `link_ignored_terminal`.
+ *
+ * Idempotent and logged once per Task.
  */
-function recordClosedPr(db: Database, task: Task, view: PrView): ProviderAction[] {
-  if (task.pr_closed_at !== null) return [];
+function settlePrPoll(
+  db: Database,
+  task: Task,
+  view: PrView,
+  reason: "closed" | "merged-uncreditable"
+): ProviderAction[] {
+  if (task.pr_settled_at !== null) return [];
   const at = Date.now();
-  db.query(`UPDATE tasks SET pr_closed_at = ?, updated_at = ? WHERE id = ?`).run(at, at, task.id);
+  db.query(`UPDATE tasks SET pr_settled_at = ?, updated_at = ? WHERE id = ?`).run(at, at, task.id);
   logEvent(db, {
     source: "workflow",
     taskId: task.id,
-    type: "workflow.pr_closed",
-    payload: { repo: view.ref.repo, number: view.ref.number, head: view.headSha },
+    type: "workflow.pr_settled",
+    payload: { reason, repo: view.ref.repo, number: view.ref.number, head: view.headSha },
   });
-  return [{ kind: "pr-closed", taskId: task.id, detail: `${view.ref.repo}#${view.ref.number}` }];
+  return [
+    {
+      kind: reason === "closed" ? "pr-closed" : "pr-merge-settled",
+      taskId: task.id,
+      detail: `${view.ref.repo}#${view.ref.number}`,
+    },
+  ];
 }
 
 /** Credit a merge only when it is at the merged head we recorded. */

@@ -170,7 +170,7 @@ describe("ISH-1132: terminal Tasks spend zero provider calls", () => {
       const id = intake(`ISH-1132-TERMINAL-${i}`, 3000 + i);
       if (i % 3 === 0) {
         // ISH-1138: a `done` Task is terminal for the poll once `merged_at` or
-        // `pr_closed_at` is set. The accept-before-merge case (both NULL) is the
+        // `pr_settled_at` is set. The accept-before-merge case (both NULL) is the
         // one carve-out and has its own test below.
         if (i % 2 === 0) {
           db.query(`UPDATE tasks SET state = 'done', phase = 'merge_ready', accepted_at = 1, merged_at = ? WHERE id = ?`).run(
@@ -178,7 +178,7 @@ describe("ISH-1132: terminal Tasks spend zero provider calls", () => {
             id
           );
         } else {
-          db.query(`UPDATE tasks SET state = 'done', phase = 'merge_ready', accepted_at = 1, pr_closed_at = ? WHERE id = ?`).run(
+          db.query(`UPDATE tasks SET state = 'done', phase = 'merge_ready', accepted_at = 1, pr_settled_at = ? WHERE id = ?`).run(
             Date.now(),
             id
           );
@@ -228,7 +228,7 @@ describe("ISH-1132: terminal Tasks spend zero provider calls", () => {
 
     db.query(`UPDATE tasks SET merged_at = ? WHERE id = ?`).run(Date.now(), doneUnmerged);
     expect(providerBoundTasks(db).map((t) => t.id)).not.toContain(doneUnmerged);
-    db.query(`UPDATE tasks SET merged_at = NULL, pr_closed_at = ? WHERE id = ?`).run(Date.now(), doneUnmerged);
+    db.query(`UPDATE tasks SET merged_at = NULL, pr_settled_at = ? WHERE id = ?`).run(Date.now(), doneUnmerged);
     expect(providerBoundTasks(db).map((t) => t.id)).not.toContain(doneUnmerged);
   });
 });

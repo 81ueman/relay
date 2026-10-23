@@ -88,10 +88,12 @@ export function pendingMechanicalVerifications(db: Database): Task[] {
  * Task spend `gh pr view`/`gh pr list`/`check-runs` calls forever.
  *
  * ISH-1138: a `done` Task accepted BEFORE its PR merged is still the one
- * exception — it has a bound PR, no `merged_at` yet, and no observed closure, so
+ * exception — it has a bound PR, no `merged_at` yet, and no settled tombstone, so
  * its merge cannot be recorded otherwise. It stays a candidate, bounded by the
- * same per-Task interval, until `merged_at` or `pr_closed_at` is set; then it
- * leaves the poll set for good. Settled Tasks still spend zero provider calls.
+ * same per-Task interval, until `merged_at` is set or `pr_settled_at` records a
+ * final observation (PR closed, or merged at a head this Task cannot credit);
+ * then it leaves the poll set for good. Settled Tasks still spend zero provider
+ * calls.
  */
 export function providerBoundTasks(db: Database): Task[] {
   return db
@@ -101,8 +103,9 @@ export function providerBoundTasks(db: Database): Task[] {
           AND (t.pr_url IS NOT NULL OR t.issue_id IS NOT NULL)
           AND t.merged_at IS NULL
           AND (
-            -- ISH-1138: accept-before-merge, until the merge/closure is observed.
-            (t.state = 'done' AND t.pr_url IS NOT NULL AND t.pr_closed_at IS NULL)
+            -- ISH-1138: accept-before-merge, until the merge or a final PR
+            -- observation (closed / merged at another head) is recorded.
+            (t.state = 'done' AND t.pr_url IS NOT NULL AND t.pr_settled_at IS NULL)
             OR (
               -- ISH-1132: a non-terminal Task that can still change.
               t.state NOT IN (${TERMINAL_STATE_SQL})

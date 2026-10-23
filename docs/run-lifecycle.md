@@ -278,14 +278,15 @@ is still refused. A Task with no linked head still adopts the produced head.
 The provider poll is bounded (ISH-1132/ISH-1138): it only considers a Task with
 a **live Run**, one in `review`/`merge_ready`/`integration`, or a `done` Task
 accepted before its bound PR merged (`merged_at IS NULL`, PR not observed
-closed). That one terminal candidate is polled until the merge is recorded or
-the PR is observed closed, then it leaves the poll set for good; every other
-terminal `done`/`failed`/`cancelled` Task is never polled. It spends at most one
-read per Task per `RELAY_PROVIDER_POLL_MS` (default 60s) — including the merge
-gate's HEAD-pinned `check-runs` read. A provider `403`/`429`/secondary-limit
-response backs the reader off until the reported reset and is surfaced as the
-typed, retryable `PROVIDER_RATE_LIMITED`; it is not a Run failure and does not
-change the Task.
+settled). That one terminal candidate is polled until the merge is recorded or a
+final `pr_settled_at` observation lands — the PR is closed, or GitHub reports it
+merged at a head the Task did not record — then it leaves the poll set for good;
+every other terminal `done`/`failed`/`cancelled` Task is never polled. It
+spends at most one read per Task per `RELAY_PROVIDER_POLL_MS` (default 60s) —
+including the merge gate's HEAD-pinned `check-runs` read. A provider
+`403`/`429`/secondary-limit response backs the reader off until the reported
+reset and is surfaced as the typed, retryable `PROVIDER_RATE_LIMITED`; it is not
+a Run failure and does not change the Task.
 
 A review is an **independent** principal (`REVIEWER_ROLE`, or the review claim)
 and may not be the worker that recorded the submission — the Run submits as
