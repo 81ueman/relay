@@ -46,6 +46,12 @@ export interface WorkflowDeps {
   checks?: ChecksReadOnly;
   authorizedReviewers?: string[];
   authority?: ProviderAuthority;
+  /**
+   * ISH-1129: daemon shutdown. The provider poll and merge-gate walk stop
+   * between Tasks when it aborts, and the readers' abortable exec cancels an
+   * in-flight provider command — so exit time does not scale with Task count.
+   */
+  signal?: AbortSignal;
 }
 
 export const EMPTY_WORKFLOW_DEPS: WorkflowDeps = {};
@@ -101,6 +107,8 @@ export async function runPendingMechanicalVerifications(
   const runner = deps.verifyRunner ?? defaultRunner;
   const fallbackCwd = deps.verifyCwd ?? process.env.RELAY_VERIFY_CWD ?? process.cwd();
   for (const t of pendingMechanicalVerifications(db)) {
+    // ISH-1129: shutdown stops the walk before the next checkout command.
+    if (deps.signal?.aborted) break;
     const checks = taskChecks(t);
     if (checks.length === 0) continue; // nothing mechanical to run
     // Bind to the TASK's own worktree (or the fallback cwd).
@@ -126,21 +134,29 @@ export async function runPendingMechanicalVerifications(
 }
 
 /** Reconcile every provider-bound task (read-only). Returns action labels. */
-export function reconcileProviderBound(db: Database, deps: WorkflowDeps): string[] {
+export async function reconcileProviderBound(db: Database, deps: WorkflowDeps): Promise<string[]> {
   if (!deps.github && !deps.linear) return [];
   const actions: string[] = [];
   const nowMs = Date.now();
   const pollMs = providerPollMs();
   for (const t of providerBoundTasks(db)) {
+    // ISH-1129: SIGTERM during a long bound-PR walk stops BEFORE the next
+    // command. Without this, N Tasks x one slow `gh` call delayed shutdown by
+    // N times the per-command timeout.
+    if (deps.signal?.aborted) break;
     // Throttle: a provider poll makes real, rate-limited API calls, so skip a
     // task polled within the interval. `0` disables the throttle (tests).
     if (pollMs > 0 && t.provider_polled_at !== null && nowMs - t.provider_polled_at < pollMs) continue;
-    const taken = reconcileTaskFromProvider(db, t.id, {
+    const taken = await reconcileTaskFromProvider(db, t.id, {
       github: deps.github,
       linear: deps.linear,
       authorizedReviewers: deps.authorizedReviewers,
       authority: deps.authority ?? NO_AUTHORITY,
+      signal: deps.signal,
     });
+    // ISH-1129: an aborted read is NOT a poll. Do not advance the throttle (and
+    // do not attribute a partial observation): the next daemon retries it.
+    if (deps.signal?.aborted) break;
     db.query(`UPDATE tasks SET provider_polled_at = ? WHERE id = ?`).run(nowMs, t.id);
     for (const a of taken) actions.push(`${a.kind}:${a.taskId}`);
   }
@@ -152,14 +168,16 @@ export function reconcileProviderBound(db: Database, deps: WorkflowDeps): string
  * raise `IntegrationRequired` on a real conflict. Logs each new decision identity
  * once. Pure observation: it never merges, rebases or writes a provider.
  */
-export function reconcileMergeGates(db: Database, deps: WorkflowDeps): string[] {
+export async function reconcileMergeGates(db: Database, deps: WorkflowDeps): Promise<string[]> {
   const actions: string[] = [];
-  const runs = runMergeGates(db, {
+  if (deps.signal?.aborted) return actions;
+  const runs = await runMergeGates(db, {
     github: deps.github,
     linear: deps.linear,
     checks: deps.checks,
     authorizedReviewers: deps.authorizedReviewers,
     authority: deps.authority ?? NO_AUTHORITY,
+    signal: deps.signal,
   });
   for (const r of runs) {
     if (r.logged) actions.push(`merge-gate-${r.decision.status.toLowerCase()}:${r.decision.taskId}`);
@@ -176,8 +194,14 @@ export function reconcileMergeGates(db: Database, deps: WorkflowDeps): string[] 
  */
 export async function processWorkflow(db: Database, deps: WorkflowDeps = EMPTY_WORKFLOW_DEPS): Promise<string[]> {
   const actions: string[] = [];
+  if (deps.signal?.aborted) return actions;
   actions.push(...(await runPendingMechanicalVerifications(db, deps)));
-  actions.push(...reconcileProviderBound(db, deps));
-  actions.push(...reconcileMergeGates(db, deps));
+  // ISH-1129: each sub-pass stops between Tasks on shutdown, and the abortable
+  // provider exec kills an in-flight command, so SIGTERM is bounded even with
+  // hundreds of bound Tasks.
+  if (deps.signal?.aborted) return actions;
+  actions.push(...(await reconcileProviderBound(db, deps)));
+  if (deps.signal?.aborted) return actions;
+  actions.push(...(await reconcileMergeGates(db, deps)));
   return actions;
 }

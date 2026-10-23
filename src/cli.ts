@@ -1261,10 +1261,10 @@ async function main(): Promise<void> {
           // deliberately not called, and an unresolved NG/HOLD refuses. ISH-1087:
           // this operator path auto-detects the read-only gh reader, so the shell
           // needs no RELAY_PROVIDER_GITHUB=gh; an explicit `off` still disables it.
-          const t = requestRebase(db, id, workerId, {
+          const t = await requestRebase(db, id, workerId, {
             reason: flag(rest, "--reason") ?? "",
             headSha: flag(rest, "--head") ?? undefined,
-            deps: operatorProviderDepsFromEnv(),
+            deps: await operatorProviderDepsFromEnv(),
           });
           console.log(
             `${t.id} -> phase=${t.phase} state=${t.state} attempt=${t.attempt} ` +
@@ -1365,10 +1365,10 @@ async function main(): Promise<void> {
         // ISH-1087: auto-detect the read-only gh reader for the operator path so
         // `merge-check` sees the worker's PR without every shell exporting
         // RELAY_PROVIDER_GITHUB=gh. An explicit `off` still disables it.
-        const base = operatorProviderDepsFromEnv();
+        const base = await operatorProviderDepsFromEnv();
         const authority = flag(rest, "--authority") === "merge" ? { ...base.authority, merge: true } : base.authority;
         const repo = resolveTaskPrTarget(task)?.repo ?? null;
-        const decision = checkMergeGate(db, id, { ...base, repo, authority });
+        const decision = await checkMergeGate(db, id, { ...base, repo, authority });
         if (!decision) throw new Error(`unknown task: ${id}`);
         console.log(hasFlag(rest, "--json") ? JSON.stringify(decision, null, 2) : formatMergeGateDecision(decision));
         break;
@@ -1389,8 +1389,8 @@ async function main(): Promise<void> {
         // because the shell had not exported RELAY_PROVIDER_GITHUB=gh. Auto-detect
         // an authenticated gh (read-only) and resolve the repo from the task
         // workspace, so the existing PR is bound instead of reported as NO_PR.
-        const base = operatorProviderDepsFromEnv();
-        const result = bindTaskPr(db, id, {
+        const base = await operatorProviderDepsFromEnv();
+        const result = await bindTaskPr(db, id, {
           github: base.github,
           repo: flag(args, "--repo") ?? undefined,
         });
@@ -1833,8 +1833,8 @@ async function main(): Promise<void> {
           // ISH-1087: the live Factory path uses the operator deps, so an
           // authenticated gh is enough to read the PR and post/read back the
           // native review. No PR = the review stage blocks (never MergeReady).
-          const providers = operatorProviderDepsFromEnv();
-          const nativeReview = factoryNativeReviewDepsFromEnv();
+          const providers = await operatorProviderDepsFromEnv();
+          const nativeReview = await factoryNativeReviewDepsFromEnv();
           const result = await runFactoryTask(db, id, {
             repo: flag(rest, "--repo") ?? undefined,
             prRepo: flag(rest, "--pr-repo") ?? undefined,
@@ -2156,7 +2156,7 @@ async function main(): Promise<void> {
         } else if (type === "session.error" && workerId) {
           const err = typeof payload === "object" && payload !== null ? JSON.stringify(payload) : String(payload);
           console.log(handleErrorSignal(db, workerId, err));
-          const { actions } = await reconcile(db, rt, undefined, operatorProviderDepsFromEnv());
+          const { actions } = await reconcile(db, rt, undefined, await operatorProviderDepsFromEnv());
           console.log(`reconciled:${actions.join(",") || "noop"}`);
         } else if (type === "permission.asked" && workerId) {
           touchSeen(db, workerId);

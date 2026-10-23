@@ -117,7 +117,7 @@ async function toReview(id: string, runner?: CommandRunner): Promise<void> {
   }
 }
 
-describe("mechanical verification: Relay runs the commands, no LLM waits", () => {
+describe("mechanical verification: Relay runs the commands, no LLM waits", async () => {
   test("a Relay-owned verify phase is never offered to the claim machine", async () => {
     const t = intakeTask(db, { provider: "github", issueId: "o/r#1", codeChange: true, headSha: FULL, checks: [CHECK] });
     claimTask(db, t.id, "impl");
@@ -186,7 +186,7 @@ describe("mechanical verification: Relay runs the commands, no LLM waits", () =>
   });
 });
 
-describe("review verdicts: PASS / FIX / BLOCKED", () => {
+describe("review verdicts: PASS / FIX / BLOCKED", async () => {
   test("PASS -> integration -> merge_ready; acceptance then merge", async () => {
     const t = intakeTask(db, { provider: "github", issueId: "o/r#7", codeChange: true, headSha: FULL, checks: [CHECK], prUrl: "https://github.com/o/r/pull/7", prRepo: "o/r" });
     await toReview(t.id);
@@ -257,7 +257,7 @@ describe("review verdicts: PASS / FIX / BLOCKED", () => {
   });
 });
 
-describe("Gateway is notified only for judgment events", () => {
+describe("Gateway is notified only for judgment events", async () => {
   test("ordinary FIX/PASS never message the Gateway; children_ready fires once", async () => {
     process.env.RELAY_HUMAN = "gateway";
     registerWorker(db, "gateway", { role: "planner" });
@@ -285,7 +285,7 @@ describe("Gateway is notified only for judgment events", () => {
   });
 });
 
-describe("provider reconciliation binds state without writing", () => {
+describe("provider reconciliation binds state without writing", async () => {
   function githubView(state: PrView["state"], headSha: string): PrView {
     return {
       ref: { repo: "o/r", number: 1 },
@@ -308,7 +308,7 @@ describe("provider reconciliation binds state without writing", () => {
     const gh = new FakeGitHub();
     gh.putPullRequest(githubView("open", FULL));
     // Only a label, no verdict marker.
-    const actions = reconcileTaskFromProvider(db, t.id, { github: gh, authorizedReviewers: ["claude"] });
+    const actions = await reconcileTaskFromProvider(db, t.id, { github: gh, authorizedReviewers: ["claude"] });
     expect(actions.some((a) => a.kind.startsWith("review-"))).toBe(false);
     expect(getTask(db, t.id)!.phase).toBe("review");
   });
@@ -321,7 +321,7 @@ describe("provider reconciliation binds state without writing", () => {
     gh.putComments({ repo: "o/r", number: 1 }, [
       { author: "impostor", createdAt: "2026-01-01T00:00:00Z", body: `<!-- ishiul-review head=${FULL} verdict=OK reviewer=claude -->` },
     ]);
-    reconcileTaskFromProvider(db, t.id, { github: gh, authorizedReviewers: ["claude"] });
+    await reconcileTaskFromProvider(db, t.id, { github: gh, authorizedReviewers: ["claude"] });
     expect(getTask(db, t.id)!.phase).toBe("review"); // self-claim ignored
 
     gh.putComments({ repo: "o/r", number: 1 }, [
@@ -329,7 +329,7 @@ describe("provider reconciliation binds state without writing", () => {
     ]);
     // A new real comment moves the PR; simulate that so comments are refetched.
     db.query(`UPDATE tasks SET pr_updated_at = NULL WHERE id = ?`).run(t.id);
-    const actions = reconcileTaskFromProvider(db, t.id, { github: gh, authorizedReviewers: ["claude"] });
+    const actions = await reconcileTaskFromProvider(db, t.id, { github: gh, authorizedReviewers: ["claude"] });
     expect(actions.some((a) => a.kind === "review-pass")).toBe(true);
     expect(getTask(db, t.id)!.phase).toBe("integration");
   });
@@ -345,7 +345,7 @@ describe("provider reconciliation binds state without writing", () => {
 
     const gh = new FakeGitHub();
     gh.putPullRequest(githubView("open", MOVED)); // synchronize: head moved
-    const actions = reconcileTaskFromProvider(db, t.id, { github: gh });
+    const actions = await reconcileTaskFromProvider(db, t.id, { github: gh });
     expect(actions.some((a) => a.kind === "pr-head-bound")).toBe(true);
     const live = getTask(db, t.id)!;
     expect(live.head_sha).toBe(MOVED);
@@ -363,7 +363,7 @@ describe("provider reconciliation binds state without writing", () => {
 
     const gh = new FakeGitHub();
     gh.putPullRequest(githubView("merged", FULL));
-    const actions = reconcileTaskFromProvider(db, t.id, { github: gh });
+    const actions = await reconcileTaskFromProvider(db, t.id, { github: gh });
     expect(actions.some((a) => a.kind === "merged")).toBe(true);
     expect(getTask(db, t.id)!.merged_at).not.toBeNull();
   });
@@ -375,17 +375,17 @@ describe("provider reconciliation binds state without writing", () => {
     await toReview(t.id);
     const lin = new FakeLinear();
     lin.putIssue({ id: "ISH-759", state: "In Progress", labels: ["hold"], updatedAt: "2026-01-01T00:00:00Z" });
-    const first = reconcileTaskFromProvider(db, t.id, { linear: lin });
+    const first = await reconcileTaskFromProvider(db, t.id, { linear: lin });
     expect(first.some((a) => a.kind === "linear-hold")).toBe(true);
     expect(getTask(db, t.id)!.state).toBe("blocked_human");
     // A second pass does not re-block or re-notify.
-    const second = reconcileTaskFromProvider(db, t.id, { linear: lin });
+    const second = await reconcileTaskFromProvider(db, t.id, { linear: lin });
     expect(second.some((a) => a.kind === "linear-hold")).toBe(false);
     expect(countMessages("gateway", "child_blocked")).toBe(1);
   });
 });
 
-describe("the reconciler drives verify and providers event-driven", () => {
+describe("the reconciler drives verify and providers event-driven", async () => {
   test("reconcile runs a pending mechanical verify and dispatches a reviewer", async () => {
     const t = intakeTask(db, { provider: "github", issueId: "o/r#16", codeChange: true, headSha: FULL, checks: [CHECK] });
     claimTask(db, t.id, "impl");
@@ -397,7 +397,7 @@ describe("the reconciler drives verify and providers event-driven", () => {
     expect(getTask(db, t.id)!.phase).toBe("review");
   });
 
-  test("pending mechanical verifications are not re-run once a result exists", () => {
+  test("pending mechanical verifications are not re-run once a result exists", async () => {
     const t = intakeTask(db, { provider: "github", issueId: "o/r#17", codeChange: true, headSha: FULL, checks: [CHECK] });
     claimTask(db, t.id, "impl");
     submitPhase(db, t.id, "impl", { headSha: FULL });
@@ -405,7 +405,7 @@ describe("the reconciler drives verify and providers event-driven", () => {
   });
 });
 
-describe("no RELAY_AUTO_APPROVE bypass on the mechanical path", () => {
+describe("no RELAY_AUTO_APPROVE bypass on the mechanical path", async () => {
   test("a verified code task in review is not auto-approved", async () => {
     process.env.RELAY_AUTO_APPROVE = "true";
     const t = intakeTask(db, { provider: "github", issueId: "o/r#18", codeChange: true, headSha: FULL, checks: [CHECK] });
@@ -417,14 +417,14 @@ describe("no RELAY_AUTO_APPROVE bypass on the mechanical path", () => {
   });
 });
 
-describe("read-only authority default", () => {
-  test("provider reconciliation with no authority never performs a merge", () => {
+describe("read-only authority default", async () => {
+  test("provider reconciliation with no authority never performs a merge", async () => {
     expect(NO_AUTHORITY.merge).toBe(false);
     expect(() => confirmMerged(db, "T404")).toThrow(/unknown task/);
   });
 });
 
-describe("finding 1: mechanical verify binds to the recorded head", () => {
+describe("finding 1: mechanical verify binds to the recorded head", async () => {
   test("a checkout HEAD != the task head BLOCKS (never PASS)", async () => {
     const t = intakeTask(db, { provider: "github", issueId: "o/r#20", codeChange: true, headSha: FULL, checks: [CHECK] });
     claimTask(db, t.id, "impl");
@@ -454,7 +454,7 @@ describe("finding 1: mechanical verify binds to the recorded head", () => {
   });
 });
 
-describe("finding 2: a blocked mechanical verify is resumable", () => {
+describe("finding 2: a blocked mechanical verify is resumable", async () => {
   test("unblock routes back to a fresh implement attempt, then re-verifies", async () => {
     const t = intakeTask(db, { provider: "github", issueId: "o/r#22", codeChange: true, headSha: FULL, checks: [CHECK] });
     claimTask(db, t.id, "impl");
@@ -476,7 +476,7 @@ describe("finding 2: a blocked mechanical verify is resumable", () => {
   });
 });
 
-describe("finding 3: a review BLOCKED / Linear HOLD is resumable", () => {
+describe("finding 3: a review BLOCKED / Linear HOLD is resumable", async () => {
   test("unblock routes a review BLOCKED back to a fresh attempt", async () => {
     const t = intakeTask(db, { provider: "github", issueId: "o/r#23", codeChange: true, headSha: FULL, checks: [CHECK] });
     await toReview(t.id);
@@ -503,7 +503,7 @@ describe("finding 3: a review BLOCKED / Linear HOLD is resumable", () => {
     await toReview(t.id);
     const lin = new FakeLinear();
     lin.putIssue({ id: "ISH-999", state: "In Progress", labels: ["hold"], updatedAt: "2026-01-01T00:00:00Z" });
-    reconcileTaskFromProvider(db, t.id, { linear: lin });
+    await reconcileTaskFromProvider(db, t.id, { linear: lin });
     expect(getTask(db, t.id)!.state).toBe("blocked_human");
 
     // A review with NO stored result resumes AT review (state=review), not
@@ -516,7 +516,7 @@ describe("finding 3: a review BLOCKED / Linear HOLD is resumable", () => {
   });
 });
 
-describe("finding 4: quietBlock releases the owning worker", () => {
+describe("finding 4: quietBlock releases the owning worker", async () => {
   test("a Linear HOLD on a running task clears the worker's current_task_id", async () => {
     const t = intakeTask(db, { provider: "linear", issueId: "ISH-1000", codeChange: true, headSha: FULL });
     claimTask(db, t.id, "impl");
@@ -524,7 +524,7 @@ describe("finding 4: quietBlock releases the owning worker", () => {
 
     const lin = new FakeLinear();
     lin.putIssue({ id: "ISH-1000", state: "In Progress", labels: ["hold"], updatedAt: "2026-01-01T00:00:00Z" });
-    reconcileTaskFromProvider(db, t.id, { linear: lin });
+    await reconcileTaskFromProvider(db, t.id, { linear: lin });
 
     expect(getTask(db, t.id)!.state).toBe("blocked_human");
     const w = getWorker(db, "impl")!;
@@ -533,7 +533,7 @@ describe("finding 4: quietBlock releases the owning worker", () => {
   });
 });
 
-describe("finding 6: the merge gate is enforced where done is decided", () => {
+describe("finding 6: the merge gate is enforced where done is decided", async () => {
   /** Walk a code child (with a PR) all the way to an internal accept. */
   async function acceptCodeChild(id: string): Promise<void> {
     await toReview(id);
@@ -589,7 +589,7 @@ describe("finding 6: the merge gate is enforced where done is decided", () => {
   });
 });
 
-describe("finding 6: marker application uses the live head and dedupes", () => {
+describe("finding 6: marker application uses the live head and dedupes", async () => {
   test("an abbreviated marker SHA applies against the live full head", async () => {
     const t = intakeTask(db, {
       provider: "github", issueId: "o/r#32", codeChange: true, headSha: FULL, checks: [CHECK],
@@ -605,7 +605,7 @@ describe("finding 6: marker application uses the live head and dedupes", () => {
     gh.putComments({ repo: "o/r", number: 4 }, [
       { author: "claude", createdAt: "2026-01-01T00:00:00Z", body: `<!-- ishiul-review head=${FULL.slice(0, 7)} verdict=OK reviewer=claude -->` },
     ]);
-    const actions = reconcileTaskFromProvider(db, t.id, { github: gh, authorizedReviewers: ["claude"] });
+    const actions = await reconcileTaskFromProvider(db, t.id, { github: gh, authorizedReviewers: ["claude"] });
     expect(actions.some((a) => a.kind === "review-pass")).toBe(true);
     const result = db.query(`SELECT * FROM task_results WHERE task_id = ? AND kind='ReviewResult'`).get(t.id) as { head_sha: string };
     expect(result.head_sha).toBe(FULL); // the live FULL head, not the abbreviation
@@ -635,7 +635,7 @@ describe("finding 6: marker application uses the live head and dedupes", () => {
       // Force a comment fetch each pass (as if the PR kept moving) so the dedupe
       // — not the comment-fetch throttle — is what limits the event.
       db.query(`UPDATE tasks SET pr_updated_at = NULL WHERE id = ?`).run(t.id);
-      reconcileTaskFromProvider(db, t.id, { github: gh, authorizedReviewers: ["claude"] });
+      await reconcileTaskFromProvider(db, t.id, { github: gh, authorizedReviewers: ["claude"] });
     }
     const n = db
       .query(`SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'workflow.marker_not_applied'`)
@@ -669,7 +669,7 @@ function githubViewAt(
   };
 }
 
-describe("round 2: a Linear HOLD on review resumes at review", () => {
+describe("round 2: a Linear HOLD on review resumes at review", async () => {
   test("HOLD -> unblock -> review PASS", async () => {
     process.env.RELAY_HUMAN = "gateway";
     registerWorker(db, "gateway", { role: "planner" });
@@ -679,7 +679,7 @@ describe("round 2: a Linear HOLD on review resumes at review", () => {
 
     const lin = new FakeLinear();
     lin.putIssue({ id: "ISH-2000", state: "In Progress", labels: ["hold"], updatedAt: "2026-01-01T00:00:00Z" });
-    reconcileTaskFromProvider(db, t.id, { linear: lin });
+    await reconcileTaskFromProvider(db, t.id, { linear: lin });
     expect(getTask(db, t.id)!.state).toBe("blocked_human");
 
     // Unblock with NO stored review: must resume at `review`, not `queued`.
@@ -698,7 +698,7 @@ describe("round 2: a Linear HOLD on review resumes at review", () => {
   });
 });
 
-describe("round 2: the merge gate is reachable in normal flows", () => {
+describe("round 2: the merge gate is reachable in normal flows", async () => {
   async function toAccepted(id: string): Promise<void> {
     await toReview(id);
     claimNext(db, "rev");
@@ -720,7 +720,7 @@ describe("round 2: the merge gate is reachable in normal flows", () => {
 
     const gh = new FakeGitHub();
     gh.putPullRequest(githubViewAt(1, FULL, "merged"));
-    const actions = reconcileProviderBound(db, { github: gh });
+    const actions = await reconcileProviderBound(db, { github: gh });
     expect(actions).toContain(`merged:${t.id}`);
     expect(getTask(db, t.id)!.merged_at).not.toBeNull();
     expect(providerBoundTasks(db).some((x) => x.id === t.id)).toBe(false); // merged -> no longer polled
@@ -738,7 +738,7 @@ describe("round 2: the merge gate is reachable in normal flows", () => {
 
     const gh = new FakeGitHub();
     gh.putPullRequest(githubViewAt(2, FULL, "merged"));
-    const actions = reconcileTaskFromProvider(db, t.id, { github: gh });
+    const actions = await reconcileTaskFromProvider(db, t.id, { github: gh });
     expect(actions.some((a) => a.kind === "merged")).toBe(true);
     expect(getTask(db, t.id)!.merged_at).not.toBeNull();
 
@@ -764,7 +764,7 @@ describe("round 2: the merge gate is reachable in normal flows", () => {
     gh.putPullRequest(githubViewAt(3, FULL, "merged"));
     const lin = new FakeLinear();
     lin.putIssue({ id: "ISH-2001", state: "In Progress", labels: [], updatedAt: "2026-01-01T00:00:00Z" });
-    const actions = reconcileTaskFromProvider(db, t.id, { github: gh, linear: lin });
+    const actions = await reconcileTaskFromProvider(db, t.id, { github: gh, linear: lin });
     expect(actions.some((a) => a.kind === "merged")).toBe(true);
     expect(getTask(db, t.id)!.merged_at).not.toBeNull();
   });
@@ -779,7 +779,7 @@ describe("round 2: the merge gate is reachable in normal flows", () => {
     gh.putPullRequest(githubViewAt(4, FULL, "merged"));
     for (let i = 0; i < 3; i++) {
       db.query(`UPDATE tasks SET pr_updated_at = NULL WHERE id = ?`).run(t.id);
-      reconcileTaskFromProvider(db, t.id, { github: gh });
+      await reconcileTaskFromProvider(db, t.id, { github: gh });
     }
     const n = db
       .query(`SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'workflow.merge_not_credited'`)
@@ -788,7 +788,7 @@ describe("round 2: the merge gate is reachable in normal flows", () => {
   });
 });
 
-describe("round 2: provider polling is throttled and comment fetch is change-gated", () => {
+describe("round 2: provider polling is throttled and comment fetch is change-gated", async () => {
   function countingGitHub(view: () => PrView) {
     const calls = { pr: 0, comments: 0 };
     const gh: GitHubReadOnly = {
@@ -814,14 +814,14 @@ describe("round 2: provider polling is throttled and comment fetch is change-gat
     });
     await toReview(t.id);
     const { gh, calls } = countingGitHub(() => githubViewAt(5, FULL));
-    reconcileProviderBound(db, { github: gh });
+    await reconcileProviderBound(db, { github: gh });
     const afterFirst = calls.pr;
     expect(afterFirst).toBeGreaterThan(0);
-    reconcileProviderBound(db, { github: gh });
+    await reconcileProviderBound(db, { github: gh });
     expect(calls.pr).toBe(afterFirst); // throttled: no second poll
     // With the throttle disabled, the next poll runs.
     process.env.RELAY_PROVIDER_POLL_MS = "0";
-    reconcileProviderBound(db, { github: gh });
+    await reconcileProviderBound(db, { github: gh });
     expect(calls.pr).toBeGreaterThan(afterFirst);
   });
 
@@ -833,17 +833,17 @@ describe("round 2: provider polling is throttled and comment fetch is change-gat
     await toReview(t.id);
     let updatedAt = "2026-01-01T00:00:00Z";
     const { gh, calls } = countingGitHub(() => githubViewAt(6, FULL, "open", updatedAt));
-    reconcileTaskFromProvider(db, t.id, { github: gh });
+    await reconcileTaskFromProvider(db, t.id, { github: gh });
     expect(calls.comments).toBe(1); // first fetch
-    reconcileTaskFromProvider(db, t.id, { github: gh });
+    await reconcileTaskFromProvider(db, t.id, { github: gh });
     expect(calls.comments).toBe(1); // unchanged -> no fetch
     updatedAt = "2026-01-02T00:00:00Z";
-    reconcileTaskFromProvider(db, t.id, { github: gh });
+    await reconcileTaskFromProvider(db, t.id, { github: gh });
     expect(calls.comments).toBe(2); // moved -> fetch again
   });
 });
 
-describe("round 3: a marker posted before review survives a pre-review poll", () => {
+describe("round 3: a marker posted before review survives a pre-review poll", async () => {
   function okMarkerComment() {
     return [
       {
@@ -871,7 +871,7 @@ describe("round 3: a marker posted before review survives a pre-review poll", ()
 
     // Poll while in verify: the comment scan does NOT run, so the watermark must
     // NOT advance (otherwise the marker is silently consumed).
-    reconcileTaskFromProvider(db, t.id, { github: gh });
+    await reconcileTaskFromProvider(db, t.id, { github: gh });
     expect(getTask(db, t.id)!.pr_updated_at).toBeNull();
     expect(getTask(db, t.id)!.phase).toBe("verify");
 
@@ -879,7 +879,7 @@ describe("round 3: a marker posted before review survives a pre-review poll", ()
     expect(getTask(db, t.id)!.phase).toBe("review");
 
     // Three polls with the SAME PR unchanged: the marker must be read and applied.
-    for (let i = 0; i < 3; i++) reconcileTaskFromProvider(db, t.id, { github: gh });
+    for (let i = 0; i < 3; i++) await reconcileTaskFromProvider(db, t.id, { github: gh });
     expect(getTask(db, t.id)!.phase).toBe("integration");
   });
 
@@ -892,13 +892,13 @@ describe("round 3: a marker posted before review survives a pre-review poll", ()
     const gh = new FakeGitHub();
     gh.putPullRequest(githubViewAt(8, FULL, "open", "u5"));
     gh.putComments({ repo: "o/r", number: 8 }, []); // no marker yet
-    reconcileTaskFromProvider(db, t.id, { github: gh });
+    await reconcileTaskFromProvider(db, t.id, { github: gh });
     expect(getTask(db, t.id)!.pr_updated_at).toBe("u5"); // scanned -> watermark set
     expect(getTask(db, t.id)!.phase).toBe("review");
   });
 });
 
-describe("round 4: a transient comment-read failure must not consume the watermark", () => {
+describe("round 4: a transient comment-read failure must not consume the watermark", async () => {
   class FlakyGitHub implements GitHubReadOnly {
     readonly name = "flaky";
     readonly readOnly = true as const;
@@ -936,12 +936,12 @@ describe("round 4: a transient comment-read failure must not consume the waterma
     gh.failComments = 1;
 
     // The one scan in review fails: the watermark must NOT be consumed.
-    reconcileTaskFromProvider(db, t.id, { github: gh });
+    await reconcileTaskFromProvider(db, t.id, { github: gh });
     expect(getTask(db, t.id)!.pr_updated_at).toBeNull();
     expect(getTask(db, t.id)!.phase).toBe("review");
 
     // Once the read recovers, the marker is applied.
-    for (let i = 0; i < 3; i++) reconcileTaskFromProvider(db, t.id, { github: gh });
+    for (let i = 0; i < 3; i++) await reconcileTaskFromProvider(db, t.id, { github: gh });
     expect(getTask(db, t.id)!.phase).toBe("integration");
   });
 });
@@ -949,7 +949,7 @@ describe("round 4: a transient comment-read failure must not consume the waterma
 // ISH-808 round 2: a cancelled code-change task is CLOSED. Every workflow entry
 // point checks isTerminalTaskState, so none of them can move it back to
 // queued/verify/review or park it blocked_human.
-describe("ISH-808: a cancelled code-change task cannot be advanced", () => {
+describe("ISH-808: a cancelled code-change task cannot be advanced", async () => {
   /** intake -> claim -> submit, leaving the task at phase=verify. */
   function toVerify(issue: string): string {
     const t = intakeTask(db, { provider: "github", issueId: issue, codeChange: true, headSha: FULL, checks: [CHECK] });
@@ -967,7 +967,7 @@ describe("ISH-808: a cancelled code-change task cannot be advanced", () => {
     expect(getTask(db, id)!.state).toBe("cancelled");
   });
 
-  test("submitPhase refuses a cancelled task", () => {
+  test("submitPhase refuses a cancelled task", async () => {
     const t = intakeTask(db, { provider: "github", issueId: "o/r#808b", codeChange: true, headSha: FULL, checks: [CHECK] });
     claimTask(db, t.id, "impl");
     cancelTask(db, t.id, "w", "duplicate");
@@ -975,7 +975,7 @@ describe("ISH-808: a cancelled code-change task cannot be advanced", () => {
     expect(getTask(db, t.id)!.state).toBe("cancelled");
   });
 
-  test("recordVerification refuses a cancelled task", () => {
+  test("recordVerification refuses a cancelled task", async () => {
     const id = toVerify("o/r#808c");
     cancelTask(db, id, "w", "obsolete");
     expect(() => recordVerification(db, id, "impl", { passed: true, headSha: FULL })).toThrow(/terminal/);
@@ -999,18 +999,59 @@ describe("ISH-808: a cancelled code-change task cannot be advanced", () => {
     expect(getTask(db, t.id)!.state).toBe("cancelled");
   });
 
-  test("confirmMerged refuses a cancelled task", () => {
+  test("confirmMerged refuses a cancelled task", async () => {
     const id = toVerify("o/r#808e");
     cancelTask(db, id, "w", "superseded");
     expect(() => confirmMerged(db, id, { headSha: FULL })).toThrow(/cannot confirm a merge/);
     expect(getTask(db, id)!.state).toBe("cancelled");
   });
 
-  test("quietBlock refuses a cancelled task", () => {
+  test("quietBlock refuses a cancelled task", async () => {
     const id = toVerify("o/r#808f");
     cancelTask(db, id, "w", "superseded");
     const live = getTask(db, id)!;
     expect(() => quietBlock(db, live, "late hold", "provider:linear")).toThrow(/terminal/);
     expect(getTask(db, id)!.state).toBe("cancelled");
+  });
+});
+
+describe("ISH-1129: shutdown interrupts the provider poll between Tasks", () => {
+  test("an aborted signal stops after the in-flight Task and leaves no partial link/throttle write", async () => {
+    const N = 60;
+    for (let i = 0; i < N; i++) {
+      intakeTask(db, {
+        provider: "test",
+        issueId: `ISH-1129-BETWEEN-${i}`,
+        codeChange: true,
+        prUrl: `https://github.com/o/r/pull/${2000 + i}`,
+      });
+    }
+    const ac = new AbortController();
+    let calls = 0;
+    const gh: GitHubReadOnly = {
+      name: "abort-fake",
+      readOnly: true as const,
+      getPullRequest() {
+        calls++;
+        ac.abort(); // SIGTERM arrives inside the first provider command
+        return null;
+      },
+      findPullRequestForBranch: () => null,
+      listComments: () => [],
+    };
+
+    const actions = await reconcileProviderBound(db, { github: gh, signal: ac.signal });
+    expect(calls).toBe(1);
+    expect(actions).toEqual([]);
+    // The aborted read is NOT a poll: no throttle and no link/head update.
+    const rows = db
+      .query(`SELECT head_sha, pr_repo, provider_polled_at FROM tasks WHERE provider = 'test'`)
+      .all() as { head_sha: string | null; pr_repo: string | null; provider_polled_at: number | null }[];
+    expect(rows).toHaveLength(N);
+    for (const r of rows) {
+      expect(r.head_sha).toBeNull();
+      expect(r.pr_repo).toBeNull();
+      expect(r.provider_polled_at).toBeNull();
+    }
   });
 });

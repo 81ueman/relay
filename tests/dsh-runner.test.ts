@@ -678,7 +678,7 @@ describe("ISH-1125: a mid-Run provider poll cannot make the Run's own submit sta
     expect(produced).not.toBe(baseHead);
 
     // The daemon's provider poll fires mid-Run and binds the live PR head.
-    const actions = reconcileProviderBound(db, { github: gh });
+    const actions = await reconcileProviderBound(db, { github: gh });
     expect(actions).toContain(`pr-head-bound:${id}`);
     const mid = getTask(db, id)!;
     expect(mid.pr_url).toBe(`https://github.com/${ISH1125_REPO}/pull/60`);
@@ -713,7 +713,7 @@ describe("ISH-1125: a mid-Run provider poll cannot make the Run's own submit sta
       gh.putPullRequest(polledPr(foreign, branch));
     };
     const h = await startDshRun(db, { taskId: id, spawner, outputRoot, cwd, fastExitMs: 0 });
-    reconcileProviderBound(db, { github: gh });
+    await reconcileProviderBound(db, { github: gh });
     expect(getTask(db, id)!.head_sha).toBe(foreign);
 
     spawner.procs[0].finish(0);
@@ -770,7 +770,7 @@ describe("ISH-1125: a mid-Run provider poll cannot make the Run's own submit sta
     };
     const run1 = await startDshRun(db, { taskId: id, spawner: spawner1, outputRoot, cwd, fastExitMs: 0 });
     expect(getRun(db, run1.id)!.base_head_sha).toBe(h0);
-    reconcileProviderBound(db, { github: gh });
+    await reconcileProviderBound(db, { github: gh });
     expect(getTask(db, id)!.head_sha).toBe(h1);
 
     spawner1.procs[0].finish(0);
@@ -808,7 +808,7 @@ describe("ISH-1125: a mid-Run provider poll cannot make the Run's own submit sta
     expect(getTask(db, id)!.head_sha).toBeNull();
 
     // The provider poll binds the FIRST push.
-    const actions = reconcileProviderBound(db, { github: gh });
+    const actions = await reconcileProviderBound(db, { github: gh });
     expect(actions).toContain(`pr-head-bound:${id}`);
     expect(getTask(db, id)!.head_sha).toBe(firstPush);
 
@@ -902,7 +902,7 @@ describe("ISH-1128: an amended + force-pushed own head is not stale", () => {
 
     // The daemon's provider poll binds the FIRST push while the Run is live and
     // records it as an own head of THIS Run.
-    expect(reconcileProviderBound(db, { github: gh })).toContain(`pr-head-bound:${id}`);
+    expect(await reconcileProviderBound(db, { github: gh })).toContain(`pr-head-bound:${id}`);
     expect(getTask(db, id)!.head_sha).toBe(firstPush);
     expect(runObservedOwnHeads(db, h.id)).toEqual([firstPush]);
 
@@ -949,7 +949,7 @@ describe("ISH-1128: an amended + force-pushed own head is not stale", () => {
     };
     const h = await startDshRun(db, { taskId: id, spawner, outputRoot, cwd, fastExitMs: 0 });
 
-    reconcileProviderBound(db, { github: gh });
+    await reconcileProviderBound(db, { github: gh });
     expect(getTask(db, id)!.head_sha).toBe(foreign);
     expect(runObservedOwnHeads(db, h.id)).not.toContain(foreign);
 
@@ -983,7 +983,7 @@ describe("ISH-1128: an amended + force-pushed own head is not stale", () => {
       gh.putPullRequest(polledPr(firstPush, branch));
     };
     const h = await startDshRun(db, { taskId: id, spawner, outputRoot, cwd, fastExitMs: 0 });
-    reconcileProviderBound(db, { github: gh });
+    await reconcileProviderBound(db, { github: gh });
     expect(getTask(db, id)!.head_sha).toBe(firstPush);
 
     // Amend + force-push, then the Run exits cleanly; no second poll runs.

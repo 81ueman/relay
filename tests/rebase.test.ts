@@ -99,8 +99,8 @@ function countReviewResults(taskId: string): number {
   return row.n;
 }
 
-describe("ISH-1122: coordinator rebase route for a merge_ready + CONFLICTING PR", () => {
-  test("the integrator returns the Task to implement at attempt+1 and the old PASS stops satisfying the gate", () => {
+describe("ISH-1122: coordinator rebase route for a merge_ready + CONFLICTING PR", async () => {
+  test("the integrator returns the Task to implement at attempt+1 and the old PASS stops satisfying the gate", async () => {
     const gh = conflictGithub();
     const t = intake("ISH-1122-1");
     toMergeReady(t.id);
@@ -109,7 +109,7 @@ describe("ISH-1122: coordinator rebase route for a merge_ready + CONFLICTING PR"
     expect(before.head_sha).toBe(HEAD);
     const reviewsBefore = countReviewResults(t.id);
 
-    const updated = requestRebase(db, t.id, "integ", { reason: REASON, deps: { github: gh } });
+    const updated = await requestRebase(db, t.id, "integ", { reason: REASON, deps: { github: gh } });
 
     expect(updated.phase).toBe("implement");
     expect(updated.state).toBe("queued");
@@ -136,7 +136,7 @@ describe("ISH-1122: coordinator rebase route for a merge_ready + CONFLICTING PR"
     expect(brief.text).toContain(REASON);
 
     // The old PASS no longer authorises a merge at the new attempt/phase.
-    const gate = checkMergeGate(db, t.id, { github: gh, checks: gh, authority: GRANT })!;
+    const gate = (await checkMergeGate(db, t.id, { github: gh, checks: gh, authority: GRANT }))!;
     expect(gate.status).toBe("BLOCKED");
     expect(gate.reasons.map((r) => r.code)).toContain("NOT_MERGE_READY");
 
@@ -153,62 +153,62 @@ describe("ISH-1122: coordinator rebase route for a merge_ready + CONFLICTING PR"
     expect(payload.supersededPass).toEqual(expect.any(Number));
   });
 
-  test("the Gateway/human identity may rebase too", () => {
+  test("the Gateway/human identity may rebase too", async () => {
     process.env.RELAY_HUMAN = "gateway";
     const gh = conflictGithub();
     const t = intake("ISH-1122-2");
     toMergeReady(t.id);
     const before = getTask(db, t.id)!;
 
-    const updated = requestRebase(db, t.id, "gateway", { reason: REASON, deps: { github: gh } });
+    const updated = await requestRebase(db, t.id, "gateway", { reason: REASON, deps: { github: gh } });
     expect(updated.phase).toBe("implement");
     expect(updated.attempt).toBe(before.attempt + 1);
     expect(updated.head_sha).toBeNull();
   });
 
-  test("a non-integrator / non-gateway identity is refused and nothing changes", () => {
+  test("a non-integrator / non-gateway identity is refused and nothing changes", async () => {
     const gh = conflictGithub();
     const t = intake("ISH-1122-3");
     toMergeReady(t.id);
     const before = getTask(db, t.id)!;
 
-    expect(() => requestRebase(db, t.id, "impl", { reason: REASON, deps: { github: gh } })).toThrow(/AUTHORITY/);
+    await expect(requestRebase(db, t.id, "impl", { reason: REASON, deps: { github: gh } })).rejects.toThrow(/AUTHORITY/);
     const after = getTask(db, t.id)!;
     expect(after.phase).toBe("merge_ready");
     expect(after.attempt).toBe(before.attempt);
     expect(after.head_sha).toBe(HEAD);
   });
 
-  test("refused when the Task is not merge_ready", () => {
+  test("refused when the Task is not merge_ready", async () => {
     const gh = conflictGithub();
     const t = intake("ISH-1122-4");
     // At implement, still with a recorded head.
     expect(getTask(db, t.id)!.phase).toBe("implement");
-    expect(() => requestRebase(db, t.id, "integ", { reason: REASON, deps: { github: gh } })).toThrow(
+    await expect(requestRebase(db, t.id, "integ", { reason: REASON, deps: { github: gh } })).rejects.toThrow(
       /not merge_ready|only at merge_ready/i
     );
     expect(getTask(db, t.id)!.phase).toBe("implement");
   });
 
-  test("refused when the PR is mergeable, unknown or unreadable", () => {
+  test("refused when the PR is mergeable, unknown or unreadable", async () => {
     const t = intake("ISH-1122-5");
     toMergeReady(t.id);
     const before = getTask(db, t.id)!;
 
     const mergeable = new FakeGitHub().putPullRequest(view({ mergeable: "mergeable" }));
-    expect(() => requestRebase(db, t.id, "integ", { reason: REASON, deps: { github: mergeable } })).toThrow(
+    await expect(requestRebase(db, t.id, "integ", { reason: REASON, deps: { github: mergeable } })).rejects.toThrow(
       /not conflicting/
     );
     const unknown = new FakeGitHub().putPullRequest(view({ mergeable: "unknown" }));
-    expect(() => requestRebase(db, t.id, "integ", { reason: REASON, deps: { github: unknown } })).toThrow(
+    await expect(requestRebase(db, t.id, "integ", { reason: REASON, deps: { github: unknown } })).rejects.toThrow(
       /not conflicting/
     );
     const unreadable = new FakeGitHub();
-    expect(() => requestRebase(db, t.id, "integ", { reason: REASON, deps: { github: unreadable } })).toThrow(
+    await expect(requestRebase(db, t.id, "integ", { reason: REASON, deps: { github: unreadable } })).rejects.toThrow(
       /no pull request bound|not be read/
     );
     const noHead = new FakeGitHub().putPullRequest(view({ headSha: "" }));
-    expect(() => requestRebase(db, t.id, "integ", { reason: REASON, deps: { github: noHead } })).toThrow(
+    await expect(requestRebase(db, t.id, "integ", { reason: REASON, deps: { github: noHead } })).rejects.toThrow(
       /reported no head/
     );
     const after = getTask(db, t.id)!;
@@ -217,7 +217,7 @@ describe("ISH-1122: coordinator rebase route for a merge_ready + CONFLICTING PR"
     expect(after.head_sha).toBe(HEAD);
   });
 
-  test("an unresolved reviewer NG/HOLD at the current HEAD is refused (never cleared)", () => {
+  test("an unresolved reviewer NG/HOLD at the current HEAD is refused (never cleared)", async () => {
     const gh = conflictGithub();
     const t = intake("ISH-1122-6");
     toMergeReady(t.id);
@@ -240,7 +240,7 @@ describe("ISH-1122: coordinator rebase route for a merge_ready + CONFLICTING PR"
     });
     const reviewsBefore = countReviewResults(t.id);
 
-    expect(() => requestRebase(db, t.id, "integ", { reason: REASON, deps: { github: gh } })).toThrow(
+    await expect(requestRebase(db, t.id, "integ", { reason: REASON, deps: { github: gh } })).rejects.toThrow(
       /unresolved reviewer NG\/HOLD/
     );
     const after = getTask(db, t.id)!;
@@ -250,19 +250,19 @@ describe("ISH-1122: coordinator rebase route for a merge_ready + CONFLICTING PR"
     expect(countReviewResults(t.id)).toBe(reviewsBefore);
   });
 
-  test("refused when the observed PR head is not the recorded HEAD", () => {
+  test("refused when the observed PR head is not the recorded HEAD", async () => {
     const gh = new FakeGitHub().putPullRequest(view({ headSha: "b".repeat(40) }));
     const t = intake("ISH-1122-7");
     toMergeReady(t.id);
     const before = getTask(db, t.id)!;
-    expect(() => requestRebase(db, t.id, "integ", { reason: REASON, deps: { github: gh } })).toThrow(
+    await expect(requestRebase(db, t.id, "integ", { reason: REASON, deps: { github: gh } })).rejects.toThrow(
       /HEAD_MISMATCH|not of this work/
     );
     expect(getTask(db, t.id)!.phase).toBe("merge_ready");
     expect(getTask(db, t.id)!.attempt).toBe(before.attempt);
   });
 
-  test("a structured owner HOLD is refused, never cleared", () => {
+  test("a structured owner HOLD is refused, never cleared", async () => {
     const gh = conflictGithub();
     const t = intakeTask(db, {
       provider: "linear",
@@ -279,23 +279,21 @@ describe("ISH-1122: coordinator rebase route for a merge_ready + CONFLICTING PR"
       readOnly: true as const,
       getIssue: () => ({ id: "ISH-1122-hold", state: "In Progress", labels: ["hold"], updatedAt: "" }),
     };
-    expect(() =>
-      requestRebase(db, t.id, "integ", { reason: REASON, deps: { github: gh, linear } })
-    ).toThrow(/owner HOLD/);
+    await expect(requestRebase(db, t.id, "integ", { reason: REASON, deps: { github: gh, linear } })).rejects.toThrow(/owner HOLD/);
     expect(getTask(db, t.id)!.phase).toBe("merge_ready");
   });
 
-  test("a reason is required", () => {
+  test("a reason is required", async () => {
     const gh = conflictGithub();
     const t = intake("ISH-1122-8");
     toMergeReady(t.id);
-    expect(() => requestRebase(db, t.id, "integ", { reason: "   ", deps: { github: gh } })).toThrow(
+    await expect(requestRebase(db, t.id, "integ", { reason: "   ", deps: { github: gh } })).rejects.toThrow(
       /reason/
     );
     expect(getTask(db, t.id)!.phase).toBe("merge_ready");
   });
 
-  test("the CLI reads the bound PR through the read-only gh reader and routes it back", () => {
+  test("the CLI reads the bound PR through the read-only gh reader and routes it back", async () => {
     const t = intake("ISH-1122-9");
     toMergeReady(t.id);
     const before = getTask(db, t.id)!;

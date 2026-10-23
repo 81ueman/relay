@@ -443,17 +443,17 @@ describe("runHeadlessReview verifies the reviewer's native GitHub review (ISH-88
 describe("gh CLI native review read-back (ISH-883)", () => {
   const ok = (stdout: string): ExecResult => ({ ok: true, stdout, stderr: "" });
 
-  test("listReviews maps paginated reviews and returns null on a failed read", () => {
+  test("listReviews maps paginated reviews and returns null on a failed read", async () => {
     const gh = new GhCliGitHub(() =>
       ok(`[{"id":1,"user":{"login":"bot"},"commit_id":"aaa","state":"COMMENTED","body":"x","html_url":"u","submitted_at":"t"}]`)
     );
-    const reviews = gh.listReviews({ repo: "o/r", number: 7 })!;
+    const reviews = (await gh.listReviews({ repo: "o/r", number: 7 }))!;
     expect(reviews).toHaveLength(1);
     expect(reviews[0].author).toBe("bot");
     expect(reviews[0].headSha).toBe("aaa");
     expect(reviews[0].body).toBe("x");
 
     const failing = new GhCliGitHub(() => ({ ok: false, stdout: "", stderr: "boom" }));
-    expect(failing.listReviews({ repo: "o/r", number: 7 })).toBeNull();
+    expect(await failing.listReviews({ repo: "o/r", number: 7 })).toBeNull();
   });
 });

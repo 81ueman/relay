@@ -6,7 +6,7 @@ import { buildRuntime } from "./runtime/herdr";
 import type { Runtime } from "./runtime/runtime";
 import { reconcile } from "./reconciler";
 import { reconcileRequestToken } from "./workflow";
-import { operatorProviderDepsFromEnv } from "./provider-adapters";
+import { defaultExec, operatorProviderDepsFromEnv } from "./provider-adapters";
 import type { WorkflowDeps } from "./workflow-driver";
 import { startSocketServer, type SocketContext, type SocketHandle } from "./socket";
 import {
@@ -58,21 +58,34 @@ export async function runDaemon(opts: DaemonOptions = {}): Promise<void> {
   const rt = opts.runtime ?? buildRuntime();
   const sockPath = opts.sockPath ?? defaultSockPath();
   const guard = !opts.bypassSingleton;
-  // ISH-759/1087: read-only provider readers + authorized-reviewer config. An
-  // explicit RELAY_PROVIDER_GITHUB=off disables GitHub; otherwise an
-  // authenticated gh is auto-detected so the merge gate can see a bound PR
-  // without every daemon deployment exporting the reader flag.
-  const workflowDeps: WorkflowDeps = operatorProviderDepsFromEnv();
 
   let lock: SupervisorLock | null = null;
   let sock: SocketHandle | null = null;
   let db: Database | null = null;
   let stop = false;
-  const onSignal = () => { stop = true; };
+  // ISH-1129: ONE shutdown signal for the whole daemon. SIGTERM both flips the
+  // loop flag and ABORTS in-flight provider commands; the provider/merge-gate
+  // walks check it between Tasks, so exit time is bounded independent of how
+  // many Tasks have a bound PR.
+  const shutdown = new AbortController();
+  const onSignal = () => {
+    stop = true;
+    shutdown.abort();
+  };
   process.on("SIGINT", onSignal);
   process.on("SIGTERM", onSignal);
 
   try {
+    // ISH-759/1087: read-only provider readers + authorized-reviewer config. An
+    // explicit RELAY_PROVIDER_GITHUB=off disables GitHub; otherwise an
+    // authenticated gh is auto-detected so the merge gate can see a bound PR
+    // without every daemon deployment exporting the reader flag.
+    const workflowDeps: WorkflowDeps = {
+      ...(await operatorProviderDepsFromEnv(process.env, (argv, o) =>
+        defaultExec(argv, { ...o, signal: shutdown.signal })
+      )),
+      signal: shutdown.signal,
+    };
     if (guard) {
       // Fail fast BEFORE any DB/runtime work: a second supervisor must never
       // reconcile. Take the SQLite supervisor lock first (the canonical state DB
@@ -105,6 +118,8 @@ export async function runDaemon(opts: DaemonOptions = {}): Promise<void> {
     // periodic interval. Reading one control row is far cheaper than a full pass.
     let lastReconcileToken = reconcileRequestToken(db);
     for (;;) {
+      // A signal during the 250ms sleep must not start another reconcile pass.
+      if (stop) break;
       const nowMs = Date.now();
       const token = reconcileRequestToken(db);
       if (token !== lastReconcileToken) {

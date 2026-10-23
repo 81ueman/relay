@@ -1,6 +1,5 @@
 import { describe, expect, test, beforeEach, afterEach } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Database } from "bun:sqlite";
 import { openDb } from "../src/db";
@@ -22,7 +21,7 @@ let dir = "";
 let db: Database | null = null;
 
 beforeEach(() => {
-  dir = mkdtempSync(join(tmpdir(), "relay-ish1125-sigterm-"));
+  dir = mkdtempSync(join(import.meta.dir, ".tmp-ish1125-"));
 });
 
 afterEach(() => {
@@ -81,9 +80,11 @@ describe("ISH-1125: daemon shutdown with the provider poll enabled", () => {
           RELAY_RUNTIME: "mock",
           RELAY_PROVIDER_GITHUB: "gh",
           RELAY_INTERVAL_MS: "50",
-          // Keep the test fast while still proving the bound is what releases
-          // the blocked reconcile: the default (5s) would be too slow here.
-          RELAY_PROVIDER_EXEC_TIMEOUT_MS: "400",
+          // Keep the test fast. 1500ms leaves scheduling headroom for the fake
+          // `gh` to write its marker on a loaded test host; ISH-1129's many-task
+          // test uses a much longer timeout and proves the shutdown ABORT, not
+          // this per-command budget, is what ends the poll.
+          RELAY_PROVIDER_EXEC_TIMEOUT_MS: "1500",
           RELAY_TEST_GH_MARKER: marker,
           PATH: `${binDir}:${process.env.PATH ?? ""}`,
         },

@@ -160,7 +160,11 @@ function viewLink(view: PrView) {
  *      create/update the PR first.
  * In every case the re-read remote head must equal the produced commit.
  */
-export function bindTaskPr(db: Database, taskId: string, deps: PrBindingDeps = {}): PrBindingResult {
+export async function bindTaskPr(
+  db: Database,
+  taskId: string,
+  deps: PrBindingDeps = {}
+): Promise<PrBindingResult> {
   const task = getTask(db, taskId);
   if (!task) throw new Error(`unknown task: ${taskId}`);
   // The produced commit is the ONLY head a PR may be bound to. A caller-supplied
@@ -228,7 +232,7 @@ export function bindTaskPr(db: Database, taskId: string, deps: PrBindingDeps = {
    * the head. If the Agent has not pushed the produced commit yet, the head
    * mismatch is a HEAD_MOVED block (retry the Agent), not a Relay write.
    */
-  const verifiable = (ref: PrRef): { view: PrView } | PrBindingResult => {
+  const verifiable = async (ref: PrRef): Promise<{ view: PrView } | PrBindingResult> => {
     if (!deps.github) {
       return blocked(
         "PROVIDER_UNREADABLE",
@@ -236,7 +240,7 @@ export function bindTaskPr(db: Database, taskId: string, deps: PrBindingDeps = {
         ref
       );
     }
-    const view = deps.github.getPullRequest(ref);
+    const view = await deps.github.getPullRequest(ref);
     if (!view) return blocked("PR_UNREADABLE", `PR ${ref.repo}#${ref.number} could not be re-read from GitHub`, ref);
     if (view.ref.repo !== ref.repo) {
       return blocked("REPO_CHANGED", `PR ${ref.repo}#${ref.number} resolved to repo ${view.ref.repo}`, ref);
@@ -289,7 +293,7 @@ export function bindTaskPr(db: Database, taskId: string, deps: PrBindingDeps = {
   // 1. Explicit identity wins: re-read + verify only.
   const existing = resolveTaskPrRef(task);
   if (existing) {
-    const r = verifiable(existing);
+    const r = await verifiable(existing);
     if ("status" in r) return r;
     return bound("bound", r.view, "pr.bound");
   }
@@ -298,7 +302,7 @@ export function bindTaskPr(db: Database, taskId: string, deps: PrBindingDeps = {
   // the produced commit. Repo AND head are both required, so this is not
   // branch-name-only identity inference. A FORK PR (same branch name + SHA) is
   // rejected instead of adopted.
-  const found = repo && task.branch ? deps.github.findPullRequestForBranch(repo, task.branch) : null;
+  const found = repo && task.branch ? await deps.github.findPullRequestForBranch(repo, task.branch) : null;
   if (found) {
     if (!prHeadRepoSafe(found, repo)) {
       return blocked(
