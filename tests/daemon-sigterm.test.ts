@@ -30,13 +30,31 @@ afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-async function waitForFile(path: string, timeoutMs: number): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (existsSync(path) && readFileSync(path, "utf-8").trim().length > 0) return true;
+/**
+ * Wait until the daemon is INSIDE the hanging provider read.
+ *
+ * This is STARTUP, not the property under test, so it deliberately has NO
+ * wall-clock budget measured from spawn. The full suite runs many files in
+ * parallel and a loaded host can take arbitrarily long to schedule the daemon
+ * child and exec the fake `gh`; the old fixed 5s wait measured that spawn time
+ * and failed here (at ~5014ms) while the daemon was healthy. The only startup
+ * failures are the child exiting before it is ready (reported with its stderr)
+ * and the test runner's liveness timeout below. The shutdown bound asserted
+ * later is measured from SIGTERM delivery, never from spawn.
+ */
+async function waitForPoll(
+  proc: Bun.Subprocess,
+  marker: string,
+  stderrP: Promise<string>
+): Promise<void> {
+  for (;;) {
+    if (existsSync(marker) && readFileSync(marker, "utf-8").trim().length > 0) return;
+    if (proc.exitCode !== null) {
+      const err = await stderrP;
+      throw new Error(`daemon exited (code ${proc.exitCode}) before reaching the provider poll.\nstderr:\n${err}`);
+    }
     await Bun.sleep(25);
   }
-  return false;
 }
 
 describe("ISH-1125: daemon shutdown with the provider poll enabled", () => {
@@ -99,25 +117,23 @@ describe("ISH-1125: daemon shutdown with the provider poll enabled", () => {
 
       try {
         // Wait until the daemon is INSIDE the hanging PR read (the signal must
-        // arrive while the poll is in flight, not before it starts).
-        const polled = await waitForFile(marker, 5000);
-        if (!polled) {
-          proc.kill("SIGKILL");
-          const err = await stderrP;
-          throw new Error(`daemon never reached the provider poll.\nstderr:\n${err}`);
-        }
+        // arrive while the poll is in flight, not before it starts). Startup is
+        // unbounded here on purpose: see waitForPoll.
+        await waitForPoll(proc, marker, stderrP);
 
-        const started = Date.now();
+        // The pinned property is SIGNAL DELIVERY -> exit. Daemon spawn and
+        // startup time are outside this measurement.
+        const signalledAt = performance.now();
         proc.kill("SIGTERM");
         const outcome = await Promise.race([
           proc.exited,
           Bun.sleep(8000).then(() => "timeout" as const),
         ]);
-        const elapsed = Date.now() - started;
+        const elapsed = performance.now() - signalledAt;
         if (outcome === "timeout") {
           proc.kill("SIGKILL");
           const err = await stderrP;
-          throw new Error(`daemon did not exit within 8s of SIGTERM (elapsed=${elapsed}ms).\nstderr:\n${err}`);
+          throw new Error(`daemon did not exit within 8s of SIGTERM (elapsed=${elapsed.toFixed(1)}ms).\nstderr:\n${err}`);
         }
         const err = await stderrP;
         await stdoutP;
@@ -129,9 +145,11 @@ describe("ISH-1125: daemon shutdown with the provider poll enabled", () => {
         // The hung read was observed BEFORE the signal: the poll path ran.
         expect(readFileSync(marker, "utf-8")).toContain("pr view");
       } finally {
-        if (!proc.killed) proc.kill("SIGKILL");
+        if (proc.exitCode === null) proc.kill("SIGKILL");
       }
     },
-    15000
+    // Harness liveness guard only (a wedged child); NOT the shutdown bound.
+    // The 5s assertion above is unchanged and is measured from SIGTERM.
+    60000
   );
 });

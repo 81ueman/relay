@@ -31,13 +31,31 @@ afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-async function waitForFile(path: string, timeoutMs: number): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (existsSync(path) && readFileSync(path, "utf-8").trim().length > 0) return true;
+/**
+ * Wait until the daemon is INSIDE the hanging provider read.
+ *
+ * This is STARTUP, not the property under test, so it deliberately has NO
+ * wall-clock budget measured from spawn. The full suite runs many files in
+ * parallel and a loaded host can take arbitrarily long to schedule the daemon
+ * child and exec the fake `gh`; the old fixed 8s wait measured that spawn time
+ * and failed here (at ~8028ms) while the daemon was healthy. The only startup
+ * failures are the child exiting before it is ready (reported with its stderr)
+ * and the test runner's liveness timeout below. The shutdown bound asserted
+ * later is measured from SIGTERM delivery, never from spawn.
+ */
+async function waitForPoll(
+  proc: Bun.Subprocess,
+  marker: string,
+  stderrP: Promise<string>
+): Promise<void> {
+  for (;;) {
+    if (existsSync(marker) && readFileSync(marker, "utf-8").trim().length > 0) return;
+    if (proc.exitCode !== null) {
+      const err = await stderrP;
+      throw new Error(`daemon exited (code ${proc.exitCode}) before reaching the provider poll.\nstderr:\n${err}`);
+    }
     await Bun.sleep(25);
   }
-  return false;
 }
 
 describe("ISH-1129: daemon shutdown is bounded by Task count", () => {
@@ -102,24 +120,23 @@ describe("ISH-1129: daemon shutdown is bounded by Task count", () => {
 
       try {
         // Wait until the daemon is INSIDE the provider poll (the signal must
-        // arrive mid-command, not before the first Task starts).
-        if (!(await waitForFile(marker, 8000))) {
-          proc.kill("SIGKILL");
-          const err = await stderrP;
-          throw new Error(`daemon never reached the provider poll.\nstderr:\n${err}`);
-        }
+        // arrive mid-command, not before the first Task starts). Startup is
+        // unbounded here on purpose: see waitForPoll.
+        await waitForPoll(proc, marker, stderrP);
 
-        const started = Date.now();
+        // The pinned property is SIGNAL DELIVERY -> exit. Daemon spawn and
+        // startup time are outside this measurement.
+        const signalledAt = performance.now();
         proc.kill("SIGTERM");
         const outcome = await Promise.race([
           proc.exited,
           Bun.sleep(8000).then(() => "timeout" as const),
         ]);
-        const elapsed = Date.now() - started;
+        const elapsed = performance.now() - signalledAt;
         if (outcome === "timeout") {
           proc.kill("SIGKILL");
           const err = await stderrP;
-          throw new Error(`daemon did not exit within 8s of SIGTERM (elapsed=${elapsed}ms).\nstderr:\n${err}`);
+          throw new Error(`daemon did not exit within 8s of SIGTERM (elapsed=${elapsed.toFixed(1)}ms).\nstderr:\n${err}`);
         }
         const err = await stderrP;
         await stdoutP;
@@ -134,7 +151,7 @@ describe("ISH-1129: daemon shutdown is bounded by Task count", () => {
         expect(polled).toHaveLength(1);
         expect(polled[0]).toContain("pr view");
       } finally {
-        if (!proc.killed) proc.kill("SIGKILL");
+        if (proc.exitCode === null) proc.kill("SIGKILL");
       }
 
       // NO PARTIAL WRITE: the aborted read never applied a link/head update and
@@ -156,6 +173,8 @@ describe("ISH-1129: daemon shutdown is bounded by Task count", () => {
         expect(t.provider_polled_at).toBeNull();
       }
     },
-    25000
+    // Harness liveness guard only (a wedged child); NOT the shutdown bound.
+    // The 5s assertion above is unchanged and is measured from SIGTERM.
+    60000
   );
 });
