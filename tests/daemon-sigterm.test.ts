@@ -30,28 +30,49 @@ afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
+// HARNESS GUARD, not the property under test. The runner timeout below is 60s;
+// this internal deadline sits under it so a wedged daemon is SIGKILLed and the
+// failure is reported with stderr instead of leaking the child and leaving the
+// 25ms poll running until the runner abandons the test body.
+const WAIT_FOR_POLL_HARNESS_DEADLINE_MS = 50_000;
+
 /**
  * Wait until the daemon is INSIDE the hanging provider read.
  *
- * This is STARTUP, not the property under test, so it deliberately has NO
- * wall-clock budget measured from spawn. The full suite runs many files in
- * parallel and a loaded host can take arbitrarily long to schedule the daemon
- * child and exec the fake `gh`; the old fixed 5s wait measured that spawn time
- * and failed here (at ~5014ms) while the daemon was healthy. The only startup
- * failures are the child exiting before it is ready (reported with its stderr)
- * and the test runner's liveness timeout below. The shutdown bound asserted
- * later is measured from SIGTERM delivery, never from spawn.
+ * This is STARTUP, not the property under test. The full suite runs many files
+ * in parallel and a loaded host can take arbitrarily long to schedule the
+ * daemon child and exec the fake `gh`; the old fixed 5s wait measured that
+ * spawn time and failed here (at ~5014ms) while the daemon was healthy. So
+ * startup gets no ASSERTION budget: the shutdown bound asserted later is
+ * measured from SIGTERM delivery, never from spawn.
+ *
+ * There is still a harness guard: WAIT_FOR_POLL_HARNESS_DEADLINE_MS (50s, below
+ * the 60s runner timeout) SIGKILLs the child and throws with stderr. That is
+ * harness liveness only; it does not tighten or measure the shutdown bound.
+ *
+ * The wait fails fast when the child dies before the poll is ready, whether it
+ * exited normally (`exitCode`) or was killed by a signal (`signalCode`, e.g.
+ * OOM/SIGKILL); both report stderr.
  */
 async function waitForPoll(
   proc: Bun.Subprocess,
   marker: string,
   stderrP: Promise<string>
 ): Promise<void> {
+  const startedAt = performance.now();
   for (;;) {
     if (existsSync(marker) && readFileSync(marker, "utf-8").trim().length > 0) return;
-    if (proc.exitCode !== null) {
+    if (proc.exitCode !== null || proc.signalCode !== null) {
       const err = await stderrP;
-      throw new Error(`daemon exited (code ${proc.exitCode}) before reaching the provider poll.\nstderr:\n${err}`);
+      const how = proc.signalCode !== null ? `signal ${proc.signalCode}` : `code ${proc.exitCode}`;
+      throw new Error(`daemon exited (${how}) before reaching the provider poll.\nstderr:\n${err}`);
+    }
+    if (performance.now() - startedAt >= WAIT_FOR_POLL_HARNESS_DEADLINE_MS) {
+      proc.kill("SIGKILL");
+      const err = await stderrP;
+      throw new Error(
+        `daemon did not reach the provider poll within the 50s harness deadline; SIGKILLed.\nstderr:\n${err}`
+      );
     }
     await Bun.sleep(25);
   }
@@ -117,8 +138,8 @@ describe("ISH-1125: daemon shutdown with the provider poll enabled", () => {
 
       try {
         // Wait until the daemon is INSIDE the hanging PR read (the signal must
-        // arrive while the poll is in flight, not before it starts). Startup is
-        // unbounded here on purpose: see waitForPoll.
+        // arrive while the poll is in flight, not before it starts). Startup has
+        // no assertion budget here, only the 50s harness guard: see waitForPoll.
         await waitForPoll(proc, marker, stderrP);
 
         // The pinned property is SIGNAL DELIVERY -> exit. Daemon spawn and
@@ -149,6 +170,7 @@ describe("ISH-1125: daemon shutdown with the provider poll enabled", () => {
       }
     },
     // Harness liveness guard only (a wedged child); NOT the shutdown bound.
+    // waitForPoll's internal 50s deadline fires first and reports stderr.
     // The 5s assertion above is unchanged and is measured from SIGTERM.
     60000
   );
