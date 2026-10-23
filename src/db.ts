@@ -329,7 +329,8 @@ function migrate(db: Database): void {
   if (columnExists(db, "runs", "id") && !columnExists(db, "runs", "launcher_lstart")) {
     db.exec("ALTER TABLE runs ADD COLUMN launcher_lstart TEXT;");
   }
-  // ISH-828 Runs: the Coding Sandbox a Run executed in (NULL for a worktree Run).
+  // Legacy (ISH-1098): retained so pre-existing DBs keep opening unchanged. New
+  // Runs always leave it NULL; the Coding Sandbox execution path is removed.
   if (columnExists(db, "runs", "id") && !columnExists(db, "runs", "sandbox_name")) {
     db.exec("ALTER TABLE runs ADD COLUMN sandbox_name TEXT;");
   }

@@ -119,7 +119,6 @@ export interface DashboardRun {
   cause: RunFailureClass | null;
   error: string | null;
   pid: number | null;
-  sandbox: string | null;
   ageMs: number | null;
   endedAt: number | null;
 }
@@ -423,7 +422,6 @@ function deriveRuns(db: Database, at: number): DashboardRun[] {
     cause: parseRunFailureClass(r.error),
     error: r.error,
     pid: r.pid,
-    sandbox: r.sandbox_name,
     ageMs: Math.max(0, at - (r.state === "starting" || r.state === "running" ? r.started_at : r.ended_at ?? r.started_at)),
     endedAt: r.ended_at,
   }));
@@ -443,7 +441,7 @@ function deriveAttention(
       kind: "run",
       id: r.id,
       ageMs: r.ageMs,
-      text: `run died: task ${r.taskId} ${r.phase}/${r.attempt} cause=${r.cause}${r.sandbox ? ` sandbox=${r.sandbox}` : ""}`,
+      text: `run died: task ${r.taskId} ${r.phase}/${r.attempt} cause=${r.cause}`,
     });
   }
   for (const w of workers) {

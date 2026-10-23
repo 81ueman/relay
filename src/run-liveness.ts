@@ -6,8 +6,6 @@ import { RELAY_TAG, sendMessage } from "./messages";
 import type { Run, RunState } from "./schema";
 import { identifyRunProcess, markRunOrphan, type OrphanIdentity } from "./factory";
 import { launcherMayStillWrite } from "./run-launcher";
-import { sweepOrphanedSandboxRuns } from "./sandbox-lifecycle";
-import type { SbxCli } from "./sandbox";
 import {
   classifyRunDeath,
   DEFAULT_RUN_FAILURE_TAIL_BYTES,
@@ -22,20 +20,18 @@ import {
  * it. If that process dies (crash, reboot, or an ENOSPC terminal write failure),
  * the durable row stays `starting`/`running` forever — the single-writer fence
  * then blocks re-entry and, worse, nobody is told the work died. Orphan
- * detection already existed for Factory adoption and the manual sandbox sweep,
- * but `reconcile()` never invoked it. This module is the periodic liveness pass.
+ * detection already existed for Factory adoption, but `reconcile()` never
+ * invoked it. This module is the periodic liveness pass.
  *
  * Safety rules (reused, never reimplemented):
  *   - the LAUNCHER must be gone before anything is declared: the child process
- *     can exit while the launching coroutine still runs `git rev-parse` or a
- *     sandbox `git fetch` before its terminal write. `launcherMayStillWrite`
- *     (PID + start token, plus an in-process active-launch registry) keeps the
- *     row live and the fence held while that coroutine may still write;
- *   - a LOCAL Run is only failed after `identifyRunProcess` proves the recorded
+ *     can exit while the launching coroutine still runs `git rev-parse` before
+ *     its terminal write. `launcherMayStillWrite` (PID + start token, plus an
+ *     in-process active-launch registry) keeps the row live and the fence held
+ *     while that coroutine may still write;
+ *   - a Run is only failed after `identifyRunProcess` proves the recorded
  *     process is dead or a reused PID (the original dsh is gone). A live PID is
  *     never signalled here, and an `undeterminable` identity keeps the fence;
- *   - a SANDBOX Run goes through `sweepOrphanedSandboxRuns({ apply: true })`,
- *     which only marks it terminal once the in-VM dsh is confirmed gone;
  *   - a `starting` row whose launch has not recorded a PID yet gets a grace
  *     window, so a sweep never races a concurrent launch.
  *
@@ -72,7 +68,6 @@ export function runStartGraceMs(
 export interface RunDeath {
   runId: string;
   taskId: string;
-  sandbox: string | null;
   class: RunFailureClass;
   detail: string;
   reason: string;
@@ -94,8 +89,6 @@ export interface RunLivenessResult {
 export interface RunLivenessOptions {
   /** Perform the transition (default true); false is a dry run. */
   apply?: boolean;
-  /** `sbx` seam for sandbox-backed Runs (default: the real CLI). */
-  cli?: SbxCli;
   /** Clock seam. */
   at?: number;
   /** Throttle only (used by `maybeSweepRunLiveness`). */
@@ -113,14 +106,6 @@ export interface RunLivenessOptions {
    */
   identify?: (run: Pick<Run, "pid" | "spawn_lstart">) => OrphanIdentity;
 }
-
-const TERMINAL: ReadonlySet<RunState> = new Set<RunState>([
-  "exited",
-  "failed",
-  "cancelled",
-  "timeout",
-  "submitted",
-]);
 
 function message(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
@@ -184,7 +169,6 @@ function announceRunDeath(
     payload: {
       runId: run.id,
       taskId: run.task_id,
-      sandbox: run.sandbox_name,
       class: failure.class,
       detail: failure.detail,
       reason,
@@ -201,7 +185,6 @@ function deathOf(run: Run, reason: string, failure: RunFailure): RunDeath {
   return {
     runId: run.id,
     taskId: run.task_id,
-    sandbox: run.sandbox_name,
     class: failure.class,
     detail: failure.detail,
     reason,
@@ -217,7 +200,7 @@ function sweepOne(
   db: Database,
   run: Run,
   opts: Required<Pick<RunLivenessOptions, "apply" | "at" | "startGraceMs" | "tailBytes">> &
-    Pick<RunLivenessOptions, "cli" | "identify">
+    Pick<RunLivenessOptions, "identify">
 ): RunDeath | null {
   const identify = opts.identify ?? identifyRunProcess;
   const age = opts.at - run.started_at;
@@ -226,13 +209,6 @@ function sweepOne(
   // before its terminal write). Only a launcher that can no longer write makes
   // this row an orphan; otherwise leave it live and the fence held.
   if (launcherMayStillWrite(run)) return null;
-
-  if (run.sandbox_name) {
-    // A sandbox launch records its host `sbx exec` pid right after the Run row;
-    // never sweep a just-inserted row that has not reached that point.
-    if (run.pid === null && age < opts.startGraceMs) return null;
-    return sweepSandboxRun(db, run, opts);
-  }
 
   if (run.pid === null) {
     // A local launch inserts `starting` and immediately spawns; a stale row with
@@ -264,77 +240,9 @@ function sweepOne(
 }
 
 /**
- * Sandbox-backed Run: delegate the identity/in-VM-dsh proof to ISH-828's
- * fail-closed sweep, then annotate the durable error with the classified cause.
- * A still-alive (or `unknown`) in-VM dsh leaves the Run non-terminal, exactly as
- * the existing sweep does.
- */
-function sweepSandboxRun(
-  db: Database,
-  run: Run,
-  opts: RunLivenessOptions & {
-    apply: boolean;
-    at: number;
-    startGraceMs: number;
-    tailBytes: number;
-  }
-): RunDeath | null {
-  let swept;
-  try {
-    swept = sweepOrphanedSandboxRuns(db, { apply: opts.apply, cli: opts.cli, runId: run.id });
-  } catch (e) {
-    // The sweep writes the terminal row BEFORE logging. If a disk-full event
-    // write threw after that, finish the classified announcement from the
-    // durable row instead of losing the death entirely.
-    const fresh = db.query(`SELECT * FROM runs WHERE id = ?`).get(run.id) as Run | null;
-    if (fresh && fresh.state === "failed" && /orphaned/i.test(fresh.error ?? "")) {
-      return finishSandboxDeath(db, fresh, run.state, opts);
-    }
-    throw e;
-  }
-  const orphan = swept.orphaned[0];
-  if (!orphan) return null; // host client still alive: the Run is live
-  if (!orphan.resolved) return null; // in-VM dsh not confirmed gone: fence held
-  if (!opts.apply) {
-    const failure = classifyRunDeath(run, { tailBytes: opts.tailBytes });
-    return deathOf(run, withCause(run.error ?? "orphaned", failure), failure);
-  }
-  const fresh = db.query(`SELECT * FROM runs WHERE id = ?`).get(run.id) as Run | null;
-  if (!fresh || !TERMINAL.has(fresh.state) || fresh.state !== "failed") return null;
-  return finishSandboxDeath(db, fresh, run.state, opts);
-}
-
-function finishSandboxDeath(
-  db: Database,
-  run: Run,
-  previousState: RunState,
-  opts: RunLivenessOptions & { apply: boolean; at: number; startGraceMs: number; tailBytes: number }
-): RunDeath | null {
-  if (run.state !== "failed") return null;
-  const failure = classifyRunDeath(run, { tailBytes: opts.tailBytes });
-  const base = run.error ?? "orphaned: no live sbx exec client";
-  const reason = withCause(base, failure);
-  if (opts.apply) {
-    // The ISH-828 sweep already wrote the terminal state; only enrich the stored
-    // error with the class (the write is idempotent).
-    db.query(`UPDATE runs SET error = ?, updated_at = ? WHERE id = ?`).run(reason, opts.at, run.id);
-    announceRunDeath(db, run, reason, failure, opts.at, previousState);
-  }
-  return {
-    runId: run.id,
-    taskId: run.task_id,
-    sandbox: run.sandbox_name,
-    class: failure.class,
-    detail: failure.detail,
-    reason,
-    previousState,
-  };
-}
-
-/**
  * One liveness pass. Never throws for a single Run: per-run failures are
- * collected in `errors`, so a full disk (or an `sbx` failure) cannot crash the
- * daemon or stop the remaining Runs from being inspected.
+ * collected in `errors`, so a full disk cannot crash the daemon or stop the
+ * remaining Runs from being inspected.
  */
 export function sweepRunLiveness(db: Database, opts: RunLivenessOptions = {}): RunLivenessResult {
   const at = opts.at ?? now();
@@ -366,7 +274,6 @@ export function sweepRunLiveness(db: Database, opts: RunLivenessOptions = {}): R
         at,
         startGraceMs,
         tailBytes,
-        cli: opts.cli,
         identify: opts.identify,
       });
       if (death) result.died.push(death);

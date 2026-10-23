@@ -70,22 +70,10 @@ export function isAncestorCommit(repo: string, ancestor: string, descendant: str
 
 /**
  * The git repositories that can prove a Run's own history: the worktree the Run
- * ran in, plus (for a Sandbox Run) the host checkout its produced HEAD is
- * fetched back into.
+ * ran in.
  */
-export function runHeadFenceRepos(
-  db: Database,
-  run: Pick<Run, "task_id" | "cwd" | "sandbox_name">
-): string[] {
-  const repos: string[] = [];
-  if (run.cwd) repos.push(run.cwd);
-  if (run.sandbox_name) {
-    const sandbox = db
-      .query(`SELECT source FROM sandboxes WHERE task_id = ? AND name = ?`)
-      .get(run.task_id, run.sandbox_name) as { source: string } | null;
-    if (sandbox?.source) repos.push(sandbox.source);
-  }
-  return repos;
+export function runHeadFenceRepos(run: Pick<Run, "cwd">): string[] {
+  return run.cwd ? [run.cwd] : [];
 }
 
 /**

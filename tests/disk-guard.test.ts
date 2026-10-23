@@ -203,7 +203,6 @@ describe("disk guard threshold", () => {
     expect(() =>
       assertLaunchDiskSpace(db, {
         taskId: "T30",
-        target: "host",
         minFreeBytes: 0,
         paths: ["/volume"],
         probe: () => {
@@ -224,7 +223,6 @@ describe("refusal event + error", () => {
       assertLaunchDiskSpace(db, {
         taskId: "T30",
         phase: "implement",
-        target: "host",
         minFreeBytes: 1_000,
         paths: ["/volume"],
         probe: () => 100,
@@ -251,11 +249,10 @@ describe("refusal event + error", () => {
     expect(() =>
       assertLaunchDiskSpace(db, {
         taskId: "T31",
-        target: "sandbox",
         minFreeBytes: 1_000,
-        paths: ["sandbox:relay-x:/var/lib/docker"],
+        paths: ["/volume"],
         probe: () => {
-          throw new Error("sbx exec df failed");
+          throw new Error("df failed");
         },
       })
     ).toThrow(LaunchDiskError);
@@ -263,7 +260,7 @@ describe("refusal event + error", () => {
     const event = onlyEvent();
     expect(event.reason).toBe("probe_failed");
     expect(event.freeBytes).toBeNull();
-    expect(event.error).toContain("sbx exec df failed");
+    expect(event.error).toContain("df failed");
     expect((event.message as string).startsWith(DISK_PROBE_FAILED)).toBe(true);
   });
 });

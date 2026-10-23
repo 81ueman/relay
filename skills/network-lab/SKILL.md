@@ -5,7 +5,7 @@ description: Deploy, inspect, exec into and destroy an arbitrary containerlab to
 
 # network-lab
 
-Run a **real, arbitrary** containerlab topology from this Coding Sandbox using the
+Run a **real, arbitrary** containerlab topology from the Task workspace using the
 `labctl` CLI. You own the topology: create a new one, or copy and adapt an
 existing one from the repo. `labctl` is a thin client for the shared Lab's
 `clab-api-server`; it starts NOS containers on the shared Lab VM. The NOS image
@@ -92,7 +92,7 @@ self-signed certificate.
 ## Endpoints
 
 `inspect --json` emits each node's management endpoints with a
-`reachable_at` string (already resolved for this sandbox), e.g.:
+`reachable_at` string (already resolved for this Task), e.g.:
 
 ```json
 { "nodes": [ { "node": "srl1", "state": "running",

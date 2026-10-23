@@ -9,12 +9,6 @@ This is implemented in `src/run-lifecycle.ts` on top of the ISH-758 phase machin
 (`src/workflow.ts`) and the ISH-803 one-shot runner (`src/dsh-runner.ts`). It does
 **not** reimplement either one.
 
-> **ISH-828:** the worktree is being superseded by a **Task-scoped Coding Sandbox**
-> (Docker Sandboxes clone mode): one Task = one private in-VM clone, one Run = one
-> fresh `dsh` inside it. That path is `src/sandbox.ts` +
-> `src/sandbox-lifecycle.ts`; see [`sandbox-lifecycle.md`](sandbox-lifecycle.md).
-> The worktree lifecycle below remains for tasks that have not moved to a sandbox.
-
 ```sh
 relay run worktree <task-id> [--branch B] [--base REF] [--path DIR] [--json]
 relay run launch   <task-id> [--timeout 30m] [--permission MODE] [--json]
@@ -116,11 +110,8 @@ surfaced by both UIs. This is fail-closed by design: an unmeasurable volume is
 treated like a full one.
 
 The guard is enforced in `startDshRun` (so raw `relay run start` cannot bypass
-it) and in `launchTaskSandboxRun` before the sandbox is created. The Task
-lifecycle calls the same guard earlier so a low-disk refusal never creates a
-worktree. Sandbox Runs additionally probe the in-VM DinD volume
-(`/var/lib/docker`) against `RELAY_MIN_FREE_DIND_BYTES` (default 2 GiB; `0`
-disables) — a separate budget from the host, since `DinDVolumeSize` is 10g.
+it). The Task lifecycle calls the same guard earlier so a low-disk refusal never
+creates a worktree.
 
 ## The Run brief is pinned BEFORE launch
 
@@ -193,10 +184,6 @@ A `starting` row that has not recorded a PID yet is left alone for
 races a concurrent launch. The sweep never kills a local process: it only writes
 a terminal row after proving the original one is gone.
 
-Sandbox Runs reuse `sweepOrphanedSandboxRuns({ apply: true })` and inherit its
-fail-closed proof: the Run is terminal only when the in-VM dsh is confirmed
-**gone** (see [`sandbox-lifecycle.md`](sandbox-lifecycle.md)).
-
 A sweep failure is never a success. It reads the tail of the Run's
 `stderr.log`/`dsh.jsonl`, classifies the cause (`ENOSPC`, `OOM`, `signal`,
 `unknown`), stores `cause=<CLASS>: <evidence>` in `runs.error`, emits `run.died`,
@@ -235,7 +222,7 @@ A review `--fail`/FIX (or a failed mechanical verify) sends the Task back to
   code defect, so they never become a "fix this" instruction. A failed
   IMPLEMENT Run is a **RETRY** instruction only because the Factory already
   classified it as repairable and issued the next attempt; an environment
-  failure (ENOSPC/resource/permission/auth/Sandbox/launch) is never retried, so
+  failure (ENOSPC/resource/permission/auth/launch) is never retried, so
   the fresh brief never presents it as a code fix;
 - starts a **new** disposable dsh Run — there is no session continuation and the
   previous Run is already terminal.
@@ -253,7 +240,7 @@ for it:
 
 - a clean `exit 0` Run that was never submitted (a crash between the process
   exit and the structured submission) is finished through the ordinary
-  `acceptRunSubmission`/`acceptSandboxSubmission` fence — never re-launched;
+  `acceptRunSubmission` fence — never re-launched;
 - a failed/cancelled/timed-out Run is surfaced as its recorded failure so the
   Factory's bounded-recovery policy decides (new attempt, or an explicit stop);
 - `blocked_human` is a **HOLD**: an in-flight Run cannot submit and advance a HELD

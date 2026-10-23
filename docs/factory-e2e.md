@@ -21,7 +21,7 @@ merged, NOT Linear Done).
   writes. What holds is independence (`recordReview`), a HEAD-bound verdict, and a
   disposable detached review checkout where one is configured
   (`reviewWorktreeRoot`; the Factory's CLI always sets it). The brief also carries
-  the mechanical VERIFY result already produced in the Task's sandbox, so the host
+  the mechanical VERIFY result already produced in the Task worktree, so the host
   reviewer can judge the code without re-running the lab. The Gateway and reviewer
   deliberately use different models/harnesses.
 
@@ -50,29 +50,6 @@ The Factory is **sequencing only**: every transition is the ordinary durable
 result (`acceptRunSubmission`, `runMechanicalVerification`, `recordReview`,
 `submitPhase`). There is no parallel state machine.
 
-## Sandbox-backed Tasks (ISH-878)
-
-A Task that already has a **durable Coding Sandbox binding** (a `sandboxes` row,
-created by `relay run sandbox create`) is implemented **INSIDE that Sandbox**,
-not in a host worktree:
-
-- **IMPLEMENT/FIX** reuses ISH-828's `launchTaskSandboxRun` — one disposable
-  `dsh` inside the Task's durable clone per attempt. A FIX is a **new Run on the
-  SAME Sandbox** with the findings inherited; the Sandbox is created **once**.
-- The produced commit is fetched back to the host (`git fetch sandbox-<name>`)
-  and advanced **only** through `acceptSandboxSubmission` (the ISH-760 fence plus
-  the Sandbox identity/HEAD fence). An `exit 0` / `final` alone never advances.
-- **VERIFY** runs through ISH-829's Sandbox runner at the recorded HEAD; the
-  **reviewer** reads the independent fixed-HEAD checkout.
-- A Sandbox that is **removed/failed**, or a launch that cannot be created/
-  probed, **fails closed**: the Task never falls back to the host worktree. A
-  Task with **no** Sandbox row keeps the host-worktree behaviour above.
-- On restart/re-entry the Factory **adopts** the live Sandbox Run and never
-  starts a duplicate writer; a Run whose `sbx exec` client is gone is resolved by
-  the ISH-828 sweep, which marks it terminal `failed` **only** once the in-VM dsh
-  is confirmed gone — so the single-writer fence is never released under a live
-  writer.
-
 ## Bounded IMPLEMENT recovery (ISH-1012)
 
 VERIFY FAIL and REVIEW FIX already continue the Task at `attempt+1`. Before
@@ -80,7 +57,7 @@ ISH-1012 an IMPLEMENT Run failure **stopped** the Task
 (`coding_failed`/`no_implementation`) with no bounded rework. The Factory now
 classifies the failed Run with a small, conservative policy
 (`src/implement-recovery.ts`) and, **only when it is provably safe**, issues a
-fresh disposable Run on the SAME Task/worktree/Sandbox through the ordinary
+fresh disposable Run on the SAME Task/worktree through the ordinary
 phase/attempt transition (`workflow.recordImplementRecovery`):
 
 | failed IMPLEMENT Run | decision |
@@ -91,7 +68,7 @@ phase/attempt transition (`workflow.recordImplementRecovery`):
 | `attempt + 1 >= maxAttempts` | **STOP** (`max_attempts`) — the SAME budget as VERIFY/REVIEW FIX |
 | ENOSPC / resource exhaustion (`ENOSPC`/`RESOURCE`) | **BLOCKED**, never retried |
 | permission / auth / credential (`PERMISSION`/`AUTH`) | **BLOCKED**, never retried |
-| Sandbox / launch problem (`SANDBOX`/`LAUNCH`) | **BLOCKED**, never retried |
+| launch problem (`LAUNCH`) | **BLOCKED**, never retried |
 | invalid/stale submission (`INVALID_RESULT`) | **BLOCKED**, never retried |
 | cancelled / time-limited / unknown cause (`CANCELLED`/`TIMEOUT`/`UNKNOWN_CAUSE`) | **STOPPED**, never retried |
 | an unconfirmed live writer (`WRITER_NOT_TERMINAL`) | the fence is held; no new Run |
@@ -106,7 +83,7 @@ attempt twice.
 The fresh Run receives the failed Run's id, terminal state/exit code, base and
 produced HEAD, its recorded error and a bounded stderr tail, plus the retry
 reason, pinned into the SAME Run brief — the original Task acceptance and the
-durable Sandbox are unchanged. A terminal Run **closes** its attempt: restart/
+durable worktree are unchanged. A terminal Run **closes** its attempt: restart/
 re-entry finishes a clean unsubmitted submission through the normal fence or
 re-reads the recorded failure, and **never starts a second Run for that
 attempt**. A `blocked_human` HOLD is never bypassed by an in-flight Run.
@@ -169,7 +146,7 @@ The minimal `class` is one of:
 | class | examples (`cause`) | resume |
 | -- | -- | -- |
 | `code_rework_exhausted` | `MAX_ATTEMPTS`, `REPEATED_FAILURE`, `NO_IMPLEMENTATION` | fix the remaining check/review finding, then re-run with a larger attempt budget |
-| `infra_blocked` | `ENOSPC`, `LOW_DISK`, `RESOURCE`, `SANDBOX`, `LAUNCH`, `TIMEOUT`, `ORPHAN`, `WORKSPACE`, `WRITER_ACTIVE` | fix the environment; a live writer must finish first; a parked Task still needs an explicit `unblock` |
+| `infra_blocked` | `ENOSPC`, `LOW_DISK`, `RESOURCE`, `LAUNCH`, `TIMEOUT`, `ORPHAN`, `WORKSPACE`, `WRITER_ACTIVE` | fix the environment; a live writer must finish first; a parked Task still needs an explicit `unblock` |
 | `permission_or_human_decision` | `PERMISSION`, `AUTH`, `HUMAN_HOLD`, `REVIEW_BLOCKED` | restore the permission/credential or make the human decision, then explicitly unblock |
 | `missing_or_inconclusive_evidence` | `REVIEW_REFUSED`, `CHECK_NOT_RUN`, `NO_REQUIRED_CHECK`, `EVIDENCE_UNAVAILABLE` | re-run the review/check with readable evidence; an unrun gate never PASSes |
 | `stale_head` | `STALE_HEAD`, `STALE_EVIDENCE` | never reuse the old attempt/HEAD; re-run only with evidence naming the current HEAD |
@@ -217,7 +194,7 @@ the detailed next action is on the surfaces above.
 
 ## PR check before review (ISH-880/885, read-only)
 
-A Sandbox-produced commit is bridged to a real GitHub PR **before the review
+A produced commit is bridged to a real GitHub PR **before the review
 stage**, so a review PASS is bound to the PR's *real current remote HEAD*. When
 `FactoryDeps.prBinding` is configured and the Task records a `pr_repo`/`pr_url`,
 the Factory re-reads the PR and requires its live `headSha` to equal the produced
@@ -474,9 +451,8 @@ unchanged by this issue.
   exit-0-no-commit → fresh Run → PASS; ENOSPC and MISSING_CREDENTIAL are BLOCKED
   with no retry; a bare non-zero exit is stopped as `UNKNOWN_CAUSE`; the attempt
   cap and the repeated-same-failure stop; restart after the cap resumes on a
-  fresh attempt without a second Run for the old one; a HOLD rejects an in-flight
-  submission; and a missing-commit Sandbox Run recovers on the SAME durable
-  Sandbox (one create). `tests/implement-recovery.test.ts` pins the classifier's
+  fresh attempt without a second Run for the old one; and a HOLD rejects an
+  in-flight submission. `tests/implement-recovery.test.ts` pins the classifier's
   explicit allow/deny reasons, and the fresh brief is asserted to carry the
   failed Run id/exit/heads/error/retry reason plus the original acceptance.
 - **NOT verified here** — an end-to-end **real-FIX** loop (real dsh attempt 0

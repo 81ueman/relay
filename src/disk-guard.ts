@@ -3,7 +3,6 @@ import { existsSync, statfsSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { defaultDbPath } from "./db";
 import { logEvent } from "./events";
-import { bashLc, sbxExecArgv, type SbxCli } from "./sandbox";
 
 /**
  * ISH-1009 — pre-launch disk-space guard for dsh Runs.
@@ -24,10 +23,6 @@ import { bashLc, sbxExecArgv, type SbxCli } from "./sandbox";
  *     dashboard and `relay status` read that event (and re-measure current
  *     space) so the refusal is visible without digging through logs.
  *
- * Sandbox Runs also probe the in-sandbox DinD volume (`/var/lib/docker`, 10g by
- * default) with a separate, smaller threshold (`RELAY_MIN_FREE_DIND_BYTES`,
- * default 2 GiB; 0 disables). That probe is an `sbx exec df`, the same cheap
- * transport the sandbox lifecycle already uses for liveness.
  */
 
 export const LOW_DISK = "LOW_DISK";
@@ -36,8 +31,6 @@ export const LAUNCH_REFUSED_EVENT = "run.launch_refused";
 
 /** 20 GiB: enough for a worktree plus a build tree, per ISH-1009. */
 export const DEFAULT_MIN_FREE_DISK_BYTES = 20 * 1024 ** 3;
-/** The sandbox DinD volume defaults to 10g, so its floor is deliberately lower. */
-export const DEFAULT_MIN_FREE_DIND_BYTES = 2 * 1024 ** 3;
 
 function envBytes(raw: string | undefined, fallback: number): number {
   if (raw === undefined || raw.trim() === "") return fallback;
@@ -49,11 +42,6 @@ function envBytes(raw: string | undefined, fallback: number): number {
 /** Configured host/worktree floor. `0` turns off the low-water comparison. */
 export function minFreeDiskBytes(env: NodeJS.ProcessEnv = process.env): number {
   return envBytes(env.RELAY_MIN_FREE_DISK_BYTES, DEFAULT_MIN_FREE_DISK_BYTES);
-}
-
-/** Configured in-sandbox DinD floor. `0` disables the DinD probe. */
-export function minFreeDindBytes(env: NodeJS.ProcessEnv = process.env): number {
-  return envBytes(env.RELAY_MIN_FREE_DIND_BYTES, DEFAULT_MIN_FREE_DIND_BYTES);
 }
 
 /** A probe returns free bytes for a path and throws when it cannot measure. */
@@ -133,20 +121,6 @@ export function probeFreeBytes(path: string): number {
   }
 }
 
-/** The in-sandbox DinD volume probe (`df -Pk /var/lib/docker`, available KiB). */
-export function probeSandboxDindFreeBytes(cli: SbxCli, name: string): number {
-  const r = cli.run(sbxExecArgv(name, bashLc("df -Pk /var/lib/docker 2>/dev/null | awk 'NR==2 {print $4}'")));
-  if (!r.ok) {
-    throw new Error(`sbx exec df /var/lib/docker failed (exit ${r.code ?? "?"}): ${(r.err || r.out).trim().slice(0, 300) || "no output"}`);
-  }
-  const raw = (r.out ?? "").trim().split(/\s+/).pop() ?? "";
-  const kib = Number(raw);
-  if (!Number.isFinite(kib) || kib < 0) {
-    throw new Error(`sbx exec df /var/lib/docker returned no usable size: ${(r.out ?? "").trim().slice(0, 300) || "empty"}`);
-  }
-  return Math.floor(kib * 1024);
-}
-
 /** Pure decision: measure every path and compare the smallest value. */
 export function evaluateDiskSpace(opts: {
   paths: string[];
@@ -224,14 +198,8 @@ export type DiskRefusalReason = "low_disk" | "probe_failed";
 
 export interface DiskRefusal {
   reason: DiskRefusalReason;
-  /** Which launch path was refused. */
-  target: "host" | "sandbox";
-  /** The host volume check or the in-sandbox DinD check. */
-  scope: "host" | "dind";
   taskId: string | null;
   phase: string | null;
-  /** The sandbox whose DinD volume was measured (null for host checks). */
-  sandbox: string | null;
   minFreeBytes: number;
   freeBytes: number | null;
   probes: DiskProbeResult[];
@@ -267,19 +235,14 @@ export interface DiskGuardOptions {
 export interface AssertDiskOptions extends DiskGuardOptions {
   taskId?: string | null;
   phase?: string | null;
-  target: "host" | "sandbox";
-  scope?: "host" | "dind";
-  /** The sandbox name for a DinD check (event evidence only). */
-  sandbox?: string | null;
 }
 
-function refusalMessage(reason: DiskRefusalReason, target: "host" | "sandbox", scope: "host" | "dind", status: DiskStatus): string {
-  const where = scope === "dind" ? "in-sandbox DinD volume" : target === "sandbox" ? "host volume for the sandbox Run" : "host volume for the Run";
+function refusalMessage(reason: DiskRefusalReason, status: DiskStatus): string {
   if (reason === "probe_failed") {
-    return `${DISK_PROBE_FAILED}: refusing to launch a Run: free-space probe failed for the ${where}: ${status.error ?? "unknown probe error"}`;
+    return `${DISK_PROBE_FAILED}: refusing to launch a Run: free-space probe failed for the host volume: ${status.error ?? "unknown probe error"}`;
   }
   return (
-    `${LOW_DISK}: refusing to launch a Run: ${formatBytes(status.freeBytes)} free on the ${where} ` +
+    `${LOW_DISK}: refusing to launch a Run: ${formatBytes(status.freeBytes)} free on the host volume ` +
     `is below the ${formatBytes(status.minFreeBytes)} minimum; free space and retry`
   );
 }
@@ -298,15 +261,11 @@ export function assertLaunchDiskSpace(db: Database, opts: AssertDiskOptions): Di
   });
   if (status.ok) return status;
   const reason: DiskRefusalReason = status.reason === "probe_failed" ? "probe_failed" : "low_disk";
-  const scope = opts.scope ?? "host";
-  const message = refusalMessage(reason, opts.target, scope, status);
+  const message = refusalMessage(reason, status);
   const refusal: DiskRefusal = {
     reason,
-    target: opts.target,
-    scope,
     taskId: opts.taskId ?? null,
     phase: opts.phase ?? null,
-    sandbox: opts.sandbox ?? null,
     minFreeBytes: status.minFreeBytes,
     freeBytes: status.freeBytes,
     probes: status.probes,
@@ -319,11 +278,8 @@ export function assertLaunchDiskSpace(db: Database, opts: AssertDiskOptions): Di
     type: LAUNCH_REFUSED_EVENT,
     payload: {
       reason,
-      target: opts.target,
-      scope,
       taskId: opts.taskId ?? null,
       phase: opts.phase ?? null,
-      sandbox: opts.sandbox ?? null,
       minFreeBytes: status.minFreeBytes,
       freeBytes: status.freeBytes,
       probes: status.probes,
@@ -338,9 +294,6 @@ export interface LaunchRefusalRecord {
   at: number;
   taskId: string | null;
   reason: string;
-  target: string | null;
-  scope: string | null;
-  sandbox: string | null;
   minFreeBytes: number | null;
   freeBytes: number | null;
   error: string | null;
@@ -366,9 +319,6 @@ export function latestLaunchRefusal(db: Database): LaunchRefusalRecord | null {
     at: row.timestamp,
     taskId: row.task_id,
     reason: str(p.reason) ?? "unknown",
-    target: str(p.target),
-    scope: str(p.scope),
-    sandbox: str(p.sandbox),
     minFreeBytes: num(p.minFreeBytes),
     freeBytes: num(p.freeBytes),
     error: str(p.error),

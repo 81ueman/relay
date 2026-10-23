@@ -163,7 +163,7 @@ export interface LabEndpoint {
   containerPort: number | null;
   hostPort: number | null;
   hostIp: string | null;
-  /** `host:port` a Coding Sandbox connects to (from `--reach-host`). */
+  /** `host:port` a Task connects to (from `--reach-host`). */
   reachableAt: string | null;
 }
 

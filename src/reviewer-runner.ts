@@ -126,10 +126,9 @@ export interface ReviewerVerdict {
 
 /**
  * ISH-830e: the mechanical VERIFY result Relay ALREADY produced for the reviewed
- * HEAD — inside the Task's Coding Sandbox, where the Shared-Lab NOS check runs.
- * It is passed to the host reviewer as CONTEXT (with the raw check output tail)
- * so the reviewer can judge the change WITHOUT re-running the lab, and without
- * having to take the check's own word for it.
+ * HEAD. It is passed to the host reviewer as CONTEXT (with the raw check output
+ * tail) so the reviewer can judge the change WITHOUT re-running the lab, and
+ * without having to take the check's own word for it.
  */
 export interface ReviewVerifyEvidence {
   head: string | null;
@@ -187,17 +186,10 @@ export interface HeadlessReviewDeps {
    */
   reviewWorktree?: string;
   /**
-   * ISH-878: the DURABLE directory the raw reviewer output is written under,
-   * overriding the default (`task.worktree`, else the review worktree). A
-   * Sandbox-backed Task has no host worktree, so the Factory passes a durable
-   * per-Task directory — the read-only review worktree is removed afterwards.
-   */
-  evidenceBase?: string;
-  /**
-   * ISH-830e: the mechanical VERIFY result for this attempt's HEAD (produced in
-   * the Task's sandbox). Rendered into the brief as context so the host reviewer
-   * can judge the change without re-running the lab. Omitted -> no VERIFY section
-   * (the old behaviour; the reviewer sees only the declared checks).
+   * ISH-830e: the mechanical VERIFY result for this attempt's HEAD. Rendered into
+   * the brief as context so the host reviewer can judge the change without
+   * re-running the lab. Omitted -> no VERIFY section (the reviewer sees only the
+   * declared checks).
    */
   verifyEvidence?: ReviewVerifyEvidence;
   /**
@@ -279,9 +271,8 @@ export function buildReviewBrief(
       "",
       `## Mechanical VERIFY — ALREADY RUN at \`${v.head ?? opts.head}\` (context; do NOT re-run)`,
       "",
-      "Relay ran the REQUIRED checks above at this exact HEAD in the Task's own Coding",
-      "Sandbox (that is where the Shared-Lab lab lives). This is the RESULT, recorded",
-      "before the review:",
+      "Relay ran the REQUIRED checks above at this exact HEAD. This is the RESULT,",
+      "recorded before the review:",
       "",
       `Outcome: \`${v.outcome}\``
     );
@@ -839,7 +830,7 @@ export async function runHeadlessReview(
   // `reviewWorktree` that the caller removes, so a recorded `evidence_ref` never
   // dangles. ISH-883: the verified native review (id/url/head), when posted, is
   // recorded alongside the structured verdict.
-  const evidenceBase = deps.evidenceBase ?? task.worktree ?? worktree;
+  const evidenceBase = task.worktree ?? worktree;
   const evidencePath = reviewEvidencePath(evidenceBase, task.attempt, head);
   const writeEvidence = (native: ReviewView | null): void => {
     try {

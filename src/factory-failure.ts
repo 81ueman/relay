@@ -51,7 +51,6 @@ export const FACTORY_FAILURE_CAUSES = [
   "ENOSPC",
   "LOW_DISK",
   "RESOURCE",
-  "SANDBOX",
   "LAUNCH",
   "TIMEOUT",
   "ORPHAN",
@@ -305,7 +304,6 @@ function collectEventEvidence(
   const types = [
     "factory.implement_retry_refused",
     "factory.implement_blocked",
-    "factory.sandbox_unusable",
     "factory.review_refused",
     "factory.attempt_closed",
     "factory.blocked_internal",
@@ -317,8 +315,8 @@ function collectEventEvidence(
     // evidence. Never let an older attempt's marker decide the cause.
     const at = eventAttempt(event.payload);
     if (at !== null && at !== attempt) continue;
-    // An attempt-less event older than the current Run is stale evidence (e.g.
-    // an old Sandbox refusal): it must not decide this failure's cause.
+    // An attempt-less event older than the current Run is stale evidence: it
+    // must not decide this failure's cause.
     if (at === null && runStartedAt !== null && event.timestamp < runStartedAt) continue;
     if (type === "factory.review_refused") {
       const namedHead = text(event.payload.head, 64);
@@ -353,10 +351,9 @@ const AUTH_RE =
 const HUMAN_HOLD_RE = /\bHOLD\b|human (?:hold|decision|release)|operator (?:hold|cancel)/i;
 const WRITER_ACTIVE_RE =
   /single-writer|still (?:live|running)|writer fence|second writer|unfinished writer|refusing a new attempt|cannot start a second/i;
-const SANDBOX_RE = /SANDBOX_ERROR|sandbox .*(?:failed|removed|unavailable|unusable)|no usable execution target|no execution target/i;
 const WORKSPACE_RE = /review workspace|no worktree|WORKTREE_ERROR|worktree .*missing|workspace .*missing/i;
 const LAUNCH_RE = /spawn failed|DSH_VERSION_MISMATCH|command not found|\bENOENT\b|dsh version/i;
-const ORPHAN_RE = /\bORPHAN\b|orphaned|adopted (?:sandbox )?run|recorded pid was reused|could not be terminated/i;
+const ORPHAN_RE = /\bORPHAN\b|orphaned|adopted run|recorded pid was reused|could not be terminated/i;
 const TIMEOUT_RE = /\bTIMEOUT\b|timed out|\btimeout\b/i;
 const RESOURCE_RE =
   /\bENOMEM\b|\bEAGAIN\b|\bEMFILE\b|\bENFILE\b|out of memory|oom[- ]?kill(?:ed)?|resource (?:exhausted|exhaustion)|too many open files|rate limit(?:ed)?|too many requests/i;
@@ -401,7 +398,6 @@ function detectCause(
   if (HUMAN_HOLD_RE.test(text)) return "HUMAN_HOLD";
   if (WRITER_ACTIVE_RE.test(text)) return "WRITER_ACTIVE";
   if (WORKSPACE_RE.test(text)) return "WORKSPACE";
-  if (SANDBOX_RE.test(text)) return "SANDBOX";
   if (LAUNCH_RE.test(text)) return "LAUNCH";
   if (ORPHAN_RE.test(text)) return "ORPHAN";
   // A check's own "timed out" output is CHECK_NOT_RUN evidence, not a Run-level
@@ -438,7 +434,6 @@ function classFor(cause: FactoryFailureCause): FactoryFailureClass {
     case "ENOSPC":
     case "LOW_DISK":
     case "RESOURCE":
-    case "SANDBOX":
     case "LAUNCH":
     case "TIMEOUT":
     case "ORPHAN":
@@ -469,7 +464,6 @@ function resumeFor(cause: FactoryFailureCause): FactoryFailureResume {
     case "ENOSPC":
     case "LOW_DISK":
     case "RESOURCE":
-    case "SANDBOX":
     case "LAUNCH":
     case "TIMEOUT":
     case "ORPHAN":
@@ -558,14 +552,6 @@ function nextFor(
         read,
         command: report.requiresUnblock ? unblock : factory,
         resumeWhen: "the step no longer stalls and the Run completes inside its budget",
-      };
-    case "SANDBOX":
-      return {
-        action:
-          "The Coding Sandbox is unusable; Relay does not fall back to the host. Repair/restart the Sandbox, then resume.",
-        read,
-        command: report.requiresUnblock ? unblock : factory,
-        resumeWhen: "the Sandbox is available again and no live writer holds it",
       };
     case "LAUNCH":
       return {

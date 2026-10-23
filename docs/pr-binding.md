@@ -1,8 +1,8 @@
 # Task ↔ PR check (ISH-880, read-only as of ISH-885)
 
-ISH-828 fetches a Task's **exact Coding Sandbox commit** to the host; ISH-829
-verifies that **exact local HEAD**; ISH-761 is a **read-only** HEAD-bound merge
-gate. ISH-880 added the one seam that binds a produced commit to a GitHub PR.
+Mechanical VERIFY binds a Task's **exact local HEAD**; ISH-761 is a **read-only**
+HEAD-bound merge gate. ISH-880 added the one seam that binds a produced commit to
+a GitHub PR.
 ISH-885 keeps that seam but makes it **read-only**: Relay observes GitHub, it
 never writes.
 
@@ -10,7 +10,7 @@ never writes.
 
 The GitHub PR workflow is **Agent-owned**:
 
-- the **Coding Agent** (dsh/DeepSeek), in its own Task Sandbox/checkout, does
+- the **Coding Agent** (dsh/DeepSeek), in its own Task workspace/checkout, does
   `git commit` + `git push` + `gh pr create`/update with normal credentials;
 - the **independent Claude reviewer** posts a native `gh pr review`.
 
@@ -191,5 +191,5 @@ there is no write argv (`git push` / `gh pr create|edit|merge|review|comment` /
 `gh api --method`) anywhere in `src/`, and Relay's `gh` calls are `pr view`,
 `pr list` and GET `api` only. The run cannot prove it independently because the
 stand-in, the Claude reviewer and the `gh` login all share ONE GitHub account
-(`81ueman`). The full Sandbox-dsh coding leg and the Factory MergeReady drive are
-covered separately (tests); this script isolates the GitHub write/read boundary.
+(`81ueman`). The full dsh coding leg and the Factory MergeReady drive are covered
+separately (tests); this script isolates the GitHub write/read boundary.

@@ -15,8 +15,8 @@ import { childEnv } from "./child-env";
  *
  *   1. the Task's **owner identifier** — a stable, never-reused string derived
  *      from the Task (`labOwnerId(task)` = id + `created_at`), recorded durably
- *      when it is handed out (`lab.owner_assigned`), injected into the Coding
- *      Sandbox as `RELAY_LAB_OWNER`, and used by the `network-lab` skill as the
+ *      when it is handed out (`lab.owner_assigned`), exposed to the Task as
+ *      `RELAY_LAB_OWNER`, and used by the `network-lab` skill as the
  *      lab `--namespace` and `name:`; and
  *   2. that a cleanup is due **when the Task ends** (merged or explicitly
  *      aborted) — never merely because it reached `merge_ready`.
@@ -73,7 +73,7 @@ export function labCleanupHookEnv(
   return env;
 }
 
-/** The durable record that Relay handed this Task's owner id to the sandbox. */
+/** The durable record that Relay assigned this Task's external Lab owner id. */
 export const LAB_OWNER_ASSIGNED_EVENT = "lab.owner_assigned";
 
 /**
@@ -177,8 +177,8 @@ export function labCleanupHookConfigured(env: NodeJS.ProcessEnv = process.env): 
 
 /**
  * The owner id Relay actually handed out for this Task, or null when none was
- * ever assigned (the Task never ran through the Coding Sandbox, so it has no
- * external Lab). Read from the durable `lab.owner_assigned` record — never
+ * ever assigned (the Task has no external Lab). Read from the durable
+ * `lab.owner_assigned` record — never
  * recomputed — so a Task whose Lab owner was never handed out is never cleaned.
  */
 export function assignedLabOwner(d: Database, taskId: string): string | null {
@@ -249,7 +249,7 @@ export function planLabCleanup(d: Database, taskId: string, opts: LabCleanupOpti
     return plan;
   }
   if (!assigned) {
-    reasons.push("no lab owner assigned (this task never ran a Coding Sandbox lab)");
+    reasons.push("no lab owner assigned for this task (no external Lab)");
     return plan;
   }
 
