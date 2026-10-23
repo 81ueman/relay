@@ -14,6 +14,17 @@ import {
   type PrView,
   type ReviewView,
 } from "./providers";
+import {
+  ProviderRateLimitGuard,
+  providerRateLimitFromExec,
+  type ProviderRateLimitState,
+} from "./provider-rate-limit";
+
+export {
+  PROVIDER_RATE_LIMITED,
+  ProviderRateLimitedError,
+  isProviderRateLimitedError,
+} from "./provider-rate-limit";
 
 /**
  * ISH-759 real provider adapters — GET-ONLY.
@@ -245,12 +256,40 @@ function toReviewView(ref: PrRef, raw: Record<string, unknown>): ReviewView {
 export class GhCliGitHub implements GitHubReadOnly, ChecksReadOnly, GitHubReviewReader {
   readonly name = "gh-cli";
   readonly readOnly = true as const;
+  private readonly rateLimits = new ProviderRateLimitGuard("github");
 
   constructor(private exec: Exec = defaultExec) {}
 
+  /** ISH-1132: the active backoff, or null when a read may spend a call. */
+  rateLimit(): ProviderRateLimitState | null {
+    return this.rateLimits.blocked();
+  }
+
+  /** Seed the backoff from an env/auth probe result (no command is run here). */
+  noteExec(result: ExecResult): void {
+    this.rateLimits.note(result);
+  }
+
+  /** Seed the backoff from an already-classified observation. */
+  noteRateLimit(state: ProviderRateLimitState): void {
+    this.rateLimits.seed(state);
+  }
+
+  /**
+   * Spawn one read unless the budget is in backoff. A rate-limit failure is
+   * recorded on the guard and reported as a failed read (`null` here); callers
+   * distinguish it by asking `rateLimit()`.
+   */
+  private async run(argv: string[]): Promise<ExecResult | null> {
+    if (this.rateLimits.blocked()) return null;
+    const r = await this.exec(argv);
+    this.rateLimits.note(r);
+    return r;
+  }
+
   async getPullRequest(ref: PrRef): Promise<PrView | null> {
-    const r = await this.exec(["gh", "pr", "view", String(ref.number), "--repo", ref.repo, "--json", PR_FIELDS]);
-    if (!r.ok) return null;
+    const r = await this.run(["gh", "pr", "view", String(ref.number), "--repo", ref.repo, "--json", PR_FIELDS]);
+    if (!r?.ok) return null;
     try {
       const j = JSON.parse(r.stdout) as GhPrJson;
       return toPrView({ repo: ref.repo, number: j.number ?? ref.number }, j);
@@ -260,11 +299,11 @@ export class GhCliGitHub implements GitHubReadOnly, ChecksReadOnly, GitHubReview
   }
 
   async findPullRequestForBranch(repo: string, branch: string): Promise<PrView | null> {
-    const r = await this.exec([
+    const r = await this.run([
       "gh", "pr", "list", "--repo", repo, "--head", branch, "--state", "all",
       "--limit", "1", "--json", PR_FIELDS,
     ]);
-    if (!r.ok) return null;
+    if (!r?.ok) return null;
     try {
       const arr = JSON.parse(r.stdout) as GhPrJson[];
       if (!Array.isArray(arr) || arr.length === 0) return null;
@@ -283,11 +322,11 @@ export class GhCliGitHub implements GitHubReadOnly, ChecksReadOnly, GitHubReview
       `repos/${ref.repo}/pulls/${ref.number}/comments`,
     ];
     for (const path of paths) {
-      const r = await this.exec(["gh", "api", path, "--paginate"]);
+      const r = await this.run(["gh", "api", path, "--paginate"]);
       // ANY endpoint failing means the stream is incomplete: report failure
       // (null) rather than a partial list, so the caller does not treat a
       // transient 5xx / rate-limit as "no comments" and consume the watermark.
-      if (!r.ok) return null;
+      if (!r?.ok) return null;
       for (const obj of parseJsonStream(r.stdout)) {
         const items = Array.isArray(obj) ? obj : [obj];
         for (const c of items as Record<string, unknown>[]) {
@@ -308,8 +347,8 @@ export class GhCliGitHub implements GitHubReadOnly, ChecksReadOnly, GitHubReview
    * "no review" from "could not verify".
    */
   async listReviews(ref: PrRef): Promise<ReviewView[] | null> {
-    const r = await this.exec(["gh", "api", "--paginate", `repos/${ref.repo}/pulls/${ref.number}/reviews`]);
-    if (!r.ok) return null;
+    const r = await this.run(["gh", "api", "--paginate", `repos/${ref.repo}/pulls/${ref.number}/reviews`]);
+    if (!r?.ok) return null;
     const out: ReviewView[] = [];
     for (const page of parseJsonStream(r.stdout)) {
       const items = Array.isArray(page) ? page : [page];
@@ -330,13 +369,15 @@ export class GhCliGitHub implements GitHubReadOnly, ChecksReadOnly, GitHubReview
    */
   async listChecks(ref: PrRef, headSha: string): Promise<CheckRunView[] | null> {
     if (!headSha) return null;
-    const runs = await this.exec([
+    const runs = await this.run([
       "gh", "api", `repos/${ref.repo}/commits/${headSha}/check-runs`, "--paginate",
       "-H", "Accept: application/vnd.github+json",
     ]);
-    if (!runs.ok) return null;
-    const statuses = await this.exec(["gh", "api", `repos/${ref.repo}/commits/${headSha}/status`]);
-    if (!statuses.ok) return null;
+    // A null result means the reader is (or just became) rate-limited: do NOT
+    // spend the second read; the caller sees `rateLimit()` and backs off.
+    if (!runs?.ok) return null;
+    const statuses = await this.run(["gh", "api", `repos/${ref.repo}/commits/${headSha}/status`]);
+    if (!statuses?.ok) return null;
 
     const runPages = parseJsonStream(runs.stdout) as {
       total_count?: number;
@@ -448,6 +489,7 @@ interface LinearGraphQLJson {
 export class LinearApiReadOnly implements LinearReadOnly {
   readonly name = "linear-api";
   readonly readOnly = true as const;
+  private readonly rateLimits = new ProviderRateLimitGuard("linear");
 
   constructor(
     private token: string,
@@ -455,7 +497,13 @@ export class LinearApiReadOnly implements LinearReadOnly {
     private endpoint = "https://api.linear.app/graphql"
   ) {}
 
+  /** ISH-1132: the active backoff, or null when a read may spend a call. */
+  rateLimit(): ProviderRateLimitState | null {
+    return this.rateLimits.blocked();
+  }
+
   async getIssue(id: string): Promise<IssueView | null> {
+    if (this.rateLimits.blocked()) return null;
     const query = "query($id:String!){issue(id:$id){id state{name} labels{nodes{name}}}}";
     const payload = JSON.stringify({ query, variables: { id } });
     // The token travels on STDIN (`-H @-`), never on argv, so it is not visible
@@ -469,7 +517,15 @@ export class LinearApiReadOnly implements LinearReadOnly {
       ],
       { stdin: new TextEncoder().encode(`Authorization: ${this.token}\n`) }
     );
+    this.rateLimits.note(r);
     if (!r.ok) return null;
+    // Linear reports a GraphQL rate limit in a 200 body (`errors` +
+    // `RATELIMITED`), so classify it from the body too. This is a GET-only
+    // query, never a write.
+    if (/RATELIMITED|rate.?limit exceeded|too many requests/i.test(r.stdout)) {
+      this.rateLimits.note({ ok: false, stdout: r.stdout, stderr: "" });
+      if (this.rateLimits.blocked()) return null;
+    }
     try {
       const j = JSON.parse(r.stdout) as LinearGraphQLJson;
       const issue = j.data?.issue;
@@ -496,6 +552,39 @@ function optOut(value: string | undefined): boolean {
 }
 
 /**
+ * ISH-1132: distinguish an exhausted API budget from a missing/invalid `gh`.
+ *
+ * `gh auth status` is known to misreport a rate-limited token as invalid. The
+ * `rate_limit` endpoint does not consume the core budget, so it is the safe
+ * disambiguation probe after a failed auth status. Returns the typed backoff
+ * state when the budget is exhausted (the reader is configured, just retrying).
+ */
+async function probeGithubRateLimit(exec: Exec): Promise<ProviderRateLimitState | null> {
+  const r = await exec(["gh", "api", "rate_limit"]);
+  const limited = providerRateLimitFromExec(r, { provider: "github" });
+  if (limited) return limited;
+  if (!r.ok) return null;
+  try {
+    const j = JSON.parse(r.stdout) as {
+      resources?: { core?: { limit?: number; remaining?: number; reset?: number } };
+    };
+    const core = j.resources?.core;
+    if (core && core.remaining === 0 && typeof core.reset === "number" && core.reset > 0) {
+      const now = Date.now();
+      return {
+        provider: "github",
+        reason: `GitHub core API budget exhausted (remaining 0 of ${core.limit ?? "?"})`,
+        observedAt: now,
+        resetAt: core.reset * 1000 > now ? core.reset * 1000 : now + 1000,
+      };
+    }
+  } catch {
+    /* not JSON: a failed/other result is handled above */
+  }
+  return null;
+}
+
+/**
  * ISH-1087: resolve the read-only GitHub reader.
  *
  * `RELAY_PROVIDER_GITHUB=gh` always enables it and an explicit `off` always
@@ -504,6 +593,10 @@ function optOut(value: string | undefined): boolean {
  * machine with an authenticated `gh` needs no extra relay env to bind the PR
  * and evaluate the merge gate. Anything unreadable stays undefined (fail
  * closed) — auto detection never invents a reader.
+ *
+ * ISH-1132: a rate-limited probe is NOT "not configured". The reader is returned
+ * with its backoff seeded, so the Factory can surface a typed, retryable
+ * `PROVIDER_RATE_LIMITED` and the daemon skips provider calls until the reset.
  */
 export async function githubReaderFromEnv(
   env: EnvLike = process.env,
@@ -516,15 +609,41 @@ export async function githubReaderFromEnv(
   if (!opts.auto || (mode !== "" && mode !== "auto")) return undefined;
   // "auto" or unset: only an AVAILABLE, AUTHENTICATED gh is a reader.
   const probe = await exec(["gh", "auth", "status"]);
-  return probe.ok ? new GhCliGitHub(exec) : undefined;
+  const probeLimit = providerRateLimitFromExec(probe, { provider: "github" });
+  if (probeLimit) {
+    const gh = new GhCliGitHub(exec);
+    gh.noteRateLimit(probeLimit);
+    return gh;
+  }
+  if (probe.ok) return new GhCliGitHub(exec);
+  // A failed auth status may be the known rate-limit misreport. Probe the
+  // non-consuming rate_limit endpoint before concluding "not configured".
+  const exhausted = await probeGithubRateLimit(exec);
+  if (exhausted) {
+    const gh = new GhCliGitHub(exec);
+    gh.noteRateLimit(exhausted);
+    return gh;
+  }
+  return undefined;
+}
+
+/**
+ * The `gh`-authenticated login plus any rate-limit evidence from the same read.
+ * A failed `api user` is otherwise indistinguishable from a bad credential.
+ */
+export async function ghAuthenticatedLoginResult(
+  exec: Exec = defaultExec
+): Promise<{ login: string | null; rateLimit: ProviderRateLimitState | null }> {
+  const r = await exec(["gh", "api", "user", "--jq", ".login"]);
+  const rateLimit = providerRateLimitFromExec(r, { provider: "github" });
+  if (!r.ok) return { login: null, rateLimit };
+  const login = r.stdout.trim();
+  return { login: /^[A-Za-z0-9-]+$/.test(login) ? login : null, rateLimit: null };
 }
 
 /** The `gh`-authenticated login, or null (read-only GET `api user`). */
 export async function ghAuthenticatedLogin(exec: Exec = defaultExec): Promise<string | null> {
-  const r = await exec(["gh", "api", "user", "--jq", ".login"]);
-  if (!r.ok) return null;
-  const login = r.stdout.trim();
-  return /^[A-Za-z0-9-]+$/.test(login) ? login : null;
+  return (await ghAuthenticatedLoginResult(exec)).login;
 }
 
 /**
@@ -609,7 +728,40 @@ export async function nativeReviewDepsFromEnv(
   if (grant !== "1" && opts.defaultGrant !== true) return undefined;
   const github = await githubReaderFromEnv(env, exec, { auto: opts.autoGithub === true });
   if (!github) return undefined;
-  const author = (env.RELAY_REVIEW_AUTHOR ?? "").trim() || (opts.autoAuthor ? await ghAuthenticatedLogin(exec) : null);
+  const authorEnv = (env.RELAY_REVIEW_AUTHOR ?? "").trim();
+  // A rate-limited auth probe already proves the reader is configured; do not
+  // spend another `gh api user` call just to fail again.
+  const probeRateLimit = github.rateLimit?.() ?? null;
+  if (probeRateLimit) {
+    return {
+      reader: github,
+      github,
+      author: authorEnv,
+      allowedTools: "Read Grep Glob Bash",
+      rateLimited: probeRateLimit,
+    };
+  }
+  let author = authorEnv;
+  let authorRateLimit: ProviderRateLimitState | null = null;
+  if (!author && opts.autoAuthor) {
+    const login = await ghAuthenticatedLoginResult(exec);
+    author = login.login ?? "";
+    authorRateLimit = login.rateLimit;
+  }
+  // ISH-1132: a rate-limited (but authenticated) gh is a retryable provider
+  // condition, not "native review not configured". Carry the typed state so the
+  // Factory returns PROVIDER_RATE_LIMITED instead of
+  // FACTORY_NATIVE_REVIEW_REQUIRED.
+  const rateLimited = github.rateLimit?.() ?? authorRateLimit;
+  if (rateLimited) {
+    return {
+      reader: github,
+      github,
+      author,
+      allowedTools: "Read Grep Glob Bash",
+      rateLimited,
+    };
+  }
   if (!author) return undefined;
   const token = env.RELAY_REVIEW_GH_TOKEN ?? env.GH_TOKEN;
   return {

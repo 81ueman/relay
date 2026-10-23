@@ -53,6 +53,9 @@ describe("ISH-1125: daemon shutdown with the provider poll enabled", () => {
         codeChange: true,
         prUrl: `https://github.com/${REPO}/pull/60`,
       });
+      // ISH-1132: no live Run and not in review would make the Task ineligible
+      // for a provider poll; put this fixture in review so the PR read runs.
+      db.query(`UPDATE tasks SET phase = 'review', state = 'review' WHERE issue_id = 'ISH-1125-SIGTERM'`).run();
       db.close();
       db = null;
 

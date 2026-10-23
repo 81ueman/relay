@@ -708,7 +708,7 @@ describe("round 2: the merge gate is reachable in normal flows", async () => {
     acceptTask(db, id, "integ");
   }
 
-  test("accept -> merge: a done, unmerged task is still polled and credited", async () => {
+  test("ISH-1132: an accepted (done) task is terminal and is NEVER polled again", async () => {
     const t = intakeTask(db, {
       provider: "github", issueId: "o/r#40", codeChange: true, headSha: FULL, checks: [CHECK],
       prUrl: "https://github.com/o/r/pull/1", prRepo: "o/r",
@@ -716,14 +716,24 @@ describe("round 2: the merge gate is reachable in normal flows", async () => {
     await toAccepted(t.id);
     expect(getTask(db, t.id)!.state).toBe("done");
     expect(getTask(db, t.id)!.merged_at).toBeNull();
-    expect(providerBoundTasks(db).some((x) => x.id === t.id)).toBe(true); // done+unmerged still polled
+    // done (accepted) is terminal: it leaves the provider-poll candidate set.
+    expect(providerBoundTasks(db).some((x) => x.id === t.id)).toBe(false);
 
-    const gh = new FakeGitHub();
-    gh.putPullRequest(githubViewAt(1, FULL, "merged"));
+    let calls = 0;
+    const gh: GitHubReadOnly = {
+      name: "counting",
+      readOnly: true,
+      getPullRequest: () => {
+        calls++;
+        return githubViewAt(1, FULL, "merged");
+      },
+      findPullRequestForBranch: () => null,
+      listComments: () => [],
+    };
     const actions = await reconcileProviderBound(db, { github: gh });
-    expect(actions).toContain(`merged:${t.id}`);
-    expect(getTask(db, t.id)!.merged_at).not.toBeNull();
-    expect(providerBoundTasks(db).some((x) => x.id === t.id)).toBe(false); // merged -> no longer polled
+    expect(calls).toBe(0);
+    expect(actions).toEqual([]);
+    expect(getTask(db, t.id)!.merged_at).toBeNull();
   });
 
   test("merge -> accept: a merge observed in integration is credited, accept still completes", async () => {
@@ -1026,6 +1036,9 @@ describe("ISH-1129: shutdown interrupts the provider poll between Tasks", () => 
         prUrl: `https://github.com/o/r/pull/${2000 + i}`,
       });
     }
+    // ISH-1132: the poll only considers a live Run or review/merge_ready/
+    // integration. These fixtures have no Run, so put them in review.
+    db.query(`UPDATE tasks SET phase = 'review', state = 'review' WHERE provider = 'test'`).run();
     const ac = new AbortController();
     let calls = 0;
     const gh: GitHubReadOnly = {

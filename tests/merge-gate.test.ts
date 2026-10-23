@@ -452,6 +452,7 @@ describe("merge gate: gathering the facts + the daemon pass (read-only)", async 
   });
 
   test("a conflict raises IntegrationRequired ONCE per (task, head), never merging", async () => {
+    process.env.RELAY_PROVIDER_POLL_MS = "0"; // idempotence, not the poll budget
     const gh = new FakeGitHub();
     gh.putPullRequest(view({ mergeable: "conflicting" }));
     gh.putChecks({ repo: "o/r", number: 1 }, HEAD, CHECKS);
@@ -482,13 +483,18 @@ describe("merge gate: gathering the facts + the daemon pass (read-only)", async 
     expect(d.action).toBe("none");
   });
 
-  test("mergeGateCandidates includes merge_ready and a done-but-unmerged PR task", async () => {
+  test("mergeGateCandidates includes merge_ready and excludes every terminal task (ISH-1132)", async () => {
     const t = intake("o/r#5");
     toMergeReady(t.id);
     expect(mergeGateCandidates(db).map((x) => x.id)).toContain(t.id);
-    // An internally accepted-but-unmerged task stays a candidate.
+    // An internally accepted-but-unmerged task is TERMINAL: it must no longer
+    // spend provider calls on every daemon tick.
     db.query(`UPDATE tasks SET state = 'done', accepted_at = 1 WHERE id = ?`).run(t.id);
-    expect(mergeGateCandidates(db).map((x) => x.id)).toContain(t.id);
+    expect(mergeGateCandidates(db).map((x) => x.id)).not.toContain(t.id);
+    db.query(`UPDATE tasks SET state = 'cancelled' WHERE id = ?`).run(t.id);
+    expect(mergeGateCandidates(db).map((x) => x.id)).not.toContain(t.id);
+    db.query(`UPDATE tasks SET state = 'failed' WHERE id = ?`).run(t.id);
+    expect(mergeGateCandidates(db).map((x) => x.id)).not.toContain(t.id);
   });
 
   test("boundPrRef falls back to a PR found by branch", async () => {

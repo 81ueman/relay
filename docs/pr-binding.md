@@ -87,8 +87,11 @@ mismatch fails closed too — Relay never overwrites it.
 
 ## Fail-closed rules
 
-- A **moved** PR head (`HEAD_MOVED`), an **unreadable** provider/PR
-  (`PROVIDER_UNREADABLE`/`PR_UNREADABLE`), a **different/fork repo**
+- A **rate-limited** provider (`PROVIDER_RATE_LIMITED`) is typed and retryable:
+  it is NOT a "PR unreadable"/"provider not configured" verdict, and binding
+  succeeds after the reported reset. A **moved** PR head (`HEAD_MOVED`), an
+  **unreadable** provider/PR (`PROVIDER_UNREADABLE`/`PR_UNREADABLE`), a
+  **different/fork repo**
   (`REPO_CHANGED` — the PR's head branch must be in the Task's own repo, never a
   fork), a **non-open** PR (`PR_NOT_OPEN`), a **missing/non-full produced commit**
   (`NO_PRODUCED_HEAD`), a caller-supplied head that is not the produced commit

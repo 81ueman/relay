@@ -1,5 +1,6 @@
 import type { Database } from "bun:sqlite";
 import { logEvent } from "./events";
+import type { ProviderRateLimitState } from "./provider-rate-limit";
 import { recordRunOwnPolledHead } from "./run-heads";
 import type { Task } from "./schema";
 import { isTerminalTaskState } from "./schema";
@@ -91,7 +92,18 @@ export interface CommentView {
  */
 export type ProviderRead<T> = T | Promise<T>;
 
-export interface GitHubReadOnly {
+/**
+ * ISH-1132: a reader MAY carry a rate-limit backoff. When it does, callers can
+ * skip provider reads entirely until the reported reset instead of treating the
+ * exhaustion as an unreadable/not-configured provider. Optional, so in-memory
+ * fakes and older readers keep working unchanged.
+ */
+export interface RateLimitAware {
+  /** The active rate-limit backoff, or null when reads may proceed. */
+  rateLimit?(): ProviderRateLimitState | null;
+}
+
+export interface GitHubReadOnly extends RateLimitAware {
   readonly name: string;
   readonly readOnly: true;
   getPullRequest(ref: PrRef): ProviderRead<PrView | null>;
@@ -158,6 +170,12 @@ export interface NativeReviewDeps {
   spawnEnv?: Record<string, string>;
   /** The reviewer's allowedTools; must include a shell so it can run `gh`. */
   allowedTools?: string;
+  /**
+   * ISH-1132: detection reached an authenticated-but-rate-limited `gh`. This is
+   * NOT "native review not configured": the Factory surfaces a typed retryable
+   * `PROVIDER_RATE_LIMITED` instead of `FACTORY_NATIVE_REVIEW_REQUIRED`.
+   */
+  rateLimited?: ProviderRateLimitState;
 }
 
 export interface IssueView {
@@ -167,7 +185,7 @@ export interface IssueView {
   updatedAt: string;
 }
 
-export interface LinearReadOnly {
+export interface LinearReadOnly extends RateLimitAware {
   readonly name: string;
   readonly readOnly: true;
   getIssue(id: string): ProviderRead<IssueView | null>;
@@ -192,7 +210,7 @@ export interface CheckRunView {
  * result can never be credited to a moved HEAD. A failed read returns `null`
  * ("unknown"), which the gate treats as NOT_RUN — never as "no checks, pass".
  */
-export interface ChecksReadOnly {
+export interface ChecksReadOnly extends RateLimitAware {
   readonly name: string;
   readonly readOnly: true;
   listChecks(ref: PrRef, headSha: string): ProviderRead<CheckRunView[] | null>;
