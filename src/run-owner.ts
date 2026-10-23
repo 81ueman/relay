@@ -42,7 +42,7 @@ export function findLiveRunFor(
 /** How long one local `git merge-base` fence probe may take. */
 const ANCESTRY_TIMEOUT_MS = 5000;
 
-function isSha(value: string | null | undefined): value is string {
+export function isSha(value: string | null | undefined): value is string {
   // A commit id, never an option or ref: validate before handing it to git.
   return typeof value === "string" && /^[0-9a-f]{4,64}$/i.test(value);
 }
@@ -95,10 +95,21 @@ export function runHeadFenceRepos(run: Pick<Run, "cwd">): string[] {
  * of the Run's produced head. A head from a different writer — before the base,
  * off the produced history, or ahead of the produced head — is still refused.
  *
+ * ISH-1128 adds one more OWN-head case: a worker may AMEND/REBASE the commit it
+ * already pushed and force-push the new head. The superseded commit is not an
+ * ancestor of the produced head, so the lineage proof above cannot accept it,
+ * yet the provider poll may have bound it onto the Task before the force-push.
+ * `observedOwnHeads` carries the heads the poll recorded for THIS Run while it
+ * was live (see `recordRunOwnPolledHead` in `run-heads.ts`); accepting them is
+ * safe because the poll only records a head when the Run's own worktree
+ * provably held it. A foreign writer's head is never in that set.
+ *
  * The heads a Run may therefore legitimately find on the Task are:
  *   - the head it started at (the Task did not move),
- *   - the head it produced (the poll saw this Run's own latest push), or
- *   - an intermediate commit between them (the poll saw an earlier own push).
+ *   - the head it produced (the poll saw this Run's own latest push),
+ *   - an intermediate commit between them (the poll saw an earlier own push), or
+ *   - a head this Run itself force-pushed earlier and then amended away
+ *     (observed during the Run; ISH-1128).
  * Any OTHER bound head means the Task moved under the Run and is refused; a
  * NULL Task head adopts the produced head, as before. No `repos` means only the
  * two exact heads can be proven, so the fence fails closed.
@@ -106,12 +117,16 @@ export function runHeadFenceRepos(run: Pick<Run, "cwd">): string[] {
 export function taskHeadOvertakenByOtherWriter(
   taskHead: string | null,
   run: Pick<Run, "base_head_sha" | "head_sha">,
-  repos: readonly string[] = []
+  repos: readonly string[] = [],
+  observedOwnHeads: readonly string[] = []
 ): boolean {
   if (taskHead === null) return false;
   const base = run.base_head_sha ?? null;
   const produced = run.head_sha ?? null;
   if (taskHead === base || taskHead === produced) return false;
+  // ISH-1128: the poll observed this exact head in the Run's own worktree while
+  // the Run was live, before the worker amended it away.
+  if (observedOwnHeads.includes(taskHead)) return false;
   // An intermediate head is provable only when both ends of the lineage exist.
   if (!isSha(base) || !isSha(produced)) return true;
   for (const repo of repos) {

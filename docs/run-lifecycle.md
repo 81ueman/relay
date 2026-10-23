@@ -259,18 +259,56 @@ Task/phase/attempt/**generation**/branch/HEAD. It refuses (never advances):
   event);
 - a submission naming a different task/phase/attempt/branch/HEAD, or a **live**
   Task whose head/branch/phase/attempt has moved since the Run started
-  (`base_head_sha` is the staleness fence; the Run's own produced `head_sha` and
-  an intermediate commit on its history — base ancestor of head ancestor of
-  produced — are accepted because the provider poll may bind the Run's own
-  pushed PR head mid-Run, and a Run may push more than once between polls —
-  ISH-1125);
+  (`base_head_sha` is the staleness fence; the Run's own produced `head_sha`, an
+  intermediate commit on its history — base ancestor of head ancestor of
+  produced — and an own head the worker pushed then **amended/rebased and
+  force-pushed away** are accepted because the provider poll may bind the Run's
+  own pushed PR head mid-Run, a Run may push more than once between polls, and
+  the worker is allowed to amend its own commit — ISH-1125/ISH-1128);
 - a duplicate `TaskSubmitted` for the same `(task, phase, attempt)`.
+
+The amended-away head is NOT on the base→produced lineage, so it cannot be
+proved by ancestry. While a Run is LIVE, the read-only provider poll records
+each PR head it binds in `run_observed_heads` **only when the Run's own
+worktree provably held that commit** (current HEAD, or its HEAD reflog) and the
+PR is on the Run's own branch. The submit fence accepts a Task head recorded
+this way; a head a different writer pushed is never attributed to the Run and
+is still refused. A Task with no linked head still adopts the produced head.
 
 A review is an **independent** principal (`REVIEWER_ROLE`, or the review claim)
 and may not be the worker that recorded the submission — the Run submits as
 `dsh-run:<run-id>`, never as the reviewer. VERIFY runs on the **changed worktree**
 at the recorded HEAD (`git rev-parse HEAD` must equal `task.head_sha`); a pass in
 the parent/main checkout is never substituted.
+
+### Recovering a Task parked by the stale-HEAD fence (ISH-1128)
+
+Before ISH-1128, a Run that amended its own pushed head was refused as stale and
+the Factory parked the Task (`blocked_human`) on the NEXT attempt. That parked
+work is already on the PR; do **not** re-implement it. The coordinator resumes
+it at the parked Run's produced head:
+
+```sh
+# 1. Find the parked Run and its PRODUCED head (an exited Run; not the Task's
+#    stale bound head). Confirm the PR's live head equals it.
+relay run list --task <task-id> --json
+relay run show <run-id> --json
+gh pr view <owner/repo#n> --json headRefOid
+# 2. Release the park and claim the fresh attempt.
+relay unblock <task-id>
+relay claim <task-id> --worker <coordinator-worker>   # add --any-role if the role differs
+# 3. Record the parked Run's produced head as this attempt's submission. This
+#    advances implement -> verify WITHOUT launching another coding Run; VERIFY
+#    and review then judge that same head.
+relay result submit <task-id> --head <produced-head> \
+  --evidence "recovered from parked run <run-id>" --worker <coordinator-worker>
+```
+
+`--head` is deliberately the parked Run's produced head, so the recovery does
+not depend on the Task row having caught up to it yet. The duplicate-result and
+phase guards still apply: this works only for an `implement` Task whose current
+attempt has no `TaskSubmitted` yet (the stale Run never recorded one). A Task
+parked for any other reason keeps its ordinary `relay unblock` path.
 
 ## Safe workspace cleanup (evidence-retaining)
 
