@@ -410,7 +410,7 @@ describe("reviewBlockedReason (ISH-830e: a blocked review is never an empty reas
 });
 
 describe("buildReviewBrief (ISH-830e: VERIFY evidence is in the brief)", () => {
-  test("renders the ALREADY-RUN verify result with the check output tail, and says not to re-run", () => {
+  test("renders the ALREADY-RUN verify result with the check output tail, and asks for focused execution", () => {
     const id = newTask();
     const task = getTask(db, id)!;
     const brief = buildReviewBrief(db, task, {
@@ -433,7 +433,11 @@ describe("buildReviewBrief (ISH-830e: VERIFY evidence is in the brief)", () => {
     expect(brief).toContain("Outcome: `pass`");
     expect(brief).toContain("- noop (`true`): pass (exit 0)");
     expect(brief).toContain("NOS_CHECK_DONE");
-    expect(brief).toContain("do NOT re-run");
+    // ISH-1135: the blanket prohibition is replaced by a narrow one plus the
+    // focused-execution expectation.
+    expect(brief).not.toContain("do NOT re-run");
+    expect(brief).toContain("The required checks below already passed; do not re-run them wholesale.");
+    expect(brief).toContain("You are expected to execute the focused tests, commands or variants");
     // No verify evidence -> no VERIFY section (backward compatible).
     expect(buildReviewBrief(db, task, { head: "a".repeat(40), worktree: "/tmp/review-wt" })).not.toContain(
       "## Mechanical VERIFY"

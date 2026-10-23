@@ -24,6 +24,7 @@ import {
   runHeadlessReview,
   type ReviewerSpawner,
   type ReviewerVerdict,
+  type ReviewRubric,
   type ReviewVerifyEvidence,
 } from "./reviewer-runner";
 import { checkMergeGate, type MergeGateDecision, type MergeGateDeps } from "./merge-gate";
@@ -103,6 +104,12 @@ export interface FactoryDeps {
   reviewerSpawner?: ReviewerSpawner;
   reviewerCommand?: string;
   reviewerModel?: string;
+  /**
+   * ISH-1135: the repo-owned review rubric read at the reviewed HEAD. Unset ->
+   * resolved per reviewed repository (`RELAY_REVIEW_RUBRICS` /
+   * `RELAY_REVIEW_RUBRIC`) or the default ishiul skill layout.
+   */
+  reviewRubric?: ReviewRubric;
   reviewerWorker?: string;
   integratorWorker?: string;
   /** Head-pinned merge-gate providers (read-only; default none). */
@@ -1079,9 +1086,10 @@ async function runFactoryTaskInner(
             model: deps.reviewerModel,
             reviewerWorker,
             reviewWorktree,
+            ...(deps.reviewRubric ? { reviewRubric: deps.reviewRubric } : {}),
             nativeReview: deps.nativeReview,
-            // ISH-830e: give the host reviewer the VERIFY evidence so it can
-            // judge the code without re-running the lab. Sourced from the
+            // ISH-830e: give the host reviewer the VERIFY evidence so it need
+            // not re-run the required checks wholesale. Sourced from the
             // DURABLE VerificationResult row (not process memory), so a resumed
             // Factory still carries it.
             ...(() => {

@@ -22,8 +22,34 @@ merged, NOT Linear Done).
   disposable detached review checkout where one is configured
   (`reviewWorktreeRoot`; the Factory's CLI always sets it). The brief also carries
   the mechanical VERIFY result already produced in the Task worktree, so the host
-  reviewer can judge the code without re-running the lab. The Gateway and reviewer
-  deliberately use different models/harnesses.
+  reviewer need not re-run the required checks **wholesale**; it is still expected
+  to run the focused variants the diff's blast radius and the repo rubric call
+  for, and to say which it ran. The Gateway and reviewer deliberately use
+  different models/harnesses.
+
+## Repo rubric and focused execution (ISH-1135)
+
+The reviewer brief tells the reviewer to **read the repository's own rubric at
+the reviewed HEAD** before judging (`src/reviewer-runner.ts`
+`## Repo review rubric — READ THIS FIRST`). The default path is the ishiul skill
+layout, `.agents/skills/independent-pr-review/references/rubric.md` plus
+`references/output-contract.md`; the path is configurable per repository with
+`RELAY_REVIEW_RUBRICS` (a JSON object keyed by `owner/name`, bare repo name or
+`default`), with `RELAY_REVIEW_RUBRIC` / `RELAY_REVIEW_OUTPUT_CONTRACT`, or with
+`--review-rubric` / `--review-output-contract` for one `relay run factory`
+invocation. The file is checked in the **reviewed commit** (not the mutable
+working tree); when it is missing at that HEAD the brief says so explicitly and
+tells the reviewer not to substitute another revision's rubric.
+
+Relay's structured verdict JSON remains the machine contract. The rubric's
+severity buckets map onto it: `Act on` → `blocker`/`major`; `Consider`/`Noted` →
+non-blocking `minor`; `Dismissed` → non-blocking `nit`. Non-blocking findings are
+**kept** in `findings` (the ISH-1086 read path), never dropped. The VERIFY section
+says the required checks already passed and not to re-run them wholesale; the
+separate `## Focused execution` section expects the reviewer to run the focused
+tests, commands or variants the blast radius calls for (other address family,
+sibling vendor, deleted path re-sweep) and to name them in `summary`, or to write
+an explicit `no execution needed because …`.
 
 ## Pipeline and where it lives
 

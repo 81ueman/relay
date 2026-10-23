@@ -402,6 +402,22 @@ It is sequencing only — every transition reuses the ordinary durable results
 `submitPhase`), so a `dsh` exit 0 / `final`, a missing/malformed reviewer result,
 a foreign/stale HEAD, or a non-independent reviewer **cannot advance** the Task.
 The Factory never pushes, merges, accepts, or writes a provider/Linear.
+**ISH-1135:** the review brief points the reviewer at the repository's OWN
+review rubric at the reviewed HEAD — by default
+`.agents/skills/independent-pr-review/references/rubric.md` plus
+`references/output-contract.md`, configurable per repo with
+`RELAY_REVIEW_RUBRICS` (JSON keyed by `owner/name`, bare repo name or `default`),
+`RELAY_REVIEW_RUBRIC` / `RELAY_REVIEW_OUTPUT_CONTRACT`, or
+`--review-rubric` / `--review-output-contract`. The file is checked in the
+reviewed COMMIT (not a mutable working tree); a missing rubric is stated in the
+brief, never silently skipped. Relay's structured JSON remains the machine
+contract: rubric `Act on` maps to `blocker`/`major`, while `Consider`/`Noted`
+become non-blocking `minor` and `Dismissed` becomes non-blocking `nit`, all kept
+in `findings` (the ISH-1086 read path). The VERIFY section says the required
+checks already passed and not to re-run them **wholesale**; the reviewer is
+expected to execute the focused tests/commands/variants the diff's blast radius
+(and the rubric) call for and name them in `summary`, or write an explicit
+`no execution needed because …`.
 **ISH-1087:** the dsh worker opens the PR (title `ISH-<n>: <what>`, body from the
 target repo's `.github/pull_request_template.md` with a `## Documentation Impact`)
 before its Run ends; the Factory records the repo at intake, **always** binds the
