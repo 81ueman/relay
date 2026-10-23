@@ -2,21 +2,13 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
-// ISH-845: the `network-lab` skill has exactly one source of truth and one
-// installed copy. The real dsh sandbox cannot see this repo, so the Coding Kit
-// embeds a copy at the path dsh 0.2.1-rc.2 actually scans for user skills
-// (`$AGENTS_HOME/skills` → `~/.agents/skills`); this test fails if the two
-// drift, so the installed skill is always the reviewed one.
+// ISH-845: the `network-lab` skill has exactly one source of truth:
+// `skills/network-lab/SKILL.md`.
 
 const repo = join(import.meta.dir, "..");
 const source = join(repo, "skills", "network-lab", "SKILL.md");
-const installed = join(repo, "sandbox", "coding-kit", "files", "home", ".agents", "skills", "network-lab", "SKILL.md");
 
 describe("network-lab skill", () => {
-  test("the Coding Kit copy is byte-for-byte the repo skill", () => {
-    expect(readFileSync(installed, "utf8")).toBe(readFileSync(source, "utf8"));
-  });
-
   test("frontmatter has the name/description dsh requires", () => {
     const body = readFileSync(source, "utf8");
     expect(body.startsWith("---\n")).toBe(true);

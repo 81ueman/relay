@@ -1,17 +1,16 @@
 import type { Database } from "bun:sqlite";
-import { dirname, join } from "node:path";
-import { defaultDbPath, now, projectRoot } from "./db";
+import { join } from "node:path";
+import { now, projectRoot } from "./db";
 import { logEvent } from "./events";
 import { getTask, claimTask } from "./tasks";
 import { ensureHeadlessWorker, HEADLESS_AGENT_KIND } from "./workers";
 import { INTEGRATOR_ROLE, REVIEWER_ROLE } from "./schema";
 import type { Run, RunState, Task, TaskState } from "./schema";
 import { isCanonicalToken, processPgid, spawnIdentityToken } from "./proc-identity";
-import { defaultRunner, type CheckSpec, type CommandRunner } from "./verify";
-import { defaultVerifyTarget, type VerifyTarget } from "./sandbox-verify";
+import { defaultRunner, type CommandRunner } from "./verify";
 import { runMechanicalVerification, submitPhase, taskChecks, blockImplementFailure, recordImplementRecovery, linkTask } from "./workflow";
 import { findTaskResult, isResultWriteError, markTaskBlockedInternal } from "./results";
-import { acceptRunSubmission, getRun, type DshSpawner } from "./dsh-runner";
+import { acceptRunSubmission, getRun } from "./dsh-runner";
 import { launchTaskRun, type LaunchRunOptions } from "./run-lifecycle";
 import {
   classifyImplementFailure,
@@ -20,15 +19,6 @@ import {
   terminalImplementRunSignature,
   type ImplementRecoveryDecision,
 } from "./implement-recovery";
-import { getSandbox, SANDBOX_ERROR, type SbxCli } from "./sandbox";
-import {
-  acceptSandboxSubmission,
-  hostSandboxClientAlive,
-  launchTaskSandboxRun,
-  sweepOrphanedSandboxRuns,
-  type LaunchSandboxOptions,
-  type LaunchedSandboxRun,
-} from "./sandbox-lifecycle";
 import {
   DEFAULT_REVIEWER_WORKER,
   runHeadlessReview,
@@ -102,11 +92,6 @@ export interface FactoryDeps {
   dshEnv?: Record<string, string>;
   /** Mechanical verify runner (default: the real command runner). */
   verifyRunner?: CommandRunner;
-  /**
-   * ISH-829: choose the VERIFY target for a Task (Coding Sandbox vs host). Null
-   * falls back to `verifyRunner` in the Task worktree.
-   */
-  verifyTarget?: (db: Database, task: Task, checks: CheckSpec[]) => VerifyTarget | null;
   /** The independent reviewer process (default: real `claude`); fake in tests. */
   reviewerSpawner?: ReviewerSpawner;
   reviewerCommand?: string;
@@ -131,14 +116,6 @@ export interface FactoryDeps {
    * live worktree. Unset -> existing behavior (the writer's worktree).
    */
   reviewWorktreeRoot?: string;
-  /**
-   * ISH-878: the `sbx` CLI used by the Sandbox-backed IMPLEMENT/FIX path
-   * (default: the real `sbx`). Production always reuses ISH-828's
-   * `launchTaskSandboxRun`; this is a test/operator seam.
-   */
-  sandboxCli?: SbxCli;
-  /** ISH-878: test seam for the `sbx exec … dsh` process of a Sandbox Run. */
-  sandboxSpawner?: DshSpawner;
   /**
    * ISH-883: post a NATIVE GitHub PR review and read it back for HEAD-bound
    * acceptance. Undefined -> the reviewer keeps the local structured-verdict
@@ -469,11 +446,7 @@ export function markRunOrphan(db: Database, runId: string, reason: string, at = 
   return true;
 }
 
-/**
- * The result of one IMPLEMENT step. `run` is null when the Task could not even
- * be bound to an execution target (a removed/failed Coding Sandbox): the Factory
- * fails closed WITHOUT launching anything (never a host fallback).
- */
+/** The result of one IMPLEMENT step. */
 interface ImplementResult {
   run: Run | null;
   producedHead: string | null;
@@ -481,41 +454,10 @@ interface ImplementResult {
 }
 
 /**
- * ISH-878: how the Factory EXECUTES an IMPLEMENT/FIX attempt for a Task.
- *   - "sandbox" — the Task has a durable Coding Sandbox binding: run INSIDE it
- *     via ISH-828's `launchTaskSandboxRun`;
- *   - "host"    — no sandbox row at all (a genuinely legacy/unmigrated Task):
- *     keep ISH-760's host-worktree behaviour;
- *   - "refused" — a sandbox row exists but is unusable (removed/failed): FAIL
- *     CLOSED. There is deliberately NO implicit Sandbox -> host fallback, which
- *     is exactly the execution gap ISH-878 closes.
- */
-export type ImplementTarget = { kind: "sandbox" } | { kind: "host" } | { kind: "refused"; reason: string };
-
-export function implementTarget(db: Database, task: Task): ImplementTarget {
-  const sandbox = getSandbox(db, task.id);
-  if (!sandbox) return { kind: "host" };
-  if (sandbox.state === "removed") {
-    return {
-      kind: "refused",
-      reason: `${SANDBOX_ERROR}: task ${task.id} Coding Sandbox ${sandbox.name} was removed; refusing to fall back to the host worktree`,
-    };
-  }
-  if (sandbox.state === "failed") {
-    return {
-      kind: "refused",
-      reason: `${SANDBOX_ERROR}: task ${task.id} Coding Sandbox ${sandbox.name} is failed; refusing to fall back to the host worktree`,
-    };
-  }
-  return { kind: "sandbox" };
-}
-
-/**
- * One implement step: dispatch on the Task's durable execution binding, adopt a
- * live Run for this phase/attempt (never start a second writer on restart), else
- * launch ONE disposable Run (inside the Coding Sandbox, or the host worktree for
- * a legacy Task); wait for it to reach a terminal state; refuse unless it is a
- * clean exit 0 that produced a NEW commit; then advance ONLY via the structured
+ * One implement step: adopt a live Run for this phase/attempt (never start a
+ * second writer on restart), else launch ONE disposable Run in the Task
+ * worktree; wait for it to reach a terminal state; refuse unless it is a clean
+ * exit 0 that produced a NEW commit; then advance ONLY via the structured
  * submission.
  */
 async function implementOnce(
@@ -523,12 +465,6 @@ async function implementOnce(
   task: Task,
   deps: FactoryDeps
 ): Promise<ImplementResult> {
-  const target = implementTarget(db, task);
-  if (target.kind === "refused") {
-    logEvent(db, { source: "factory", taskId: task.id, type: "factory.sandbox_unusable", payload: { reason: target.reason } });
-    return { run: null, producedHead: null, error: `${CODING_FAILED}: ${target.reason}` };
-  }
-
   // ISH-1012: a TERMINAL Run for this attempt CLOSES the attempt. Reuse it (a
   // clean unsubmitted Run is finished through the normal submission fence) and
   // NEVER launch a second writer for the same attempt on restart/re-entry.
@@ -541,10 +477,6 @@ async function implementOnce(
       payload: { runId: closed.id, state: closed.state, attempt: closed.attempt },
     });
     return finishTerminalAttempt(db, closed, deps);
-  }
-
-  if (target.kind === "sandbox") {
-    return await implementInSandbox(db, task, deps);
   }
 
   const existing = latestRun(db, task.id, "implement", task.attempt);
@@ -661,9 +593,7 @@ async function implementOnce(
 /**
  * The shared tail of an IMPLEMENT step: a process exit is NOT a submission — the
  * Run must be a clean `exit 0` that produced a NEW commit, and the advance
- * happens ONLY through the structured submission. A Sandbox Run submits through
- * `acceptSandboxSubmission` (the ISH-760 fence plus the Sandbox identity/HEAD
- * fence); a host Run through `acceptRunSubmission`.
+ * happens ONLY through the structured submission (`acceptRunSubmission`).
  */
 function finishImplement(db: Database, run: Run, deps: FactoryDeps): ImplementResult {
   if (run.state !== "exited" || run.exit_code !== 0) {
@@ -677,15 +607,14 @@ function finishImplement(db: Database, run: Run, deps: FactoryDeps): ImplementRe
     };
   }
   try {
-    if (run.sandbox_name) acceptSandboxSubmission(db, { runId: run.id });
-    else acceptRunSubmission(db, { runId: run.id });
+    acceptRunSubmission(db, { runId: run.id });
   } catch (e) {
     // ISH-904: a failed RESULT WRITE is not a submission refusal. Rethrow it so
     // the Factory's outer catch parks the Task `blocked_internal` with the real
     // error instead of reporting a misleading SUBMIT_REFUSED/coding failure.
     if (isResultWriteError(e)) throw e;
-    // A refused submission (stale/superseded run, moved head/phase, sandbox
-    // mismatch) NEVER advances the Task; surface a fail-closed outcome.
+    // A refused submission (stale/superseded run, moved head/phase) NEVER
+    // advances the Task; surface a fail-closed outcome.
     return {
       run,
       producedHead: run.head_sha,
@@ -695,110 +624,11 @@ function finishImplement(db: Database, run: Run, deps: FactoryDeps): ImplementRe
   return { run, producedHead: run.head_sha, error: null };
 }
 
-/** ISH-878: the ISH-828 launch options for a Sandbox-backed IMPLEMENT/FIX run. */
-function sandboxRunOptions(deps: FactoryDeps): LaunchSandboxOptions {
-  return {
-    // `sbx create --clone` must run from the MAIN checkout (never a linked worktree).
-    source: deps.repo,
-    outputRoot: deps.outputRoot,
-    permissionMode: deps.permissionMode,
-    timeoutMs: deps.timeoutMs,
-    fastExitMs: deps.fastExitMs,
-    env: deps.dshEnv,
-    cli: deps.sandboxCli,
-    spawner: deps.sandboxSpawner,
-    // The host `dshBin` is deliberately NOT forwarded: inside the Sandbox the
-    // pinned `dsh` (ISH-869) is probed/installed by the lifecycle itself.
-  };
-}
-
-/**
- * ISH-878: adopt a still-live Sandbox IMPLEMENT Run after a restart/re-entry —
- * never start a second writer into the same clone.
- *
- * The recorded pid is the host `sbx exec` CLIENT; the in-VM dsh can outlive it.
- * Identity/signalling therefore reuses ISH-828's sweep: the Run is marked
- * terminal `failed` ONLY once the in-VM dsh is CONFIRMED gone, so the
- * single-writer fence is never released while a writer may still commit.
- */
-async function adoptLiveSandboxRun(db: Database, live: Run, deps: FactoryDeps): Promise<ImplementResult> {
-  logEvent(db, {
-    source: "factory",
-    taskId: live.task_id,
-    type: "factory.run_adopted",
-    payload: { runId: live.id, pid: live.pid, sandbox: live.sandbox_name },
-  });
-  if (!hostSandboxClientAlive(live)) {
-    // Scope the sweep to THIS adopted Run: a concurrent Task's just-inserted
-    // `starting` Run (pid still NULL) must never be swept from here.
-    sweepOrphanedSandboxRuns(db, { apply: true, cli: deps.sandboxCli, runId: live.id });
-    const r = getRun(db, live.id)!;
-    if (RUN_TERMINAL_STATES.has(r.state)) {
-      return {
-        run: r,
-        producedHead: r.head_sha,
-        error: `${CODING_FAILED}: orphaned sandbox run ${live.id}: ${r.error ?? "no live sbx exec client"}`,
-      };
-    }
-    return {
-      run: r,
-      producedHead: r.head_sha,
-      error: `${CODING_FAILED}: sandbox run ${live.id} still holds the single-writer fence (in-VM dsh not confirmed gone)`,
-    };
-  }
-  // The client is alive: bound the wait from the Run's OWN start + budget.
-  const runTimeoutMs = deps.timeoutMs ?? DEFAULT_RUN_TIMEOUT_MS;
-  const deadlineMs = (live.started_at || Date.now()) + runTimeoutMs;
-  const { run: waited, timedOut } = await waitRunBounded(db, live.id, deadlineMs);
-  if (timedOut) {
-    return {
-      run: waited,
-      producedHead: waited.head_sha,
-      error: `${CODING_FAILED}: adopted sandbox run ${live.id} exceeded its ${runTimeoutMs}ms budget (fence held for the ISH-828 sweep)`,
-    };
-  }
-  return { run: waited, producedHead: waited.head_sha, error: null };
-}
-
-/**
- * ISH-878: the Sandbox-backed IMPLEMENT/FIX path. Adopts the Task's live Sandbox
- * Run (no duplicate writer), else launches ONE disposable `dsh` INSIDE the SAME
- * durable Task Sandbox. A FIX is simply another call here: the sandbox mapping
- * is reused (new Run, inherited findings) — never a second Factory.
- */
-async function implementInSandbox(db: Database, task: Task, deps: FactoryDeps): Promise<ImplementResult> {
-  const existing = latestRun(db, task.id, "implement", task.attempt);
-  if (existing && isLive(existing) && existing.sandbox_name) {
-    const adopted = await adoptLiveSandboxRun(db, existing, deps);
-    if (adopted.error) return adopted;
-    return finishImplement(db, adopted.run!, deps);
-  }
-  let launched: LaunchedSandboxRun;
-  try {
-    launched = await launchTaskSandboxRun(db, task.id, sandboxRunOptions(deps));
-  } catch (e) {
-    // A Sandbox that cannot be created/probed is fail-closed: never a host fallback.
-    return { run: null, producedHead: null, error: `${CODING_FAILED}: ${e instanceof Error ? e.message : String(e)}` };
-  }
-  const run = await launched.handle.wait();
-  return finishImplement(db, run, deps);
-}
-
-/**
- * ISH-878: the DURABLE directory a Sandbox-backed Task's raw reviewer evidence is
- * written under. It mirrors the Run evidence root (`<control-plane>/runs`), so
- * the lifecycle's `outputRoot` and this agree — and a `task_results.evidence_ref`
- * never points into the temporary read-only review worktree.
- */
-function reviewEvidenceBase(deps: FactoryDeps, taskId: string): string {
-  return join(deps.outputRoot ?? join(dirname(defaultDbPath()), "runs"), taskId, "review");
-}
-
 /**
  * ISH-830e: the DURABLE mechanical VERIFY evidence for a review — read from the
  * `VerificationResult` row (SQLite is the only source of truth), never from
  * process memory, so a Factory resumed directly into `review` still hands the
- * host reviewer the sandbox result. Only a PASSING verify at the EXACT reviewed
+ * host reviewer the VERIFY result. Only a PASSING verify at the EXACT reviewed
  * head is used; anything else yields no VERIFY section (fail closed to the old
  * behaviour: the reviewer sees only the declared checks).
  */
@@ -890,8 +720,8 @@ async function runFactoryTaskInner(
   const reviewerWorker = deps.reviewerWorker ?? DEFAULT_REVIEWER_WORKER;
   const integratorWorker = deps.integratorWorker ?? DEFAULT_INTEGRATOR_WORKER;
   // ISH-1087: when a GitHub PR workflow is configured, the Task's repo may live
-  // only in the Factory's source checkout (a Sandbox-backed Task has no host
-  // worktree yet). Resolve it there; a purely local Factory keeps no fallback.
+  // only in the Factory's source checkout. Resolve it there; a purely local
+  // Factory keeps no fallback.
   const prSourceRepo = deps.repo ?? (deps.prBinding ? projectRoot() : null);
   // ISH-904: refuse a NON-code-change / phase-less Task UP FRONT — before any
   // worktree is created — with the one actionable instruction. The old path fell
@@ -920,10 +750,6 @@ async function runFactoryTaskInner(
       });
     }
   }
-  // ISH-829: default to the durable-Coding-Sandbox VERIFY target. It returns null
-  // for a Task with no sandbox row, so a worktree Task is unchanged; a
-  // sandbox-backed Task can never silently fall back to host `bash -lc`.
-  const resolveVerifyTarget = deps.verifyTarget ?? defaultVerifyTarget;
   // ISH-904: these principals are headless — register them `idle` (never
   // `starting`) so neither surface reports a permanent stuck attach.
   ensureHeadlessWorker(db, reviewerWorker, { role: REVIEWER_ROLE, agentKind: HEADLESS_AGENT_KIND });
@@ -1087,19 +913,13 @@ async function runFactoryTaskInner(
             steps,
           };
         }
-        // ISH-829/ISH-878: verify INSIDE the Task's Coding Sandbox when it has
-        // one. A Sandbox-backed Task has NO host worktree, so the target's in-VM
-        // clone path is the working directory; a legacy Task still requires its
-        // recorded worktree.
-        const target = resolveVerifyTarget(db, task, checks) ?? null;
-        const cwd = target?.cwd ?? task.worktree;
+        // Mechanical VERIFY runs in the Task's own worktree at its recorded HEAD.
+        const cwd = task.worktree;
         if (!cwd) return { taskId, outcome: "blocked", head: task.head_sha, attempts, gate: null, reason: "no worktree", steps };
         const v = await runMechanicalVerification(db, taskId, {
           checks,
-          runner: target?.runner ?? deps.verifyRunner ?? defaultRunner,
+          runner: deps.verifyRunner ?? defaultRunner,
           cwd,
-          headSha: target?.headSha,
-          headProbe: target?.headProbe,
         });
         if (current) current.verifyOutcome = v.outcome;
         if (v.stale) {
@@ -1121,8 +941,8 @@ async function runFactoryTaskInner(
       case "review": {
         // ISH-880/1087: BEFORE the review stage, bind the produced commit to a
         // real GitHub PR and require the PR's CURRENT remote head to equal it.
-        // This is the only place a Sandbox-produced commit becomes a PR; if the
-        // PR cannot be read, is unreadable/moved/unauthorized, or does not exist
+        // This is the only place a produced commit becomes a PR; if the PR
+        // cannot be read, is unreadable/moved/unauthorized, or does not exist
         // yet, the Factory BLOCKS and the reviewer never runs (never a fake
         // review_pass). The target repo is resolved from the live Task, so a
         // Task that records only a branch still binds the worker's PR.
@@ -1189,14 +1009,9 @@ async function runFactoryTaskInner(
             model: deps.reviewerModel,
             reviewerWorker,
             reviewWorktree,
-            // ISH-878: a Sandbox-backed Task has no host worktree, so pin the raw
-            // reviewer evidence to a DURABLE per-Task directory (the read-only
-            // review worktree is removed below — a recorded evidence_ref must not
-            // dangle).
-            evidenceBase: task.worktree ? undefined : reviewEvidenceBase(deps, taskId),
             nativeReview: deps.nativeReview,
-            // ISH-830e: give the host reviewer the sandbox VERIFY evidence so it
-            // can judge the code without re-running the lab. Sourced from the
+            // ISH-830e: give the host reviewer the VERIFY evidence so it can
+            // judge the code without re-running the lab. Sourced from the
             // DURABLE VerificationResult row (not process memory), so a resumed
             // Factory still carries it.
             ...(() => {

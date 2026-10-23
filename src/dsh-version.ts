@@ -1,12 +1,9 @@
 /**
- * ISH-869 — the ONE pinned dsh build, shared by BOTH headless Coding Worker
- * paths (the host `dsh-runner` and the in-sandbox `sandbox-lifecycle`).
+ * ISH-869 — the ONE pinned dsh build used by the headless Coding Worker.
  *
- * The pin must match `sandbox/coding-kit/spec.yaml`'s `npm i -g
- * @deepseek-ai/dsh@<version>`. A floating `latest`/`alpha`, a second 0.2.x code
- * path, or an old-version fallback is deliberately NOT introduced.
- * DeepSeek-V4.1-Flash-1017 requires dsh >= 0.2.1-rc.1; Relay pins the 2026-10-17
- * `0.2.1-rc.2` build.
+ * A floating `latest`/`alpha`, a second 0.2.x code path, or an old-version
+ * fallback is deliberately NOT introduced. DeepSeek-V4.1-Flash-1017 requires
+ * dsh >= 0.2.1-rc.1; Relay pins the 2026-10-17 `0.2.1-rc.2` build.
  */
 
 export const PINNED_DSH_VERSION = "0.2.1-rc.2";
@@ -23,9 +20,8 @@ export function isPinnedDsh(version: string | null, want = PINNED_DSH_VERSION): 
 }
 
 /**
- * `dsh --version` (first line) for a HOST executable, or null when the binary
- * cannot be run / exits non-zero. Used by the host `startDshRun` guard; the
- * sandbox path reads the version through `sbx exec` instead.
+ * `dsh --version` (first line) for a host executable, or null when the binary
+ * cannot be run / exits non-zero. Used by the `startDshRun` guard.
  */
 export function readDshVersion(bin: string): string | null {
   try {

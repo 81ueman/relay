@@ -87,8 +87,6 @@ export interface PrTargetOptions {
   repo?: string | null;
   /**
    * The Task workspace to read `origin` from (defaults to `task.worktree`).
-   * A Sandbox caller may pass the host source because the in-VM path is not
-   * readable from the host.
    */
   worktree?: string | null;
 }

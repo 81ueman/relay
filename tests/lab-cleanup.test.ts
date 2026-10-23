@@ -48,7 +48,7 @@ function newTask(): string {
   }).id;
 }
 
-/** Record that Relay handed this Task's owner id to the sandbox (as launch does). */
+/** Record that Relay assigned this Task's external Lab owner id. */
 function assignOwner(id: string): string {
   const owner = labOwnerId(getTask(db, id)!);
   logEvent(db, { source: "lab-cleanup", taskId: id, type: LAB_OWNER_ASSIGNED_EVENT, payload: { ownerId: owner } });

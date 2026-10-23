@@ -28,7 +28,6 @@ import {
 import { acceptTask, confirmMerged, intakeTask, recordReview, recordVerification, runMechanicalVerification, submitPhase, taskChecks } from "./workflow";
 import { requestRebase } from "./rebase";
 import { defaultRunner, type CheckSpec } from "./verify";
-import { sandboxVerifyTarget } from "./sandbox-verify";
 import { acceptRunSubmission, getRun, listRuns, startDshRun } from "./dsh-runner";
 import { formatDshEvent, readDshEvents } from "./dsh-events";
 import { parseRunFailureClass } from "./run-failure";
@@ -38,16 +37,6 @@ import {
   ensureTaskWorktree,
   launchTaskRun,
 } from "./run-lifecycle";
-import {
-  acceptSandboxSubmission,
-  applySandboxCleanup,
-  ensureTaskSandbox,
-  fetchSandboxHead,
-  launchTaskSandboxRun,
-  planSandboxCleanup,
-  sweepOrphanedSandboxRuns,
-} from "./sandbox-lifecycle";
-import { getSandbox as getTaskSandbox, listSandboxes } from "./sandbox";
 import { applyLabCleanup, planLabCleanup, type LabCleanupPlan } from "./lab-cleanup";
 import { factoryNativeReviewDepsFromEnv, operatorProviderDepsFromEnv } from "./provider-adapters";
 import { checkMergeGate, formatMergeGateDecision } from "./merge-gate";
@@ -134,12 +123,6 @@ Usage:
   relay run launch <task-id> [--timeout 30m] [--permission MODE] [--json]   # ensure worktree + pin brief + ONE dsh Run
   relay run factory <task-id> [--max-attempts N] [--dsh BIN] [--reviewer CMD] [--model M] [--permission MODE] [--timeout 30m] [--json]  # code-change tasks only; dsh -> VERIFY -> Claude review -> MergeReady
   relay run worktree <task-id> [--branch B] [--base REF] [--path DIR] [--json]
-  relay run sandbox create <task-id> [--agent K] [--source DIR] [--json]   # Task Coding Sandbox (sbx clone mode)
-  relay run sandbox launch <task-id> [--timeout 30m] [--permission MODE] [--json]  # fresh dsh Run inside the sandbox
-  relay run sandbox show|head|list [--json]
-  relay run sandbox sweep [--apply] [--json]
-  relay run sandbox submit <run-id> [--evidence E] [--summary S]
-  relay run sandbox cleanup <task-id> [--abort REASON] [--apply] [--force] [--json]
   relay run cleanup <task-id> [--abort REASON] [--apply] [--force] [--json]
   relay run list [--task <id>] [--json]
   relay run show <run-id> [--json]          # a headless dsh Run (no Herdr)
@@ -178,7 +161,6 @@ Manual attach: requires a live Herdr agent (use --pane/--tab or $HERDR_PANE_ID/$
 Runtime cleanup: RELAY_RUNTIME_CLEANUP_GRACE_MS RELAY_ATTACH_TIMEOUT_MS RELAY_RESTART_COOLDOWN_MS
 Task Lab cleanup: RELAY_LAB_CLEANUP_CMD RELAY_LAB_CLEANUP_TIMEOUT_MS (trusted hook; owner id per task)
 Run disk guard: RELAY_MIN_FREE_DISK_BYTES (default 20 GiB; 0 = threshold off)
-                RELAY_MIN_FREE_DIND_BYTES (sandbox DinD, default 2 GiB; 0 = probe off)
 Restart cap: RELAY_RESTART_CAP (default 3) RELAY_RESTART_CAP_WINDOW_MS (default 1800000)
 Herdr is required. RELAY_RUNTIME=mock is test-only.
 Help: relay <command> [subcommand] --help
@@ -199,20 +181,12 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
       "ISH-760 adds the Task lifecycle: `launch` owns ONE branch+worktree per Task, pins the task spec + verification steps + prior findings into the worktree BEFORE launch, and runs ONE disposable dsh Run per phase/attempt (a FIX is the SAME worktree + findings + a NEW Run). A second writer on the same worktree/branch is refused until the previous Run ends; different worktrees/branches may run in parallel. `worktree` creates/selects the worktree; `cleanup` reclaims it only when safe (real merge or --abort, no open PR, no active writer, no uncommitted changes, relay-owned) and retains the run logs. `relay run logs <run-id>` renders the read-only dsh session/status/text/tool_call/tool_result/final chronology from the per-Run dsh.jsonl (no TUI/Web UI needed). " +
       "ISH-762 adds `relay run factory <task-id>`: the whole factory for ONE Task with no hand-driven pane for the coding — a real headless dsh Run implements, Relay mechanically VERIFYs the recorded HEAD, an INDEPENDENT headless Claude reviewer (`claude -p --output-format json`) returns a structured FIX/PASS (FIX = the SAME worktree + findings + a FRESH Run), and a PASS reaches read-only MergeReady. It never pushes, merges, accepts or writes a provider." +
       " ISH-1013: a non-ready Factory outcome is classified from the EXISTING rows (code rework exhausted / infra blocked / permission-or-human decision / missing-or-inconclusive evidence / stale head / unknown) with the last Run/attempt/HEAD, failing check/review/log references and a concrete next action. The same projection is stored as a durable `factory.outcome` event and shown by `relay run show` / `relay run logs` and `relay task show`; `relay run factory --json` carries it as `failure`." +
-      " ISH-845: the same task-end `cleanup` (merged or --abort) also reclaims the Task's external Network Lab through the single trusted hook $RELAY_LAB_CLEANUP_CMD, invoked as `<cmd> <owner-id>` (the owner id Relay assigned to the Task, recorded when it launched the sandbox). With no hook, or no assigned owner, it is a no-op; an active Run, or a Task that has not ended, is refused. Reaching MergeReady alone never cleans anything.",
+      " ISH-845: the same task-end `cleanup` (merged or --abort) also reclaims the Task's external Network Lab through the single trusted hook $RELAY_LAB_CLEANUP_CMD, invoked as `<cmd> <owner-id>` (the owner id Relay assigned to the Task). With no hook, or no assigned owner, it is a no-op; an active Run, or a Task that has not ended, is refused. Reaching MergeReady alone never cleans anything.",
     usage: [
       "relay run start <task-id> [--cwd DIR] [--prompt TEXT] [--permission MODE] [--timeout 30m] [--json]",
       "relay run launch <task-id> [--timeout 30m] [--permission MODE] [--json]",
       "relay run factory <task-id> [--max-attempts N] [--dsh BIN] [--reviewer CMD] [--model M] [--permission MODE] [--timeout 30m] [--json]",
       "relay run worktree <task-id> [--branch B] [--base REF] [--path DIR] [--json]",
-      "relay run sandbox create <task-id> [--agent K] [--source DIR] [--json]",
-      "relay run sandbox launch <task-id> [--timeout 30m] [--permission MODE] [--agent K] [--json]",
-      "relay run sandbox show <task-id> [--json]",
-      "relay run sandbox head <task-id> [--json]",
-      "relay run sandbox list [--json]",
-      "relay run sandbox sweep [--apply] [--json]",
-      "relay run sandbox submit <run-id> [--evidence E] [--summary S]",
-      "relay run sandbox cleanup <task-id> [--abort REASON] [--apply] [--force] [--json]",
       "relay run cleanup <task-id> [--abort REASON] [--apply] [--force] [--json]",
       "relay run list [--task <id>] [--limit N] [--json]",
       "relay run show <run-id> [--json]",
@@ -226,7 +200,7 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
       "Drive ONE code-change Task through the whole factory: headless dsh implement -> Relay mechanical VERIFY -> independent headless Claude review/FIX -> integration -> read-only MergeReady. It NEVER pushes, merges, accepts or writes to a provider. " +
       "CODE-CHANGE TASKS ONLY: a task must have a workflow phase (created with `relay task intake --code-change`); a plain `relay task add` task is refused UP FRONT, before any worktree, with the re-intake instruction. " +
       "VERIFY needs at least ONE REQUIRED mechanical check recorded at intake (`--check name=command`); with none (or only optional checks) the outcome is `no_checks` — an unrun gate is never a PASS. " +
-      "`--permission MODE` is forwarded to the headless dsh Run (default `workspace-write`). `--timeout` is the per-Run budget, `--max-attempts` the coding/review attempt cap (it also bounds a fresh IMPLEMENT Run issued for a repairable `NO_IMPLEMENTATION`/partial-commit failure; ENOSPC/resource/permission/auth/Sandbox/unknown failures are never auto-retried). " +
+      "`--permission MODE` is forwarded to the headless dsh Run (default `workspace-write`). `--timeout` is the per-Run budget, `--max-attempts` the coding/review attempt cap (it also bounds a fresh IMPLEMENT Run issued for a repairable `NO_IMPLEMENTATION`/partial-commit failure; ENOSPC/resource/permission/auth/unknown failures are never auto-retried). " +
       "The task branch is cut from the SOURCE repo's freshly fetched `origin/main` (or the task's `pr_base`), and a resolved base behind `origin/main` is warned about, never silently accepted. " +
       "ISH-1013: every non-ready result carries a `failure` object: a minimal `class`, the concrete evidence-derived `cause`, the last Run/attempt/HEAD, bounded evidence references (`run show/logs`, check/review/evidence paths), and `next` (what to fix, what to read, the existing safe resume command, and the condition that permits resume). Classification never auto-unblocks: a HOLD, missing permission, live writer or stale/old HEAD stays blocked until an explicit `relay unblock` or a fresh HEAD-bound result.",
     usage: [
@@ -364,7 +338,7 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
   },
   pr: {
     about:
-      "ISH-880/885/1087 READ-ONLY Task↔PR check. Bridges a Sandbox-produced commit to a real GitHub PR and binds the PR's CURRENT remote HEAD to the SAME Task/attempt — by READING GitHub only. The head is ALWAYS the Task's produced commit (`task.head_sha`, a full 40-hex SHA) — there is no caller-supplied head. It re-reads an already-recorded PR (owner/repo#n) or adopts an existing PR for the task's (repo, branch), and requires its live head to equal the produced commit; a moved/unreadable PR, a different/fork repo, or no identity/adoptable PR is BLOCKED (never a fake pass). The repo is resolved from the Task's recorded identity, else the Task workspace's `origin`, so a Task that records only a branch still binds its PR. Relay NEVER writes to GitHub — no push, no create/update, no review; the Coding Agent performs those with normal `git`/`gh`, then Relay observes. The read-only `gh` reader is auto-detected when RELAY_PROVIDER_GITHUB is unset; `off` disables it.",
+      "ISH-880/885/1087 READ-ONLY Task↔PR check. Bridges a produced commit to a real GitHub PR and binds the PR's CURRENT remote HEAD to the SAME Task/attempt — by READING GitHub only. The head is ALWAYS the Task's produced commit (`task.head_sha`, a full 40-hex SHA) — there is no caller-supplied head. It re-reads an already-recorded PR (owner/repo#n) or adopts an existing PR for the task's (repo, branch), and requires its live head to equal the produced commit; a moved/unreadable PR, a different/fork repo, or no identity/adoptable PR is BLOCKED (never a fake pass). The repo is resolved from the Task's recorded identity, else the Task workspace's `origin`, so a Task that records only a branch still binds its PR. Relay NEVER writes to GitHub — no push, no create/update, no review; the Coding Agent performs those with normal `git`/`gh`, then Relay observes. The read-only `gh` reader is auto-detected when RELAY_PROVIDER_GITHUB is unset; `off` disables it.",
     usage: ["relay pr bind <task-id> [--repo R] [--json]"],
   },
   "task list": { about: "List tasks (id, state, priority, role, assignee, plan, depends, title).", usage: ["relay task list [--state <state>]"] },
@@ -713,7 +687,7 @@ function resolveText(args: string[], usageLine: string, flagName?: string): stri
 
 /**
  * Render the Task-owned external Network Lab cleanup result that accompanies
- * `relay run [sandbox] cleanup`. The hook is the single trusted
+ * `relay run cleanup`. The hook is the single trusted
  * `RELAY_LAB_CLEANUP_CMD`; with none configured this is a no-op.
  */
 function printLabCleanup(lab: LabCleanupPlan): void {
@@ -1376,21 +1350,16 @@ async function main(): Promise<void> {
         if (!task) throw new Error(`unknown task: ${id}`);
         const checks = taskChecks(task);
         if (checks.length === 0) throw new Error(`task ${id} has no mechanical checks (intake it with --check name=command)`);
-        // ISH-829: a Task with a durable Coding Sandbox verifies INSIDE it unless
-        // an explicit --cwd override is given.
         const explicitCwd = flag(rest, "--cwd");
-        const target = explicitCwd ? null : sandboxVerifyTarget(db, task, checks);
-        const cwd = explicitCwd ?? target?.cwd ?? task.worktree ?? process.env.RELAY_VERIFY_CWD ?? process.cwd();
+        const cwd = explicitCwd ?? task.worktree ?? process.env.RELAY_VERIFY_CWD ?? process.cwd();
         const { task: after, outcome, checks: executed, stale } = await runMechanicalVerification(db, id, {
           checks,
-          runner: target?.runner ?? defaultRunner,
+          runner: defaultRunner,
           cwd,
-          headProbe: target?.headProbe,
-          headSha: flag(rest, "--head") ?? target?.headSha ?? undefined,
+          headSha: flag(rest, "--head") ?? undefined,
         });
         for (const c of executed) {
-          const where = c.sandbox ? ` [sandbox:${c.sandbox}]` : "";
-          console.log(`check ${c.name}: ${c.outcome}${where}${c.exitCode === null ? "" : ` (exit ${c.exitCode})`}`);
+          console.log(`check ${c.name}: ${c.outcome}${c.exitCode === null ? "" : ` (exit ${c.exitCode})`}`);
         }
         console.log(`${after.id} verify=${outcome}${stale ? " stale-discarded" : ""} -> phase=${after.phase} state=${after.state}`);
         break;
@@ -1931,8 +1900,7 @@ async function main(): Promise<void> {
           // ISH-760 safe cleanup: merged or explicit abort, no open PR, no active
           // writer, no uncommitted changes, relay-owned. Run logs are retained.
           // ISH-845: the same task-end guard also reclaims the Task's external
-          // Network Lab via the trusted RELAY_LAB_CLEANUP_CMD hook (owner id
-          // assigned at sandbox launch).
+          // Network Lab via the trusted RELAY_LAB_CLEANUP_CMD hook.
           const id = positionals(rest)[0];
           if (!id) throw new Error("usage: relay run cleanup <task-id> [--abort REASON] [--apply] [--force] [--json]");
           const abort = flag(rest, "--abort") ?? undefined;
@@ -1957,161 +1925,7 @@ async function main(): Promise<void> {
           printLabCleanup(lab);
           break;
         }
-        if (sub === "sandbox") {
-          // ISH-828: Task-scoped Coding Sandbox (Docker Sandboxes clone mode).
-          // The Task/sandbox mapping is durable; each Run is a fresh in-VM dsh.
-          const sandboxSub = rest[0];
-          const srest = rest.slice(1);
-          const agent = () => flag(srest, "--agent") ?? flag(rest, "--agent") ?? undefined;
-          const source = () => flag(srest, "--source") ?? flag(rest, "--source") ?? undefined;
-          if (sandboxSub === "list") {
-            const rows = listSandboxes(db);
-            if (hasFlag(srest, "--json") || hasFlag(rest, "--json")) {
-              console.log(JSON.stringify(rows, null, 2));
-              break;
-            }
-            if (rows.length === 0) console.log("(no sandboxes)");
-            for (const s of rows) {
-              console.log(`${s.name}  ${s.state.padEnd(9)}  task=${s.task_id}  branch=${s.branch ?? "-"}  head=${s.head_sha?.slice(0, 12) ?? "-"}`);
-            }
-            break;
-          }
-          if (sandboxSub === "show") {
-            const id = positionals(srest)[0];
-            if (!id) throw new Error("usage: relay run sandbox show <task-id> [--json]");
-            const s = getTaskSandbox(db, id);
-            if (!s) throw new Error(`no sandbox recorded for task ${id}`);
-            if (hasFlag(srest, "--json") || hasFlag(rest, "--json")) {
-              console.log(JSON.stringify(s, null, 2));
-              break;
-            }
-            for (const [k, v] of Object.entries(s)) console.log(`${k}: ${v ?? "-"}`);
-            break;
-          }
-          if (sandboxSub === "create") {
-            const id = positionals(srest)[0];
-            if (!id) throw new Error("usage: relay run sandbox create <task-id> [--agent K] [--source DIR] [--json]");
-            const b = ensureTaskSandbox(db, id, { agent: agent(), source: source() });
-            if (hasFlag(srest, "--json") || hasFlag(rest, "--json")) {
-              console.log(JSON.stringify(b, null, 2));
-              break;
-            }
-            console.log(`${id} sandbox=${b.name} agent=${b.agent} branch=${b.branch} ${b.created ? "(created)" : "(reused)"}`);
-            console.log(`source: ${b.source}  workspace: ${b.workspace}`);
-            break;
-          }
-          if (sandboxSub === "head") {
-            const id = positionals(srest)[0];
-            if (!id) throw new Error("usage: relay run sandbox head <task-id> [--json]");
-            const s = getTaskSandbox(db, id);
-            if (!s) throw new Error(`no sandbox recorded for task ${id}`);
-            const f = fetchSandboxHead(s.source, s.name, s.branch);
-            if (hasFlag(srest, "--json") || hasFlag(rest, "--json")) {
-              console.log(JSON.stringify(f, null, 2));
-            } else if (f.ok) {
-              console.log(`${id} ${f.remote}/${s.branch ?? "HEAD"} -> ${f.sha}`);
-            } else {
-              console.log(`${id} fetch failed: ${f.error}`);
-              process.exitCode = 1;
-            }
-            break;
-          }
-          if (sandboxSub === "launch") {
-            const id = positionals(srest)[0];
-            if (!id) {
-              throw new Error(
-                "usage: relay run sandbox launch <task-id> [--timeout 30m] [--permission MODE] [--agent K] [--source DIR] [--json]"
-              );
-            }
-            const timeoutRaw = flag(srest, "--timeout") ?? flag(rest, "--timeout");
-            const launched = await launchTaskSandboxRun(db, id, {
-              agent: agent(),
-              source: source(),
-              timeoutMs: timeoutRaw ? parseDuration(timeoutRaw) : undefined,
-              permissionMode: flag(srest, "--permission") ?? flag(rest, "--permission") ?? undefined,
-            });
-            const r = await launched.handle.wait();
-            if (hasFlag(srest, "--json") || hasFlag(rest, "--json")) {
-              console.log(
-                JSON.stringify(
-                  { run: r, sandbox: launched.sandbox, brief: launched.briefPath, findings: launched.findings },
-                  null,
-                  2
-                )
-              );
-            } else {
-              console.log(`${r.id} -> state=${r.state} exit=${r.exit_code ?? "-"}`);
-              console.log(`sandbox: ${launched.sandbox.name} (branch ${launched.sandbox.branch})`);
-              console.log(`head: ${r.head_sha ?? "-"}  session: ${r.session_id ?? "-"}`);
-              console.log(`output: ${r.output_dir}`);
-              console.log("note: exit 0 is NOT a submission; advance the task with `relay run sandbox submit <run-id>`");
-            }
-            if (r.state !== "exited") process.exitCode = 1;
-            break;
-          }
-          if (sandboxSub === "submit") {
-            const id = positionals(srest)[0];
-            if (!id) throw new Error("usage: relay run sandbox submit <run-id> [--evidence E] [--summary S]");
-            const r = acceptSandboxSubmission(db, {
-              runId: id,
-              summary: flag(srest, "--summary") ?? undefined,
-              evidence: flag(srest, "--evidence") ?? undefined,
-            });
-            const t = getTask(db, r.task_id);
-            console.log(`${r.id} accepted -> task ${r.task_id} phase=${t?.phase} state=${t?.state}`);
-            break;
-          }
-          if (sandboxSub === "sweep") {
-            // ISH-828: fail-closed sweep of `running` sandbox Runs whose host
-            // `sbx exec` client is gone (a Relay/host restart). Dry-run unless --apply.
-            const res = sweepOrphanedSandboxRuns(db, { apply: hasFlag(srest, "--apply") || hasFlag(rest, "--apply") });
-            if (hasFlag(srest, "--json") || hasFlag(rest, "--json")) {
-              console.log(JSON.stringify(res, null, 2));
-              break;
-            }
-            console.log(`inspected ${res.inspected} non-terminal sandbox run(s); ${res.orphaned.length} orphaned`);
-            for (const o of res.orphaned) {
-              console.log(
-                `  ${o.runId} task=${o.taskId} sandbox=${o.sandbox} in-vm-dsh=${o.inVmAlive ? "alive" : "gone"} ${o.applied ? (o.stopped ? "(stopped + failed)" : "(failed)") : "(dry-run; pass --apply)"}`
-              );
-            }
-            break;
-          }
-          if (sandboxSub === "cleanup") {
-            const id = positionals(srest)[0];
-            if (!id) throw new Error("usage: relay run sandbox cleanup <task-id> [--abort REASON] [--apply] [--force] [--json]");
-            const abort = flag(srest, "--abort") ?? undefined;
-            const apply = hasFlag(srest, "--apply");
-            const plan = apply
-              ? applySandboxCleanup(db, id, {
-                  apply: true,
-                  force: hasFlag(srest, "--force"),
-                  abort,
-                })
-              : planSandboxCleanup(db, id, {
-                  force: hasFlag(srest, "--force"),
-                  abort,
-                });
-            // ISH-845: also reclaim the Task's external Network Lab (trusted hook,
-            // owner id assigned at launch); dry-run unless --apply.
-            const lab = apply ? applyLabCleanup(db, id, { apply: true, abort }) : planLabCleanup(db, id, { abort });
-            if (hasFlag(srest, "--json") || hasFlag(rest, "--json")) {
-              console.log(JSON.stringify({ ...plan, labCleanup: lab }, null, 2));
-              break;
-            }
-            const verdict = plan.apply ? (plan.removed ? "REMOVED" : plan.remove ? "would remove" : "skipped") : "dry-run (pass --apply)";
-            console.log(`relay run sandbox cleanup ${id} — ${verdict}`);
-            console.log(`  sandbox: ${plan.name ?? "-"}  branch: ${plan.branch ?? "-"}  saved head: ${plan.savedHead ?? "-"}`);
-            console.log(`  retained runs (evidence): ${plan.retainedRuns}`);
-            for (const reason of plan.reasons) console.log(`  skip: ${reason}`);
-            printLabCleanup(lab);
-            break;
-          }
-          throw new Error(
-            `unknown run sandbox subcommand: ${sandboxSub ?? "(none)"} (try: create|launch|show|head|list|sweep|submit|cleanup)`
-          );
-        }
-        throw new Error(`unknown run subcommand: ${sub} (try: start|launch|worktree|sandbox|cleanup|list|show|logs|cancel|submit)`);
+        throw new Error(`unknown run subcommand: ${sub} (try: start|launch|worktree|cleanup|list|show|logs|cancel|submit)`);
       }
 
       case "status": {

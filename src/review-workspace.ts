@@ -1,5 +1,23 @@
-import { hostGit } from "./sandbox";
+import { spawnSync } from "node:child_process";
 import { gitHead } from "./verify";
+
+export interface HostGitResult {
+  ok: boolean;
+  code: number | null;
+  out: string;
+  err: string;
+}
+
+/** Run a host git command (never throws). */
+export function hostGit(cwd: string, args: string[]): HostGitResult {
+  const p = spawnSync("git", ["-C", cwd, ...args], { encoding: "utf8" });
+  return {
+    ok: p.status === 0,
+    code: p.status,
+    out: (p.stdout ?? "").toString().trim(),
+    err: (p.stderr ?? p.error?.message ?? "").toString().trim(),
+  };
+}
 
 /**
  * ISH-904 — the source a Task workspace is read from. The Task workspace is a

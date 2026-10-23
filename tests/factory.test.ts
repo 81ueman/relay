@@ -18,14 +18,11 @@ import {
   taskChecks,
 } from "../src/workflow";
 import { getTaskResult, insertTaskResult, RESULT_WRITE_ERROR } from "../src/results";
-import { acceptRunSubmission, DUPLICATE_WRITER, listRuns, type DshProcess, type DshSpawner } from "../src/dsh-runner";
+import { acceptRunSubmission, DUPLICATE_WRITER, listRuns } from "../src/dsh-runner";
 import { PINNED_DSH_VERSION } from "../src/dsh-version";
-import { inheritFindings, launchTaskRun, taskBranchName } from "../src/run-lifecycle";
+import { inheritFindings, launchTaskRun } from "../src/run-lifecycle";
 import { buildDashboardView } from "../src/dashboard/model";
 import { defaultRunner, gitHead, type CommandRunner } from "../src/verify";
-import { sandboxNameForTask, upsertSandbox, type SbxCli, type SbxResult } from "../src/sandbox";
-import { ensureTaskSandbox, launchTaskSandboxRun, ensureSandboxRelayExcluded } from "../src/sandbox-lifecycle";
-import { sandboxVerifyTarget, type SandboxExec } from "../src/sandbox-verify";
 import { processPgid, spawnIdentityToken } from "../src/proc-identity";
 import { DEFAULT_INTEGRATOR_WORKER, FACTORY_NATIVE_REVIEW_REQUIRED, pidAlive, reviewBlockedReason, runFactoryTask, verifyChecksReason } from "../src/factory";
 import { findFactoryOutcomeForRun, latestFactoryOutcome } from "../src/factory-failure";
@@ -171,143 +168,6 @@ echo '{"type":"final","text":""}'
 echo "dsh: MISSING_CREDENTIAL: no API key for provider" >&2
 exit 1
 `;
-
-// ---------------------------------------------------------------------------
-// ISH-878: fakes for the Sandbox IMPLEMENT/FIX path (no Docker, no sandbox).
-// A fake `sbx` CLI + a fake `sbx exec … dsh` process + a real local git remote
-// named `sandbox-<name>` so the host commit fetch and submit fence are exercised.
-// ---------------------------------------------------------------------------
-
-class FakeDshProcess implements DshProcess {
-  private static seq = 0;
-  readonly pid = 80_000 + FakeDshProcess.seq++;
-  readonly stdout: ReadableStream<Uint8Array>;
-  readonly stderr: ReadableStream<Uint8Array>;
-  readonly exited: Promise<number | null>;
-  private outC!: ReadableStreamDefaultController<Uint8Array>;
-  private errC!: ReadableStreamDefaultController<Uint8Array>;
-  private resolveExit!: (c: number | null) => void;
-  private settled = false;
-  constructor() {
-    this.stdout = new ReadableStream({ start: (c) => (this.outC = c) });
-    this.stderr = new ReadableStream({ start: (c) => (this.errC = c) });
-    this.exited = new Promise((res) => (this.resolveExit = res));
-  }
-  writeOut(s: string): void {
-    this.outC.enqueue(new TextEncoder().encode(s));
-  }
-  finish(code: number | null): void {
-    if (this.settled) return;
-    this.settled = true;
-    try { this.outC.close(); } catch { /* noop */ }
-    try { this.errC.close(); } catch { /* noop */ }
-    this.resolveExit(code);
-  }
-  kill(): void {
-    this.finish(143);
-  }
-}
-
-class FakeSandboxSpawner implements DshSpawner {
-  procs: FakeDshProcess[] = [];
-  onSpawn?: (p: FakeDshProcess) => void;
-  spawn(): DshProcess {
-    const p = new FakeDshProcess();
-    this.procs.push(p);
-    this.onSpawn?.(p);
-    return p;
-  }
-}
-
-/** A fake `sbx`: `exec` answers HEAD from `head()`, plus branch/probe/version. */
-class FakeSbxCli implements SbxCli {
-  created: string[] = [];
-  currentBranch: string | null = "main";
-  dshVersion = PINNED_DSH_VERSION;
-  /** When true, `pgrep` reports the in-VM dsh ALIVE (and `pkill` does not stop it). */
-  inVmDshAlive = false;
-  constructor(private readonly head: () => string) {}
-  run(args: string[]): SbxResult {
-    const ok = (out = ""): SbxResult => ({ ok: true, code: 0, out, err: "" });
-    if (args[0] === "ls") {
-      return ok(JSON.stringify(this.created.map((name) => ({ name, agent: "shell", status: "running" }))));
-    }
-    if (args[0] === "create") {
-      const i = args.indexOf("--name");
-      const name = i >= 0 ? args[i + 1] : "?";
-      if (!this.created.includes(name)) this.created.push(name);
-      return ok("created");
-    }
-    if (args[0] === "exec") {
-      const joined = args.join(" ");
-      // ISH-1009: the in-sandbox DinD disk probe (8 GiB in KiB, above the 2 GiB floor).
-      if (joined.includes("df -Pk /var/lib/docker")) return ok(String(8 * 1024 * 1024));
-      if (joined.includes("git checkout")) {
-        const m = joined.match(/git checkout (?:-b )?([^\s;&|]+)/);
-        if (m) this.currentBranch = m[1];
-        return ok("");
-      }
-      if (joined.includes("rev-parse HEAD")) return ok(this.head());
-      if (joined.includes("rev-parse --abbrev-ref HEAD")) return ok(this.currentBranch ?? "");
-      if (joined.includes("--version")) return ok(this.dshVersion);
-      if (joined.includes("pkill")) return ok("");
-      if (joined.includes("pgrep")) return ok(this.inVmDshAlive ? "ALIVE" : "GONE");
-      return ok("");
-    }
-    return ok("");
-  }
-}
-
-/**
- * Simulate the sandbox clone's commit reaching the host: create a commit on
- * `branch`, push it (force) to a real bare repo, and register it as the host
- * remote `sandbox-<name>` that `git fetch` reads. Idempotent across attempts.
- */
-function publishSandboxCommit(name: string, branch: string, marker: string): string {
-  const producer = join(dir, `producer-${name}-${marker}`);
-  mkdirSync(producer, { recursive: true });
-  git(producer, "init", "-q", "-b", branch);
-  git(producer, "config", "user.email", "sbx@test");
-  git(producer, "config", "user.name", "sbx");
-  writeFileSync(join(producer, "change.txt"), `${marker}\n`);
-  git(producer, "add", "change.txt");
-  git(producer, "commit", "-q", "-m", marker);
-  const sha = git(producer, "rev-parse", "HEAD");
-  const bare = join(dir, `bare-${name}.git`);
-  if (!existsSync(bare)) git(producer, "init", "-q", "--bare", bare);
-  git(producer, "remote", "add", "origin", bare);
-  git(producer, "push", "-q", "--force", "origin", `${branch}:refs/heads/${branch}`);
-  const remote = `sandbox-${name}`;
-  if (git(repo, "remote").split("\n").includes(remote)) git(repo, "remote", "set-url", remote, bare);
-  else git(repo, "remote", "add", remote, bare);
-  return sha;
-}
-
-/**
- * ISH-1012: seed the sandbox host remote with an EXISTING commit (the Task base)
- * so a no-commit sandbox Run observes a successful fetch at the same head — a
- * legitimate `NO_IMPLEMENTATION`, not a fetch failure.
- */
-function publishSandboxBase(name: string, branch: string, sha: string): void {
-  const bare = join(dir, `bare-${name}.git`);
-  if (!existsSync(bare)) git(repo, "init", "-q", "--bare", bare);
-  git(repo, "push", "-q", "--force", bare, `${sha}:refs/heads/${branch}`);
-  const remote = `sandbox-${name}`;
-  if (git(repo, "remote").split("\n").includes(remote)) git(repo, "remote", "set-url", remote, bare);
-  else git(repo, "remote", "add", remote, bare);
-}
-
-/** A fake `sbx exec` seam for VERIFY: HEAD tracks the task's recorded head. */
-function sandboxVerifyExec(headOf: () => string | null): SandboxExec {
-  return {
-    async exec(_name, argv) {
-      const j = argv.join(" ");
-      if (j.includes("rev-parse HEAD")) return { code: 0, stdout: `${headOf()}\n`, stderr: "", timedOut: false };
-      if (j.includes("--porcelain")) return { code: 0, stdout: "", stderr: "", timedOut: false };
-      return { code: 0, stdout: "sbx-ran", stderr: "", timedOut: false };
-    },
-  };
-}
 
 type ReviewPlan =
   | "pass"
@@ -549,7 +409,7 @@ describe("reviewBlockedReason (ISH-830e: a blocked review is never an empty reas
   });
 });
 
-describe("buildReviewBrief (ISH-830e: sandbox VERIFY evidence is in the brief)", () => {
+describe("buildReviewBrief (ISH-830e: VERIFY evidence is in the brief)", () => {
   test("renders the ALREADY-RUN verify result with the check output tail, and says not to re-run", () => {
     const id = newTask();
     const task = getTask(db, id)!;
@@ -581,31 +441,16 @@ describe("buildReviewBrief (ISH-830e: sandbox VERIFY evidence is in the brief)",
   });
 });
 
-describe("ISH-830e: VERIFY block reason + sandbox .relay exclusion", () => {
+describe("ISH-830e: VERIFY block reason", () => {
   test("verifyChecksReason names the check, its outcome, and an output tail", () => {
     const s = verifyChecksReason([
-      { name: "srl-nos-readback", outcome: "not_run", exitCode: null, output: "sandbox working tree is dirty before the check" },
+      { name: "srl-nos-readback", outcome: "not_run", exitCode: null, output: "working tree is dirty before the check" },
     ]);
     expect(s).toContain("srl-nos-readback=not_run");
     expect(s).toContain("dirty");
     expect(verifyChecksReason([])).toBe("no checks executed");
   });
 
-  test("ensureSandboxRelayExcluded adds .relay/ to the clone's git info/exclude", () => {
-    const calls: string[][] = [];
-    const cli = {
-      run: (args: string[]) => {
-        calls.push(args);
-        return { ok: true, code: 0, out: "", err: "" };
-      },
-    } as unknown as SbxCli;
-    ensureSandboxRelayExcluded(cli, "sbx-1", "/in-vm/repo");
-    const joined = calls.map((a) => a.join(" ")).join("\n");
-    expect(joined).toContain("git rev-parse --path-format=absolute --git-common-dir");
-    expect(joined).toContain("info/exclude");
-    expect(joined).toContain(".relay/");
-    expect(joined).toContain("sbx-1");
-  });
 });
 
 describe("extractReviewerVerdict (fail-closed parsing)", () => {
@@ -685,7 +530,7 @@ describe("Factory E2E: real worktree, fake headless dsh + independent reviewer",
     expect(res.attempts.map((a) => a.reviewVerdict)).toEqual(["fix", "pass"]);
     expect(res.attempts.map((a) => a.verifyOutcome)).toEqual(["pass", "pass"]);
     // ISH-830e: the host reviewer is handed the mechanical VERIFY result as
-    // context (it never sees the sandbox where the checks ran).
+    // context (it never re-runs the checks).
     expect(rev.calls[0].brief).toContain("## Mechanical VERIFY — ALREADY RUN");
     expect(rev.calls[0].brief).toContain("Outcome: `pass`");
     const runs = listRuns(db, { taskId: id });
@@ -718,225 +563,6 @@ describe("Factory E2E: real worktree, fake headless dsh + independent reviewer",
     // The brief still has the Mechanical VERIFY section, read from the row.
     expect(rev.calls[0].brief).toContain("## Mechanical VERIFY — ALREADY RUN");
     expect(rev.calls[0].brief).toContain("Outcome: `pass`");
-  });
-
-  test("ISH-878: a Sandbox-backed Task IMPLEMENTs + FIXes INSIDE the Sandbox (never the host)", async () => {
-    const dsh = fakeDsh("dsh-sbx", COMMITTING_DSH);
-    const id = newTask();
-    const task0 = getTask(db, id)!;
-    const sbxName = sandboxNameForTask(task0);
-    const branch = taskBranchName(task0);
-    const baseSha = git(repo, "rev-parse", "HEAD");
-    // The clone HEAD tracks the latest published commit; attempt 0 starts at base.
-    let sandboxTip = baseSha;
-    const sbx = new FakeSbxCli(() => getTask(db, id)!.head_sha ?? sandboxTip);
-    const spawner = new FakeSandboxSpawner();
-    let published = 0;
-    spawner.onSpawn = (p) => {
-      // The in-VM dsh committed a NEW revision: publish it so `git fetch` finds it.
-      sandboxTip = publishSandboxCommit(sbxName, branch, `sbx-change-${++published}`);
-      p.writeOut(JSON.stringify({ type: "session", sessionId: `sbx-${published}` }) + "\n");
-      p.writeOut(JSON.stringify({ type: "final", text: "done" }) + "\n");
-      p.finish(0);
-    };
-    // The Task must already have a DURABLE Coding Sandbox binding (as created by
-    // `relay run sandbox create`); that binding is what selects the Sandbox path.
-    await ensureTaskSandbox(db, id, { source: repo, cli: sbx });
-    const rev = reviewerHarness(["fix", "pass"]);
-    let hostCalls = 0;
-    const hostSpy: CommandRunner = {
-      async run(s) {
-        hostCalls++;
-        return { name: s.name, required: true, outcome: "pass", exitCode: 0, output: "host", durationMs: 0 };
-      },
-    };
-    const res = await runFactoryTask(db, id, {
-      ...factoryDeps(dsh, rev.spawner),
-      reviewWorktreeRoot: join(dir, "review-wt"),
-      sandboxCli: sbx,
-      sandboxSpawner: spawner,
-      verifyRunner: hostSpy,
-      verifyTarget: (d, t, checks) =>
-        sandboxVerifyTarget(d, t, checks, { exec: sandboxVerifyExec(() => getTask(db, id)!.head_sha), headProbe: () => getTask(db, id)!.head_sha }),
-    });
-
-    expect(res.outcome).toBe("merge_ready");
-    expect(res.attempts.map((a) => a.reviewVerdict)).toEqual(["fix", "pass"]);
-    expect(res.attempts.map((a) => a.verifyOutcome)).toEqual(["pass", "pass"]);
-    // VERIFY ran INSIDE the sandbox: the host runner was NEVER reached.
-    expect(hostCalls).toBe(0);
-
-    // Two Runs, BOTH inside the SAME durable Sandbox — and NO host-worktree Run.
-    const runs = listRuns(db, { taskId: id });
-    expect(runs).toHaveLength(2);
-    expect(runs.map((r) => r.sandbox_name)).toEqual([sbxName, sbxName]);
-    const run0 = runs.find((r) => r.attempt === 0)!;
-    const run1 = runs.find((r) => r.attempt === 1)!;
-    expect(run0).toBeTruthy();
-    expect(run1).toBeTruthy();
-    expect(run0.id).not.toBe(run1.id);
-    expect(run0.base_head_sha).toBe(baseSha);
-    expect(sbx.created.filter((n) => n === sbxName)).toHaveLength(1); // created ONCE; FIX reused it
-    expect(getTask(db, id)!.worktree).toBeNull(); // never a host worktree
-
-    // The FIX is a fresh Run on the SAME sandbox with the prior finding inherited.
-    const brief = readFileSync(run1.spec_path!, "utf-8");
-    expect(brief).toContain("needs the B marker");
-
-    // The reviewer's raw evidence is DURABLE (not inside the removed review worktree).
-    const row = db
-      .query(`SELECT evidence_ref FROM task_results WHERE task_id = ? AND kind = 'ReviewResult' ORDER BY id DESC LIMIT 1`)
-      .get(id) as { evidence_ref: string | null } | null;
-    expect(row?.evidence_ref).toBeTruthy();
-    expect(existsSync(row!.evidence_ref!)).toBe(true);
-  });
-
-  test("ISH-878: a removed/failed Coding Sandbox FAILS CLOSED (never a host fallback)", async () => {
-    const dsh = fakeDsh("dsh-refuse", COMMITTING_DSH);
-    for (const state of ["failed", "removed"] as const) {
-      const id = newTask();
-      upsertSandbox(db, {
-        taskId: id,
-        name: `relay-ish878-${state}`,
-        agent: "shell",
-        source: repo,
-        workspace: "/in-vm/repo",
-        branch: "relay/ish-878",
-        headSha: null,
-        state,
-      });
-      const res = await runFactoryTask(db, id, factoryDeps(dsh, reviewerHarness(["pass"]).spawner));
-      // ISH-1012: a Sandbox problem is BLOCKED (never auto-retried), not a host
-      // fallback and not a coding retry.
-      expect(res.outcome).toBe("blocked");
-      expect(res.reason).toContain("IMPLEMENT_RECOVERY/SANDBOX");
-      expect(res.reason).toContain("SANDBOX_ERROR");
-      expect(res.reason).toContain("refusing to fall back to the host worktree");
-      // NOTHING was launched — no host Run, no sandbox Run, no worktree.
-      expect(listRuns(db, { taskId: id })).toHaveLength(0);
-      const task = getTask(db, id)!;
-      expect(task.worktree).toBeNull();
-      expect(task.phase).toBe("implement");
-      expect(task.state).toBe("blocked_human");
-      expect(task.attempt).toBe(1); // unblock starts a FRESH attempt
-    }
-  });
-
-  test("ISH-878: re-entry ADOPTS the live Sandbox Run and resolves the orphan (no duplicate writer)", async () => {
-    const id = newTask();
-    const sbx = new FakeSbxCli(() => git(repo, "rev-parse", "HEAD"));
-    const spawner = new FakeSandboxSpawner();
-    // A live in-VM Run whose process never finishes (the host owner then dies).
-    spawner.onSpawn = (p) => p.writeOut(JSON.stringify({ type: "session", sessionId: "live" }) + "\n");
-    const live = await launchTaskSandboxRun(db, id, {
-      source: repo,
-      cli: sbx,
-      spawner,
-      outputRoot: join(dir, "runs"),
-      fastExitMs: 0,
-    });
-    expect(live.run.sandbox_name).toBe(sandboxNameForTask(getTask(db, id)!));
-    expect(spawner.procs).toHaveLength(1);
-    // Prove the recorded host client is GONE, deterministically (a dead pid, so
-    // the fake pid can never collide with a real live host process).
-    const dead = Bun.spawnSync(["true"]);
-    db.query(`UPDATE runs SET pid = ?, spawn_lstart = NULL WHERE id = ?`).run(dead.pid ?? 999999, live.handle.id);
-
-    const res = await runFactoryTask(db, id, {
-      ...factoryDeps(fakeDsh("dsh-x", COMMITTING_DSH), reviewerHarness(["pass"]).spawner),
-      sandboxCli: sbx,
-      sandboxSpawner: spawner,
-    });
-    // Adoption (NOT a fresh launch) resolved the orphan: the host `sbx exec`
-    // client is gone and the in-VM dsh is confirmed GONE, so the Run is terminal
-    // `failed` — and a SECOND dsh was NEVER spawned into the same sandbox.
-    expect(res.outcome).toBe("coding_failed");
-    expect(res.reason).toContain("orphaned sandbox run");
-    const runs = listRuns(db, { taskId: id });
-    expect(runs).toHaveLength(1);
-    expect(runs[0].id).toBe(live.handle.id);
-    expect(runs[0].state).toBe("failed");
-    expect(spawner.procs).toHaveLength(1);
-  });
-
-  test("ISH-878: an adopted Run whose in-VM dsh SURVIVES keeps the single-writer fence", async () => {
-    const id = newTask();
-    const sbx = new FakeSbxCli(() => git(repo, "rev-parse", "HEAD"));
-    sbx.inVmDshAlive = true; // `pgrep` says ALIVE before AND after `pkill`
-    const spawner = new FakeSandboxSpawner();
-    spawner.onSpawn = (p) => p.writeOut(JSON.stringify({ type: "session", sessionId: "stubborn" }) + "\n");
-    const live = await launchTaskSandboxRun(db, id, {
-      source: repo,
-      cli: sbx,
-      spawner,
-      outputRoot: join(dir, "runs"),
-      fastExitMs: 0,
-    });
-    // A dead client pid (deterministic) with the in-VM dsh still ALIVE.
-    const dead = Bun.spawnSync(["true"]);
-    db.query(`UPDATE runs SET pid = ?, spawn_lstart = NULL WHERE id = ?`).run(dead.pid ?? 999999, live.handle.id);
-
-    const res = await runFactoryTask(db, id, {
-      ...factoryDeps(fakeDsh("dsh-x", COMMITTING_DSH), reviewerHarness(["pass"]).spawner),
-      sandboxCli: sbx,
-      sandboxSpawner: spawner,
-    });
-    // The sweep could NOT confirm the in-VM dsh gone: the Run must stay
-    // NON-TERMINAL so the fence keeps holding, and no second writer is admitted.
-    expect(res.outcome).toBe("coding_failed");
-    expect(res.reason).toContain("still holds the single-writer fence");
-    const runs = listRuns(db, { taskId: id });
-    expect(runs).toHaveLength(1);
-    expect(runs[0].id).toBe(live.handle.id);
-    expect(runs[0].state).toBe("running");
-    expect(spawner.procs).toHaveLength(1);
-  });
-
-  test("ISH-878: an adopted Run with a LIVE client is bounded by its budget (fence held)", async () => {
-    const id = newTask();
-    const sbx = new FakeSbxCli(() => git(repo, "rev-parse", "HEAD"));
-    const spawner = new FakeSandboxSpawner();
-    spawner.onSpawn = (p) => p.writeOut(JSON.stringify({ type: "session", sessionId: "alive" }) + "\n");
-    const live = await launchTaskSandboxRun(db, id, {
-      source: repo,
-      cli: sbx,
-      spawner,
-      outputRoot: join(dir, "runs"),
-      fastExitMs: 0,
-    });
-    // Make the recorded client pid provably ALIVE: this very process, with its
-    // own canonical start token, so `hostSandboxClientAlive` returns true.
-    db.query(`UPDATE runs SET pid = ?, spawn_lstart = ? WHERE id = ?`).run(
-      process.pid,
-      spawnIdentityToken(process.pid),
-      live.handle.id
-    );
-
-    const res = await runFactoryTask(db, id, {
-      ...factoryDeps(fakeDsh("dsh-x", COMMITTING_DSH), reviewerHarness(["pass"]).spawner),
-      sandboxCli: sbx,
-      sandboxSpawner: spawner,
-      timeoutMs: 300,
-    });
-    // The live client never finished: the bounded wait times out and the fence
-    // is held (the Run is left for the operator `relay run sandbox sweep`).
-    expect(res.outcome).toBe("coding_failed");
-    expect(res.reason).toContain("exceeded its 300ms budget");
-    const runs = listRuns(db, { taskId: id });
-    expect(runs).toHaveLength(1);
-    expect(runs[0].state).toBe("running");
-    expect(spawner.procs).toHaveLength(1);
-  });
-
-  test("ISH-878: a Task with NO sandbox row still uses the host worktree path", async () => {
-    const dsh = fakeDsh("dsh-legacy", COMMITTING_DSH);
-    const id = newTask();
-    const res = await runFactoryTask(db, id, factoryDeps(dsh, reviewerHarness(["pass"]).spawner));
-    expect(res.outcome).toBe("merge_ready");
-    const runs = listRuns(db, { taskId: id });
-    expect(runs).toHaveLength(1);
-    expect(runs[0].sandbox_name).toBeNull();
-    expect(getTask(db, id)!.worktree).not.toBeNull();
   });
 
   test("ISH-829: the independent reviewer reads a detached read-only worktree at the fixed head", async () => {
@@ -1647,59 +1273,6 @@ describe("ISH-1012: bounded IMPLEMENT recovery (fresh Run only for repairable fa
     expect(task.phase).toBe("implement");
   });
 
-  test("ISH-1012: a missing-commit Sandbox Run recovers on the SAME Sandbox (fresh Run, ONE create)", async () => {
-    const id = newTask({ acceptance: "the sandbox recovery acceptance is preserved" });
-    const task0 = getTask(db, id)!;
-    const sbxName = sandboxNameForTask(task0);
-    const branch = taskBranchName(task0);
-    const baseSha = git(repo, "rev-parse", "HEAD");
-    let tip = baseSha;
-    const sbx = new FakeSbxCli(() => getTask(db, id)!.head_sha ?? tip);
-    const spawner = new FakeSandboxSpawner();
-    let spawned = 0;
-    spawner.onSpawn = (p) => {
-      spawned++;
-      p.writeOut(JSON.stringify({ type: "session", sessionId: `sbx-recovery-${spawned}` }) + "\n");
-      // The FIRST Run exits 0 with NO new in-VM commit (the remote branch is the
-      // base); the retry publishes a real commit.
-      if (spawned > 1) tip = publishSandboxCommit(sbxName, branch, `sbx-recovery-${spawned}`);
-      p.writeOut(JSON.stringify({ type: "final", text: "done" }) + "\n");
-      p.finish(0);
-    };
-    await ensureTaskSandbox(db, id, { source: repo, cli: sbx });
-    // Seed the sandbox remote with the task base so the first Run's fetch is a
-    // legitimate no-op (head == base) rather than a fetch failure.
-    publishSandboxBase(sbxName, branch, baseSha);
-    const rev = reviewerHarness(["pass"]);
-    const res = await runFactoryTask(db, id, {
-      ...factoryDeps(fakeDsh("dsh-1012-host", COMMITTING_DSH), rev.spawner),
-      sandboxCli: sbx,
-      sandboxSpawner: spawner,
-      reviewWorktreeRoot: join(dir, "review-wt-1012"),
-      verifyTarget: (d, t, checks) =>
-        sandboxVerifyTarget(d, t, checks, {
-          exec: sandboxVerifyExec(() => getTask(db, id)!.head_sha),
-          headProbe: () => getTask(db, id)!.head_sha,
-        }),
-    });
-
-    expect(res.outcome).toBe("merge_ready");
-    const runs = listRuns(db, { taskId: id });
-    expect(runs.map((r) => r.attempt).sort((a, b) => a - b)).toEqual([0, 1]);
-    expect(runs.map((r) => r.sandbox_name)).toEqual([sbxName, sbxName]);
-    const sbxRun0 = runs.find((r) => r.attempt === 0)!;
-    expect(sbxRun0.state).toBe("exited");
-    expect(sbxRun0.exit_code).toBe(0);
-    expect(sbxRun0.head_sha).toBe(baseSha);
-    // ONE durable Sandbox; the fresh Run reused it (never a host worktree).
-    expect(sbx.created.filter((n) => n === sbxName)).toHaveLength(1);
-    expect(getTask(db, id)!.worktree).toBeNull();
-    const sbxRun1 = runs.find((r) => r.attempt === 1)!;
-    const brief = readFileSync(sbxRun1.spec_path!, "utf-8");
-    expect(brief).toContain("### IMPLEMENT Run — RETRY (attempt 0)");
-    expect(brief).toContain("produced no new commit");
-    expect(brief).toContain("the sandbox recovery acceptance is preserved");
-  });
 });
 
 describe("ISH-904: factory defects (phase-null, worker state, merge_ready rework, result writes)", () => {

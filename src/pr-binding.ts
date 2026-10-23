@@ -10,16 +10,16 @@ import { linkTask } from "./workflow";
  * ISH-885 — the READ-ONLY Task↔PR check.
  *
  * The GitHub PR workflow is Agent-owned: the Coding Agent (dsh/DeepSeek) does
- * `git commit` + `git push` + `gh pr create`/update in its own Task Sandbox, and
- * the independent Claude reviewer posts a native `gh pr review`. Relay is the
+ * `git commit` + `git push` + `gh pr create`/update in its own Task workspace,
+ * and the independent Claude reviewer posts a native `gh pr review`. Relay is the
  * supervisor and NEVER writes to GitHub — it has no publisher, no `git push`, no
  * PR mutation and no review submission. (The ISH-880 `GitGhPrPublisher` /
  * `--publish` write path was removed by ISH-885: Agent tools, not Relay
  * capabilities.)
  *
- * This module is the ONE seam that binds the exact Sandbox-produced commit
- * (fetched to the host by ISH-828, HEAD-verified by ISH-829) to a GitHub PR by
- * RE-READING GitHub and then binds the PR's live remote HEAD to the SAME
+ * This module is the ONE seam that binds the exact produced commit
+ * (HEAD-verified by mechanical VERIFY) to a GitHub PR by RE-READING GitHub and
+ * then binds the PR's live remote HEAD to the SAME
  * Task/attempt. It composes existing pieces only — the read-only `GitHubReadOnly`
  * reader and `linkTask` (whose HEAD fence already invalidates a Review/VERIFY at
  * a moved HEAD) — and adds no second workflow engine, provider framework,

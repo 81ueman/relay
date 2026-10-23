@@ -147,7 +147,6 @@ describe("relay status: disk guard (ISH-1009)", () => {
     expect(() =>
       assertLaunchDiskSpace(db, {
         taskId: task.id,
-        target: "host",
         minFreeBytes: 20 * 1024 ** 3,
         paths: ["/volume"],
         probe: () => 12 * 1024 ** 3,

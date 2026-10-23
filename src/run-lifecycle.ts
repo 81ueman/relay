@@ -685,8 +685,8 @@ function verificationChecks(payload: Record<string, unknown> | null, commands: M
     const name = typeof item.name === "string" ? item.name.trim() : "";
     const outcome = typeof item.outcome === "string" ? item.outcome : "";
     if (!name || !outcome || outcome === "pass") continue;
-    // The host runner stores a combined `output`; the sandbox runner also keeps
-    // separate stdout/stderr. Prefer the combined tail, then stderr, then stdout.
+    // The runner stores a combined `output`; tolerate separate stdout/stderr
+    // tails that an older VerificationResult may carry.
     const output =
       (typeof item.output === "string" && item.output) ||
       (typeof item.stderr === "string" && item.stderr) ||
@@ -991,16 +991,14 @@ export interface BuildBriefOptions {
   branch: string;
   findings?: RunFinding[];
   /**
-   * The exact base HEAD this Run starts from. Defaults to probing `worktree`
-   * (the host path); a Sandbox caller passes the in-VM HEAD because the path is
-   * not a host checkout. `null` means unknown (skip HEAD filtering).
+   * The exact base HEAD this Run starts from. Defaults to probing `worktree`.
+   * `null` means unknown (skip HEAD filtering).
    */
   baseHead?: string | null;
   /**
    * ISH-1087: the source checkout (a path) or an explicit `owner/name`, used to
    * resolve the Task's GitHub PR target when the Task itself records no
-   * `pr_repo`/`pr_url`. A Sandbox caller passes the HOST source because the
-   * in-VM workspace path is not readable here.
+   * `pr_repo`/`pr_url`.
    */
   repo?: string | null;
 }
@@ -1208,7 +1206,6 @@ export async function launchTaskRun(db: Database, taskId: string, opts: LaunchRu
   assertLaunchDiskSpace(db, {
     taskId,
     phase: task.phase,
-    target: "host",
     ...opts.diskGuard,
     paths: opts.diskGuard?.paths ?? defaultDiskPaths(db, { worktreesRoot: taskWorktreesRoot(opts.worktreesRoot) }),
   });

@@ -430,11 +430,11 @@ describe("ISH-1013: a Factory stop is classified from existing evidence, never g
 
   test("an OLD attempt-less event cannot decide a later failure (never guess)", () => {
     const id = newTask();
-    // A Sandbox refusal from an earlier attempt, before the current Run started.
+    // A refusal from an earlier attempt, before the current Run started.
     db.query(
       `INSERT INTO events (timestamp, source, task_id, type, payload_json)
-       VALUES (?, 'factory', ?, 'factory.sandbox_unusable', ?)`
-    ).run(now() - 60_000, id, JSON.stringify({ reason: "SANDBOX_ERROR: old sandbox was removed" }));
+       VALUES (?, 'factory', ?, 'factory.implement_blocked', ?)`
+    ).run(now() - 60_000, id, JSON.stringify({ reason: "OLD_EVIDENCE: an earlier attempt was blocked" }));
     const run = insertRun({ taskId: id, attempt: 0, state: "failed", exitCode: 1 });
     setTask(id, { phase: "implement", state: "queued", attempt: 0, headSha: null });
 
@@ -449,7 +449,7 @@ describe("ISH-1013: a Factory stop is classified from existing evidence, never g
 
     expect(report.cause).toBe("UNKNOWN");
     expect(report.class).toBe("unknown");
-    expect(report.evidence.join("\n")).not.toContain("old sandbox was removed");
+    expect(report.evidence.join("\n")).not.toContain("OLD_EVIDENCE");
   });
 
   test("a Factory call on a terminal Task records no new failure and preserves the real outcome", () => {

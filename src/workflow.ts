@@ -740,7 +740,7 @@ export function submitImplementationFromRun(db: Database, taskId: string, impl: 
     taskHeadOvertakenByOtherWriter(
       task.head_sha,
       { base_head_sha: baseHead ?? null, head_sha: producedHead },
-      sourceRun ? runHeadFenceRepos(db, sourceRun) : []
+      sourceRun ? runHeadFenceRepos(sourceRun) : []
     )
   ) {
     throw new Error(
@@ -972,7 +972,7 @@ export interface ImplementRecoveryTransition {
 
 /**
  * ISH-1012: route a FAILED IMPLEMENT attempt to a FRESH attempt on the SAME
- * Task/worktree/Sandbox. This is the ordinary phase/attempt transition VERIFY
+ * Task/worktree. This is the ordinary phase/attempt transition VERIFY
  * FAIL already uses (`applyPhase`), NOT a new state machine:
  *
  *   implement@N (terminal failed Run) -> implement@N+1 (no Run yet)

@@ -14,7 +14,6 @@ import {
   type PrView,
   type ReviewView,
 } from "./providers";
-import { defaultVerifyTarget } from "./sandbox-verify";
 
 /**
  * ISH-759 real provider adapters — GET-ONLY.
@@ -456,10 +455,6 @@ export function providerDepsFromEnv(
     checks: github,
     authorizedReviewers: authorizedReviewers.length > 0 ? authorizedReviewers : [DEFAULT_REVIEW_OWNER],
     authority: NO_AUTHORITY,
-    // ISH-829: mechanical VERIFY of a Task with a durable Coding Sandbox runs
-    // INSIDE that sandbox at the recorded HEAD; a Task without one falls back to
-    // the host runner (see runPendingMechanicalVerifications).
-    verifyTarget: defaultVerifyTarget,
   };
 }
 
@@ -516,7 +511,7 @@ export function nativeReviewDepsFromEnv(
     author,
     ...(token ? { spawnEnv: { GH_TOKEN: token } } : {}),
     // The reviewer must be able to run `gh` (and git) to post; this is an
-    // approval allowlist, NOT an OS sandbox (ISH-883 explicitly does not claim
+    // approval allowlist, NOT an OS-level containment boundary (ISH-883 explicitly does not claim
     // isolation from it).
     allowedTools: "Read Grep Glob Bash",
   };

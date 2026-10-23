@@ -7,9 +7,9 @@ import type { Run } from "./schema";
  *
  * A Run row is inserted by the coroutine that launches it, and that same
  * coroutine writes the terminal state after the dsh exits. The row can stay
- * `running` for a noticeable window after the child is gone: a local Run still
- * runs `git rev-parse`, and a sandbox Run still fetches the produced commit out
- * of the VM. During that window the child PID is dead while the launcher is very
+ * `running` for a noticeable window after the child is gone: a Run still runs
+ * `git rev-parse` to record its produced head. During that window the child PID
+ * is dead while the launcher is very
  * much alive and about to write the real outcome.
  *
  * The periodic liveness sweep must therefore prove BOTH processes are gone —

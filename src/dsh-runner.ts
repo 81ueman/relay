@@ -433,7 +433,6 @@ export async function startDshRun(db: Database, opts: StartRunOptions): Promise<
     assertLaunchDiskSpace(db, {
       taskId: task.id,
       phase,
-      target: "host",
       ...opts.diskGuard,
     });
   }
@@ -821,7 +820,7 @@ export function acceptRunSubmission(db: Database, sub: RunSubmission): Run {
   // (ISH-1087/ISH-1125), and a Run may push more than once between polls. The
   // lineage is checked in the Run's own repo so a foreign head is still refused.
   // A NULL task head is "not yet bound" and adopts the Run's produced head.
-  if (taskHeadOvertakenByOtherWriter(task.head_sha, run, runHeadFenceRepos(db, run))) {
+  if (taskHeadOvertakenByOtherWriter(task.head_sha, run, runHeadFenceRepos(run))) {
     rejectSubmission(
       `run ${run.id} is stale: task head is ${task.head_sha}, run started at ${run.base_head_sha ?? "none"} ` +
         `and produced ${run.head_sha ?? "none"}`

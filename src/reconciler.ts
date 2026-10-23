@@ -1563,10 +1563,9 @@ export async function reconcile(db: Database, rt: Runtime, at = now(), deps: Wor
   // 0c. ISH-1008 RUN LIVENESS: the launching coroutine is normally the only
   //     writer of a Run's terminal state. If it died (crash/reboot/ENOSPC), the
   //     durable row would stay starting/running forever and nothing would alert.
-  //     Throttled and identity-checked: a live Run is never touched, an
-  //     undeterminable identity keeps the single-writer fence, and a sandbox Run
-  //     is failed only once the in-VM dsh is confirmed gone. Kept fail-soft so a
-  //     full disk or an sbx probe failure cannot abort the whole reconcile pass.
+  //     Throttled and identity-checked: a live Run is never touched and an
+  //     undeterminable identity keeps the single-writer fence. Kept fail-soft so
+  //     a full disk cannot abort the whole reconcile pass.
   try {
     const liveness = maybeSweepRunLiveness(db, at);
     for (const d of liveness.died) actions.push(`run-died:${d.runId}:${d.class}`);

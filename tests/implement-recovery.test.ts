@@ -33,7 +33,6 @@ function run(overrides: Partial<ImplementRun> = {}): ImplementRun {
     head_sha: A,
     base_head_sha: A,
     error: "exit 1",
-    sandbox_name: null,
     dsh_events_path: null,
     stdout_path: null,
     stderr_path: null,
@@ -163,16 +162,6 @@ describe("ISH-1012 classifier: non-recoverable causes (never auto-fixed)", () =>
     expect(d.reason).toContain("MISSING_CREDENTIAL");
   });
 
-  test("a removed/failed Sandbox (no Run launched) is SANDBOX-denied", () => {
-    const d = classifyImplementFailure({
-      run: null,
-      error: "CODING_FAILED: SANDBOX_ERROR: task T1 Coding Sandbox is failed; refusing to fall back to the host worktree",
-      readTurn: () => noTurn,
-    });
-    expect(d.stop).toBe("SANDBOX");
-    expect(d.action).toBe("block");
-  });
-
   test("a stale/refused submission is INVALID_RESULT-denied (never laundered)", () => {
     const d = classifyImplementFailure({
       run: run({ state: "exited", exit_code: 0, head_sha: B }),
@@ -195,22 +184,6 @@ describe("ISH-1012 classifier: non-recoverable causes (never auto-fixed)", () =>
     expect(d.action).toBe("stop");
     expect(d.reason).toContain("cause is unknown");
     expect(implementStopReason(d)).toContain("IMPLEMENT_RECOVERY/UNKNOWN_CAUSE");
-  });
-
-  test("a non-zero exit after a commit in a SANDBOX is not provable progress: stopped", () => {
-    const d = classifyImplementFailure({
-      run: run({
-        state: "failed",
-        exit_code: 1,
-        sandbox_name: "relay-sbx",
-        head_sha: null,
-        base_head_sha: A,
-      }),
-      error: CODING_FAILED,
-      readTurn: () => noTurn,
-    });
-    expect(d.stop).toBe("UNKNOWN_CAUSE");
-    expect(d.action).toBe("stop");
   });
 
   test("a cancelled/signalled Run is never retried", () => {
@@ -263,7 +236,6 @@ describe("ISH-1012: durable signatures/evidence helpers", () => {
     expect(terminalImplementRunSignature(run({ state: "failed", exit_code: 1 }))).toBeNull();
     expect(terminalImplementRunSignature(run({ state: "failed", exit_code: 1, head_sha: B, signal: "timeout" }))).toBeNull();
     expect(terminalImplementRunSignature(run({ state: "cancelled" }))).toBeNull();
-    expect(terminalImplementRunSignature(run({ state: "failed", exit_code: 1, head_sha: B, sandbox_name: "sbx" }))).toBeNull();
   });
 
   test("implementRecoverySignature is base-HEAD scoped (a new commit = new signature)", () => {

@@ -7,10 +7,6 @@ manual attach. One Run = one process = one coding attempt.
 This is implemented in `src/dsh-runner.ts` (process lifecycle) and
 `src/dsh-events.ts` (the JSONL decoder) and driven from the CLI:
 
-> **ISH-828:** the same one-shot dsh contract is launched **inside a Task Coding
-> Sandbox** via `sbx exec`; the JSONL/evidence collection is reused unchanged. See
-> [`sandbox-lifecycle.md`](sandbox-lifecycle.md).
-
 ```sh
 relay run start <task-id> [--cwd DIR] [--prompt TEXT] [--permission MODE] [--timeout 30m] [--json]
 relay run list [--task <id>] [--json]
@@ -26,9 +22,8 @@ is no long-lived `dsh web` bridge.
 ## Pinned CLI contract (dsh 0.2.1-rc.2)
 
 Confirmed against the installed tool, not guessed. The pin is a single
-constant, `PINNED_DSH_VERSION` in `src/sandbox-lifecycle.ts` (and
-`sandbox/coding-kit/spec.yaml`); Relay never floats on `latest`/`alpha` and
-carries **one** 0.2.x code path (ISH-869).
+constant, `PINNED_DSH_VERSION` in `src/dsh-version.ts`; Relay never floats on
+`latest`/`alpha` and carries **one** 0.2.x code path (ISH-869).
 
 - `dsh --version` → **`0.2.1-rc.2`**, checked with the real `dsh --help` and
   `dsh --profile headless --help`. **The CLI/JSONL contract below is identical
@@ -73,14 +68,7 @@ carries **one** 0.2.x code path (ISH-869).
   `tests/dsh-smoke.test.ts` pass no provider key `env`/`dshEnv` to `startDshRun`,
   and `DEEPSEEK_API_KEY` is deliberately **not** on the allowlist. The operator
   authenticates dsh through their **own provider configuration** (a dsh profile /
-  provider route, an injected `.env`, or a sandbox credential proxy). The Coding
-  Kit (ISH-830c) provisions that provider for the sandbox path: it ships a
-  `headless` profile that declares the `ollama-cloud` provider explicitly
-  (`OLLAMA_CLOUD_V41_API_KEY` + `deepseek-v4.1-flash:1017`), which the operator's
-  `sbx` proxy fills — see [`sandbox-lifecycle.md`](sandbox-lifecycle.md).
-  **Host vs. sandbox isolation differs.** Inside a **Coding Sandbox** the VM has
-  no host `HOME`, so Relay does not share the host `~/.dsh` (including
-  `.credentials.yaml`) with a sandbox Run. On the **host** path, though,
+  provider route or an injected `.env`).
   `childEnv` forwards `HOME` and `DSH_HOME` unchanged (`src/child-env.ts`), so a
   host Run runs against the operator's own `~/.dsh` and **can read
   `~/.dsh/.credentials.yaml`**: dsh 0.2.1 headless does not *read* a saved
@@ -234,8 +222,8 @@ Session lives under `$DSH_HOME`). An unknown id is an error. Relay never passes
   asserts the Session ID and an ordered `session` → … → `final` stream with a
   real `tool_call`/`tool_result`.
 - **ISH-869:** the pin is `0.2.1-rc.2` and the JSONL contract above is unchanged
-  from `0.2.0-rc.2` (diffed on real streams). Both this **host** runner
-  (`startDshRun`) and the in-sandbox runner enforce the pin fail-closed: `dshBin
+  from `0.2.0-rc.2` (diffed on real streams). The host runner
+  (`startDshRun`) enforces the pin fail-closed: `dshBin
   --version` must be exactly `0.2.1-rc.2` or the Run is refused with
   `DSH_VERSION_MISMATCH` before any Run row or process. The authenticated
   `deepseek-flash` smoke (`RELAY_DSH_SMOKE=1 …`) is **opt-in**; Relay does not

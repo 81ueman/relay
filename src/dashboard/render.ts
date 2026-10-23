@@ -176,12 +176,11 @@ export function renderDashboard(view: DashboardView, opts: RenderOptions = {}): 
     lines.push(c("RUNS", "bold"));
     for (const r of view.runs) {
       const state = r.cause ? `${r.state}/${r.cause}` : r.state;
-      const where = r.sandbox ? `sbx:${r.sandbox}` : "host";
       const age = r.ageMs != null ? `  ${fmtAge(r.ageMs)}` : "";
       const detail = r.error ? `  ${r.error}` : "";
       const line =
         `  ${r.id.padEnd(12)} ${r.taskId.padEnd(8)} ${`${r.phase}/${r.attempt}`.padEnd(14)} ` +
-        `${state.padEnd(18)} ${where}${age}${detail}`;
+        `${state.padEnd(18)}${age}${detail}`;
       lines.push(c(trim(line, width), r.state === "failed" ? "red" : "green"));
     }
   }

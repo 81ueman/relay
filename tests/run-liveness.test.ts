@@ -13,7 +13,6 @@ import { reconcile } from "../src/reconciler";
 import { MockRuntime } from "../src/runtime/runtime";
 import { buildDashboardView } from "../src/dashboard/model";
 import { renderDashboard, renderDashboardJson } from "../src/dashboard/render";
-import type { SbxCli, SbxResult } from "../src/sandbox";
 import {
   classifyRunDeath,
   classifyRunFailure,
@@ -27,8 +26,8 @@ import { beginRunLaunch, endRunLaunch } from "../src/run-launcher";
 
 // ISH-1008: a dead Run must be failed by the daemon's liveness sweep, with a
 // classified cause, without anyone touching the Task. Everything below is
-// deterministic: fake evidence logs, dead PIDs, an injected identity where the
-// sandbox cannot run `ps`, and a fake `sbx` CLI.
+// deterministic: fake evidence logs, dead PIDs, and an injected identity where
+// `ps` is unavailable.
 
 const SAVED_ENV: Record<string, string | undefined> = {};
 const ENV_KEYS = ["RELAY_HUMAN", "RELAY_RUN_LIVENESS_MS", "RELAY_RUN_START_GRACE_MS"];
@@ -74,7 +73,6 @@ interface InsertRunOptions {
   spawnLstart?: string | null;
   launcherPid?: number | null;
   launcherLstart?: string | null;
-  sandbox?: string | null;
   stderr?: string;
   dshJsonl?: string;
   startedAt?: number;
@@ -96,10 +94,10 @@ function insertRun(opts: InsertRunOptions): string {
     `INSERT INTO runs
        (id, task_id, phase, attempt, generation, cwd, branch, head_sha, base_head_sha, prompt,
         spec_path, output_dir, state, pid, spawn_lstart, launcher_pid, launcher_lstart,
-        sandbox_name, error, stdout_path, stderr_path, events_path, dsh_events_path, exit_code, signal,
+        error, stdout_path, stderr_path, events_path, dsh_events_path, exit_code, signal,
         fast_exit, started_at, ended_at, created_at, updated_at)
      VALUES (?, ?, 'implement', 0, 0, ?, NULL, NULL, NULL, '', NULL, ?, ?, ?, ?, ?, ?,
-             ?, ?, NULL, ?, NULL, ?, NULL, NULL, 0, ?, ?, ?, ?)`
+             ?, NULL, ?, NULL, ?, NULL, NULL, 0, ?, ?, ?, ?)`
   ).run(
     id,
     opts.taskId,
@@ -110,7 +108,6 @@ function insertRun(opts: InsertRunOptions): string {
     opts.spawnLstart ?? null,
     opts.launcherPid ?? null,
     opts.launcherLstart ?? null,
-    opts.sandbox ?? null,
     opts.error ?? null,
     stderrPath,
     dshPath,
@@ -393,98 +390,6 @@ describe("sweepRunLiveness (ISH-1008)", () => {
     const run = getRun(db, id)!;
     expect(run.state).toBe("failed");
     expect(run.error).toContain("never recorded a pid");
-  });
-
-  test("a dead sandbox Run is failed by ISH-828's sweep and gets the cause", () => {
-    process.env.RELAY_HUMAN = "coord";
-    const taskId = newTask();
-    const id = insertRun({
-      taskId,
-      pid: DEAD_PID,
-      sandbox: "sbx-T29",
-      stderr: "dsh: ENOSPC: no space left on device\n",
-      startedAt: 0,
-    });
-    const cli: SbxCli = {
-      run(args: string[]): SbxResult {
-        return args.join(" ").includes("pgrep")
-          ? { ok: true, code: 0, out: "GONE", err: "" }
-          : { ok: true, code: 0, out: "", err: "" };
-      },
-    };
-
-    const res = sweepRunLiveness(db, { at: 1_000, startGraceMs: 0, cli });
-    expect(res.errors).toEqual([]);
-    expect(res.died).toHaveLength(1);
-    const run = getRun(db, id)!;
-    expect(run.state).toBe("failed");
-    expect(run.error).toContain("orphaned");
-    expect(run.error).toContain("cause=ENOSPC");
-    expect(run.error).toContain("no live sbx exec client");
-    expect(runDiedEvents(id)).toHaveLength(1);
-
-    // The dashboard shows the classified cause (text + JSON projection).
-    const view = buildDashboardView(db, { root: dir, panes: null, at: 1_000 });
-    expect(view.runs.find((r) => r.id === id)?.cause).toBe("ENOSPC");
-    expect(view.attention.some((a) => a.kind === "run" && a.text.includes("cause=ENOSPC"))).toBe(true);
-    const out = renderDashboard(view, { color: false, width: 180 });
-    expect(out).toContain("RUNS");
-    expect(out).toContain("ENOSPC");
-    const json = JSON.parse(renderDashboardJson(view));
-    expect(json.runs.find((r: { id: string }) => r.id === id)?.cause).toBe("ENOSPC");
-  });
-
-  test("a sandbox Run is held while its launcher is alive, then swept once released", () => {
-    process.env.RELAY_HUMAN = "coord";
-    const taskId = newTask();
-    const id = insertRun({
-      taskId,
-      pid: DEAD_PID,
-      launcherPid: process.pid,
-      launcherLstart: null,
-      sandbox: "sbx-launcher",
-      stderr: "dsh: ENOSPC: no space left on device\n",
-      startedAt: 0,
-    });
-    const cli: SbxCli = {
-      run(args: string[]): SbxResult {
-        return args.join(" ").includes("pgrep")
-          ? { ok: true, code: 0, out: "GONE", err: "" }
-          : { ok: true, code: 0, out: "", err: "" };
-      },
-    };
-
-    const held = sweepRunLiveness(db, { at: 1_000, startGraceMs: 0, cli });
-    expect(held.died).toEqual([]);
-    expect(getRun(db, id)!.state).toBe("running");
-    expect(runDiedEvents(id)).toEqual([]);
-
-    // The launcher finished without a terminal write: releasing the lease is the
-    // same durable update `releaseRunLauncher` performs in the launcher's finally.
-    db.query(`UPDATE runs SET launcher_pid = NULL, launcher_lstart = NULL WHERE id = ?`).run(id);
-    const after = sweepRunLiveness(db, { at: 1_001, startGraceMs: 0, cli });
-    expect(after.died).toHaveLength(1);
-    expect(getRun(db, id)!.state).toBe("failed");
-    expect(getRun(db, id)!.error).toContain("cause=ENOSPC");
-    expect(runDiedEvents(id)).toHaveLength(1);
-  });
-
-  test("a still-alive in-VM dsh leaves the sandbox Run fenced", () => {
-    const taskId = newTask();
-    const id = insertRun({ taskId, pid: DEAD_PID, sandbox: "sbx-live", startedAt: 0 });
-    const cli: SbxCli = {
-      run(args: string[]): SbxResult {
-        // `pkill` does not change the outcome: still ALIVE -> unresolved.
-        return args.join(" ").includes("pgrep")
-          ? { ok: true, code: 0, out: "ALIVE", err: "" }
-          : { ok: true, code: 0, out: "", err: "" };
-      },
-    };
-    const res = sweepRunLiveness(db, { at: 1_000, startGraceMs: 0, cli });
-    expect(res.died).toEqual([]);
-    const run = getRun(db, id)!;
-    expect(run.state).toBe("running");
-    expect(run.error).toContain("still alive");
   });
 
   test("fails soft on a DB write error and retries on the next pass", () => {

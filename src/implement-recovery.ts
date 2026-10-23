@@ -9,7 +9,7 @@ import { readDshEvents, turnEndReason } from "./dsh-events";
  * (`CODING_FAILED` / `NO_IMPLEMENTATION`) while VERIFY FAIL and REVIEW FIX
  * already continued on a NEW attempt. This module is the missing MINIMAL judge:
  * it decides, from the EXISTING evidence of the failed Run, whether one fresh
- * dsh Coding Run on the SAME Task/worktree/Sandbox may be issued.
+ * dsh Coding Run on the SAME Task/worktree may be issued.
  *
  * It is deliberately NOT an orchestrator/state machine: the Factory still owns
  * sequencing and `workflow.recordImplementRecovery` performs the ordinary
@@ -21,9 +21,9 @@ import { readDshEvents, turnEndReason } from "./dsh-events";
  *   - `partial-commit` — the Run exited non-zero but DID commit a new revision
  *     (the coding turn made concrete progress before the process failed).
  * Everything else STOPS: ENOSPC / resource exhaustion, permission / auth /
- * Sandbox / launch problems, invalid (stale/refused) submissions, signalled or
- * cancelled Runs, an unconfirmed live writer, and unknown causes. The same
- * failure with no progress is stopped even inside the attempt budget.
+ * launch problems, invalid (stale/refused) submissions, signalled or cancelled
+ * Runs, an unconfirmed live writer, and unknown causes. The same failure with no
+ * progress is stopped even inside the attempt budget.
  */
 
 /** The prefix every IMPLEMENT recovery decision carries in a Factory reason. */
@@ -35,7 +35,6 @@ export const IMPLEMENT_RECOVERY = "IMPLEMENT_RECOVERY";
  */
 export type ImplementStopCode =
   | "NO_EXECUTION_TARGET"
-  | "SANDBOX"
   | "LAUNCH"
   | "ENOSPC"
   | "RESOURCE"
@@ -84,7 +83,6 @@ export type ImplementRun = Pick<
   | "head_sha"
   | "base_head_sha"
   | "error"
-  | "sandbox_name"
   | "dsh_events_path"
   | "stdout_path"
   | "stderr_path"
@@ -163,7 +161,7 @@ export function readTurnEvidence(path: string | null | undefined): ImplementTurn
 /**
  * Non-recoverable cause markers, checked in this order. The FIRST match wins and
  * names the stop code. These are the concerns other issues own (disk, resources,
- * auth, sandbox, launch): Relay must stop, never retry them.
+ * auth, launch): Relay must stop, never retry them.
  */
 const CAUSE_MARKERS: readonly [ImplementStopCode, RegExp][] = [
   ["ENOSPC", /\bENOSPC\b|no space left on device|disk (?:is )?full|quota exceeded|insufficient (?:free )?(?:disk|space)/i],
@@ -179,7 +177,6 @@ const CAUSE_MARKERS: readonly [ImplementStopCode, RegExp][] = [
     "AUTH",
     /MISSING_CREDENTIAL|unauthori[sz]ed|\bforbidden\b|authentication (?:failed|required)|credential|api[- ]?key|token (?:expired|invalid)|login required/i,
   ],
-  ["SANDBOX", /SANDBOX_ERROR|sandbox .*(?:failed|unavailable|removed|error)|\bsbx\b/i],
   ["LAUNCH", /spawn failed|DSH_VERSION_MISMATCH|dsh version|command not found|\bENOENT\b/i],
 ];
 
@@ -188,7 +185,7 @@ const CAUSE_MARKERS: readonly [ImplementStopCode, RegExp][] = [
  * records that they must NOT be retried; it never diagnoses liveness itself.
  */
 const ORPHAN_MARKER =
-  /\borphan(?:ed)?\b|adopted (?:sandbox )?run .*exceeded its .* budget|recorded pid was reused|owner pid (?:is not alive|is no longer alive)|could not be terminated/i;
+  /\borphan(?:ed)?\b|adopted run .*exceeded its .* budget|recorded pid was reused|owner pid (?:is not alive|is no longer alive)|could not be terminated/i;
 
 const INVALID_RESULT_MARKER = /\bRUN_SUBMISSION_(?:REFUSED|REJECTED)\b|AUTHORITY|STALE_(?:RESULT|ATTEMPT|LEASE)|HEAD_MISMATCH/i;
 
@@ -232,7 +229,7 @@ export function implementRecoverySignature(
  * stop across restarts without a new durable column.
  */
 export function terminalImplementRunSignature(
-  run: Pick<ImplementRun, "state" | "exit_code" | "signal" | "head_sha" | "base_head_sha" | "sandbox_name">
+  run: Pick<ImplementRun, "state" | "exit_code" | "signal" | "head_sha" | "base_head_sha">
 ): string | null {
   if (run.signal) return null;
   if (run.state === "exited" && run.exit_code === 0 && run.head_sha !== null && run.head_sha === run.base_head_sha) {
@@ -241,7 +238,6 @@ export function terminalImplementRunSignature(
   if (
     run.state === "failed" &&
     !run.signal &&
-    !run.sandbox_name &&
     run.head_sha !== null &&
     run.base_head_sha !== null &&
     run.head_sha !== run.base_head_sha
@@ -310,12 +306,8 @@ export function classifyImplementFailure(input: ClassifyImplementFailureInput): 
   const readTurn = input.readTurn ?? readTurnEvidence;
   const evidence = runEvidence(run);
 
-  // Nothing was launched at all (a removed/failed Sandbox, or no target): a
-  // host fallback is forbidden, and a retry could only repeat the same refusal.
+  // Nothing was launched at all: a retry could only repeat the same refusal.
   if (!run) {
-    if (error && /SANDBOX_ERROR|sandbox .*(?:failed|removed|unavailable)/i.test(error)) {
-      return stop("SANDBOX", "block", error, evidence);
-    }
     return stop(
       "NO_EXECUTION_TARGET",
       "block",
@@ -368,7 +360,7 @@ export function classifyImplementFailure(input: ClassifyImplementFailureInput): 
     return stop("INVALID_RESULT", "block", `run ${run.id} did not produce a valid submission: ${error}`, evidence);
   }
 
-  // Environment/resource/auth/Sandbox/launch causes: STOP, never auto-fix.
+  // Environment/resource/auth/launch causes: STOP, never auto-fix.
   for (const [code, pattern] of CAUSE_MARKERS) {
     if (pattern.test(text)) {
       // Name the concrete marker line as well as the Factory error, so an
@@ -429,7 +421,6 @@ export function classifyImplementFailure(input: ClassifyImplementFailureInput): 
   const isPartialCommit =
     run.state === "failed" &&
     !run.signal &&
-    !run.sandbox_name &&
     run.head_sha !== null &&
     run.base_head_sha !== null &&
     run.head_sha !== run.base_head_sha;

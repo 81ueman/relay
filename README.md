@@ -436,7 +436,7 @@ does not claim process
 isolation from it. The reviewer model is configurable (`RELAY_REVIEW_MODEL` /
 `--model`, default `opus`).
 
-**PR check (ISH-880/885/1087, read-only):** a Sandbox-produced commit is bridged
+**PR check (ISH-880/885/1087, read-only):** a produced commit is bridged
 to a real GitHub PR **before the review stage** (`FactoryDeps.prBinding`). The
 Factory records `pr_repo` at intake from the Task identity or the workspace/source
 `origin` (`--pr-repo` overrides), re-reads the PR and requires its live `headSha`
@@ -507,34 +507,13 @@ no open PR, no active writer, no uncommitted changes, relay-owned) and always
 [`docs/run-lifecycle.md`](docs/run-lifecycle.md).
 
 **Pre-launch disk guard (ISH-1009).** Before a Run row is created, and before a
-Task workspace is created or a sandbox Run starts, Relay measures free space on
-the worktrees root and the volume holding the Relay DB. Below
+Task workspace is created, Relay measures free space on the worktrees root and
+the volume holding the Relay DB. Below
 `RELAY_MIN_FREE_DISK_BYTES` (default 20 GiB) no Run starts: the Task stays
 `queued` and `run.launch_refused` records reason `low_disk`, the measured bytes
 and the threshold. A failed probe is **also** a refusal (`probe_failed`), never
 a pass. `relay status` and the dashboard show the live measurement and the last
-refusal; the next launch attempt after space is freed proceeds normally. A
-Sandbox Run additionally probes the in-VM DinD volume (`/var/lib/docker`)
-against `RELAY_MIN_FREE_DIND_BYTES` (default 2 GiB; `0` disables).
-
-### Task Coding Sandbox lifecycle (ISH-828)
-
-`relay run sandbox` runs a coding Task inside its own **Docker Sandboxes
-clone-mode microVM** instead of a host worktree. `relay run sandbox create`
-(or `launch`) creates, or **selects and reuses**, one sandbox per Task
-(`sbx create --clone --name <name> <agent|kit> <main-checkout>`), refusing a
-linked worktree as the clone source. The Task→sandbox `name`/`branch`/`HEAD`
-mapping is durable in SQLite (`sandboxes`), and each Run/attempt is a fresh
-`dsh` started with `sbx exec` inside the same sandbox — a **FIX reuses the
-sandbox** with the previous findings pinned into the brief. The original dsh
-JSONL, Relay's events and the produced commit (`git fetch sandbox-<name>`) are
-recorded per Run; `exit 0` is not a submission. A fetch failure, a non-zero exit,
-a cancel/timeout whose in-VM dsh survived (`orphaned`) and a stale/duplicate
-submit all fail **closed**. `relay run sandbox cleanup` is dry-run by default and
-refuses to remove the VM until the produced commit and every Run's evidence
-directory are saved; run logs are retained. One-command fixture smoke:
-`bun run smoke:sandbox`; the real-sandbox smoke is `bun run smoke:sandbox:real`
-(opt-in). See [`docs/sandbox-lifecycle.md`](docs/sandbox-lifecycle.md).
+refusal; the next launch attempt after space is freed proceeds normally.
 
 ### Daemon Run liveness sweep (ISH-1008)
 
@@ -545,8 +524,8 @@ fence and alerting nobody. `reconcile()` now performs a **throttled liveness
 sweep** (`RELAY_RUN_LIVENESS_MS`, default 45s) over every non-terminal Run:
 
 - **launcher first** — the child can exit while the launching coroutine is still
-  finishing (`git rev-parse`, or a sandbox `git fetch` before its terminal
-  write). The Run row records the launcher PID + start-time token, and the sweep
+  finishing (`git rev-parse` before its terminal write). The Run row records the
+  launcher PID + start-time token, and the sweep
   leaves the Run alone while that launcher may still write. The lease is cleared
   in the launcher's `finally`; only then may the sweep finish a row whose
   terminal write did not land.
@@ -555,9 +534,6 @@ sweep** (`RELAY_RUN_LIVENESS_MS`, default 45s) over every non-terminal Run:
   `orphaned:` reason; a **live** PID is never touched and an **undeterminable**
   identity leaves the Run running so the fence keeps holding. The sweep never
   signals a local process.
-- **sandbox Run** — reuses `sweepOrphanedSandboxRuns({ apply: true })`; the Run
-  becomes terminal only when the in-VM dsh is confirmed **gone**. A still-alive
-  or `unknown` dsh keeps the Run non-terminal.
 - A just-inserted `starting` row with no PID yet gets a launch grace window
   (`RELAY_RUN_START_GRACE_MS`, default 2x the sweep interval / at least 60s), so
   the sweep never races a concurrent launch.
@@ -581,14 +557,12 @@ A coding Task may deploy an **arbitrary containerlab topology** on the shared
 Network Lab. Relay stays **containerlab-agnostic**: it models no network, no NOS
 and no topology, and adds **no `relay lab` command**. It knows only the Task's
 **owner id** (`labOwnerId` = `<task id>-<created_at>`, never reused, handed out as
-`RELAY_LAB_OWNER` and recorded as `lab.owner_assigned` when the Coding Sandbox is
-launched) and *when* cleanup is due. The `network-lab` skill
-([`skills/network-lab/SKILL.md`](skills/network-lab/SKILL.md), installed for the
-pinned dsh at the real Sandbox skill path `~/.agents/skills/` by
-`sandbox/coding-kit`) tells the agent to deploy with `labctl` under
-`--namespace "$RELAY_LAB_OWNER"`.
+`RELAY_LAB_OWNER` and recorded as `lab.owner_assigned` when an owner is assigned)
+and *when* cleanup is due. The `network-lab` skill
+([`skills/network-lab/SKILL.md`](skills/network-lab/SKILL.md)) tells the agent to
+deploy with `labctl` under `--namespace "$RELAY_LAB_OWNER"`.
 
-`relay run [sandbox] cleanup <task-id>` reclaims the Task's external Lab through
+`relay run cleanup <task-id>` reclaims the Task's external Lab through
 **one trusted, pre-configured hook** (the repo ships a reference,
 [`scripts/lab-cleanup.sh`](scripts/lab-cleanup.sh)), `RELAY_LAB_CLEANUP_CMD`,
 invoked as `<cmd> <owner-id>` (the only argument). A Task-prompt-derived
@@ -601,7 +575,7 @@ its owner id stays addressable). The reference hook selects the lab by exact
 owner name (`netlab-<owner>`), never by suffix, and fails closed if its workspace
 purge does not succeed. Relay forwards a narrow, named `LABCTL_*` set
 (`LABCTL_ENV_ALLOWLIST`) to the **hook only** (never to the dsh Run), so the hook
-can authenticate without leaking host secrets into the sandbox. Image and
+can authenticate without leaking host secrets into a Run. Image and
 Shared-Lab VM management stay out of Relay.
 
 ### Historical cleanup: `relay gc`
@@ -1031,7 +1005,6 @@ RELAY_TOOL_WARN_MS=60000 RELAY_TOOL_BACKGROUND_MS=180000
 RELAY_TOOL_MAX_MS=3600000 RELAY_TOOL_STALE_GRACE_MS=60000
 RELAY_TOOL_HARD_CAP_MS=900000 RELAY_TOOL_NO_OUTPUT_MS=600000
 RELAY_MIN_FREE_DISK_BYTES=21474836480   # 20 GiB pre-launch floor (0 = threshold off)
-RELAY_MIN_FREE_DIND_BYTES=2147483648    # 2 GiB sandbox DinD floor (0 = probe off)
 RELAY_BACKGROUND_KEY=ctrl+b
 RELAY_WEB_TOKEN=<t>          # token required by `relay web` (unless --token is given)
 RELAY_DEDICATED=1            # opt-in: allow $RELAY_SOCK when no session dir is known
@@ -1730,8 +1703,8 @@ The alt-screen + pause/scroll behaviour is verified in a real tmux emulator
 src/cli.ts  daemon.ts  db.ts  schema.ts  scheduler.ts  reconciler.ts
     sessions.ts  socket.ts  messages.ts  tasks.ts  workers.ts  events.ts
     runtimes.ts  mail-policy.ts  harness.ts  dsh-runner.ts
-    run-lifecycle.ts  sandbox.ts  sandbox-lifecycle.ts
-docs/dsh-headless-runner.md  docs/run-lifecycle.md  docs/sandbox-lifecycle.md
+    run-lifecycle.ts  verify.ts  factory.ts  workflow-driver.ts
+docs/dsh-headless-runner.md  docs/run-lifecycle.md
 docs/factory-e2e.md  docs/pr-binding.md
     runtime/{runtime,herdr}.ts
     dashboard/{command,model,render,affinity,herdr,doctor}.ts
