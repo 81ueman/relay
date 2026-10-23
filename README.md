@@ -301,7 +301,10 @@ implement --TaskSubmitted--> verify --VerificationResult--> review
   read-only GraphQL query (the token rides **stdin**, never argv), and
   `RELAY_REVIEW_AUTHORIZED=a,b` sets the authorized marker authors. The
   operator/Factory/daemon paths auto-detect an authenticated `gh` when the flag is
-  **unset**; `RELAY_PROVIDER_GITHUB=off` disables it (fail closed). Each task is
+  **unset**; `RELAY_PROVIDER_GITHUB=off` disables it (fail closed). Every reader
+  command is killed after `RELAY_PROVIDER_EXEC_TIMEOUT_MS` (default 5s), so a hung
+  `gh`/`curl` read can never block the daemon's synchronous reconcile — including
+  its SIGTERM shutdown — indefinitely. Each task is
   polled at most once per `RELAY_PROVIDER_POLL_MS` (default 60s) and comments are
   fetched only when the PR `updatedAt`/head moved; the "comments scanned"
   watermark advances only when a scan **succeeded**, so neither a marker posted
@@ -462,7 +465,11 @@ Cancel/timeout kill the whole process group. Permissions stay in the worktree
 event is **not** a submission — only a structured `relay run submit` bound to the
 current Run/Task/phase/attempt/branch/HEAD advances the Task (a task with no
 linked branch/HEAD yet adopts the Run's; the recorded head is the produced one);
-a non-zero/cancelled/stale Run never does. `relay run logs <run-id>` renders the
+the HEAD fence also accepts a commit on the Run's **own** history — its base, its
+produced head, or an intermediate push the provider poll bound between them
+(proved with `git merge-base --is-ancestor`) — so a worker that pushes and opens
+its PR before the Run ends is not refused as stale, while a foreign head is.
+A non-zero/cancelled/stale Run never advances the Task. `relay run logs <run-id>` renders the
 read-only session id + ordered `tool_call`/`tool_result` chronology (no TUI/Web UI
 needed). This covers one Run's launch/observe/terminate only; the Task worktree
 (create/select/own), single-writer control and FIX re-entry are ISH-760 — see

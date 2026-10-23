@@ -23,7 +23,13 @@ import {
   resolveHumanInterface,
   taskChildren,
 } from "./tasks";
-import { findLiveRunFor, findActiveWriterRow, runOwnedError } from "./run-owner";
+import {
+  findLiveRunFor,
+  findActiveWriterRow,
+  runHeadFenceRepos,
+  runOwnedError,
+  taskHeadOvertakenByOtherWriter,
+} from "./run-owner";
 import { clearCurrentTask, getWorker, normalizeWorkerAfterTaskRelease, touchProgress } from "./workers";
 import {
   gitHead,
@@ -649,8 +655,10 @@ export interface RunImplementation {
    */
   headSha?: string | null;
   /**
-   * The HEAD the Run STARTED at — the staleness fence. A task already bound to
-   * a different head has moved since the Run began and is refused.
+   * The HEAD the Run STARTED at — the staleness fence. A task bound to a head
+   * that is neither this base, the Run's produced head, nor an intermediate
+   * commit on the Run's own history has moved since the Run began and is
+   * refused (ISH-1087/ISH-1125).
    */
   baseHeadSha?: string | null;
   summary?: string;
@@ -709,15 +717,31 @@ export function submitImplementationFromRun(db: Database, taskId: string, impl: 
       `${STALE_RESULT}: run ${impl.runId} produced branch ${impl.branch ?? "none"}, task ${taskId} is ${task.branch ?? "none"}`
     );
   }
-  // HEAD fence vs produced head: the Run started at `baseHeadSha`; a task whose
-  // head is already bound to a different revision has moved since the Run began.
+  // HEAD fence vs produced head: the Run started at `baseHeadSha`; a task bound
+  // to any OTHER revision than that base or a commit on the Run's own history
+  // has moved since the Run began. The Run's own history includes its produced
+  // head and any intermediate push the daemon's provider poll may have bound
+  // mid-Run (ISH-1087/1125); the lineage is checked in the Run's own repo so a
+  // foreign head is still refused.
+  //
+  // `baseHeadSha === undefined` (a direct caller, not `acceptRunSubmission`)
+  // falls back to `headSha`, so BOTH fence heads are the produced head and only
+  // that exact head (or NULL) can be accepted.
   const baseHead = impl.baseHeadSha !== undefined ? impl.baseHeadSha : impl.headSha;
-  if (task.head_sha !== null && (baseHead ?? null) !== task.head_sha) {
+  const producedHead = impl.headSha ?? null;
+  const sourceRun = db.query(`SELECT * FROM runs WHERE id = ?`).get(impl.runId) as Run | null;
+  if (
+    taskHeadOvertakenByOtherWriter(
+      task.head_sha,
+      { base_head_sha: baseHead ?? null, head_sha: producedHead },
+      sourceRun ? runHeadFenceRepos(db, sourceRun) : []
+    )
+  ) {
     throw new Error(
-      `${HEAD_MISMATCH}: run ${impl.runId} started at head ${baseHead ?? "none"}, task ${taskId} is bound to ${task.head_sha}`
+      `${HEAD_MISMATCH}: run ${impl.runId} started at head ${baseHead ?? "none"} and produced ` +
+        `${producedHead ?? "none"}, task ${taskId} is bound to ${task.head_sha}`
     );
   }
-  const producedHead = impl.headSha ?? null;
   // Adopt the Run's branch onto the task ONLY when the task has none.
   const adoptBranch = task.branch === null && impl.branch ? impl.branch : null;
   // An INTEGRATION Run that commits a DIFFERENT head invalidates the review that

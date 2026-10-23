@@ -18,7 +18,12 @@ import { isPinnedDsh, PINNED_DSH_VERSION, readDshVersion } from "./dsh-version";
 import { assertLaunchDiskSpace, type DiskGuardOptions } from "./disk-guard";
 import { gitHead } from "./verify";
 import { submitImplementationFromRun, type RunImplementation } from "./workflow";
-import { findActiveWriterRow, type ActiveWriterQuery as ActiveWriterRowQuery } from "./run-owner";
+import {
+  findActiveWriterRow,
+  runHeadFenceRepos,
+  taskHeadOvertakenByOtherWriter,
+  type ActiveWriterQuery as ActiveWriterRowQuery,
+} from "./run-owner";
 import {
   countDshLine,
   dshSessionId,
@@ -743,8 +748,10 @@ export function rejectSubmission(reason: string): never {
  *   - the submission names a different task/phase/attempt/branch/HEAD than the
  *     Run recorded;
  *   - the LIVE task has moved: its phase/attempt changed, its branch is bound to
- *     a different branch, or its head is bound to a revision other than the Run's
- *     START head.
+ *     a different branch, or its head is bound to a revision that is neither the
+ *     Run's START head, the Run's produced head, nor an intermediate commit on
+ *     the Run's own history (the provider poll may bind an own pushed PR head
+ *     mid-Run — ISH-1087/ISH-1125).
  * A task with no linked branch/head YET (the normal implement phase) adopts the
  * Run's produced branch/head; the Run's own `base_head_sha` is the staleness
  * fence. A process `exit 0` or the Run's final stdout text does NOT call this.
@@ -806,13 +813,18 @@ export function acceptRunSubmission(db: Database, sub: RunSubmission): Run {
       `run ${run.id} is stale: task branch is ${task.branch ?? "none"}, run produced ${run.branch ?? "none"}`
     );
   }
-  // HEAD fence: the Run started at `run.base_head_sha`. A task whose head is
-  // already bound to a DIFFERENT revision has moved since the Run started, so
-  // the Run can never advance the current attempt. A NULL task head is "not yet
-  // bound" and adopts the Run's produced head.
-  if (task.head_sha !== null && (run.base_head_sha ?? null) !== task.head_sha) {
+  // HEAD fence: the Run started at `run.base_head_sha`. A task bound to any
+  // revision OTHER than that base, the Run's own produced head, or an
+  // intermediate commit this Run pushed has moved under the Run, so the Run can
+  // never advance the current attempt. The Run's own heads are accepted because
+  // the daemon's provider poll may bind its pushed PR head mid-Run
+  // (ISH-1087/ISH-1125), and a Run may push more than once between polls. The
+  // lineage is checked in the Run's own repo so a foreign head is still refused.
+  // A NULL task head is "not yet bound" and adopts the Run's produced head.
+  if (taskHeadOvertakenByOtherWriter(task.head_sha, run, runHeadFenceRepos(db, run))) {
     rejectSubmission(
-      `run ${run.id} is stale: task head is ${task.head_sha}, run started at ${run.base_head_sha ?? "none"}`
+      `run ${run.id} is stale: task head is ${task.head_sha}, run started at ${run.base_head_sha ?? "none"} ` +
+        `and produced ${run.head_sha ?? "none"}`
     );
   }
 

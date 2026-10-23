@@ -33,6 +33,7 @@ import {
   type DshEventCounts,
 } from "./dsh-events";
 import { buildRunBrief, inheritFindings, taskBranchName, type RunFinding } from "./run-lifecycle";
+import { taskHeadOvertakenByOtherWriter } from "./run-owner";
 import { spawnIdentityToken } from "./proc-identity";
 import {
   beginRunLaunch,
@@ -985,8 +986,11 @@ export function sandboxSubmitterError(run: Run, task: Task, sandbox: Sandbox | n
   if (task.branch !== null && run.branch !== task.branch) {
     return `run ${run.id} produced branch ${run.branch ?? "none"}, task is ${task.branch}`;
   }
-  if (task.head_sha !== null && (run.base_head_sha ?? null) !== task.head_sha) {
-    return `run ${run.id} started at head ${run.base_head_sha ?? "none"}, task is bound to ${task.head_sha}`;
+  if (taskHeadOvertakenByOtherWriter(task.head_sha, run, sandbox.source ? [sandbox.source] : [])) {
+    return (
+      `run ${run.id} started at head ${run.base_head_sha ?? "none"} and produced ` +
+      `${run.head_sha ?? "none"}, task is bound to ${task.head_sha}`
+    );
   }
   return null;
 }

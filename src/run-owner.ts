@@ -39,6 +39,102 @@ export function findLiveRunFor(
       .get(taskId, phase, attempt) as Run | null) ?? null;
 }
 
+/** How long one local `git merge-base` fence probe may take. */
+const ANCESTRY_TIMEOUT_MS = 5000;
+
+function isSha(value: string | null | undefined): value is string {
+  // A commit id, never an option or ref: validate before handing it to git.
+  return typeof value === "string" && /^[0-9a-f]{4,64}$/i.test(value);
+}
+
+/**
+ * True when `ancestor` is an ancestor of (or equal to) `descendant` in `repo`.
+ *
+ * A missing/unreadable repo, an unknown object or a git error is `false`: the
+ * stale-Run fence FAILS CLOSED when it cannot prove the lineage.
+ */
+export function isAncestorCommit(repo: string, ancestor: string, descendant: string): boolean {
+  if (!repo || !isSha(ancestor) || !isSha(descendant)) return false;
+  try {
+    const p = Bun.spawnSync(["git", "-C", repo, "merge-base", "--is-ancestor", ancestor, descendant], {
+      stdout: "pipe",
+      stderr: "pipe",
+      timeout: ANCESTRY_TIMEOUT_MS,
+      killSignal: "SIGKILL",
+    });
+    return p.exitCode === 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The git repositories that can prove a Run's own history: the worktree the Run
+ * ran in, plus (for a Sandbox Run) the host checkout its produced HEAD is
+ * fetched back into.
+ */
+export function runHeadFenceRepos(
+  db: Database,
+  run: Pick<Run, "task_id" | "cwd" | "sandbox_name">
+): string[] {
+  const repos: string[] = [];
+  if (run.cwd) repos.push(run.cwd);
+  if (run.sandbox_name) {
+    const sandbox = db
+      .query(`SELECT source FROM sandboxes WHERE task_id = ? AND name = ?`)
+      .get(run.task_id, run.sandbox_name) as { source: string } | null;
+    if (sandbox?.source) repos.push(sandbox.source);
+  }
+  return repos;
+}
+
+/**
+ * ISH-1125: has the Task's bound HEAD been overtaken by someone OTHER than this
+ * Run?
+ *
+ * A submit-time HEAD fence compares the Task's bound head with the Run's
+ * pre-run base. That is right for a Task whose head moved under the Run, but it
+ * also rejected a Run's OWN work: since ISH-1087 the daemon's provider poll
+ * copies a live PR head onto the Task mid-Run, so a worker that pushes its
+ * branch and opens its PR before the Run ends leaves `task.head_sha` equal to
+ * the Run's produced commit (not its base). THAT movement is the Run's own
+ * output, not a foreign writer, so it must not be called stale.
+ *
+ * A Run may push more than once inside one poll interval, so the bound head may
+ * be an INTERMEDIATE commit of this Run rather than its final produced head.
+ * When a repo is supplied, the fence accepts a bound head that lies on the
+ * Run's own history: the Run's base is an ancestor of it AND it is an ancestor
+ * of the Run's produced head. A head from a different writer — before the base,
+ * off the produced history, or ahead of the produced head — is still refused.
+ *
+ * The heads a Run may therefore legitimately find on the Task are:
+ *   - the head it started at (the Task did not move),
+ *   - the head it produced (the poll saw this Run's own latest push), or
+ *   - an intermediate commit between them (the poll saw an earlier own push).
+ * Any OTHER bound head means the Task moved under the Run and is refused; a
+ * NULL Task head adopts the produced head, as before. No `repos` means only the
+ * two exact heads can be proven, so the fence fails closed.
+ */
+export function taskHeadOvertakenByOtherWriter(
+  taskHead: string | null,
+  run: Pick<Run, "base_head_sha" | "head_sha">,
+  repos: readonly string[] = []
+): boolean {
+  if (taskHead === null) return false;
+  const base = run.base_head_sha ?? null;
+  const produced = run.head_sha ?? null;
+  if (taskHead === base || taskHead === produced) return false;
+  // An intermediate head is provable only when both ends of the lineage exist.
+  if (!isSha(base) || !isSha(produced)) return true;
+  for (const repo of repos) {
+    if (!repo) continue;
+    if (isAncestorCommit(repo, base, taskHead) && isAncestorCommit(repo, taskHead, produced)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 export function runOwnedError(run: Run, taskId: string): Error {
   return new Error(
     `${RUN_OWNED}: run ${run.id} (${run.state}) owns ${taskId} ${run.phase}/${run.attempt}; ` +

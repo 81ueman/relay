@@ -34,12 +34,28 @@ export interface ExecResult {
 }
 export type Exec = (argv: string[], opts?: { stdin?: Uint8Array }) => ExecResult;
 
+/**
+ * ISH-1125: how long one read-only provider command (`gh`/`curl`) may run before
+ * it is killed. The default is deliberately generous for a slow network, but
+ * BOUNDED: the daemon reconciles providers synchronously, so an un-timed `gh`
+ * call blocks the whole supervisor loop — including SIGTERM shutdown — for as
+ * long as the command hangs. `0`/a non-number falls back to the default.
+ */
+export function providerExecTimeoutMs(env: EnvLike = process.env): number {
+  const v = Number(env.RELAY_PROVIDER_EXEC_TIMEOUT_MS ?? "");
+  return Number.isFinite(v) && v > 0 ? v : 5000;
+}
+
 export const defaultExec: Exec = (argv, opts) => {
   try {
     const p = Bun.spawnSync(argv, {
       stdout: "pipe",
       stderr: "pipe",
       stdin: opts?.stdin ?? "ignore",
+      timeout: providerExecTimeoutMs(),
+      // SIGKILL (not the default SIGTERM) so a child that ignores a polite signal
+      // can never keep the supervisor's single-threaded reconcile blocked.
+      killSignal: "SIGKILL",
     });
     return { ok: p.exitCode === 0, stdout: p.stdout.toString(), stderr: p.stderr.toString() };
   } catch (e) {

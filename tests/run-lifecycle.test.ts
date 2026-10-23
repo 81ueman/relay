@@ -7,7 +7,7 @@ import type { Database } from "bun:sqlite";
 import { openDb } from "../src/db";
 import { getTask, claimTask, claimNext } from "../src/tasks";
 import { registerWorker } from "../src/workers";
-import { intakeTask, recordReview, recordVerification } from "../src/workflow";
+import { intakeTask, linkTask, recordReview, recordVerification } from "../src/workflow";
 import { getRun, listRuns, type DshProcess, type DshSpawner } from "../src/dsh-runner";
 import { insertTaskResult } from "../src/results";
 import { PINNED_DSH_VERSION } from "../src/dsh-version";
@@ -1006,6 +1006,32 @@ describe("submitter binding: a stale/late/failed Run never advances the Task", (
     expect(runSubmitterError(fake({ attempt: 9 }), t)).toMatch(/attempt/);
     expect(runSubmitterError(fake({ generation: 9 }), t)).toMatch(/generation/);
     expect(runSubmitterError(fake({ task_id: "T999" }), t)).toMatch(/belongs to task/);
+  });
+
+  test("ISH-1125: the Run's own produced head is not a foreign move; another head still is", () => {
+    const t = getTask(db, newTask())!;
+    const base = "a".repeat(40);
+    const produced = "b".repeat(40);
+    const foreign = "c".repeat(40);
+    const run = {
+      id: "run-x",
+      task_id: t.id,
+      phase: t.phase,
+      attempt: t.attempt,
+      generation: t.attempt,
+      branch: t.branch,
+      base_head_sha: base,
+      head_sha: produced,
+    } as never;
+    // The provider poll bound the Run's OWN pushed PR head mid-Run.
+    linkTask(db, t.id, { headSha: produced });
+    expect(runSubmitterError(run, getTask(db, t.id)!)).toBeNull();
+    // The base (the Task never moved) is still accepted.
+    linkTask(db, t.id, { headSha: base });
+    expect(runSubmitterError(run, getTask(db, t.id)!)).toBeNull();
+    // A different writer's head is still refused.
+    linkTask(db, t.id, { headSha: foreign });
+    expect(runSubmitterError(run, getTask(db, t.id)!)).toMatch(new RegExp(foreign));
   });
 });
 
