@@ -30,6 +30,8 @@ import { processPgid, spawnIdentityToken } from "../src/proc-identity";
 import { DEFAULT_INTEGRATOR_WORKER, FACTORY_NATIVE_REVIEW_REQUIRED, pidAlive, reviewBlockedReason, runFactoryTask, verifyChecksReason } from "../src/factory";
 import { findFactoryOutcomeForRun, latestFactoryOutcome } from "../src/factory-failure";
 import type { GitHubReadOnly, GitHubReviewReader, PrView, ReviewView } from "../src/providers";
+import { FakeGitHub } from "../src/providers";
+import { requestRebase } from "../src/rebase";
 import {
   DEFAULT_REVIEWER_WORKER as REVIEWER_WORKER,
   REVIEW_NOT_INDEPENDENT,
@@ -1846,6 +1848,69 @@ describe("ISH-904: factory defects (phase-null, worker state, merge_ready rework
     expect(after.state).toBe("queued");
     expect(after.attempt).toBe(before.attempt + 1);
     expect(after.head_sha).toBeNull();
+  });
+
+  test("ISH-1122: a conflicting merge_ready Task is rebased, then the factory runs implement at attempt+1 with the reason, VERIFY and a new review", async () => {
+    const dsh = fakeDsh("dsh-commit", COMMITTING_DSH);
+    const id = intakeTask(db, {
+      provider: "test",
+      issueId: `ISH-1122-${issueSeq++}`,
+      codeChange: true,
+      title: "rebase fixture",
+      checks: [{ name: "noop", command: "true" }],
+      prUrl: "https://github.com/o/r/pull/1",
+      prRepo: "o/r",
+      branch: "relay/ish-1122-fixture",
+    }).id;
+    const first = await runFactoryTask(db, id, factoryDeps(dsh, reviewerHarness(["pass"]).spawner));
+    expect(first.outcome).toBe("merge_ready");
+    const before = getTask(db, id)!;
+    expect(before.head_sha).not.toBeNull();
+
+    registerWorker(db, "integ", { role: "integrator" });
+    const gh = new FakeGitHub().putPullRequest({
+      ref: { repo: "o/r", number: 1 },
+      url: "https://github.com/o/r/pull/1",
+      state: "open",
+      isDraft: false,
+      headRefName: before.branch ?? "relay/ish-1122-fixture",
+      headSha: before.head_sha!,
+      baseRef: "main",
+      baseSha: "0".repeat(40),
+      mergeable: "conflicting",
+      labels: [],
+      updatedAt: "2026-01-01T00:00:00Z",
+    } satisfies PrView);
+    const reason = "sibling lane merged first: rebase onto the new trunk, then re-run checks";
+    const rebased = requestRebase(db, id, "integ", { reason, deps: { github: gh } });
+    expect(rebased.phase).toBe("implement");
+    expect(rebased.state).toBe("queued");
+    expect(rebased.attempt).toBe(before.attempt + 1);
+    expect(rebased.head_sha).toBeNull();
+
+    const second = await runFactoryTask(db, id, factoryDeps(dsh, reviewerHarness(["pass"]).spawner));
+    expect(second.outcome).toBe("merge_ready");
+    const after = getTask(db, id)!;
+    expect(after.phase).toBe("merge_ready");
+    expect(after.attempt).toBe(before.attempt + 1);
+
+    const rebaseRun = listRuns(db, { taskId: id }).find((r) => r.attempt === after.attempt);
+    expect(rebaseRun).toBeTruthy();
+    const brief = readFileSync(rebaseRun!.spec_path!, "utf-8");
+    expect(brief).toContain("### RebaseRequested — FAIL (attempt 0)");
+    expect(brief).toContain(reason);
+
+    // The new attempt needs a fresh VERIFY and a fresh independent review, both
+    // bound to the head the rebase Run produced.
+    const results = db
+      .query(
+        `SELECT kind, passed, head_sha FROM task_results
+          WHERE task_id = ? AND attempt = ? AND kind IN ('VerificationResult','ReviewResult')`
+      )
+      .all(id, after.attempt) as { kind: string; passed: number; head_sha: string | null }[];
+    expect(results.find((r) => r.kind === "VerificationResult")?.passed).toBe(1);
+    expect(results.find((r) => r.kind === "ReviewResult")?.passed).toBe(1);
+    expect(results.every((r) => r.head_sha === after.head_sha)).toBe(true);
   });
 
   test("a result-write failure parks the task blocked_internal instead of a half-applied phase", async () => {

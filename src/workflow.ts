@@ -65,6 +65,12 @@ export const HEAD_MISMATCH = "HEAD_MISMATCH";
 export const UNRESOLVED_NG = "UNRESOLVED_NG";
 /** ISH-759: a result/nonce that no longer matches the live task (head moved). */
 export const STALE_RESULT = "STALE_RESULT";
+/**
+ * ISH-1122: a coordinator-authorised `merge_ready` -> `implement` rebase route
+ * was refused (not merge_ready, the PR is mergeable, an unresolved reviewer
+ * NG/HOLD is present, or the observed conflict does not match the bound HEAD).
+ */
+export const REBASE_REFUSED = "REBASE_REFUSED";
 
 /**
  * ISH-759: the pseudo-role Relay itself takes while it MECHANICALLY verifies a
@@ -1514,6 +1520,181 @@ export function recordReview(db: Database, taskId: string, reviewerId: string, o
     });
   }
   requestReconcile(db, `review-fix:${taskId}`);
+  return updated;
+}
+
+export interface MergeReadyRebaseOptions {
+  /** The FIX brief the next implement Run inherits. */
+  reason: string;
+  /**
+   * The OBSERVED mergeability of the bound PR. Only a real conflict can be
+   * routed here; a mergeable/unknown PR is refused (never assumed conflicting).
+   */
+  prMergeable: "mergeable" | "conflicting" | "unknown";
+  /** The PR head the observation was made at; it must match the recorded head. */
+  prHeadSha?: string | null;
+  /** A structured owner HOLD observed on Linear / a PR label, if any. */
+  hold?: string | null;
+  /** The caller's expected recorded HEAD (a stale caller is refused). */
+  headSha?: string | null;
+}
+
+/**
+ * ISH-1122: the coordinator-authorised REBASE FIX route.
+ *
+ * A Task parked at `merge_ready` whose bound PR has become CONFLICTING can be
+ * returned to `implement` at attempt+1 with `reason` as the FIX brief. This is
+ * deliberately NOT a review verdict:
+ *
+ *   - it never inserts/updates a ReviewResult (the prior PASS stays as history);
+ *   - it refuses when an unresolved reviewer NG/HOLD exists at the current HEAD,
+ *     so it can never clear or override one;
+ *   - it refuses a structured owner HOLD (passed in from the provider read);
+ *   - it clears the recorded HEAD and advances the attempt, so the prior PASS can
+ *     never authorise a merge: the new head needs a fresh VERIFY + independent
+ *     review.
+ *
+ * Authority: the Gateway/human for the Task, or an `integrator` identity. This is
+ * exactly the same principal that may ACCEPT a merge_ready Task; the independent
+ * reviewer role is not required (and is not impersonated by the coordinator).
+ *
+ * The provider observation (conflict / HOLD / PR head) is resolved by
+ * `src/rebase.ts`, which reads the bound PR through the read-only GitHub reader.
+ */
+export function requestMergeReadyRebase(
+  db: Database,
+  taskId: string,
+  actor: string,
+  opts: MergeReadyRebaseOptions
+): Task {
+  const task = getTask(db, taskId);
+  if (!task) throw new Error(`unknown task: ${taskId}`);
+  if (!isCodeTask(task)) throw new Error(`${WORKFLOW_ERROR}: ${taskId} is not a code-change task`);
+  if (!actor.trim()) throw new Error(`${AUTHORITY_ERROR}: a rebase request needs an actor identity`);
+  if (isTerminalTaskState(task.state)) {
+    throw new Error(`${REBASE_REFUSED}: cannot rebase terminal task ${taskId} (state=${task.state})`);
+  }
+  const phase = phaseOf(task);
+  if (phase !== "merge_ready") {
+    throw new Error(
+      `${REBASE_REFUSED}: cannot rebase ${taskId} at phase '${phase}'; the route applies only at merge_ready`
+    );
+  }
+  if (task.state !== "queued" && task.state !== "review") {
+    throw new Error(
+      `${REBASE_REFUSED}: cannot rebase ${taskId} while it is ${task.state}; a merge_ready Task awaiting acceptance is ` +
+      `queued (not held/running)`
+    );
+  }
+  if (task.merged_at !== null) {
+    throw new Error(`${REBASE_REFUSED}: ${taskId} is already merged; there is nothing to rebase`);
+  }
+  if (!task.head_sha) {
+    throw new Error(`${REBASE_REFUSED}: ${taskId} records no HEAD; a conflict cannot be bound to a revision`);
+  }
+  if (opts.headSha && opts.headSha !== task.head_sha) {
+    throw new Error(
+      `${HEAD_MISMATCH}: rebase head ${opts.headSha} != task head ${task.head_sha} for ${taskId}`
+    );
+  }
+  const reason = (opts.reason ?? "").trim();
+  if (!reason) {
+    throw new Error(
+      `${REBASE_REFUSED}: a rebase needs --reason "<why the PR is not mergeable>" (it becomes the FIX brief)`
+    );
+  }
+  if (opts.prMergeable !== "conflicting") {
+    throw new Error(
+      `${REBASE_REFUSED}: the bound PR is ${opts.prMergeable}, not conflicting; ` +
+      `only a real merge conflict can route a merge_ready Task back for a rebase`
+    );
+  }
+  if (opts.prHeadSha && opts.prHeadSha !== task.head_sha) {
+    throw new Error(
+      `${HEAD_MISMATCH}: the conflicting PR head ${opts.prHeadSha} != recorded head ${task.head_sha} for ${taskId}; ` +
+      `the observation is not of this work`
+    );
+  }
+  if (opts.hold) {
+    throw new Error(`${REBASE_REFUSED}: ${taskId} is under an owner HOLD (${opts.hold}); a rebase cannot clear it`);
+  }
+  // An unresolved NG/HOLD at this HEAD is a reviewer decision, not a routing
+  // problem. Refuse before touching anything: a rebase must never clear it.
+  const unresolved = findUnresolvedNgAtHead(db, taskId, task.head_sha);
+  if (unresolved) {
+    throw new Error(
+      `${REBASE_REFUSED}: ${taskId} HEAD ${task.head_sha} carries an unresolved reviewer NG/HOLD ` +
+      `(result ${unresolved.id}); resolve or explicitly supersede it through the review path instead`
+    );
+  }
+  // The transition inherits the reviewed merge_ready state. Requiring the PASS is
+  // what makes "the old PASS no longer authorises a merge" a strict downgrade:
+  // the row stays as history, but the task moves past it.
+  const pass = findPassingReview(db, taskId, task.attempt);
+  if (!pass) {
+    throw new Error(
+      `${REBASE_REFUSED}: ${taskId} has no passing review for attempt ${task.attempt}; a rebase is not a review`
+    );
+  }
+  if ((pass.head_sha ?? null) !== task.head_sha) {
+    throw new Error(
+      `${HEAD_MISMATCH}: the passing review judged ${pass.head_sha ?? "none"}, not the current head ${task.head_sha} ` +
+      `for ${taskId}; re-review is required before a rebase route`
+    );
+  }
+
+  // Authority: the Gateway/human for the Task, or an integrator. This mirrors
+  // acceptTask; a reviewer is deliberately not enough (and is never impersonated).
+  const actorWorker = getWorker(db, actor);
+  const isIntegrator = actorWorker?.role === INTEGRATOR_ROLE;
+  const gateway = resolveHumanInterface(db, task);
+  const isGateway = gateway !== null && gateway === actor;
+  if (!isIntegrator && !isGateway) {
+    throw new Error(
+      `${AUTHORITY_ERROR}: ${actor} may not rebase ${taskId}; need the Gateway/human ` +
+      `(${gateway ?? "unresolved"}) or role '${INTEGRATOR_ROLE}'`
+    );
+  }
+
+  const fromAttempt = task.attempt;
+  const toAttempt = fromAttempt + 1;
+  const updated = db.transaction(() => {
+    const t = now();
+    db.query(
+      `INSERT INTO task_notes (task_id, worker_id, kind, body, created_at)
+       VALUES (?, ?, 'rebase', ?, ?)`
+    ).run(task.id, actor, reason, t);
+    const u = applyPhase(db, task, "implement", {
+      state: "queued",
+      attempt: toAttempt,
+      claimRole: claimRoleForPhase("implement", task.role),
+      // The new head is not known yet, and the prior PASS judged the old one.
+      clearHead: true,
+      resultRef: null,
+      expectPhase: "merge_ready",
+      expectAttempt: fromAttempt,
+    });
+    logEvent(db, {
+      source: "workflow",
+      workerId: actor,
+      taskId,
+      type: "workflow.rebase_requested",
+      payload: {
+        fromPhase: "merge_ready",
+        fromHead: task.head_sha,
+        fromAttempt,
+        toAttempt,
+        reason,
+        prMergeable: opts.prMergeable,
+        prHead: opts.prHeadSha ?? null,
+        supersededPass: pass.id,
+        hold: opts.hold ?? null,
+      },
+    });
+    releaseWorker(db, actor, taskId, t);
+    return u;
+  })();
+  requestReconcile(db, `rebase:${taskId}`);
   return updated;
 }
 

@@ -38,3 +38,20 @@ describe("ISH-904: CLI help documents the operator flags and preconditions", () 
     expect(out).toContain("--description D");
   });
 });
+
+describe("ISH-1122: CLI help documents the coordinator rebase route", () => {
+  test("`relay result rebase --help` documents the reason, authority and refusals", () => {
+    const out = help(["result", "rebase"]);
+    expect(out).toContain("relay result rebase <task-id> --reason <text>");
+    expect(out).toContain("merge_ready");
+    expect(out).toContain("CONFLICTING");
+    expect(out).toContain("integrator");
+    expect(out).toContain("reviewer NG/HOLD");
+    expect(out).toContain("never records a review verdict");
+  });
+
+  test("the top-level usage and `relay result --help` list the rebase subcommand", () => {
+    expect(help([])).toContain("relay result rebase <task-id> --reason");
+    expect(help(["result"])).toContain("relay result rebase <task-id> --reason");
+  });
+});
