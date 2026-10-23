@@ -279,7 +279,10 @@ implement --TaskSubmitted--> verify --VerificationResult--> review
   reviewer must hold `REVIEWER_ROLE` (or the review claim) and may not be the
   worker that submitted the attempt; a reviewer has **no write/merge** authority.
 - **HEAD is the review identity.** A PASS must name the current `head_sha`; a
-  moved head sends the task back to review. The same PR+HEAD+profile is reviewed
+  moved head invalidates the PASS **and** the VERIFY that backed it, so the task
+  re-enters `verify` at the new head (Relay re-runs the mechanical checks) before
+  it is reviewed again. A base-branch retarget keeps the same head, so only the
+  review re-opens. The same PR+HEAD+profile is reviewed
   once, and an **unresolved NG at the same HEAD is never cleared by a later OK
   alone** (it must `--supersedes <result-id>` explicitly).
 - **Provider reconciliation is read-only / fail-closed.** With a bound PR, Relay
@@ -365,13 +368,21 @@ required SQLite evidence, and prints ONE structured decision — `READY`,
   that only moves the base does **not** force a rebase/review loop (no
   unconditional ancestor requirement); a **changed HEAD** does require a fresh
   independent review at the new HEAD.
-- **Evidence in SQLite.** A trusted **independent** review PASS at the CURRENT
-  head, no **unresolved NG** at that head (a later OK alone never clears it), no
-  owner **HOLD** (a STRUCTURED Linear state/label or an owner label on the PR —
-  never a keyword scan of free text), the required **check results** (a failed or
-  unreadable read, zero reported checks, or an all-skipped roll-up is `NOT_RUN` →
-  BLOCKED; a CI credit outage can never become PASS), and the **dependent change
-  order** (a PR-bound prerequisite counts as complete only once merged).
+- **Evidence in SQLite.** The required mechanical **VERIFY** result passed at the
+  recorded head (a missing, stale or failed VERIFY is `VERIFY_MISSING` /
+  `VERIFY_STALE` / `VERIFY_FAILED`), a trusted **independent** review PASS at the
+  CURRENT head, no **unresolved NG** at that head (a later OK alone never clears
+  it), no owner **HOLD** (a STRUCTURED Linear state/label or an owner label on the
+  PR — never a keyword scan of free text), and the **dependent change order** (a
+  PR-bound prerequisite counts as complete only once merged).
+- **Hosted CI is informational only (ISH-1140).** GitHub check runs are still
+  read (HEAD-pinned) but are **never** a merge gate: `CHECKS_NOT_RUN` and
+  `CHECKS_NOT_PASSED` no longer exist, so a failing, absent, all-skipped or
+  unreadable hosted-CI roll-up cannot make the gate `BLOCKED`. The observation is
+  reported as `hosted_ci: not verified | passing | failing` in `--json` and in
+  the human line (`not verified` = absent/unreadable/all-skipped/still pending;
+  `failing` = a check run concluded fail/cancel). A real merge is decided by
+  Relay's own evidence above, not by the hosted provider.
 - **Permission.** A real merge needs an explicit point-of-use authority
   (ISH-288); with none the verdict is `BLOCKED/NO_PERMISSION`. The gate has **no
   push/rebase/merge executor** and never writes a provider or Linear — it only
@@ -386,6 +397,14 @@ The decision is a PURE function of observable facts (`evaluateMergeGate`), so th
 whole table is unit-tested; the daemon pass (`runMergeGates`) is idempotent and
 logs each new decision identity once. Real-PR dry run:
 `relay merge-check <task> --json`.
+
+The coordinator still performs the merge (`gh pr merge`) and records it in the
+Task/PR, naming Relay's own evidence rather than hosted CI:
+
+`merged on local checks: <commands → results>; hosted CI: not verified`
+
+See [`docs/ish-1140-merge-gate.md`](docs/ish-1140-merge-gate.md) for the exact
+live-verification command and the ishiul gateway-skill note.
 
 ### Factory E2E: dsh → VERIFY → Claude review → MergeReady (ISH-762)
 

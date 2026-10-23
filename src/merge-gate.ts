@@ -37,9 +37,15 @@ import {
  * An independent Review PASS is NOT merge permission and NOT Task Done. This
  * module mechanically verifies the GitHub current state (open/non-draft,
  * head/base/diff, mergeability, the re-fetched `merged` flag) together with the
- * REQUIRED evidence already stored in SQLite (a trusted independent review at
- * the CURRENT head, an unresolved NG, an owner HOLD, required check results, and
- * dependent change order) and produces ONE structured decision:
+ * REQUIRED evidence already stored in SQLite (the mechanical VERIFY at the
+ * CURRENT head, a trusted independent review at the CURRENT head, an unresolved
+ * NG, an owner HOLD, and dependent change order) and produces ONE structured
+ * decision:
+ *
+ * ISH-1140: GitHub check runs are NOT a gate. They are still read (HEAD-pinned)
+ * and reported as the informational `hosted_ci` field (`not verified` /
+ * `passing` / `failing`); a failing, absent, all-skipped or unreadable hosted-CI
+ * roll-up can never turn the decision BLOCKED.
  *
  *   READY    — every merge-readiness condition is satisfied AND a point-of-use
  *              merge authority is granted. Nothing here performs the merge.
@@ -78,10 +84,11 @@ export type MergeBlockCode =
   | "REVIEW_MISSING"
   | "REVIEW_STALE"
   | "REVIEW_NOT_INDEPENDENT"
+  | "VERIFY_MISSING"
+  | "VERIFY_STALE"
+  | "VERIFY_FAILED"
   | "UNRESOLVED_NG"
   | "HOLD"
-  | "CHECKS_NOT_RUN"
-  | "CHECKS_NOT_PASSED"
   | "CONFLICT"
   | "MERGEABILITY_UNKNOWN"
   | "BASE_CHANGED"
@@ -122,6 +129,8 @@ export interface MergeGateInput {
   /** The re-fetched PR view, or null when unbound/unreadable. */
   pr: PrView | null;
   prRead: PrRead;
+  /** The mechanical VERIFY result at the recorded head, or null. */
+  verify: { passed: boolean; head: string | null } | null;
   /** A passing ReviewResult at the current head/attempt, or null. */
   review: { workerId: string | null; head: string | null; reviewer: string | null } | null;
   /** The author of the TaskSubmitted for this attempt (independence check). */
@@ -132,13 +141,12 @@ export interface MergeGateInput {
   prBase: string | null;
   /** A structured owner HOLD (Linear state/label or PR label), or null. */
   hold: string | null;
-  /** The required-check roll-up; null = the read FAILED (NOT_RUN). */
-  checks: CheckRollup | null;
   /**
-   * ISH-1132: the check read itself hit the provider's rate-limit backoff. This
-   * is NOT "checks not run"; it is a retryable `PROVIDER_RATE_LIMITED` block.
+   * ISH-1140: the HEAD-pinned hosted-CI roll-up, INFORMATION ONLY. `null` = the
+   * read failed / no reader / no recorded head. It is never a gate; it only
+   * feeds the decision's `hosted_ci` field.
    */
-  checksRateLimited?: boolean;
+  checks: CheckRollup | null;
   /** Declared prerequisites that are not complete (merged, for a PR-bound dep). */
   unmetDependencies: string[];
   /** Point-of-use merge authority (ISH-288). Default DENY. */
@@ -146,6 +154,15 @@ export interface MergeGateInput {
   /** The PR is a draft the OWNER designated to keep as a draft. */
   draftRetained: boolean;
 }
+
+/**
+ * ISH-1140: what Relay observed about GitHub-hosted CI. INFORMATIONAL ONLY:
+ * every value is compatible with READY, and none of them can BLOCK the gate.
+ *   - `passing`      at least one required check concluded green, none red/pending
+ *   - `failing`      a check run concluded fail/cancel
+ *   - `not verified` absent, unreadable, all-skipped, or still pending
+ */
+export type HostedCiState = "not verified" | "passing" | "failing";
 
 export interface MergeGateDecision {
   taskId: string;
@@ -155,10 +172,22 @@ export interface MergeGateDecision {
   reasons: MergeGateReason[];
   /** The re-fetched PR this decision judged (null when unbound/unreadable). */
   pr: PrView | null;
+  /** ISH-1140: hosted-CI observation. Informational; never a gate. */
+  hosted_ci: HostedCiState;
   /** The routing the gate RECOMMENDS. Never executed by this module. */
   action: "merge" | "IntegrationRequired" | "none";
   /** Stable identity of this decision (task, head, attempt, status, reasons). */
   identity: string;
+}
+
+/** Classify an informational check roll-up into the reported hosted-CI state. */
+export function hostedCiState(checks: CheckRollup | null): HostedCiState {
+  if (!checks || checks.total === 0) return "not verified";
+  if (checks.requiredPassed) return "passing";
+  if (checks.failing.length > 0) return "failing";
+  // Zero passing + no failing leaves an all-skipped / all-pending roll-up: the
+  // hosted gate has not actually verified this head, so say so (never green).
+  return "not verified";
 }
 
 // ---------------------------------------------------------------------------
@@ -173,13 +202,26 @@ function decide(input: MergeGateInput, status: MergeGateStatus, reasons: MergeGa
       ? "merge"
       : "none";
   const identity = `merge-gate:${input.taskId}:${input.head ?? "none"}:${input.attempt}:${status}:${codes.join("+") || "ok"}`;
-  return { taskId: input.taskId, head: input.head, attempt: input.attempt, status, reasons, pr: input.pr, action, identity };
+  return {
+    taskId: input.taskId,
+    head: input.head,
+    attempt: input.attempt,
+    status,
+    reasons,
+    pr: input.pr,
+    // ISH-1140: informational observation; deliberately NOT part of the identity
+    // (a hosted-CI transition is not a gate-decision change and must not spam).
+    hosted_ci: hostedCiState(input.checks),
+    action,
+    identity,
+  };
 }
 
 /**
- * The decision. Fail-closed: any unknown / unreadable condition is BLOCKED, and
- * a zero-check roll-up is NOT_RUN. A `done` (internally accepted) task whose PR
- * is not merged is explicitly distinguished from Done.
+ * The decision. Fail-closed: any unknown / unreadable REQUIRED condition is
+ * BLOCKED. ISH-1140: hosted-CI check runs are not a required condition — they are
+ * reported in `hosted_ci` and never add a reason. A `done` (internally accepted)
+ * task whose PR is not merged is explicitly distinguished from Done.
  */
 export function evaluateMergeGate(input: MergeGateInput): MergeGateDecision {
   const reasons: MergeGateReason[] = [];
@@ -288,6 +330,18 @@ export function evaluateMergeGate(input: MergeGateInput): MergeGateDecision {
     }
   }
 
+  // --- Required Relay VERIFY at the CURRENT head ---------------------------
+  // ISH-1140: Relay's own mechanical VERIFY is the evidence that gates readiness;
+  // hosted CI is only informational (below). A VERIFY recorded at another head, a
+  // missing VERIFY, or a failed VERIFY never satisfies the gate.
+  if (!input.verify) {
+    push("VERIFY_MISSING", "no mechanical VERIFY result at the recorded HEAD");
+  } else if (!input.verify.passed) {
+    push("VERIFY_FAILED", "the mechanical VERIFY at this HEAD failed");
+  } else if (!input.verify.head || (input.head && !headsMatch(input.verify.head, input.head))) {
+    push("VERIFY_STALE", `the VERIFY names ${short(input.verify.head)}, not the current head ${short(input.head)}`);
+  }
+
   // --- Independent review at the CURRENT head -----------------------------
   if (!input.review) {
     push("REVIEW_MISSING", "no trusted independent review PASS at the current HEAD");
@@ -312,22 +366,9 @@ export function evaluateMergeGate(input: MergeGateInput): MergeGateDecision {
     push("HOLD", `owner HOLD: ${input.hold}`);
   }
 
-  // --- Required check results ---------------------------------------------
-  if (input.checksRateLimited) {
-    push("PROVIDER_RATE_LIMITED", "required check results could not be read because the GitHub API is rate-limited (retry after the reset)");
-  } else if (!input.checks) {
-    push("CHECKS_NOT_RUN", "required check results are unavailable (NOT_RUN; a CI outage or an unreadable read)");
-  } else if (input.checks.total === 0) {
-    push("CHECKS_NOT_RUN", "no check results were reported for this HEAD");
-  } else if (input.checks.passed === 0 && input.checks.failing.length === 0 && input.checks.pending.length === 0) {
-    // Every reported check was skipped: no required gate actually RAN.
-    push("CHECKS_NOT_RUN", "every reported check was skipped; no required gate actually ran");
-  } else if (!input.checks.requiredPassed) {
-    const detail: string[] = [];
-    if (input.checks.failing.length) detail.push(`failing: ${input.checks.failing.join(",")}`);
-    if (input.checks.pending.length) detail.push(`pending: ${input.checks.pending.join(",")}`);
-    push("CHECKS_NOT_PASSED", `required checks are not all passing (${detail.join("; ") || "unknown"})`);
-  }
+  // ISH-1140: hosted CI is deliberately NOT evaluated here. `input.checks` only
+  // feeds the informational `hosted_ci` field on the decision; a failing, absent,
+  // skipped or unreadable roll-up must never add a BLOCK reason.
 
   // --- Dependent change order ---------------------------------------------
   if (input.unmetDependencies.length > 0) {
@@ -356,7 +397,7 @@ function short(sha: string | null | undefined): string {
 export interface MergeGateDeps {
   github?: GitHubReadOnly;
   linear?: LinearReadOnly;
-  /** HEAD-pinned required-check reader. Absent -> checks are NOT_RUN (BLOCK). */
+  /** ISH-1140: HEAD-pinned check reader for the INFORMATIONAL hosted_ci only. */
   checks?: ChecksReadOnly;
   authorizedReviewers?: string[];
   authority?: ProviderAuthority;
@@ -444,6 +485,20 @@ export async function gatherMergeGateInput(
         reviewer: reviewPayloadReviewer(reviewRow.payload_json) ?? reviewRow.worker_id,
       }
     : null;
+  // ISH-1140: the required VERIFY is Relay's own mechanical evidence at the
+  // RECORDED head. The row is keyed by head (not attempt) because a base retarget
+  // re-opens the review at the next attempt while the produced HEAD is unchanged;
+  // that HEAD's VERIFY still applies.
+  const verifyRow = head
+    ? (db
+        .query(
+          `SELECT passed, head_sha FROM task_results
+            WHERE task_id = ? AND kind = 'VerificationResult' AND head_sha = ?
+            ORDER BY id DESC LIMIT 1`
+        )
+        .get(taskId, head) as { passed: number | null; head_sha: string | null } | null)
+    : null;
+  const verify = verifyRow ? { passed: verifyRow.passed === 1, head: verifyRow.head_sha } : null;
   const submission = findSubmissionForAttempt(db, taskId, attempt);
   const ng = findUnresolvedNgAtHead(db, taskId, head);
 
@@ -464,18 +519,14 @@ export async function gatherMergeGateInput(
     if (label) hold = `github-label:${label}`;
   }
 
+  // ISH-1140: hosted-CI check runs are read (HEAD-pinned) for INFORMATION only.
+  // With no recorded head there is nothing to pin to, so the observation stays
+  // "not verified" (never the live PR head). A failed read is also merely
+  // "not verified": it can no longer block the gate.
   let checks: CheckRollup | null = null;
-  let checksRateLimited = false;
-  // Checks are pinned to the RECORDED head. With no recorded head there is no
-  // head to pin to, so the roll-up stays NOT_RUN (never the live PR head).
-  if (deps.checks && pr && head) {
-    if (activeProviderRateLimit(deps.checks.rateLimit?.())) {
-      checksRateLimited = true;
-    } else {
-      const raw = await deps.checks.listChecks(pr.ref, head);
-      if (raw === null && activeProviderRateLimit(deps.checks.rateLimit?.())) checksRateLimited = true;
-      else checks = raw === null ? null : rollupChecks(raw);
-    }
+  if (deps.checks && pr && head && !activeProviderRateLimit(deps.checks.rateLimit?.())) {
+    const raw = await deps.checks.listChecks(pr.ref, head);
+    checks = raw === null ? null : rollupChecks(raw);
   }
 
   const unmetDependencies: string[] = [];
@@ -494,13 +545,13 @@ export async function gatherMergeGateInput(
     merged,
     pr,
     prRead,
+    verify,
     review,
     submitter: submission?.worker_id ?? null,
     unresolvedNgId: ng?.id ?? null,
     prBase: task.pr_base ?? null,
     hold,
     checks,
-    checksRateLimited,
     unmetDependencies,
     authority: deps.authority ?? NO_AUTHORITY,
     draftRetained: !!pr && pr.isDraft && pr.labels.some((l) => DRAFT_RETAIN_LABELS.includes((l ?? "").toLowerCase())),
@@ -635,8 +686,9 @@ export async function runMergeGates(db: Database, deps: MergeGateDeps = {}): Pro
   for (const t of mergeGateCandidates(db)) {
     // ISH-1129: shutdown interrupts a long candidate walk between Tasks.
     if (stopped(deps.signal)) break;
-    // ISH-1132: the gate reads `gh pr view` AND `check-runs`; it obeys the SAME
-    // per-Task interval as the PR poll and stops on a provider rate limit.
+    // ISH-1132/ISH-1140: the gate reads `gh pr view` AND (informationally)
+    // `check-runs`; it obeys the SAME per-Task interval as the PR poll and stops
+    // on a provider rate limit.
     const limited = currentProviderRateLimit(deps);
     const preLimited = limited !== null;
     if (limited) {
@@ -669,6 +721,8 @@ export async function runMergeGates(db: Database, deps: MergeGateDeps = {}): Pro
           attempt: decision.attempt,
           action: decision.action,
           reasons: decision.reasons.map((r) => r.code),
+          // ISH-1140: informational only; NOT part of the identity above.
+          hosted_ci: decision.hosted_ci,
         },
       });
       logged = true;
@@ -699,7 +753,7 @@ export async function runMergeGates(db: Database, deps: MergeGateDeps = {}): Pro
 export function formatMergeGateDecision(d: MergeGateDecision): string {
   const pr = d.pr ? `${d.pr.ref.repo}#${d.pr.ref.number}@${short(d.pr.headSha)}` : "none";
   const lines = [
-    `${d.taskId}  ${d.status}  head=${short(d.head)}  pr=${pr}  attempt=${d.attempt}  action=${d.action}`,
+    `${d.taskId}  ${d.status}  head=${short(d.head)}  pr=${pr}  attempt=${d.attempt}  action=${d.action}  hosted_ci: ${d.hosted_ci}`,
   ];
   for (const r of d.reasons) lines.push(`  - ${r.code}: ${r.message}`);
   return lines.join("\n");

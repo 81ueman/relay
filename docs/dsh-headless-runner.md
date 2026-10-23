@@ -201,8 +201,9 @@ structured result and advances `implement`/`integration` via the existing
 workflow — the same phase machine every other submission uses. An **integration**
 Run whose produced head differs from the reviewed head does **not** advance:
 exactly like `submitPhase`, it calls `invalidateReview` and sends the task back
-to `review` at a new attempt, so it can never reach `merge_ready` with an
-unreviewed head (which would dead-end at the accept gate).
+to `verify` at a new attempt (Relay re-runs the mechanical checks there, then the
+new head is reviewed), so it can never reach `merge_ready` with an unreviewed
+head (which would dead-end at the accept gate).
 
 ## Resuming a Session manually (operator only)
 

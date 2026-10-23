@@ -104,7 +104,7 @@ Usage:
   relay result merged <task-id> [--head SHA] [--repo R] [--reason R]
   relay result accept <task-id> [--worker <id>]
   relay verify <task-id> [--cwd <dir>] [--head SHA]   # mechanical verify (Relay runs the commands)
-  relay merge-check <task-id> [--json] [--authority merge]   # read-only HEAD-bound merge readiness (dry-run)
+  relay merge-check <task-id> [--json] [--authority merge]   # read-only HEAD-bound merge readiness (dry-run; hosted CI is informational)
   relay pr bind <task-id> [--json]   # READ-ONLY: bind the produced commit (task.head_sha) to a real PR the Agent created (re-read/verify; Relay never writes to GitHub)
 
   relay next [--worker <id>] [--role <r>] [--any-role]
@@ -331,7 +331,7 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
   },
   "merge-check": {
     about:
-      "READ-ONLY, HEAD-bound merge readiness (dry-run by default). Judges the GitHub PR (OPEN, non-draft, head/base/diff, mergeability, re-fetched `merged`), a trusted independent review at the CURRENT head, an unresolved NG, an owner HOLD, required check results and dependent change order, and prints READY / BLOCKED with concrete reasons. It NEVER pushes, rebases or merges: a real merge needs a point-of-use authority (ISH-288), so without one the verdict is BLOCKED/NO_PERMISSION. --authority merge only assumes the permission for the DRY-RUN verdict; it performs nothing. A conflict raises IntegrationRequired for a Gateway routing decision. --json emits the structured decision.",
+      "READ-ONLY, HEAD-bound merge readiness (dry-run by default). Judges the GitHub PR (OPEN, non-draft, head/base/diff, mergeability, re-fetched `merged`), the required mechanical VERIFY at the CURRENT head, a trusted independent review OK pinned to that head, an unresolved NG, an owner HOLD and dependent change order, and prints READY / BLOCKED with concrete reasons. ISH-1140: GitHub-hosted CI (check runs) is NEVER a gate — it is read only for the informational `hosted_ci: not verified | passing | failing` field, so failing or absent hosted checks cannot block. It NEVER pushes, rebases or merges: a real merge needs a point-of-use authority (ISH-288), so without one the verdict is BLOCKED/NO_PERMISSION. --authority merge only assumes the permission for the DRY-RUN verdict; it performs nothing. A conflict raises IntegrationRequired for a Gateway routing decision. --json emits the structured decision.",
     usage: ["relay merge-check <task-id> [--json] [--authority merge]"],
   },
   pr: {

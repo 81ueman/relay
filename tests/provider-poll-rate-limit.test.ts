@@ -425,6 +425,7 @@ describe("ISH-1132: a rate limit is a typed retryable outcome, never not-configu
     expect(codes).toContain("PROVIDER_RATE_LIMITED");
     expect(codes).not.toContain("PROVIDER_UNREADABLE");
     expect(codes).not.toContain("CHECKS_NOT_RUN");
+    expect(decision.hosted_ci).toBe("not verified");
   });
 
   test("the Factory returns provider_rate_limited, not FACTORY_NATIVE_REVIEW_REQUIRED", async () => {

@@ -6,21 +6,24 @@ import type { Database } from "bun:sqlite";
 import { openDb } from "../src/db";
 import { claimTask, getTask } from "../src/tasks";
 import { registerWorker } from "../src/workers";
-import { intakeTask, recordReview, recordVerification, submitPhase } from "../src/workflow";
+import { intakeTask, linkTask, recordReview, recordVerification, runMechanicalVerification, submitPhase, taskChecks } from "../src/workflow";
 import {
   DEFAULT_REVIEW_OWNER,
   FakeGitHub,
   rollupChecks,
   type CheckRunView,
+  type ChecksReadOnly,
   type PrView,
   type ProviderAuthority,
 } from "../src/providers";
 import { GhCliGitHub, mapCheckRunBucket, mapCommitStatusBucket, type Exec } from "../src/provider-adapters";
-import { processWorkflow } from "../src/workflow-driver";
+import type { CommandRunner } from "../src/verify";
+import { processWorkflow, runPendingMechanicalVerifications } from "../src/workflow-driver";
 import {
   boundPrRef,
   checkMergeGate,
   evaluateMergeGate,
+  formatMergeGateDecision,
   gatherMergeGateInput,
   mergeGateCandidates,
   mergeGateDecisionLogged,
@@ -71,6 +74,7 @@ function base(over: Partial<MergeGateInput> = {}): MergeGateInput {
     merged: false,
     pr: view(),
     prRead: "ok",
+    verify: { passed: true, head: HEAD },
     review: { workerId: "rev", head: HEAD, reviewer: "claude" },
     submitter: "impl",
     unresolvedNgId: null,
@@ -143,27 +147,66 @@ describe("merge gate: the READY / BLOCKED decision table (pure)", async () => {
     expect(codes({ hold: "github-label:do-not-merge" })).toContain("HOLD");
   });
 
-  test("an unrun required gate -> BLOCKED CHECKS_NOT_RUN (and it is never a PASS)", async () => {
-    expect(codes({ checks: null })).toContain("CHECKS_NOT_RUN");
-    expect(codes({ checks: { total: 0, passed: 0, pending: [], failing: [], skipped: [], requiredPassed: false } })).toContain(
-      "CHECKS_NOT_RUN"
-    );
+  // ISH-1140: hosted CI is INFORMATIONAL. A failing / absent / skipped roll-up
+  // never blocks a Task whose Relay evidence (VERIFY + head-pinned OK + PR) is
+  // green.
+  test("green VERIFY + head-pinned OK + mergeable PR is READY when every check run FAILED", async () => {
+    const fail = { total: 2, passed: 0, pending: [], failing: ["typecheck", "test"], skipped: [], requiredPassed: false };
+    const d = evaluateMergeGate(base({ checks: fail }));
+    expect(d.status).toBe("READY");
+    expect(d.reasons).toEqual([]);
+    expect(d.hosted_ci).toBe("failing");
+    // The failing hosted-CI names are not gate reasons.
+    expect(d.reasons.map((r) => r.code)).not.toContain("CHECKS_NOT_PASSED");
   });
 
-  test("a failing / pending required check -> BLOCKED CHECKS_NOT_PASSED", async () => {
-    const fail = { total: 1, passed: 0, pending: [], failing: ["test"], skipped: [], requiredPassed: false };
-    const pending = { total: 1, passed: 0, pending: ["test"], failing: [], skipped: [], requiredPassed: false };
-    expect(codes({ checks: fail })).toContain("CHECKS_NOT_PASSED");
-    expect(codes({ checks: pending })).toContain("CHECKS_NOT_PASSED");
+  test("green VERIFY + head-pinned OK + mergeable PR is READY when check runs are ABSENT", async () => {
+    const absent = { total: 0, passed: 0, pending: [], failing: [], skipped: [], requiredPassed: false };
+    const d = evaluateMergeGate(base({ checks: absent }));
+    expect(d.status).toBe("READY");
+    expect(d.hosted_ci).toBe("not verified");
+    // No reader / unreadable read is the same informational "not verified".
+    expect(evaluateMergeGate(base({ checks: null })).hosted_ci).toBe("not verified");
+    expect(evaluateMergeGate(base({ checks: null })).status).toBe("READY");
   });
 
-  test("#2 an all-skipped roll-up -> BLOCKED CHECKS_NOT_RUN (no gate actually ran); a pass+skip mix stays READY", async () => {
-    const allSkipped = { total: 1, passed: 0, pending: [], failing: [], skipped: ["ci"], requiredPassed: false };
-    const d = evaluateMergeGate(base({ checks: allSkipped }));
+  test("hosted_ci classifies the observed roll-up (passing / failing / not verified) without gating", async () => {
+    const checks = (over: Partial<NonNullable<MergeGateInput["checks"]>>) => ({
+      total: 1,
+      passed: 0,
+      pending: [] as string[],
+      failing: [] as string[],
+      skipped: [] as string[],
+      requiredPassed: false,
+      ...over,
+    });
+    expect(evaluateMergeGate(base({ checks: checks({ passed: 1, requiredPassed: true }) })).hosted_ci).toBe("passing");
+    expect(evaluateMergeGate(base({ checks: checks({ failing: ["test"] }) })).hosted_ci).toBe("failing");
+    expect(evaluateMergeGate(base({ checks: checks({ pending: ["test"] }) })).hosted_ci).toBe("not verified");
+    expect(evaluateMergeGate(base({ checks: checks({ skipped: ["ci"] }) })).hosted_ci).toBe("not verified");
+    expect(
+      evaluateMergeGate(base({ checks: checks({ passed: 1, skipped: ["b"], total: 2, requiredPassed: true }) })).status
+    ).toBe("READY");
+  });
+
+  test("the --json contract exposes hosted_ci (the informational hosted-CI field)", async () => {
+    const json = JSON.stringify(evaluateMergeGate(base({ checks: null })));
+    expect(json).toContain('"hosted_ci":"not verified"');
+    expect(json).not.toContain("CHECKS_NOT_RUN");
+    // The human line reports the same observation.
+    expect(formatMergeGateDecision(evaluateMergeGate(base({ checks: null })))).toContain("hosted_ci: not verified");
+  });
+
+  test("a FAILED mechanical VERIFY -> BLOCKED VERIFY_FAILED even with green hosted CI", async () => {
+    const d = evaluateMergeGate(base({ verify: { passed: false, head: HEAD } }));
     expect(d.status).toBe("BLOCKED");
-    expect(d.reasons.map((r) => r.code)).toContain("CHECKS_NOT_RUN");
-    const mixed = { total: 2, passed: 1, pending: [], failing: [], skipped: ["b"], requiredPassed: true };
-    expect(evaluateMergeGate(base({ checks: mixed })).status).toBe("READY");
+    expect(d.reasons.map((r) => r.code)).toContain("VERIFY_FAILED");
+  });
+
+  test("a MISSING VERIFY or one at another head -> BLOCKED (never assumed green)", async () => {
+    expect(codes({ verify: null })).toContain("VERIFY_MISSING");
+    expect(codes({ verify: { passed: true, head: MOVED } })).toContain("VERIFY_STALE");
+    expect(codes({ verify: { passed: true, head: null } })).toContain("VERIFY_STALE");
   });
 
   test("a conflict -> BLOCKED CONFLICT and action IntegrationRequired (a Gateway routing decision)", async () => {
@@ -414,7 +457,7 @@ function intake(id: string, over: { prUrl?: string } = {}) {
 }
 
 describe("merge gate: gathering the facts + the daemon pass (read-only)", async () => {
-  test("gather resolves the bound PR, the passing review and the HEAD-pinned checks", async () => {
+  test("gather resolves the bound PR, the passing VERIFY/review and the HEAD-pinned checks", async () => {
     const gh = new FakeGitHub();
     gh.putPullRequest(view());
     gh.putChecks({ repo: "o/r", number: 1 }, HEAD, CHECKS);
@@ -424,20 +467,81 @@ describe("merge gate: gathering the facts + the daemon pass (read-only)", async 
     const input = (await gatherMergeGateInput(db, t.id, { github: gh, checks: gh, authority: GRANT }))!;
     expect(input.prRead).toBe("ok");
     expect(input.head).toBe(HEAD);
+    expect(input.verify).toEqual({ passed: true, head: HEAD });
     expect(input.review?.head).toBe(HEAD);
     expect(input.checks?.requiredPassed).toBe(true);
     expect(evaluateMergeGate(input).status).toBe("READY");
+    expect(evaluateMergeGate(input).hosted_ci).toBe("passing");
     expect((await checkMergeGate(db, t.id, { github: gh, checks: gh, authority: GRANT }))!.status).toBe("READY");
   });
 
-  test("without a check reader the checks are NOT_RUN (BLOCKED, never assumed green)", async () => {
+  test("without a check reader the Task is READY and hosted_ci is 'not verified' (absent CI never blocks)", async () => {
     const gh = new FakeGitHub();
     gh.putPullRequest(view());
     const t = intake("o/r#2");
     toMergeReady(t.id);
     const d = (await checkMergeGate(db, t.id, { github: gh, authority: GRANT }))!;
+    expect(d.status).toBe("READY");
+    expect(d.hosted_ci).toBe("not verified");
+    expect(d.reasons).toEqual([]);
+  });
+
+  test("a rate-limited hosted-CI read is informational, never a block", async () => {
+    const gh = new FakeGitHub();
+    gh.putPullRequest(view());
+    const limited: ChecksReadOnly = {
+      name: "rate-limited-checks",
+      readOnly: true,
+      rateLimit: () => ({
+        provider: "github",
+        reason: "API rate limit exceeded",
+        observedAt: Date.now(),
+        resetAt: Date.now() + 60_000,
+      }),
+      listChecks: () => {
+        throw new Error("a rate-limited checks reader must not be called");
+      },
+    };
+    const t = intake("o/r#2d");
+    toMergeReady(t.id);
+    const d = (await checkMergeGate(db, t.id, { github: gh, checks: limited, authority: GRANT }))!;
+    expect(d.status).toBe("READY");
+    expect(d.hosted_ci).toBe("not verified");
+    expect(d.reasons).toEqual([]);
+  });
+
+  test("a live-style head with only FAILING check runs is READY and reports hosted_ci=failing", async () => {
+    const gh = new FakeGitHub();
+    gh.putPullRequest(view());
+    const failing: CheckRunView[] = [
+      { name: "gate", bucket: "fail" },
+      { name: "check", bucket: "fail" },
+      { name: "cross-plane", bucket: "skipping" },
+    ];
+    gh.putChecks({ repo: "o/r", number: 1 }, HEAD, failing);
+    const t = intake("o/r#2b");
+    toMergeReady(t.id);
+    const d = (await checkMergeGate(db, t.id, { github: gh, checks: gh, authority: GRANT }))!;
+    expect(d.status).toBe("READY");
+    expect(d.hosted_ci).toBe("failing");
+    expect(d.reasons).toEqual([]);
+  });
+
+  test("a genuinely FAILED mechanical VERIFY blocks even when hosted CI is green", async () => {
+    const gh = new FakeGitHub();
+    gh.putPullRequest(view());
+    gh.putChecks({ repo: "o/r", number: 1 }, HEAD, CHECKS);
+    // Simulate the durable evidence of a failed VERIFY at the recorded head while
+    // the Task is parked at merge_ready (the gate's decision table must catch it).
+    const t = intake("o/r#2c");
+    toMergeReady(t.id);
+    db.query(
+      `UPDATE task_results SET passed = 0, reason = 'failed'
+        WHERE task_id = ? AND phase = 'verify' AND attempt = 0 AND kind = 'VerificationResult'`
+    ).run(t.id);
+    const d = (await checkMergeGate(db, t.id, { github: gh, checks: gh, authority: GRANT }))!;
     expect(d.status).toBe("BLOCKED");
-    expect(d.reasons.map((r) => r.code)).toContain("CHECKS_NOT_RUN");
+    expect(d.reasons.map((r) => r.code)).toContain("VERIFY_FAILED");
   });
 
   test("a Linear HOLD is a structured block", async () => {
@@ -532,7 +636,7 @@ describe("merge gate: gathering the facts + the daemon pass (read-only)", async 
     expect(events.n).toBe(1);
   });
 
-  test("#2 a null-head task never reaches READY and its checks stay NOT_RUN", async () => {
+  test("#2 a null-head task never reaches READY and its hosted_ci stays 'not verified'", async () => {
     const gh = new FakeGitHub();
     gh.putPullRequest(view());
     gh.putChecks({ repo: "o/r", number: 1 }, HEAD, CHECKS);
@@ -560,6 +664,7 @@ describe("merge gate: gathering the facts + the daemon pass (read-only)", async 
     const d = evaluateMergeGate(input);
     expect(d.status).toBe("BLOCKED");
     expect(d.reasons.map((r) => r.code)).toContain("HEAD_UNKNOWN");
+    expect(d.hosted_ci).toBe("not verified");
   });
 
   test("#1 (round-2) a retargeted base branch is caught by the daemon pass, not silently overwritten", async () => {
@@ -738,5 +843,127 @@ describe("merge gate: gathering the facts + the daemon pass (read-only)", async 
     submitPhase(db, t.id, "integ");
     expect(getTask(db, t.id)!.phase).toBe("merge_ready");
     expect((await checkMergeGate(db, t.id, { github: gh, checks: gh, authority: GRANT }))!.status).toBe("READY");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ISH-1140 (FIX): a post-review HEAD move must re-run Relay VERIFY at the new
+// HEAD. Without it the new VERIFY gate would leave a rebased Task stuck at
+// merge_ready with VERIFY_MISSING forever (`relay verify` only runs in the
+// verify phase). These are end-to-end: real phase transitions, a real
+// VerificationResult row at the moved head, then the merge gate must be READY.
+// ---------------------------------------------------------------------------
+
+const VERIFY_CHECK = { name: "typecheck", command: "bun run typecheck", required: true };
+
+function passingRunner(): CommandRunner {
+  return {
+    async run(spec) {
+      return { name: spec.name, required: true, outcome: "pass", exitCode: 0, output: "ok", durationMs: 0 };
+    },
+  };
+}
+
+/** Drive implement -> mechanical verify -> review PASS at `head`, leaving integration. */
+async function reviewedIntegration(head: string, issueId: string): Promise<string> {
+  const t = intakeTask(db, {
+    provider: "github",
+    issueId,
+    codeChange: true,
+    headSha: head,
+    prUrl: "https://github.com/o/r/pull/1",
+    prRepo: "o/r",
+    branch: "feat/x",
+    checks: [VERIFY_CHECK],
+  });
+  claimTask(db, t.id, "impl");
+  submitPhase(db, t.id, "impl", { headSha: head });
+  const v = await runMechanicalVerification(db, t.id, {
+    checks: taskChecks(getTask(db, t.id)!),
+    runner: passingRunner(),
+    cwd: "/work",
+    headProbe: () => head,
+  });
+  expect(v.outcome).toBe("pass");
+  expect(getTask(db, t.id)!.phase).toBe("review");
+  recordReview(db, t.id, "rev", { verdict: "pass", headSha: head });
+  expect(getTask(db, t.id)!.phase).toBe("integration");
+  return t.id;
+}
+
+describe("merge gate: a post-review HEAD move re-runs VERIFY and reaches READY (ISH-1140 fix)", async () => {
+  test("integration submit at a NEW head -> verify -> review PASS -> merge_ready -> READY", async () => {
+    const id = await reviewedIntegration(HEAD, "o/r#fix-1");
+    claimTask(db, id, "integ");
+
+    // The integrator rebases / merges main and submits the NEW head H2.
+    const rebased = submitPhase(db, id, "integ", { headSha: MOVED });
+    expect(rebased.phase).toBe("verify");
+    expect(rebased.state).toBe("queued");
+    expect(rebased.claim_role).toBe("relay");
+    expect(rebased.attempt).toBe(1);
+    expect(rebased.head_sha).toBe(MOVED);
+
+    // Relay's ordinary pending-verify pass picks the re-entered verify up and
+    // re-runs the required mechanical checks at H2 (no manual phase surgery).
+    const actions = await runPendingMechanicalVerifications(db, {
+      verifyRunner: passingRunner(),
+      verifyCwd: "/work",
+      verifyHeadProbe: () => MOVED,
+    });
+    expect(actions).toContain(`verify-pass:${id}`);
+    expect(getTask(db, id)!.phase).toBe("review");
+
+    // The independent reviewer PASSes the same H2, then integration accepts it.
+    recordReview(db, id, "rev", { verdict: "pass", headSha: MOVED });
+    claimTask(db, id, "integ");
+    submitPhase(db, id, "integ", { headSha: MOVED });
+    expect(getTask(db, id)!.phase).toBe("merge_ready");
+
+    const gh = new FakeGitHub();
+    gh.putPullRequest(view({ headSha: MOVED }));
+    const input = (await gatherMergeGateInput(db, id, { github: gh, authority: GRANT }))!;
+    expect(input.head).toBe(MOVED);
+    expect(input.verify).toEqual({ passed: true, head: MOVED });
+    expect(input.review?.head).toBe(MOVED);
+    // No hosted CI at all: `not verified` is informational, never a block.
+    expect(input.checks).toBeNull();
+    const d = evaluateMergeGate(input);
+    expect(d.status).toBe("READY");
+    expect(d.reasons).toEqual([]);
+    expect(d.hosted_ci).toBe("not verified");
+  });
+
+  test("a PR head move at merge_ready (provider poll / re-push) -> verify -> READY", async () => {
+    const id = await reviewedIntegration(HEAD, "o/r#fix-2");
+    claimTask(db, id, "integ");
+    submitPhase(db, id, "integ", { headSha: HEAD });
+    expect(getTask(db, id)!.phase).toBe("merge_ready");
+
+    // The poll observes a re-pushed PR head H2.
+    const moved = linkTask(db, id, { headSha: MOVED });
+    expect(moved.phase).toBe("verify");
+    expect(moved.state).toBe("queued");
+    expect(moved.claim_role).toBe("relay");
+    expect(moved.attempt).toBe(1);
+
+    const v = await runMechanicalVerification(db, id, {
+      checks: taskChecks(getTask(db, id)!),
+      runner: passingRunner(),
+      cwd: "/work",
+      headProbe: () => MOVED,
+    });
+    expect(v.outcome).toBe("pass");
+    recordReview(db, id, "rev", { verdict: "pass", headSha: MOVED });
+    claimTask(db, id, "integ");
+    submitPhase(db, id, "integ", { headSha: MOVED });
+    expect(getTask(db, id)!.phase).toBe("merge_ready");
+
+    const gh = new FakeGitHub();
+    gh.putPullRequest(view({ headSha: MOVED }));
+    const d = (await checkMergeGate(db, id, { github: gh, authority: GRANT }))!;
+    expect(d.status).toBe("READY");
+    expect(d.reasons).toEqual([]);
+    expect(d.hosted_ci).toBe("not verified");
   });
 });

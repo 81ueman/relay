@@ -241,24 +241,47 @@ function applyPhase(db: Database, task: Task, phase: CodePhase, u: PhaseUpdate):
 }
 
 /**
- * A HEAD change after the review phase invalidates the pending/prior review:
- * send the task BACK to review at a new attempt, so a PASS can never survive a
- * moved HEAD. Must be called inside a transaction.
+ * A HEAD or BASE change after the review phase invalidates the pending/prior
+ * review. A HEAD change ALSO invalidates the VERIFY evidence that backed it
+ * (ISH-1140): the Task goes BACK to `verify` at the new HEAD and a new attempt,
+ * so Relay re-runs the required checks before a reviewer judges the new tree.
+ * A BASE-branch change alone keeps the same HEAD, so that HEAD's VERIFY still
+ * applies and the Task goes straight back to `review`.
+ *
+ * A Task WITHOUT mechanical checks also returns to `verify` on a HEAD move: its
+ * manual VerificationResult is HEAD-scoped too, and the merge gate refuses a
+ * PASS that has no VERIFY at the recorded head (`VERIFY_MISSING`). Must be
+ * called inside a transaction.
  */
 function invalidateReview(db: Database, task: Task, newHead: string | null, reason: string, workerId?: string): Task {
   const t = now();
+  const headChanged = (newHead ?? null) !== (task.head_sha ?? null);
+  const phase: CodePhase = headChanged ? "verify" : "review";
+  const claimRole =
+    phase === "verify"
+      ? hasMechanicalChecks(task)
+        ? RELAY_ROLE
+        : claimRoleForPhase("verify", task.role)
+      : REVIEWER_ROLE;
   db.query(
     `UPDATE tasks
-        SET phase = 'review', state = 'review', claim_role = ?, assignee = NULL,
+        SET phase = ?, state = ?, claim_role = ?, assignee = NULL,
             attempt = attempt + 1, head_sha = ?,
             lease_token = lease_token + 1, lease_until = NULL, updated_at = ?
       WHERE id = ?`
-  ).run(REVIEWER_ROLE, newHead, t, task.id);
+  ).run(phase, phase === "review" ? "review" : "queued", claimRole, newHead, t, task.id);
   logEvent(db, {
     source: "workflow",
     taskId: task.id,
     type: "workflow.review_invalidated",
-    payload: { reason, fromHead: task.head_sha, toHead: newHead, fromPhase: task.phase, attempt: task.attempt + 1 },
+    payload: {
+      reason,
+      fromHead: task.head_sha,
+      toHead: newHead,
+      fromPhase: task.phase,
+      toPhase: phase,
+      attempt: task.attempt + 1,
+    },
   });
   if (workerId) releaseWorker(db, workerId, task.id);
   return getTask(db, task.id)!;
@@ -361,7 +384,7 @@ export function findTaskByWorkIdentity(
  *
  * A replayed intake fills in any link (PR/branch/HEAD) it was previously missing
  * rather than creating a second row — and, per the HEAD invariant, a HEAD change
- * on a task already past review sends it back to review (see `linkTask`).
+ * on a task already past review sends it back to verify (see `linkTask`).
  */
 export function intakeTask(db: Database, input: IntakeInput): Task {
   const provider = input.provider.trim();
@@ -463,15 +486,16 @@ export function intakeTask(db: Database, input: IntakeInput): Task {
   return getTask(db, id)!;
 }
 
-/** Phases in which a HEAD change must send the task back to review. */
+/** Phases in which a HEAD change must invalidate the review (and its VERIFY). */
 const REVIEW_PINNED_PHASES: CodePhase[] = ["review", "integration", "merge_ready"];
 
 /**
  * Fill in / update the PR link on a task without clobbering existing values.
  *
  * HEAD is the review's identity: if the task is already at/past review and the
- * HEAD changes, the prior review no longer applies — the task is sent back to
- * review at a new attempt (a PASS can never survive a moved HEAD).
+ * HEAD changes, the prior review (and the VERIFY that backed it) no longer
+ * applies — the task is sent back to verify at a new attempt (a PASS can never
+ * survive a moved HEAD). A base-branch change alone re-opens only the review.
  *
  * A TERMINAL task (done/failed, or already accepted) is NEVER re-opened by a
  * link/replay: its outcome is settled, so the update is ignored entirely.
@@ -493,7 +517,8 @@ export function linkTask(
   if (!task) throw new Error(`unknown task: ${taskId}`);
   const terminal = isTerminalTaskState(task.state) || task.accepted_at !== null;
   if (terminal) {
-    // Do not touch a settled task, and never invalidateReview it back to review.
+    // Do not touch a settled task, and never invalidateReview it back into the
+    // phase machine (verify/review).
     if (link.headSha !== undefined && link.headSha !== task.head_sha) {
       logEvent(db, {
         source: "workflow",
@@ -536,7 +561,10 @@ export function linkTask(
     let next = getTask(db, taskId)!;
     const phase = derivePhase(task);
     if ((headChanged || baseBranchChanged) && isCodeTask(task) && phase && REVIEW_PINNED_PHASES.includes(phase)) {
-      next = invalidateReview(db, next, headSha, baseBranchChanged ? "base-changed" : "head-changed");
+      // Pass the PRE-update snapshot: `invalidateReview` compares its head with
+      // `newHead` to decide verify-vs-review, and reports `fromHead`/`fromPhase`
+      // from it. `next` already carries the new head after the UPDATE above.
+      next = invalidateReview(db, task, headSha, baseBranchChanged ? "base-changed" : "head-changed");
     }
     return next;
   })();
@@ -578,7 +606,8 @@ export interface SubmitOptions {
  * moves to `verify`, never to terminal.
  *
  * An integration submit that names a DIFFERENT HEAD invalidates the review PASS
- * (the task goes back to review) rather than advancing to merge_ready.
+ * and the VERIFY that backed it (the task goes back to verify) rather than
+ * advancing to merge_ready.
  */
 export function submitPhase(db: Database, taskId: string, workerId: string, opts: SubmitOptions = {}): Task {
   const task = getTask(db, taskId);
@@ -685,8 +714,9 @@ export interface RunImplementation {
  *
  * An INTEGRATION Run whose produced head differs from the reviewed head calls
  * `invalidateReview` (exactly like `submitPhase`) and sends the task back to
- * `review` at a new attempt — it never advances to `merge_ready` with an
- * unreviewed head.
+ * `verify` at a new attempt — Relay re-runs the mechanical checks there, then the
+ * new head is reviewed; it never advances to `merge_ready` with an unreviewed
+ * head.
  */
 export function submitImplementationFromRun(db: Database, taskId: string, impl: RunImplementation): Task {
   const task = getTask(db, taskId);
