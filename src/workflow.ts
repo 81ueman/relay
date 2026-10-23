@@ -655,8 +655,10 @@ export interface RunImplementation {
    */
   headSha?: string | null;
   /**
-   * The HEAD the Run STARTED at — the staleness fence. A task already bound to
-   * a different head has moved since the Run began and is refused.
+   * The HEAD the Run STARTED at — the staleness fence. A task bound to a head
+   * that is neither this base, the Run's produced head, nor an intermediate
+   * commit on the Run's own history has moved since the Run began and is
+   * refused (ISH-1087/ISH-1125).
    */
   baseHeadSha?: string | null;
   summary?: string;

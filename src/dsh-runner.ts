@@ -748,8 +748,10 @@ export function rejectSubmission(reason: string): never {
  *   - the submission names a different task/phase/attempt/branch/HEAD than the
  *     Run recorded;
  *   - the LIVE task has moved: its phase/attempt changed, its branch is bound to
- *     a different branch, or its head is bound to a revision other than the Run's
- *     START head.
+ *     a different branch, or its head is bound to a revision that is neither the
+ *     Run's START head, the Run's produced head, nor an intermediate commit on
+ *     the Run's own history (the provider poll may bind an own pushed PR head
+ *     mid-Run — ISH-1087/ISH-1125).
  * A task with no linked branch/head YET (the normal implement phase) adopts the
  * Run's produced branch/head; the Run's own `base_head_sha` is the staleness
  * fence. A process `exit 0` or the Run's final stdout text does NOT call this.
