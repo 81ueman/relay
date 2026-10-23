@@ -708,7 +708,8 @@ describe("round 2: the merge gate is reachable in normal flows", async () => {
     acceptTask(db, id, "integ");
   }
 
-  test("ISH-1132: an accepted (done) task is terminal and is NEVER polled again", async () => {
+  test("ISH-1138: an accepted (done) task whose PR merges later gets merged_at within one poll interval", async () => {
+    process.env.RELAY_PROVIDER_POLL_MS = "60000";
     const t = intakeTask(db, {
       provider: "github", issueId: "o/r#40", codeChange: true, headSha: FULL, checks: [CHECK],
       prUrl: "https://github.com/o/r/pull/1", prRepo: "o/r",
@@ -716,7 +717,58 @@ describe("round 2: the merge gate is reachable in normal flows", async () => {
     await toAccepted(t.id);
     expect(getTask(db, t.id)!.state).toBe("done");
     expect(getTask(db, t.id)!.merged_at).toBeNull();
-    // done (accepted) is terminal: it leaves the provider-poll candidate set.
+    // ISH-1138: accept-before-merge is the one terminal poll candidate.
+    expect(providerBoundTasks(db).some((x) => x.id === t.id)).toBe(true);
+
+    const gh = new FakeGitHub();
+    gh.putPullRequest(githubViewAt(1, FULL, "open"));
+    let calls = 0;
+    const counting: GitHubReadOnly = {
+      name: "counting",
+      readOnly: true,
+      getPullRequest: (ref) => {
+        calls++;
+        return gh.getPullRequest(ref);
+      },
+      findPullRequestForBranch: (repo, branch) => gh.findPullRequestForBranch(repo, branch),
+      listComments: (ref) => gh.listComments(ref),
+    };
+
+    // First poll: still open. It spends exactly one read and starts the interval.
+    await reconcileProviderBound(db, { github: counting });
+    expect(calls).toBe(1);
+    expect(getTask(db, t.id)!.merged_at).toBeNull();
+    expect(getTask(db, t.id)!.provider_polled_at).not.toBeNull();
+
+    // Inside the interval: bounded, no second read.
+    await reconcileProviderBound(db, { github: counting });
+    expect(calls).toBe(1);
+
+    // The PR merges after the interval: the next poll records merged_at and the
+    // Task leaves the poll set for good.
+    db.query(`UPDATE tasks SET provider_polled_at = ? WHERE id = ?`).run(Date.now() - 60_001, t.id);
+    gh.putPullRequest(githubViewAt(1, FULL, "merged"));
+    const actions = await reconcileProviderBound(db, { github: counting });
+    expect(calls).toBe(2);
+    expect(actions).toContain(`merged:${t.id}`);
+    expect(getTask(db, t.id)!.merged_at).not.toBeNull();
+    expect(providerBoundTasks(db).some((x) => x.id === t.id)).toBe(false);
+
+    // Once merged_at is set it issues zero further reads, even when due.
+    db.query(`UPDATE tasks SET provider_polled_at = NULL WHERE id = ?`).run(t.id);
+    await reconcileProviderBound(db, { github: counting });
+    expect(calls).toBe(2);
+  });
+
+  test("ISH-1138: a done Task with merged_at set issues zero provider calls", async () => {
+    const t = intakeTask(db, {
+      provider: "github", issueId: "o/r#42", codeChange: true, headSha: FULL, checks: [CHECK],
+      prUrl: "https://github.com/o/r/pull/4", prRepo: "o/r",
+    });
+    await toAccepted(t.id);
+    confirmMerged(db, t.id, { headSha: FULL, repo: "o/r", actor: "provider:github" });
+    expect(getTask(db, t.id)!.state).toBe("done");
+    expect(getTask(db, t.id)!.merged_at).not.toBeNull();
     expect(providerBoundTasks(db).some((x) => x.id === t.id)).toBe(false);
 
     let calls = 0;
@@ -725,7 +777,7 @@ describe("round 2: the merge gate is reachable in normal flows", async () => {
       readOnly: true,
       getPullRequest: () => {
         calls++;
-        return githubViewAt(1, FULL, "merged");
+        return githubViewAt(4, FULL, "merged");
       },
       findPullRequestForBranch: () => null,
       listComments: () => [],
@@ -733,7 +785,128 @@ describe("round 2: the merge gate is reachable in normal flows", async () => {
     const actions = await reconcileProviderBound(db, { github: gh });
     expect(calls).toBe(0);
     expect(actions).toEqual([]);
+  });
+
+  test("ISH-1138: a done Task whose PR is closed leaves the poll set for good", async () => {
+    const t = intakeTask(db, {
+      provider: "github", issueId: "o/r#43", codeChange: true, headSha: FULL, checks: [CHECK],
+      prUrl: "https://github.com/o/r/pull/5", prRepo: "o/r",
+    });
+    await toAccepted(t.id);
     expect(getTask(db, t.id)!.merged_at).toBeNull();
+    expect(providerBoundTasks(db).some((x) => x.id === t.id)).toBe(true);
+
+    const gh = new FakeGitHub();
+    gh.putPullRequest(githubViewAt(5, FULL, "closed"));
+    let calls = 0;
+    const counting: GitHubReadOnly = {
+      name: "counting",
+      readOnly: true,
+      getPullRequest: (ref) => {
+        calls++;
+        return gh.getPullRequest(ref);
+      },
+      findPullRequestForBranch: (repo, branch) => gh.findPullRequestForBranch(repo, branch),
+      listComments: (ref) => gh.listComments(ref),
+    };
+
+    const actions = await reconcileProviderBound(db, { github: counting });
+    expect(calls).toBe(1);
+    expect(actions).toContain(`pr-closed:${t.id}`);
+    expect(getTask(db, t.id)!.merged_at).toBeNull();
+    expect(getTask(db, t.id)!.pr_settled_at).not.toBeNull();
+    expect(providerBoundTasks(db).some((x) => x.id === t.id)).toBe(false);
+
+    await reconcileProviderBound(db, { github: counting });
+    expect(calls).toBe(1);
+  });
+
+  test("ISH-1138: a done Task whose PR merged at another head leaves the poll set", async () => {
+    process.env.RELAY_PROVIDER_POLL_MS = "60000";
+    const t = intakeTask(db, {
+      provider: "github", issueId: "o/r#44", codeChange: true, headSha: FULL, checks: [CHECK],
+      prUrl: "https://github.com/o/r/pull/6", prRepo: "o/r",
+    });
+    await toAccepted(t.id);
+    expect(getTask(db, t.id)!.merged_at).toBeNull();
+    expect(providerBoundTasks(db).some((x) => x.id === t.id)).toBe(true);
+
+    // The PR merged at MOVED, a head the accepted Task does not record. That
+    // merge can never be credited; the poll must not re-read it forever.
+    const gh = new FakeGitHub();
+    gh.putPullRequest(githubViewAt(6, MOVED, "merged"));
+    let calls = 0;
+    const counting: GitHubReadOnly = {
+      name: "counting",
+      readOnly: true,
+      getPullRequest: (ref) => {
+        calls++;
+        return gh.getPullRequest(ref);
+      },
+      findPullRequestForBranch: (repo, branch) => gh.findPullRequestForBranch(repo, branch),
+      listComments: (ref) => gh.listComments(ref),
+    };
+
+    const actions = await reconcileProviderBound(db, { github: counting });
+    expect(calls).toBe(1);
+    expect(actions).toContain(`merge-not-credited:${t.id}`);
+    expect(actions).toContain(`pr-merge-settled:${t.id}`);
+    expect(getTask(db, t.id)!.merged_at).toBeNull();
+    expect(getTask(db, t.id)!.pr_settled_at).not.toBeNull();
+    expect(providerBoundTasks(db).some((x) => x.id === t.id)).toBe(false);
+
+    // The settlement is durable: even a due poll spends zero further reads.
+    db.query(`UPDATE tasks SET provider_polled_at = NULL WHERE id = ?`).run(t.id);
+    await reconcileProviderBound(db, { github: counting });
+    expect(calls).toBe(1);
+  });
+
+  test("ISH-1138: a PR closed during review is not tombstoned, so a later accept still gets merged_at", async () => {
+    process.env.RELAY_PROVIDER_POLL_MS = "0";
+    const t = intakeTask(db, {
+      provider: "github", issueId: "o/r#45", codeChange: true, headSha: FULL, checks: [CHECK],
+      prUrl: "https://github.com/o/r/pull/7", prRepo: "o/r",
+    });
+    await toReview(t.id);
+    expect(getTask(db, t.id)!.state).toBe("review");
+
+    const gh = new FakeGitHub();
+    gh.putPullRequest(githubViewAt(7, FULL, "closed"));
+    let calls = 0;
+    const counting: GitHubReadOnly = {
+      name: "counting",
+      readOnly: true,
+      getPullRequest: (ref) => {
+        calls++;
+        return gh.getPullRequest(ref);
+      },
+      findPullRequestForBranch: (repo, branch) => gh.findPullRequestForBranch(repo, branch),
+      listComments: (ref) => gh.listComments(ref),
+    };
+
+    // Closed while the Task is NOT accepted: a review/merge_ready PR can be
+    // reopened, so no tombstone may be written here.
+    await reconcileProviderBound(db, { github: counting });
+    expect(calls).toBe(1);
+    expect(getTask(db, t.id)!.pr_settled_at).toBeNull();
+    expect(providerBoundTasks(db).some((x) => x.id === t.id)).toBe(true);
+
+    // Reopen, review PASS, accept — then the merge still lands.
+    gh.putPullRequest(githubViewAt(7, FULL, "open"));
+    claimNext(db, "rev");
+    recordReview(db, t.id, "rev", { verdict: "pass", headSha: FULL });
+    claimTask(db, t.id, "integ");
+    submitPhase(db, t.id, "integ");
+    acceptTask(db, t.id, "integ");
+    expect(getTask(db, t.id)!.state).toBe("done");
+    expect(getTask(db, t.id)!.merged_at).toBeNull();
+    expect(providerBoundTasks(db).some((x) => x.id === t.id)).toBe(true);
+
+    gh.putPullRequest(githubViewAt(7, FULL, "merged"));
+    db.query(`UPDATE tasks SET provider_polled_at = NULL WHERE id = ?`).run(t.id);
+    const actions = await reconcileProviderBound(db, { github: counting });
+    expect(actions).toContain(`merged:${t.id}`);
+    expect(getTask(db, t.id)!.merged_at).not.toBeNull();
   });
 
   test("merge -> accept: a merge observed in integration is credited, accept still completes", async () => {

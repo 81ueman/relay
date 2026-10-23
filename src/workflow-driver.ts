@@ -1,7 +1,7 @@
 import type { Database } from "bun:sqlite";
 import { findTaskResult } from "./results";
 import type { Task } from "./schema";
-import { TERMINAL_TASK_STATES } from "./schema";
+import { TERMINAL_TASK_STATES, isTerminalTaskState } from "./schema";
 import { getTask } from "./tasks";
 import { defaultRunner, type CommandRunner } from "./verify";
 import { confirmMerged, runMechanicalVerification, taskChecks } from "./workflow";
@@ -82,12 +82,18 @@ export function pendingMechanicalVerifications(db: Database): Task[] {
 /**
  * Code tasks with a provider binding that may need reconciling this pass.
  *
- * ISH-1132: a terminal Task is NEVER polled. `done` used to be an exception
- * while an internal accept was waiting for the PR merge, which meant every
- * already-merged/accepted Task kept spending `gh pr view`/`gh pr list`/
- * `check-runs` calls forever. The poll now admits only a Task that can still
- * change: one with a LIVE Run (mid-implementation PR/head binding) or one in
- * review/merge_ready/integration.
+ * ISH-1132: the poll admits only a Task that can still change — one with a LIVE
+ * Run (mid-implementation PR/head binding), or one in review/merge_ready/
+ * integration. The old unconditional `done` exception made every already-merged
+ * Task spend `gh pr view`/`gh pr list`/`check-runs` calls forever.
+ *
+ * ISH-1138: a `done` Task accepted BEFORE its PR merged is still the one
+ * exception — it has a bound PR, no `merged_at` yet, and no settled tombstone, so
+ * its merge cannot be recorded otherwise. It stays a candidate, bounded by the
+ * same per-Task interval, until `merged_at` is set or `pr_settled_at` records a
+ * final observation (PR closed, or merged at a head this Task cannot credit);
+ * then it leaves the poll set for good. Settled Tasks still spend zero provider
+ * calls.
  */
 export function providerBoundTasks(db: Database): Task[] {
   return db
@@ -95,14 +101,22 @@ export function providerBoundTasks(db: Database): Task[] {
       `SELECT * FROM tasks t
         WHERE t.code_change = 1 AND t.provider IS NOT NULL
           AND (t.pr_url IS NOT NULL OR t.issue_id IS NOT NULL)
-          AND t.state NOT IN (${TERMINAL_STATE_SQL})
-          -- merged/accepted is terminal even if a phase was not advanced.
-          AND t.merged_at IS NULL AND t.accepted_at IS NULL
+          AND t.merged_at IS NULL
           AND (
-            t.phase IN (${PROVIDER_POLL_PHASES.map((p) => `'${p}'`).join(",")})
-            OR EXISTS (
-              SELECT 1 FROM runs r
-               WHERE r.task_id = t.id AND r.state IN ('starting', 'running')
+            -- ISH-1138: accept-before-merge, until the merge or a final PR
+            -- observation (closed / merged at another head) is recorded.
+            (t.state = 'done' AND t.pr_url IS NOT NULL AND t.pr_settled_at IS NULL)
+            OR (
+              -- ISH-1132: a non-terminal Task that can still change.
+              t.state NOT IN (${TERMINAL_STATE_SQL})
+              AND t.accepted_at IS NULL
+              AND (
+                t.phase IN (${PROVIDER_POLL_PHASES.map((p) => `'${p}'`).join(",")})
+                OR EXISTS (
+                  SELECT 1 FROM runs r
+                   WHERE r.task_id = t.id AND r.state IN ('starting', 'running')
+                )
+              )
             )
           )
         ORDER BY t.priority DESC, t.created_at ASC`
@@ -186,11 +200,14 @@ export async function reconcileProviderBound(db: Database, deps: WorkflowDeps): 
       logProviderRateLimitOnce(db, after);
       break;
     }
-    // A merge_ready Task is read by BOTH this pass (PR link/retarget/marker) and
-    // the merge-gate pass (the SAME PR + HEAD-pinned check-runs) in one tick.
-    // The gate owns the durable timestamp here, so the two reads stay one
+    // ISH-1138: a `done` Task accepted before its PR merged is polled by THIS
+    // pass only (the merge gate excludes terminal Tasks), so this pass owns its
+    // interval. A non-terminal merge_ready Task is read by BOTH this pass (PR
+    // link/retarget/marker) and the gate (the SAME PR + HEAD-pinned check-runs);
+    // the gate owns the durable timestamp there, so the two reads stay one
     // interval's budget instead of starving the gate on the next tick.
-    if (t.phase !== "merge_ready") markProviderPolled(db, t.id, nowMs);
+    const gateOwnsPoll = t.phase === "merge_ready" && !isTerminalTaskState(t.state);
+    if (!gateOwnsPoll) markProviderPolled(db, t.id, nowMs);
     for (const a of taken) actions.push(`${a.kind}:${a.taskId}`);
   }
   return actions;
@@ -215,9 +232,11 @@ export async function reconcileMergeGates(db: Database, deps: WorkflowDeps): Pro
   for (const r of runs) {
     if (r.logged) actions.push(`merge-gate-${r.decision.status.toLowerCase()}:${r.decision.taskId}`);
     if (r.integrationRaised) actions.push(`integration-required:${r.decision.taskId}`);
-    // ISH-1132: merge_ready Tasks are no longer polled by the PR pass (the gate
-    // reads the same PR under the same interval). A merge observed by the gate
-    // is still credited exactly like the provider pass did before.
+    // ISH-1132/ISH-1138: a non-terminal merge_ready Task IS also read by the PR
+    // pass (`merge_ready` is in PROVIDER_POLL_PHASES); that pass deliberately
+    // leaves the shared interval's timestamp to this gate so both reads fit one
+    // budget. A merge observed here is credited exactly like the provider pass
+    // credits one.
     if (r.decision.status === "MERGED" && r.decision.pr) {
       const live = getTask(db, r.decision.taskId);
       if (live && live.merged_at === null) {

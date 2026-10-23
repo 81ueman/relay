@@ -15,7 +15,10 @@ import type { Task } from "./schema";
  * The poll ALSO only ever runs for a Task that can still change: a live Run
  * (mid-implementation PR binding), or review/merge_ready/integration. Terminal
  * Tasks (done/failed/cancelled) are never polled, no matter how many are bound
- * to a PR in the DB.
+ * to a PR in the DB — with the ISH-1138 exception of a `done` Task accepted
+ * before its PR merged, which stays polled until `merged_at` or a final
+ * `pr_settled_at` observation (closed, or merged at an uncreditable head) is
+ * recorded and then leaves for good.
  */
 
 /** The phases that still need provider reads even with no live Run. */

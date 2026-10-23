@@ -487,8 +487,9 @@ describe("merge gate: gathering the facts + the daemon pass (read-only)", async 
     const t = intake("o/r#5");
     toMergeReady(t.id);
     expect(mergeGateCandidates(db).map((x) => x.id)).toContain(t.id);
-    // An internally accepted-but-unmerged task is TERMINAL: it must no longer
-    // spend provider calls on every daemon tick.
+    // An internally accepted-but-unmerged task is TERMINAL for the GATE: the
+    // PR poll owns that one remaining read (ISH-1138), so the gate must not
+    // double-spend on it.
     db.query(`UPDATE tasks SET state = 'done', accepted_at = 1 WHERE id = ?`).run(t.id);
     expect(mergeGateCandidates(db).map((x) => x.id)).not.toContain(t.id);
     db.query(`UPDATE tasks SET state = 'cancelled' WHERE id = ?`).run(t.id);
