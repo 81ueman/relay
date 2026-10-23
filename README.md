@@ -301,7 +301,10 @@ implement --TaskSubmitted--> verify --VerificationResult--> review
   read-only GraphQL query (the token rides **stdin**, never argv), and
   `RELAY_REVIEW_AUTHORIZED=a,b` sets the authorized marker authors. The
   operator/Factory/daemon paths auto-detect an authenticated `gh` when the flag is
-  **unset**; `RELAY_PROVIDER_GITHUB=off` disables it (fail closed). Each task is
+  **unset**; `RELAY_PROVIDER_GITHUB=off` disables it (fail closed). Every reader
+  command is killed after `RELAY_PROVIDER_EXEC_TIMEOUT_MS` (default 5s), so a hung
+  `gh`/`curl` read can never block the daemon's synchronous reconcile — including
+  its SIGTERM shutdown — indefinitely. Each task is
   polled at most once per `RELAY_PROVIDER_POLL_MS` (default 60s) and comments are
   fetched only when the PR `updatedAt`/head moved; the "comments scanned"
   watermark advances only when a scan **succeeded**, so neither a marker posted

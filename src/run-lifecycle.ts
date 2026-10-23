@@ -22,6 +22,7 @@ import type { CheckSpec } from "./verify";
 import { redactSecrets } from "./lab";
 import { readEvidenceTail, terminalImplementRunSignature } from "./implement-recovery";
 import { issueKeyForTask, resolveTaskPrTarget } from "./pr-target";
+import { taskHeadOvertakenByOtherWriter } from "./run-owner";
 
 /**
  * ISH-760 — Task Worktree + disposable dsh Run lifecycle, single-writer.
@@ -1229,8 +1230,11 @@ export function runSubmitterError(run: Run, task: Task): string | null {
   if (task.branch !== null && run.branch !== task.branch) {
     return `run ${run.id} produced branch ${run.branch ?? "none"}, task is ${task.branch}`;
   }
-  if (task.head_sha !== null && (run.base_head_sha ?? null) !== task.head_sha) {
-    return `run ${run.id} started at head ${run.base_head_sha ?? "none"}, task is bound to ${task.head_sha}`;
+  if (taskHeadOvertakenByOtherWriter(task.head_sha, run)) {
+    return (
+      `run ${run.id} started at head ${run.base_head_sha ?? "none"} and produced ` +
+      `${run.head_sha ?? "none"}, task is bound to ${task.head_sha}`
+    );
   }
   return null;
 }

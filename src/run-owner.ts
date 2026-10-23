@@ -39,6 +39,32 @@ export function findLiveRunFor(
       .get(taskId, phase, attempt) as Run | null) ?? null;
 }
 
+/**
+ * ISH-1125: has the Task's bound HEAD been overtaken by someone OTHER than this
+ * Run?
+ *
+ * A submit-time HEAD fence compares the Task's bound head with the Run's
+ * pre-run base. That is right for a Task whose head moved under the Run, but it
+ * also rejected a Run's OWN work: since ISH-1087 the daemon's provider poll
+ * copies a live PR head onto the Task mid-Run, so a worker that pushes its
+ * branch and opens its PR before the Run ends leaves `task.head_sha` equal to
+ * the Run's produced commit (not its base). THAT movement is the Run's own
+ * output, not a foreign writer, so it must not be called stale.
+ *
+ * The two heads a Run may legitimately find on the Task are therefore:
+ *   - the head it started at (the Task did not move), or
+ *   - the head it produced (the provider poll observed this Run's own push).
+ * Any OTHER bound head still means the Task moved under the Run and is refused;
+ * a NULL Task head adopts the produced head, as before.
+ */
+export function taskHeadOvertakenByOtherWriter(
+  taskHead: string | null,
+  run: Pick<Run, "base_head_sha" | "head_sha">
+): boolean {
+  if (taskHead === null) return false;
+  return taskHead !== (run.base_head_sha ?? null) && taskHead !== (run.head_sha ?? null);
+}
+
 export function runOwnedError(run: Run, taskId: string): Error {
   return new Error(
     `${RUN_OWNED}: run ${run.id} (${run.state}) owns ${taskId} ${run.phase}/${run.attempt}; ` +

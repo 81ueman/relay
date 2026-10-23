@@ -23,7 +23,12 @@ import {
   resolveHumanInterface,
   taskChildren,
 } from "./tasks";
-import { findLiveRunFor, findActiveWriterRow, runOwnedError } from "./run-owner";
+import {
+  findLiveRunFor,
+  findActiveWriterRow,
+  runOwnedError,
+  taskHeadOvertakenByOtherWriter,
+} from "./run-owner";
 import { clearCurrentTask, getWorker, normalizeWorkerAfterTaskRelease, touchProgress } from "./workers";
 import {
   gitHead,
@@ -709,15 +714,23 @@ export function submitImplementationFromRun(db: Database, taskId: string, impl: 
       `${STALE_RESULT}: run ${impl.runId} produced branch ${impl.branch ?? "none"}, task ${taskId} is ${task.branch ?? "none"}`
     );
   }
-  // HEAD fence vs produced head: the Run started at `baseHeadSha`; a task whose
-  // head is already bound to a different revision has moved since the Run began.
+  // HEAD fence vs produced head: the Run started at `baseHeadSha`; a task bound
+  // to any OTHER revision than that base or the Run's own produced head has moved
+  // since the Run began. The produced head is legitimate because the daemon's
+  // provider poll may bind this Run's own pushed PR head mid-Run (ISH-1087/1125).
   const baseHead = impl.baseHeadSha !== undefined ? impl.baseHeadSha : impl.headSha;
-  if (task.head_sha !== null && (baseHead ?? null) !== task.head_sha) {
+  const producedHead = impl.headSha ?? null;
+  if (
+    taskHeadOvertakenByOtherWriter(task.head_sha, {
+      base_head_sha: baseHead ?? null,
+      head_sha: producedHead,
+    })
+  ) {
     throw new Error(
-      `${HEAD_MISMATCH}: run ${impl.runId} started at head ${baseHead ?? "none"}, task ${taskId} is bound to ${task.head_sha}`
+      `${HEAD_MISMATCH}: run ${impl.runId} started at head ${baseHead ?? "none"} and produced ` +
+        `${producedHead ?? "none"}, task ${taskId} is bound to ${task.head_sha}`
     );
   }
-  const producedHead = impl.headSha ?? null;
   // Adopt the Run's branch onto the task ONLY when the task has none.
   const adoptBranch = task.branch === null && impl.branch ? impl.branch : null;
   // An INTEGRATION Run that commits a DIFFERENT head invalidates the review that

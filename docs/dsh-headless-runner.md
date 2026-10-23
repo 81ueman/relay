@@ -173,7 +173,10 @@ relay run submit <run-id> [--evidence E] [--summary S]
 when the submission names a different task/phase/attempt than the Run recorded,
 or when the **live** Task has moved: its branch is bound to a different branch,
 or its head is bound to a revision other than the Run's **start** head
-(`base_head_sha`). A task with no linked branch/head **yet** (the normal
+(`base_head_sha`) **or the Run's own produced head** (`head_sha`). The produced
+head is accepted because the daemon's provider poll may bind the Run's own pushed
+PR head onto the Task mid-Run (ISH-1087/ISH-1125); a head bound by anyone else is
+still refused. A task with no linked branch/head **yet** (the normal
 implement phase — the branch is not linked until a PR exists) **adopts** the
 Run's produced branch and HEAD, so a clean Run from a real git worktree with no
 linked branch/HEAD is submittable.

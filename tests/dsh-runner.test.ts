@@ -26,6 +26,8 @@ import {
   type DshSpawner,
 } from "../src/dsh-runner";
 import { PINNED_DSH_VERSION } from "../src/dsh-version";
+import { FakeGitHub, type PrView } from "../src/providers";
+import { reconcileProviderBound } from "../src/workflow-driver";
 
 // ISH-803 one-shot headless dsh runner. Everything here drives a FAKE process —
 // no real dsh, no network — so the lifecycle (exit / crash / cancel / malformed
@@ -615,6 +617,171 @@ describe("real git worktree: base/produced HEAD binding (findings 1 & 2)", () =>
     expect(run.base_head_sha).toBe(baseHead);
     expect(() => acceptRunSubmission(db, { runId: run.id })).toThrow(/stale: task head/);
     expect(findTaskResult(db, id, "implement", 0, "TaskSubmitted")).toBeNull();
+  });
+});
+
+// ISH-1125: #59 (ISH-1087) records the PR target at intake and the daemon's
+// provider poll binds the LIVE PR head onto the Task. A worker that pushes its
+// branch and opens the PR before the Run ends therefore leaves `task.head_sha`
+// on the Run's OWN produced commit mid-Run. That is the Run's output, not a
+// foreign move, so the submit must still advance to VERIFY; a head bound by
+// someone else must still be refused.
+const ISH1125_REPO = "81ueman/relay";
+
+function polledPr(headSha: string, branch: string): PrView {
+  return {
+    ref: { repo: ISH1125_REPO, number: 60 },
+    url: `https://github.com/${ISH1125_REPO}/pull/60`,
+    state: "open",
+    isDraft: false,
+    headRefName: branch,
+    headSha,
+    baseRef: "main",
+    baseSha: "0".repeat(40),
+    mergeable: "mergeable",
+    labels: [],
+    updatedAt: "2026-10-23T00:00:00Z",
+    isCrossRepository: false,
+    headRepo: ISH1125_REPO,
+  };
+}
+
+/** A fresh Task that records its branch + PR repo at intake (the Factory shape). */
+function newPrTargetTask(): { id: string; cwd: string; outputRoot: string; baseHead: string; branch: string } {
+  const t = newGitTask();
+  linkTask(db, t.id, { branch: t.branch, prRepo: ISH1125_REPO });
+  return t;
+}
+
+describe("ISH-1125: a mid-Run provider poll cannot make the Run's own submit stale", () => {
+  test("(a) fresh Task: the worker pushes + opens its PR mid-Run; the poll binds that head; submit advances to VERIFY", async () => {
+    const { id, cwd, outputRoot, baseHead, branch } = newPrTargetTask();
+    const gh = new FakeGitHub();
+    let produced = "";
+    const spawner = new FakeSpawner();
+    spawner.onSpawn = (p) => {
+      writeFileSync(join(cwd, "pr-change.txt"), "the PR change\n");
+      git(cwd, "add", "pr-change.txt");
+      git(cwd, "commit", "-q", "-m", "the PR change");
+      produced = git(cwd, "rev-parse", "HEAD");
+      // The worker has pushed and opened the PR; the Run is still active.
+      gh.putPullRequest(polledPr(produced, branch));
+      p.writeOut("pushed and opened the PR\n");
+      // Deliberately NOT finished: the poll below must see a LIVE Run.
+    };
+    const h = await startDshRun(db, { taskId: id, spawner, outputRoot, cwd, fastExitMs: 0 });
+    expect(getTask(db, id)!.head_sha).toBeNull();
+    expect(produced).not.toBe(baseHead);
+
+    // The daemon's provider poll fires mid-Run and binds the live PR head.
+    const actions = reconcileProviderBound(db, { github: gh });
+    expect(actions).toContain(`pr-head-bound:${id}`);
+    const mid = getTask(db, id)!;
+    expect(mid.pr_url).toBe(`https://github.com/${ISH1125_REPO}/pull/60`);
+    expect(mid.head_sha).toBe(produced);
+    expect(mid.state).toBe("queued"); // still implementing: the poll did not advance it
+
+    spawner.procs[0].finish(0);
+    const run = await h.wait();
+    expect(run.head_sha).toBe(produced);
+
+    // The Run's own produced head is bound on the Task; the submission is NOT stale.
+    const accepted = acceptRunSubmission(db, { runId: run.id });
+    expect(accepted.state).toBe("submitted");
+    const task = getTask(db, id)!;
+    expect(task.phase).toBe("verify");
+    expect(task.head_sha).toBe(produced);
+    expect(findTaskResult(db, id, "implement", 0, "TaskSubmitted")!.head_sha).toBe(produced);
+  });
+
+  test("(b) a DIFFERENT writer moves the task head mid-Run: the submit is still refused", async () => {
+    const { id, cwd, outputRoot, baseHead, branch } = newPrTargetTask();
+    const gh = new FakeGitHub();
+    const foreign = "f".repeat(40);
+    let produced = "";
+    const spawner = new FakeSpawner();
+    spawner.onSpawn = (p) => {
+      writeFileSync(join(cwd, "own-change.txt"), "own\n");
+      git(cwd, "add", "own-change.txt");
+      git(cwd, "commit", "-q", "-m", "own change");
+      produced = git(cwd, "rev-parse", "HEAD");
+      // Someone else's head is the live PR head mid-Run.
+      gh.putPullRequest(polledPr(foreign, branch));
+    };
+    const h = await startDshRun(db, { taskId: id, spawner, outputRoot, cwd, fastExitMs: 0 });
+    reconcileProviderBound(db, { github: gh });
+    expect(getTask(db, id)!.head_sha).toBe(foreign);
+
+    spawner.procs[0].finish(0);
+    const run = await h.wait();
+    expect(run.head_sha).toBe(produced);
+    expect(produced).not.toBe(foreign);
+    expect(produced).not.toBe(baseHead);
+
+    expect(() => acceptRunSubmission(db, { runId: run.id })).toThrow(/stale: task head/);
+    const task = getTask(db, id)!;
+    expect(task.phase).toBe("implement");
+    expect(task.head_sha).toBe(foreign);
+    expect(findTaskResult(db, id, "implement", 0, "TaskSubmitted")).toBeNull();
+  });
+
+  test("(c) FIX round (attempt 1): same push + poll pattern is accepted", async () => {
+    const { id, cwd, outputRoot, baseHead, branch } = newPrTargetTask();
+    const gh = new FakeGitHub();
+
+    // attempt 0: commit H0 and submit normally -> VERIFY.
+    let h0 = "";
+    const spawner0 = new FakeSpawner();
+    spawner0.onSpawn = (p) => {
+      writeFileSync(join(cwd, "first.txt"), "first\n");
+      git(cwd, "add", "first.txt");
+      git(cwd, "commit", "-q", "-m", "first");
+      h0 = git(cwd, "rev-parse", "HEAD");
+      p.finish(0);
+    };
+    const run0 = await startDshRun(db, { taskId: id, spawner: spawner0, outputRoot, cwd, fastExitMs: 0 });
+    const r0 = await run0.wait();
+    acceptRunSubmission(db, { runId: r0.id });
+    expect(getTask(db, id)!.phase).toBe("verify");
+    expect(getTask(db, id)!.head_sha).toBe(h0);
+
+    // Verified FAIL -> FIX: implement at attempt 1, old head cleared.
+    registerWorker(db, "ish1125-verifier", { role: "worker" });
+    claimTask(db, id, "ish1125-verifier");
+    const fix = recordVerification(db, id, "ish1125-verifier", { passed: false, evidence: "needs the B marker" });
+    expect(fix.phase).toBe("implement");
+    expect(fix.attempt).toBe(1);
+    expect(fix.head_sha).toBeNull();
+
+    // attempt 1: the FIX Run starts at H0, commits H1 mid-Run and opens/updates
+    // the PR; the poll binds H1 while the Run is still live.
+    let h1 = "";
+    const spawner1 = new FakeSpawner();
+    spawner1.onSpawn = (p) => {
+      writeFileSync(join(cwd, "fix.txt"), "fix\n");
+      git(cwd, "add", "fix.txt");
+      git(cwd, "commit", "-q", "-m", "fix");
+      h1 = git(cwd, "rev-parse", "HEAD");
+      gh.putPullRequest(polledPr(h1, branch));
+    };
+    const run1 = await startDshRun(db, { taskId: id, spawner: spawner1, outputRoot, cwd, fastExitMs: 0 });
+    expect(getRun(db, run1.id)!.base_head_sha).toBe(h0);
+    reconcileProviderBound(db, { github: gh });
+    expect(getTask(db, id)!.head_sha).toBe(h1);
+
+    spawner1.procs[0].finish(0);
+    const r1 = await run1.wait();
+    expect(r1.head_sha).toBe(h1);
+    expect(h1).not.toBe(h0);
+    expect(h1).not.toBe(baseHead);
+
+    const accepted = acceptRunSubmission(db, { runId: r1.id });
+    expect(accepted.state).toBe("submitted");
+    const task = getTask(db, id)!;
+    expect(task.phase).toBe("verify");
+    expect(task.attempt).toBe(1);
+    expect(task.head_sha).toBe(h1);
+    expect(findTaskResult(db, id, "implement", 1, "TaskSubmitted")!.head_sha).toBe(h1);
   });
 });
 

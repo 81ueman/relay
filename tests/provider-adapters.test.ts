@@ -2,9 +2,11 @@ import { describe, expect, test } from "bun:test";
 import {
   GhCliGitHub,
   LinearApiReadOnly,
+  defaultExec,
   factoryNativeReviewDepsFromEnv,
   parseJsonStream,
   providerDepsFromEnv,
+  providerExecTimeoutMs,
   type Exec,
   type ExecResult,
 } from "../src/provider-adapters";
@@ -220,5 +222,31 @@ describe("ISH-1087 provider auto-detection (read-only, fail closed)", () => {
     expect(
       factoryNativeReviewDepsFromEnv({ RELAY_REVIEW_AUTHOR: "reviewer-login" }, ghAuthed())?.author
     ).toBe("reviewer-login");
+  });
+});
+
+describe("ISH-1125: a provider command is time-bounded", () => {
+  test("providerExecTimeoutMs defaults to 5s and rejects non-positive/non-numeric values", () => {
+    expect(providerExecTimeoutMs({})).toBe(5000);
+    expect(providerExecTimeoutMs({ RELAY_PROVIDER_EXEC_TIMEOUT_MS: "1500" })).toBe(1500);
+    expect(providerExecTimeoutMs({ RELAY_PROVIDER_EXEC_TIMEOUT_MS: "0" })).toBe(5000);
+    expect(providerExecTimeoutMs({ RELAY_PROVIDER_EXEC_TIMEOUT_MS: "-1" })).toBe(5000);
+    expect(providerExecTimeoutMs({ RELAY_PROVIDER_EXEC_TIMEOUT_MS: "nope" })).toBe(5000);
+  });
+
+  test("defaultExec kills a hung command instead of blocking the caller forever", () => {
+    const prev = process.env.RELAY_PROVIDER_EXEC_TIMEOUT_MS;
+    process.env.RELAY_PROVIDER_EXEC_TIMEOUT_MS = "150";
+    try {
+      const started = Date.now();
+      const hung = defaultExec(["sh", "-c", "sleep 5"]);
+      expect(hung.ok).toBe(false);
+      expect(Date.now() - started).toBeLessThan(3000);
+      // A fast command still succeeds unchanged.
+      expect(defaultExec(["sh", "-c", "printf ok"]).stdout).toBe("ok");
+    } finally {
+      if (prev === undefined) delete process.env.RELAY_PROVIDER_EXEC_TIMEOUT_MS;
+      else process.env.RELAY_PROVIDER_EXEC_TIMEOUT_MS = prev;
+    }
   });
 });

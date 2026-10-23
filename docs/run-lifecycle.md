@@ -272,7 +272,9 @@ Task/phase/attempt/**generation**/branch/HEAD. It refuses (never advances):
   event);
 - a submission naming a different task/phase/attempt/branch/HEAD, or a **live**
   Task whose head/branch/phase/attempt has moved since the Run started
-  (`base_head_sha` is the staleness fence);
+  (`base_head_sha` is the staleness fence; the Run's own produced `head_sha` is
+  accepted because the provider poll may bind the Run's own pushed PR head
+  mid-Run — ISH-1125);
 - a duplicate `TaskSubmitted` for the same `(task, phase, attempt)`.
 
 A review is an **independent** principal (`REVIEWER_ROLE`, or the review claim)
