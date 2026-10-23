@@ -169,13 +169,20 @@ describe("ISH-1132: terminal Tasks spend zero provider calls", () => {
     for (let i = 0; i < N; i++) {
       const id = intake(`ISH-1132-TERMINAL-${i}`, 3000 + i);
       if (i % 3 === 0) {
-        // ISH-1138: a `done` Task is terminal for the poll once merged_at is
-        // set. The accept-before-merge case is the one carve-out and has its
-        // own test below.
-        db.query(`UPDATE tasks SET state = 'done', phase = 'merge_ready', accepted_at = 1, merged_at = ? WHERE id = ?`).run(
-          Date.now(),
-          id
-        );
+        // ISH-1138: a `done` Task is terminal for the poll once `merged_at` or
+        // `pr_closed_at` is set. The accept-before-merge case (both NULL) is the
+        // one carve-out and has its own test below.
+        if (i % 2 === 0) {
+          db.query(`UPDATE tasks SET state = 'done', phase = 'merge_ready', accepted_at = 1, merged_at = ? WHERE id = ?`).run(
+            Date.now(),
+            id
+          );
+        } else {
+          db.query(`UPDATE tasks SET state = 'done', phase = 'merge_ready', accepted_at = 1, pr_closed_at = ? WHERE id = ?`).run(
+            Date.now(),
+            id
+          );
+        }
       } else if (i % 3 === 1) {
         db.query(`UPDATE tasks SET state = 'cancelled', phase = 'review' WHERE id = ?`).run(id);
       } else {
