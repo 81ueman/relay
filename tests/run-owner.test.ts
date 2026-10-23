@@ -139,6 +139,17 @@ describe("ISH-1125: taskHeadOvertakenByOtherWriter provenance fence", () => {
       expect(recordRunOwnPolledHead(db, "T1", foreign, "relay/amended")).toEqual([]);
       expect(runObservedOwnHeads(db, "run-1")).toEqual([pushed]);
       expect(produced).not.toBe(pushed);
+
+      // The worktree is REUSED across FIX attempts: a reflog entry written before
+      // THIS Run started is not its own observation.
+      db.query(
+        `INSERT INTO runs
+           (id, task_id, phase, attempt, generation, cwd, branch, base_head_sha, output_dir,
+            state, started_at, created_at, updated_at)
+         VALUES ('run-future', 'T1', 'implement', 1, 1, ?, 'relay/amended', ?, 'out', 'running', ?, ?, ?)`
+      ).run(cwd, base, at + 60_000, at + 60_000, at + 60_000);
+      expect(recordRunOwnPolledHead(db, "T1", pushed, "relay/amended")).toEqual(["run-1"]);
+      expect(runObservedOwnHeads(db, "run-future")).toEqual([]);
     } finally {
       db.close();
       rmSync(cwd, { recursive: true, force: true });

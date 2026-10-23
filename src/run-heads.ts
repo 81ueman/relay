@@ -23,6 +23,12 @@ import type { Run } from "./schema";
 const HEAD_PROBE_TIMEOUT_MS = 5000;
 /** How many recent HEAD reflog entries prove a Run's own amended-away head. */
 const HEAD_REFLOG_LIMIT = 512;
+/**
+ * Slack before the Run's start time for a reflog entry. `started_at` is in
+ * milliseconds and git records whole seconds, so a commit at the very start of
+ * the Run can render a second "before" it.
+ */
+const REFLOG_START_SLACK_MS = 5000;
 
 /** The commit `ref` (default HEAD) resolves to in `repo`, or null. */
 function gitCommitAt(repo: string, ref = "HEAD"): string | null {
@@ -42,37 +48,60 @@ function gitCommitAt(repo: string, ref = "HEAD"): string | null {
   }
 }
 
-/** Recent commits the worktree's HEAD pointed at (bounded, newest first). */
-function headReflogHeads(repo: string): string[] {
+/**
+ * Recent commits the worktree's HEAD pointed at, with the reflog entry time
+ * (unix seconds). `--date=unix` makes `%gD` render `HEAD@{<unix>}`, so the
+ * entry time is available without parsing the human date format.
+ */
+function headReflogEntries(repo: string): { sha: string; at: number }[] {
   if (!repo) return [];
   try {
     const p = Bun.spawnSync(
-      ["git", "-C", repo, "reflog", "show", "--format=%H", "-n", String(HEAD_REFLOG_LIMIT), "HEAD"],
+      [
+        "git",
+        "-C",
+        repo,
+        "reflog",
+        "show",
+        "--date=unix",
+        "--format=%H %gD",
+        "-n",
+        String(HEAD_REFLOG_LIMIT),
+        "HEAD",
+      ],
       { stdout: "pipe", stderr: "pipe", timeout: HEAD_PROBE_TIMEOUT_MS, killSignal: "SIGKILL" }
     );
     if (p.exitCode !== 0) return [];
-    return p.stdout
-      .toString()
-      .split("\n")
-      .map((l) => l.trim())
-      .filter((l) => isSha(l));
+    const out: { sha: string; at: number }[] = [];
+    for (const line of p.stdout.toString().split("\n")) {
+      const [sha, selector] = line.trim().split(/\s+/, 2);
+      if (!isSha(sha)) continue;
+      const at = /@\{(\d+)\}/.exec(selector ?? "")?.[1];
+      if (at === undefined) continue;
+      out.push({ sha, at: Number(at) });
+    }
+    return out;
   } catch {
     return [];
   }
 }
 
 /**
- * ISH-1128: did THIS Run's worktree provably hold `headSha` at some point?
+ * ISH-1128: did THIS Run's worktree provably hold `headSha` since the Run
+ * started?
  *
  * The current HEAD covers the ordinary "pushed, then the poll ran" window, and
  * the HEAD reflog covers the amend/force-push case where the worker already
- * moved the worktree on before the poll observed the earlier push. A commit a
- * different writer pushed is neither checked out here nor in this clone's
- * reflog, so it can never be attributed to the Run.
+ * moved the worktree on before the poll observed the earlier push. Only reflog
+ * entries written during THIS Run count: the worktree is reused across FIX
+ * attempts, so an older attempt's head must not be misread as this Run's own. A
+ * commit a different writer pushed is neither checked out here nor in this
+ * clone's reflog, so it can never be attributed to the Run.
  */
-function runWorktreeHeldHead(repo: string, headSha: string): boolean {
-  if (gitCommitAt(repo) === headSha) return true;
-  return headReflogHeads(repo).includes(headSha);
+function runWorktreeHeldHead(run: Pick<Run, "cwd" | "started_at">, headSha: string): boolean {
+  if (gitCommitAt(run.cwd) === headSha) return true;
+  const sinceMs = run.started_at - REFLOG_START_SLACK_MS;
+  return headReflogEntries(run.cwd).some((e) => e.sha === headSha && e.at * 1000 >= sinceMs);
 }
 
 /**
@@ -106,7 +135,7 @@ export function recordRunOwnPolledHead(
     if (!run.branch || run.branch !== branch) continue;
     // The pre-run base is the fence, not an own push.
     if (run.base_head_sha !== null && run.base_head_sha === headSha) continue;
-    if (!runWorktreeHeldHead(run.cwd, headSha)) continue;
+    if (!runWorktreeHeldHead(run, headSha)) continue;
     const inserted = db
       .query(
         `INSERT OR IGNORE INTO run_observed_heads (run_id, task_id, branch, head_sha, observed_at)
