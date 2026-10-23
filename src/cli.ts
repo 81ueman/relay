@@ -349,7 +349,7 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
   },
   "result rebase": {
     about:
-      "ISH-1122: return a merge_ready code-change Task to implement at attempt+1 when its bound/observed PR is CONFLICTING at the recorded HEAD (a sibling lane merged first). The reason becomes the FIX brief; the prior PASS stays as history but no longer authorises a merge, so the produced HEAD needs a fresh VERIFY and a fresh independent review. Refused unless the PR is observed CONFLICTING (a mergeable PR, unknown mergeability, or an unreadable PR is never assumed), and refused when an unresolved reviewer NG/HOLD or owner HOLD exists. It never records a review verdict and never pushes, rebases, merges or writes a provider. Authority: an integrator identity or the Task's Gateway/human. Requires the read-only GitHub reader (RELAY_PROVIDER_GITHUB=gh).",
+      "ISH-1122: return a merge_ready code-change Task to implement at attempt+1 when its bound/observed PR is CONFLICTING at the recorded HEAD (a sibling lane merged first). The reason becomes the FIX brief; the prior PASS stays as history but no longer authorises a merge, so the produced HEAD needs a fresh VERIFY and a fresh independent review. Refused unless the PR is observed CONFLICTING (a mergeable PR, unknown mergeability, or an unreadable PR is never assumed), and refused when an unresolved reviewer NG/HOLD or owner HOLD exists. It never records a review verdict and never pushes, rebases, merges or writes a provider. Authority: an integrator identity or the Task's Gateway/human. The read-only `gh` reader is auto-detected when RELAY_PROVIDER_GITHUB is unset; `off` disables it.",
     usage: ["relay result rebase <task-id> --reason <text> [--head SHA] [--worker <id>]"],
   },
   verify: {
@@ -1298,11 +1298,13 @@ async function main(): Promise<void> {
         if (sub === "rebase") {
           // ISH-1122: the coordinator's merge_ready + CONFLICTING-PR route back to
           // implement at attempt+1. It is NOT a review verdict: recordReview is
-          // deliberately not called, and an unresolved NG/HOLD refuses.
+          // deliberately not called, and an unresolved NG/HOLD refuses. ISH-1087:
+          // this operator path auto-detects the read-only gh reader, so the shell
+          // needs no RELAY_PROVIDER_GITHUB=gh; an explicit `off` still disables it.
           const t = requestRebase(db, id, workerId, {
             reason: flag(rest, "--reason") ?? "",
             headSha: flag(rest, "--head") ?? undefined,
-            deps: providerDepsFromEnv(),
+            deps: operatorProviderDepsFromEnv(),
           });
           console.log(
             `${t.id} -> phase=${t.phase} state=${t.state} attempt=${t.attempt} ` +

@@ -10,8 +10,9 @@ import { HEAD_MISMATCH, requestMergeReadyRebase } from "./workflow";
  * the OBSERVATION: it reads the Task's bound/observed PR through the existing
  * read-only merge-gate reader, and only calls the transition when the PR is
  * really CONFLICTING at the recorded HEAD. Reading is the same `gh` reader the
- * merge gate uses (`RELAY_PROVIDER_GITHUB=gh`); nothing here writes a provider,
- * rebases, pushes or merges.
+ * merge gate uses (ISH-1087: auto-detected on the operator path when
+ * `RELAY_PROVIDER_GITHUB` is unset, and disabled by `off`); nothing here writes a
+ * provider, rebases, pushes or merges.
  *
  * Deliberately NOT a review path: no `ReviewResult` is written, and an
  * unresolved reviewer NG/HOLD or owner HOLD is refused rather than cleared.
@@ -47,7 +48,7 @@ export function requestRebase(
   if (!opts.deps?.github) {
     throw new Error(
       `${REBASE_ERROR}: cannot observe the bound PR for ${taskId}: the read-only GitHub reader is not ` +
-      `configured (set RELAY_PROVIDER_GITHUB=gh)`
+      `configured (set RELAY_PROVIDER_GITHUB=gh, or authenticate gh so the operator path can auto-detect it)`
     );
   }
   if (input.head === null) {
