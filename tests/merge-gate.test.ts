@@ -18,7 +18,7 @@ import {
 } from "../src/providers";
 import { GhCliGitHub, mapCheckRunBucket, mapCommitStatusBucket, type Exec } from "../src/provider-adapters";
 import type { CommandRunner } from "../src/verify";
-import { processWorkflow } from "../src/workflow-driver";
+import { processWorkflow, runPendingMechanicalVerifications } from "../src/workflow-driver";
 import {
   boundPrRef,
   checkMergeGate,
@@ -903,14 +903,14 @@ describe("merge gate: a post-review HEAD move re-runs VERIFY and reaches READY (
     expect(rebased.attempt).toBe(1);
     expect(rebased.head_sha).toBe(MOVED);
 
-    // Relay re-runs the required mechanical checks at H2.
-    const v = await runMechanicalVerification(db, id, {
-      checks: taskChecks(getTask(db, id)!),
-      runner: passingRunner(),
-      cwd: "/work",
-      headProbe: () => MOVED,
+    // Relay's ordinary pending-verify pass picks the re-entered verify up and
+    // re-runs the required mechanical checks at H2 (no manual phase surgery).
+    const actions = await runPendingMechanicalVerifications(db, {
+      verifyRunner: passingRunner(),
+      verifyCwd: "/work",
+      verifyHeadProbe: () => MOVED,
     });
-    expect(v.outcome).toBe("pass");
+    expect(actions).toContain(`verify-pass:${id}`);
     expect(getTask(db, id)!.phase).toBe("review");
 
     // The independent reviewer PASSes the same H2, then integration accepts it.
