@@ -34,8 +34,9 @@ has no hosted CI (previously `BLOCKED — CHECKS_NOT_RUN` on every PR).
 Check runs are still read, HEAD-pinned, when a reader is configured
 (`gatherMergeGateInput`, `src/merge-gate.ts:521-530`), but the roll-up only fills
 the decision's `hosted_ci` field (`src/merge-gate.ts:165-192`,
-`src/merge-gate.ts:214`). It is never part of the decision identity and never adds
-a block reason (`src/merge-gate.ts:369-371`).
+`src/merge-gate.ts:214`). It is never part of the decision identity
+(`src/merge-gate.ts:211-213`) and never adds a block reason
+(`src/merge-gate.ts:369-371`).
 
 | `hosted_ci` | Meaning |
 | --- | --- |
@@ -87,9 +88,9 @@ RELAY_DB=/tmp/relay-live.db  bun src/cli.ts merge-check <relay-task>  --authorit
 RELAY_DB=/tmp/ishiul-live.db bun src/cli.ts merge-check <ishiul-task> --authority merge
 ```
 
-A live relay `merge_ready` Task is `T46` (PR #68) and a live ishiul one is `T271`
-(PR #952) in the 2026-10-23 DBs; the PR body records the exact commands and output
-that were run against them.
+In the 2026-10-23 DBs, `T46` (PR #68) was a live relay `merge_ready` Task and
+`T271` (PR #952) a live ishiul one; the PR body records the exact commands and
+output that were run against them.
 
 Add `--json` for the structured decision. The live output recorded in the
 ISH-1140 PR body shows a live relay Task `READY` with `hosted_ci: not verified`
