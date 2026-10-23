@@ -37,7 +37,6 @@ import {
   ensureTaskWorktree,
   launchTaskRun,
 } from "./run-lifecycle";
-import { applyLabCleanup, planLabCleanup, type LabCleanupPlan } from "./lab-cleanup";
 import { factoryNativeReviewDepsFromEnv, operatorProviderDepsFromEnv } from "./provider-adapters";
 import { checkMergeGate, formatMergeGateDecision } from "./merge-gate";
 import { resolveTaskPrTarget } from "./pr-target";
@@ -159,7 +158,6 @@ DB: $RELAY_DB, else $RELAY_CONFIG/~/.config/relay/config.json {"db":...}, else t
 Spawn: RELAY_HERDR_WORKSPACE (required to spawn; else $HERDR_WORKSPACE_ID)
 Manual attach: requires a live Herdr agent (use --pane/--tab or $HERDR_PANE_ID/$HERDR_TAB_ID)
 Runtime cleanup: RELAY_RUNTIME_CLEANUP_GRACE_MS RELAY_ATTACH_TIMEOUT_MS RELAY_RESTART_COOLDOWN_MS
-Task Lab cleanup: RELAY_LAB_CLEANUP_CMD RELAY_LAB_CLEANUP_TIMEOUT_MS (trusted hook; owner id per task)
 Run disk guard: RELAY_MIN_FREE_DISK_BYTES (default 20 GiB; 0 = threshold off)
 Restart cap: RELAY_RESTART_CAP (default 3) RELAY_RESTART_CAP_WINDOW_MS (default 1800000)
 Herdr is required. RELAY_RUNTIME=mock is test-only.
@@ -180,8 +178,7 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
       "ISH-803/ISH-810 one-shot headless dsh Runs: 1 Run = 1 `dsh --profile headless --json` process = 1 coding attempt, in the Task's worktree, with NO Herdr pane/TUI/`dsh web`/wake/attach. Under <control-plane>/runs/<run-id>/: stdout.log (raw dsh JSONL), stderr.log (reasoning/errors), dsh.jsonl (the ORIGINAL dsh session/status/text/tool_call/tool_result/final events, per-Run evidence) and events.jsonl (Relay's own lifecycle log, kept distinct). A process `exit 0` or a terminal `final` does NOT complete anything — only `relay run submit` (a structured submission bound to the Run/Task/phase/attempt/branch/HEAD) advances the Task. `start` waits for the Run to reach a terminal state (there is no detached mode yet). Permissions are the worktree: $DSH_PERMISSION_MODE=workspace-write by default. " +
       "ISH-760 adds the Task lifecycle: `launch` owns ONE branch+worktree per Task, pins the task spec + verification steps + prior findings into the worktree BEFORE launch, and runs ONE disposable dsh Run per phase/attempt (a FIX is the SAME worktree + findings + a NEW Run). A second writer on the same worktree/branch is refused until the previous Run ends; different worktrees/branches may run in parallel. `worktree` creates/selects the worktree; `cleanup` reclaims it only when safe (real merge or --abort, no open PR, no active writer, no uncommitted changes, relay-owned) and retains the run logs. `relay run logs <run-id>` renders the read-only dsh session/status/text/tool_call/tool_result/final chronology from the per-Run dsh.jsonl (no TUI/Web UI needed). " +
       "ISH-762 adds `relay run factory <task-id>`: the whole factory for ONE Task with no hand-driven pane for the coding — a real headless dsh Run implements, Relay mechanically VERIFYs the recorded HEAD, an INDEPENDENT headless Claude reviewer (`claude -p --output-format json`) returns a structured FIX/PASS (FIX = the SAME worktree + findings + a FRESH Run), and a PASS reaches read-only MergeReady. It never pushes, merges, accepts or writes a provider." +
-      " ISH-1013: a non-ready Factory outcome is classified from the EXISTING rows (code rework exhausted / infra blocked / permission-or-human decision / missing-or-inconclusive evidence / stale head / unknown) with the last Run/attempt/HEAD, failing check/review/log references and a concrete next action. The same projection is stored as a durable `factory.outcome` event and shown by `relay run show` / `relay run logs` and `relay task show`; `relay run factory --json` carries it as `failure`." +
-      " ISH-845: the same task-end `cleanup` (merged or --abort) also reclaims the Task's external Network Lab through the single trusted hook $RELAY_LAB_CLEANUP_CMD, invoked as `<cmd> <owner-id>` (the owner id Relay assigned to the Task). With no hook, or no assigned owner, it is a no-op; an active Run, or a Task that has not ended, is refused. Reaching MergeReady alone never cleans anything.",
+      " ISH-1013: a non-ready Factory outcome is classified from the EXISTING rows (code rework exhausted / infra blocked / permission-or-human decision / missing-or-inconclusive evidence / stale head / unknown) with the last Run/attempt/HEAD, failing check/review/log references and a concrete next action. The same projection is stored as a durable `factory.outcome` event and shown by `relay run show` / `relay run logs` and `relay task show`; `relay run factory --json` carries it as `failure`.",
     usage: [
       "relay run start <task-id> [--cwd DIR] [--prompt TEXT] [--permission MODE] [--timeout 30m] [--json]",
       "relay run launch <task-id> [--timeout 30m] [--permission MODE] [--json]",
@@ -683,18 +680,6 @@ function resolveText(args: string[], usageLine: string, flagName?: string): stri
     );
   }
   return text;
-}
-
-/**
- * Render the Task-owned external Network Lab cleanup result that accompanies
- * `relay run cleanup`. The hook is the single trusted
- * `RELAY_LAB_CLEANUP_CMD`; with none configured this is a no-op.
- */
-function printLabCleanup(lab: LabCleanupPlan): void {
-  const where = lab.cmd ? ` via ${lab.cmd}` : "";
-  console.log(`  lab cleanup: ${lab.status} (owner ${lab.ownerId})${where}`);
-  for (const reason of lab.reasons) console.log(`    skip: ${reason}`);
-  if (lab.error) console.log(`    error: ${lab.error}`);
 }
 
 async function main(): Promise<void> {
@@ -1899,8 +1884,6 @@ async function main(): Promise<void> {
         if (sub === "cleanup") {
           // ISH-760 safe cleanup: merged or explicit abort, no open PR, no active
           // writer, no uncommitted changes, relay-owned. Run logs are retained.
-          // ISH-845: the same task-end guard also reclaims the Task's external
-          // Network Lab via the trusted RELAY_LAB_CLEANUP_CMD hook.
           const id = positionals(rest)[0];
           if (!id) throw new Error("usage: relay run cleanup <task-id> [--abort REASON] [--apply] [--force] [--json]");
           const abort = flag(rest, "--abort") ?? undefined;
@@ -1910,11 +1893,8 @@ async function main(): Promise<void> {
             force: hasFlag(rest, "--force"),
             abort,
           });
-          const lab = apply
-            ? applyLabCleanup(db, id, { apply: true, abort })
-            : planLabCleanup(db, id, { abort });
           if (hasFlag(rest, "--json")) {
-            console.log(JSON.stringify({ ...plan, labCleanup: lab }, null, 2));
+            console.log(JSON.stringify(plan, null, 2));
             break;
           }
           const verdict = plan.apply ? (plan.removed ? "REMOVED" : plan.remove ? "would remove" : "skipped") : "dry-run (pass --apply)";
@@ -1922,7 +1902,6 @@ async function main(): Promise<void> {
           console.log(`  worktree: ${plan.worktree ?? "-"}  branch: ${plan.branch ?? "-"}`);
           console.log(`  retained runs (evidence): ${plan.retainedRuns}`);
           for (const reason of plan.reasons) console.log(`  skip: ${reason}`);
-          printLabCleanup(lab);
           break;
         }
         throw new Error(`unknown run subcommand: ${sub} (try: start|launch|worktree|cleanup|list|show|logs|cancel|submit)`);

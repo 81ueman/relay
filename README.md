@@ -551,32 +551,16 @@ DB-write error (e.g. a full disk) does not crash the daemon, leaves the throttle
 unadvanced, and the next reconcile tick retries. It does **not** implement a
 pre-launch disk guard (ISH-1009) or stall detection for a live-but-silent dsh.
 
-### Task-owned Network Lab skill + cleanup hook (ISH-845)
+### Network Lab skill
 
 A coding Task may deploy an **arbitrary containerlab topology** on the shared
-Network Lab. Relay stays **containerlab-agnostic**: it models no network, no NOS
-and no topology, and adds **no `relay lab` command**. It knows only the Task's
-**owner id** (`labOwnerId` = `<task id>-<created_at>`, never reused, handed out as
-`RELAY_LAB_OWNER` and recorded as `lab.owner_assigned` when an owner is assigned)
-and *when* cleanup is due. The `network-lab` skill
-([`skills/network-lab/SKILL.md`](skills/network-lab/SKILL.md)) tells the agent to
-deploy with `labctl` under `--namespace "$RELAY_LAB_OWNER"`.
-
-`relay run cleanup <task-id>` reclaims the Task's external Lab through
-**one trusted, pre-configured hook** (the repo ships a reference,
-[`scripts/lab-cleanup.sh`](scripts/lab-cleanup.sh)), `RELAY_LAB_CLEANUP_CMD`,
-invoked as `<cmd> <owner-id>` (the only argument). A Task-prompt-derived
-shell/URL is never executed; with no hook configured — or no owner ever assigned
-— it is a pure no-op. The hook runs only when the Task has **ended** (merged or
-`--abort`) with **no active Run** — reaching `merge_ready` alone cleans nothing —
-and a non-zero exit, a missing hook or a timeout is **recorded** and
-**re-runnable** (`relay gc` refuses a Task whose Lab cleanup is still pending, so
-its owner id stays addressable). The reference hook selects the lab by exact
-owner name (`netlab-<owner>`), never by suffix, and fails closed if its workspace
-purge does not succeed. Relay forwards a narrow, named `LABCTL_*` set
-(`LABCTL_ENV_ALLOWLIST`) to the **hook only** (never to the dsh Run), so the hook
-can authenticate without leaking host secrets into a Run. Image and
-Shared-Lab VM management stay out of Relay.
+Network Lab with the `network-lab` skill
+([`skills/network-lab/SKILL.md`](skills/network-lab/SKILL.md)). Relay stays
+**containerlab-agnostic**: it models no network, no NOS and no topology, adds
+**no `relay lab` command**, and runs **no cleanup hook**. The skill scopes the
+lab namespace by `RELAY_TASK_ID` (which every dsh Run receives), and the agent
+owns the full lifecycle: it deploys with `labctl` and destroys its own lab when
+done. Image and Shared-Lab VM management stay out of Relay.
 
 ### Historical cleanup: `relay gc`
 

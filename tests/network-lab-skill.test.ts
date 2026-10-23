@@ -16,9 +16,12 @@ describe("network-lab skill", () => {
     expect(body).toMatch(/^description: .+/m);
   });
 
-  test("the skill presses the Task owner contract and forbids image/host-Docker work", () => {
+  test("the skill scopes labs by Task id, owns cleanup, and forbids image/host-Docker work", () => {
     const body = readFileSync(source, "utf8");
-    expect(body).toContain("RELAY_LAB_OWNER");
+    expect(body).toContain("RELAY_TASK_ID");
+    // ISH-1099: the skill must not depend on the removed Relay cleanup hook.
+    expect(body).not.toContain("RELAY_LAB_OWNER");
+    expect(body).not.toContain("RELAY_LAB_CLEANUP_CMD");
     expect(body).toContain("--namespace");
     expect(body).toContain("labctl deploy");
     expect(body).toContain("labctl inspect");

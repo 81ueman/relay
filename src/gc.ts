@@ -3,7 +3,6 @@ import { now } from "./db";
 import { logEvent } from "./events";
 import type { Task, Worker } from "./schema";
 import { TERMINAL_TASK_STATES } from "./schema";
-import { labCleanupHookConfigured, labCleanupPending } from "./lab-cleanup";
 
 /** Terminal task states as an SQL `IN (...)` list (done/failed/cancelled). */
 const TERMINAL_STATE_SQL = TERMINAL_TASK_STATES.map((s) => `'${s}'`).join(",");
@@ -49,13 +48,6 @@ export interface GcPlan {
 export interface GcOptions {
   withHistory?: boolean;
   olderThanMs?: number;
-  /**
-   * ISH-845: treat a trusted Lab cleanup hook as configured (default:
-   * $RELAY_LAB_CLEANUP_CMD). When set, a terminal Task with an unfinished Lab
-   * cleanup is SKIPPED so its owner id stays addressable and its lab can still
-   * be reclaimed.
-   */
-  labCleanupHook?: boolean;
 }
 
 function inClause(n: number): string {
@@ -71,7 +63,6 @@ export function planGc(db: Database, opts: GcOptions = {}): GcPlan {
   const olderThanMs = Math.max(0, opts.olderThanMs ?? 0);
   const cutoff = now() - olderThanMs;
   const skipped: GcSkip[] = [];
-  const labHook = opts.labCleanupHook ?? labCleanupHookConfigured();
 
   // 1. Workers: only RETIRED tombstones. A retired worker by definition owns no
   //    task (retire refuses), but re-check anyway.
@@ -96,13 +87,6 @@ export function planGc(db: Database, opts: GcOptions = {}): GcPlan {
   for (const t of terminal) {
     if (t.updated_at > cutoff) {
       skipped.push({ kind: "task", id: t.id, reason: "within the grace window" });
-      continue;
-    }
-    // ISH-845 finding 2: keep a Task whose Lab cleanup has not succeeded, so its
-    // owner id stays addressable (`relay run cleanup <id>` can retry) and `gc`
-    // can never hand that id/namespace to a new Task.
-    if (labHook && labCleanupPending(db, t.id)) {
-      skipped.push({ kind: "task", id: t.id, reason: "lab cleanup pending (owner id still needed)" });
       continue;
     }
     const liveChildren = db
