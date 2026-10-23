@@ -605,6 +605,7 @@ export function mergeGateCandidates(db: Database): Task[] {
       `SELECT * FROM tasks
         WHERE code_change = 1
           AND state NOT IN (${TERMINAL_TASK_STATES.map((s) => `'${s}'`).join(",")})
+          AND merged_at IS NULL AND accepted_at IS NULL
           AND phase = 'merge_ready'
         ORDER BY priority DESC, created_at ASC`
     )

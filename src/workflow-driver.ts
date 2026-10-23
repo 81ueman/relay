@@ -96,6 +96,8 @@ export function providerBoundTasks(db: Database): Task[] {
         WHERE t.code_change = 1 AND t.provider IS NOT NULL
           AND (t.pr_url IS NOT NULL OR t.issue_id IS NOT NULL)
           AND t.state NOT IN (${TERMINAL_STATE_SQL})
+          -- merged/accepted is terminal even if a phase was not advanced.
+          AND t.merged_at IS NULL AND t.accepted_at IS NULL
           AND (
             t.phase IN (${PROVIDER_POLL_PHASES.map((p) => `'${p}'`).join(",")})
             OR EXISTS (

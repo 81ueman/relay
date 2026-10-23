@@ -197,13 +197,18 @@ describe("ISH-1132: terminal Tasks spend zero provider calls", () => {
     toMergeReady(mergeReady);
     const integration = intake("ISH-1132-INTEG", 4004);
     toIntegration(integration);
+    // A merged/accepted Task is terminal even if a stale phase was not advanced.
+    const merged = intake("ISH-1132-MERGED", 4005);
+    db.query(`UPDATE tasks SET state = 'review', phase = 'merge_ready', merged_at = ? WHERE id = ?`).run(Date.now(), merged);
 
     const ids = providerBoundTasks(db).map((t) => t.id);
     expect(ids).not.toContain(queued); // implement/verify with no live Run
+    expect(ids).not.toContain(merged); // merged/accepted is terminal
     expect(ids).toContain(live);
     expect(ids).toContain(review);
     expect(ids).toContain(mergeReady);
     expect(ids).toContain(integration);
+    expect(mergeGateCandidates(db).map((t) => t.id)).not.toContain(merged);
   });
 });
 
