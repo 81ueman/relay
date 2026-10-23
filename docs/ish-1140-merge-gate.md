@@ -78,8 +78,11 @@ sqlite3 -readonly /Users/81ueman/ghq/github.com/81ueman/ishiul/.relay/state.db \
   ".backup /tmp/ishiul-live.db"
 
 # READ-ONLY merge readiness of a live merge_ready Task. --authority merge is the
-# DRY-RUN grant; merge-check never performs the merge.
-cd /Users/81ueman/ghq/github.com/81ueman/relay/.relay/worktrees/T49
+# DRY-RUN grant; merge-check never performs the merge. Run from a checkout of this
+# PR head (or main after merge):
+git -C /Users/81ueman/ghq/github.com/81ueman/relay worktree add /tmp/relay-ish1140 \
+  origin/relay/ish-1140-factory
+cd /tmp/relay-ish1140
 RELAY_DB=/tmp/relay-live.db  bun src/cli.ts merge-check <relay-task>  --authority merge
 RELAY_DB=/tmp/ishiul-live.db bun src/cli.ts merge-check <ishiul-task> --authority merge
 ```
