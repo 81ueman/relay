@@ -129,6 +129,12 @@ export interface Task {
   pr_updated_at: string | null;
   /** ISH-759: when the bound PR was confirmed merged (the true "done"). */
   merged_at: number | null;
+  /**
+   * ISH-1138: when the bound PR was observed CLOSED (not merged). A `done` Task
+   * accepted before its PR merged stays in the provider poll until `merged_at`
+   * is set or this is set; either way it leaves the poll set for good.
+   */
+  pr_closed_at: number | null;
   /** Evidence ref for the CURRENT attempt (a structured-result id or note id). */
   result_ref: string | null;
   /** Review profile used for duplicate-dispatch protection (e.g. "default"). */
@@ -500,6 +506,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   provider_polled_at INTEGER,
   pr_updated_at TEXT,
   merged_at INTEGER,
+  pr_closed_at INTEGER,
   result_ref TEXT,
   review_profile TEXT,
   accepted_at INTEGER,

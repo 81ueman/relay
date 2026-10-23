@@ -563,6 +563,11 @@ export async function reconcileTaskFromProvider(
         if (view.state === "merged") {
           actions.push(...confirmMergeFromView(db, getTask(db, taskId)!, view));
         }
+        // ISH-1138: a closed PR is a durable observation, not "still open". It
+        // is what removes a done-but-unmerged Task from the poll for good.
+        if (view.state === "closed") {
+          actions.push(...recordClosedPr(db, getTask(db, taskId)!, view));
+        }
 
         // Comments cost three `gh api` calls, so fetch them only when the PR
         // actually moved (updatedAt/head changed since the last comment scan).
@@ -618,6 +623,25 @@ export async function reconcileTaskFromProvider(
   }
 
   return actions;
+}
+
+/**
+ * ISH-1138: record that the bound PR was observed CLOSED (not merged). A `done`
+ * Task accepted before its merge is the one terminal poll candidate; this
+ * tombstone is what removes it for good once the PR will never merge. Idempotent
+ * and logged once per Task.
+ */
+function recordClosedPr(db: Database, task: Task, view: PrView): ProviderAction[] {
+  if (task.pr_closed_at !== null) return [];
+  const at = Date.now();
+  db.query(`UPDATE tasks SET pr_closed_at = ?, updated_at = ? WHERE id = ?`).run(at, at, task.id);
+  logEvent(db, {
+    source: "workflow",
+    taskId: task.id,
+    type: "workflow.pr_closed",
+    payload: { repo: view.ref.repo, number: view.ref.number, head: view.headSha },
+  });
+  return [{ kind: "pr-closed", taskId: task.id, detail: `${view.ref.repo}#${view.ref.number}` }];
 }
 
 /** Credit a merge only when it is at the merged head we recorded. */
