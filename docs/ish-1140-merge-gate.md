@@ -118,6 +118,8 @@ skill in its own PR.
   failing and with check runs absent;
 - `hosted_ci` classifies passing / failing / not-verified without changing the
   status;
+- a rate-limited hosted-CI read is informational too (`not verified`, never a
+  block);
 - a failed VERIFY, a missing/stale VERIFY, a missing/stale review, a moved head and
   a HOLD still `BLOCKED`.
 

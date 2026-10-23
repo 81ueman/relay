@@ -12,6 +12,7 @@ import {
   FakeGitHub,
   rollupChecks,
   type CheckRunView,
+  type ChecksReadOnly,
   type PrView,
   type ProviderAuthority,
 } from "../src/providers";
@@ -479,6 +480,30 @@ describe("merge gate: gathering the facts + the daemon pass (read-only)", async 
     const t = intake("o/r#2");
     toMergeReady(t.id);
     const d = (await checkMergeGate(db, t.id, { github: gh, authority: GRANT }))!;
+    expect(d.status).toBe("READY");
+    expect(d.hosted_ci).toBe("not verified");
+    expect(d.reasons).toEqual([]);
+  });
+
+  test("a rate-limited hosted-CI read is informational, never a block", async () => {
+    const gh = new FakeGitHub();
+    gh.putPullRequest(view());
+    const limited: ChecksReadOnly = {
+      name: "rate-limited-checks",
+      readOnly: true,
+      rateLimit: () => ({
+        provider: "github",
+        reason: "API rate limit exceeded",
+        observedAt: Date.now(),
+        resetAt: Date.now() + 60_000,
+      }),
+      listChecks: () => {
+        throw new Error("a rate-limited checks reader must not be called");
+      },
+    };
+    const t = intake("o/r#2d");
+    toMergeReady(t.id);
+    const d = (await checkMergeGate(db, t.id, { github: gh, checks: limited, authority: GRANT }))!;
     expect(d.status).toBe("READY");
     expect(d.hosted_ci).toBe("not verified");
     expect(d.reasons).toEqual([]);
