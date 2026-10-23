@@ -54,6 +54,23 @@ tests, commands or variants the blast radius calls for (other address family,
 sibling vendor, deleted path re-sweep) and to name them in `summary`, or to write
 an explicit `no execution needed because …`.
 
+## No-env defaults (ISH-1133)
+
+`relay run factory` requires no environment variables:
+
+- **GitHub** — the read-only `gh` reader is the default for PR binding **and** the
+  native review; both legs share one detection
+  (`factoryGithubDepsFromEnv` in `src/provider-adapters.ts`). An authenticated
+  `gh` is required; a missing/unauthenticated `gh` blocks fail-closed.
+  `RELAY_PROVIDER_GITHUB=off` is the explicit opt-out for tests (the Factory then
+  refuses the mandatory native review). An exhausted `gh` budget stays the typed,
+  retryable `PROVIDER_RATE_LIMITED`, never "not configured".
+- **dsh binary** — `$HOME/.dsh/bin/dsh-model` when it is an executable file, else
+  `dsh`; `--dsh` / `RELAY_DSH_BIN` still override. The chosen binary and its
+  source (`option` / `env` / `dsh-model` / `path`) are recorded in the Run's
+  `run.started` and durable `dsh.run.started` events.
+- **Review budget** — 45 min / 2,700,000 ms; `RELAY_REVIEW_TIMEOUT_MS` overrides.
+
 ## Pipeline and where it lives
 
 ```
@@ -243,7 +260,9 @@ bun test tests/factory.test.ts              # fixture: fake dsh + fake reviewer 
 # the pilot entrypoint (one Task, real dsh + real Claude by default)
 relay run factory <task-id> [--repo DIR] [--dsh BIN] [--reviewer CMD] [--model M] \
   [--max-attempts N] [--permission MODE] [--timeout 30m] [--json]
-# overrides also via RELAY_DSH_BIN / RELAY_REVIEW_CMD / RELAY_REVIEW_MODEL
+# no env required (see "No-env defaults" above); overrides:
+# --dsh / RELAY_DSH_BIN / RELAY_REVIEW_CMD / RELAY_REVIEW_MODEL /
+# RELAY_REVIEW_TIMEOUT_MS
 ```
 
 The one-off ISH-762 smoke scripts were removed in ISH-1100; their recorded

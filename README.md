@@ -311,12 +311,14 @@ implement --TaskSubmitted--> verify --VerificationResult--> review
   **label**, and a self-claimed comment are **not** an approval. Repeated
   `merge_not_credited` / `marker_not_applied` events are logged once per
   (task, head / marker).
-- **Providers are GET-only readers.** `RELAY_PROVIDER_GITHUB=gh` uses the `gh`
-  CLI (read verbs only), `RELAY_PROVIDER_LINEAR=api` + `LINEAR_API_TOKEN` uses a
-  read-only GraphQL query (the token rides **stdin**, never argv), and
-  `RELAY_REVIEW_AUTHORIZED=a,b` sets the authorized marker authors. The
-  operator/Factory/daemon paths auto-detect an authenticated `gh` when the flag is
-  **unset**; `RELAY_PROVIDER_GITHUB=off` disables it (fail closed). Every reader
+- **Providers are GET-only readers.** `RELAY_PROVIDER_GITHUB=gh` forces the `gh`
+  CLI (read verbs only) and `RELAY_PROVIDER_GITHUB=off` disables it (fail
+  closed); when the flag is **unset**, the operator/Factory/daemon paths use an
+  authenticated `gh` by default (ISH-1133). `RELAY_PROVIDER_LINEAR=api` +
+  `LINEAR_API_TOKEN` uses a read-only GraphQL query (the token rides **stdin**,
+  never argv), and `RELAY_REVIEW_AUTHORIZED=a,b` sets the authorized marker
+  authors. The Factory's PR-binding and native-review legs share the same
+  detection, so they cannot disagree. Every reader
   command is killed after `RELAY_PROVIDER_EXEC_TIMEOUT_MS` (default 5s), so a hung
   `gh`/`curl` read can never block the daemon's synchronous reconcile — including
   its SIGTERM shutdown — indefinitely. Each task is
@@ -421,6 +423,15 @@ It is sequencing only — every transition reuses the ordinary durable results
 `submitPhase`), so a `dsh` exit 0 / `final`, a missing/malformed reviewer result,
 a foreign/stale HEAD, or a non-independent reviewer **cannot advance** the Task.
 The Factory never pushes, merges, accepts, or writes a provider/Linear.
+**ISH-1133 — no environment variable is required.** `relay run factory` defaults
+to: the read-only `gh` provider for **both** PR binding and the native review
+(an authenticated `gh` is required; a missing/unauthenticated `gh` fails closed),
+with `RELAY_PROVIDER_GITHUB=off` as the explicit test opt-out; the coding binary
+`$HOME/.dsh/bin/dsh-model` when it is an executable file, else `dsh` (`--dsh` /
+`RELAY_DSH_BIN` override; the chosen binary and source are recorded in the Run's
+`run.started` and `dsh.run.started` events); and a **45 min** (2,700,000 ms)
+headless-review budget (`RELAY_REVIEW_TIMEOUT_MS` overrides). The Gateway no
+longer needs to set any of those three variables.
 **ISH-1135:** the review brief points the reviewer at the repository's OWN
 review rubric at the reviewed HEAD — by default
 `.agents/skills/independent-pr-review/references/rubric.md` plus
@@ -485,11 +496,12 @@ This external write is **deny-by-default** (ISH-288) for a direct reviewer call:
 the reviewer is given the `gh` shell + a scoped token (`RELAY_REVIEW_GH_TOKEN`,
 else `GH_TOKEN`) ONLY when an operator grants `RELAY_GITHUB_REVIEW_WRITE=1`
 **and** names the gh-authenticated login the review posts as
-(`RELAY_REVIEW_AUTHOR=<login>`) with `RELAY_PROVIDER_GITHUB=gh`. The **Factory**
-(ISH-1087 owner decision) authorizes the reviewer's `COMMENT` review by default,
-derives the author from `gh api user` unless `RELAY_REVIEW_AUTHOR` is set, and
-auto-detects the reader; `RELAY_GITHUB_REVIEW_WRITE=0` opts out, after which
-`relay run factory` refuses to reach MergeReady. Without the grant the plain
+(`RELAY_REVIEW_AUTHOR=<login>`) with `RELAY_PROVIDER_GITHUB=gh` for a direct
+reviewer call. The **Factory** (ISH-1087 owner decision) authorizes the
+reviewer's `COMMENT` review by default, derives the author from `gh api user`
+unless `RELAY_REVIEW_AUTHOR` is set, and (ISH-1133) uses the authenticated `gh`
+reader by default with no env; `RELAY_GITHUB_REVIEW_WRITE=0` opts out, after
+which `relay run factory` refuses to reach MergeReady. Without the grant the plain
 reviewer keeps the local structured-verdict path and Relay requires no native
 review. `--allowedTools` is an approval allowlist, **not** an OS sandbox — Relay
 does not claim process
@@ -524,7 +536,10 @@ per-Run evidence**, and `events.jsonl` is **Relay's own lifecycle log** (a
 `dsh.event` annotation only — never a dsh payload). The durable `runs` row is
 keyed to the Task (it is not a second workflow state), records the dsh `sessionId`
 and both the pre-run `base_head_sha` and the PRODUCED HEAD re-read in the worktree
-at Run end (dsh is asked to commit). `relay run start` waits for a terminal state.
+at Run end (dsh is asked to commit). The coding binary defaults to
+`$HOME/.dsh/bin/dsh-model` when it is executable, else `dsh` (`--dsh` /
+`RELAY_DSH_BIN` override); `run.started` and `dsh.run.started` record the chosen
+binary and its source. `relay run start` waits for a terminal state.
 Cancel/timeout kill the whole process group. Permissions stay in the worktree
 (`DSH_PERMISSION_MODE=workspace-write`). A process `exit 0` or a terminal `final`
 event is **not** a submission — only a structured `relay run submit` bound to the

@@ -278,6 +278,30 @@ describe("one-shot headless dsh Run lifecycle", () => {
     expect(exited?.turnReason).toBe("completed");
   });
 
+  test("ISH-1133: run.started records the chosen dsh binary and its source", async () => {
+    const { id, outputRoot } = newTask();
+    const spawner = new FakeSpawner();
+    spawner.onSpawn = (p) => {
+      emitHappyJsonl(p, "session-bin-choice-0000-1111-2222-333333333333");
+      p.finish(0);
+    };
+
+    const h = await startDshRun(db, { taskId: id, spawner, outputRoot, fastExitMs: 0 });
+    const run = await h.wait();
+
+    const started = readEvents(run.id).find((e) => e.t === "run.started");
+    expect(started?.dshBin).toBe(process.env.RELAY_DSH_BIN!);
+    expect(started?.dshBinSource).toBe("env");
+
+    const durable = db
+      .query("SELECT payload_json FROM events WHERE type = 'dsh.run.started' AND task_id = ? ORDER BY id DESC LIMIT 1")
+      .get(id) as { payload_json: string };
+    expect(JSON.parse(durable.payload_json)).toMatchObject({
+      dshBin: process.env.RELAY_DSH_BIN!,
+      dshBinSource: "env",
+    });
+  });
+
   test("records the launcher lease and clears it when the launch coroutine finishes", async () => {
     const { id, outputRoot } = newTask();
     const spawner = new FakeSpawner();

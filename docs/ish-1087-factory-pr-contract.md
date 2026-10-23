@@ -70,13 +70,18 @@ worker's brief forbids reviews; the reviewer's brief requires one.
 
 ## Operator configuration
 
-- `RELAY_PROVIDER_GITHUB=gh` forces the read-only `gh` reader; `off` disables it.
-  When unset, the operator/Factory/daemon paths auto-detect a `gh` that passes
+- **No env is required for the Factory (ISH-1133).** The read-only `gh` reader is
+  the default for PR binding and the native review; both legs share one
+  detection. `RELAY_PROVIDER_GITHUB=gh` forces it and `off` disables it. When
+  unset, the operator/Factory/daemon paths auto-detect a `gh` that passes
   `gh auth status`.
 - The Factory authorizes the reviewer's `COMMENT` review by default
   (`RELAY_GITHUB_REVIEW_WRITE=0` opts out and then `requireNativeReview` blocks).
 - `RELAY_REVIEW_AUTHOR=<login>` overrides the author; otherwise the authenticated
   `gh api user` login is used.
+- The coding binary defaults to `$HOME/.dsh/bin/dsh-model` when executable, else
+  `dsh`; `RELAY_DSH_BIN` overrides. The native-review budget defaults to 45 min;
+  `RELAY_REVIEW_TIMEOUT_MS` overrides.
 - `relay pr bind <task>` / `relay merge-check <task>` print the bound PR
   (`pr=owner/name#n@sha`).
 

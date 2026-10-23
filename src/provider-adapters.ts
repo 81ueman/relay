@@ -717,16 +717,31 @@ export async function operatorProviderDepsFromEnv(env: EnvLike = process.env, ex
  *   - `defaultGrant` lets the Factory authorize the reviewer's COMMENT review
  *     when `RELAY_GITHUB_REVIEW_WRITE` is unset (owner decision ISH-1087). An
  *     explicit `0` still disables it.
+ *
+ * ISH-1133: `github` lets the Factory hand in the reader it already resolved
+ * (so the PR-binding and native-review legs cannot diverge); `null` means the
+ * caller already decided there is no reader and no further probe should run.
+ * When `autoAuthor` is requested but `gh api user` cannot resolve a login, the
+ * Factory gets a deps object with an empty author (it reports the concrete
+ * author failure) instead of the misleading "not configured".
  */
 export async function nativeReviewDepsFromEnv(
   env: EnvLike = process.env,
   exec: Exec = defaultExec,
-  opts: { autoGithub?: boolean; autoAuthor?: boolean; defaultGrant?: boolean } = {}
+  opts: {
+    autoGithub?: boolean;
+    autoAuthor?: boolean;
+    defaultGrant?: boolean;
+    github?: GhCliGitHub | null;
+  } = {}
 ): Promise<NativeReviewDeps | undefined> {
   const grant = (env.RELAY_GITHUB_REVIEW_WRITE ?? "").trim();
   if (optOut(grant)) return undefined;
   if (grant !== "1" && opts.defaultGrant !== true) return undefined;
-  const github = await githubReaderFromEnv(env, exec, { auto: opts.autoGithub === true });
+  const github =
+    opts.github === null
+      ? undefined
+      : opts.github ?? (await githubReaderFromEnv(env, exec, { auto: opts.autoGithub === true }));
   if (!github) return undefined;
   const authorEnv = (env.RELAY_REVIEW_AUTHOR ?? "").trim();
   // A rate-limited auth probe already proves the reader is configured; do not
@@ -762,7 +777,16 @@ export async function nativeReviewDepsFromEnv(
       rateLimited,
     };
   }
-  if (!author) return undefined;
+  if (!author) {
+    // ISH-1133: the Factory must be able to distinguish "no gh reader" from
+    // "gh is authenticated but the expected reviewer login could not be read".
+    // Keep the reader for the Factory's concrete author error; the ordinary
+    // native-review callers keep the old undefined (unavailable) result.
+    if (opts.autoAuthor === true && opts.defaultGrant === true) {
+      return { reader: github, github, author, allowedTools: "Read Grep Glob Bash" };
+    }
+    return undefined;
+  }
   const token = env.RELAY_REVIEW_GH_TOKEN ?? env.GH_TOKEN;
   return {
     reader: github,
@@ -783,10 +807,37 @@ export async function nativeReviewDepsFromEnv(
  * author from the gh login, and auto-detects the read-only reader. An explicit
  * `RELAY_GITHUB_REVIEW_WRITE=0` still turns it off (the Factory then refuses to
  * reach MergeReady when `requireNativeReview` is set).
+ *
+ * ISH-1133: pass `github` to reuse the reader the provider/PR-binding leg
+ * already resolved (`null` when it found none).
  */
 export async function factoryNativeReviewDepsFromEnv(
   env: EnvLike = process.env,
-  exec: Exec = defaultExec
+  exec: Exec = defaultExec,
+  opts: { github?: GhCliGitHub | null } = {}
 ): Promise<NativeReviewDeps | undefined> {
-  return nativeReviewDepsFromEnv(env, exec, { autoGithub: true, autoAuthor: true, defaultGrant: true });
+  return nativeReviewDepsFromEnv(env, exec, {
+    autoGithub: true,
+    autoAuthor: true,
+    defaultGrant: true,
+    github: opts.github,
+  });
+}
+
+/**
+ * ISH-1133: the Factory's no-env GitHub defaults. One auto-detection resolves
+ * the read-only provider; the native-review leg reuses that SAME reader, so an
+ * authenticated `gh` selected for PR binding can never be "not configured" for
+ * the native review. `RELAY_PROVIDER_GITHUB=off` disables both (fail closed),
+ * and a rate-limited detection is carried through as a retryable state.
+ */
+export async function factoryGithubDepsFromEnv(
+  env: EnvLike = process.env,
+  exec: Exec = defaultExec
+): Promise<{ providers: Awaited<ReturnType<typeof providerDepsFromEnv>>; nativeReview: NativeReviewDeps | undefined }> {
+  const providers = await providerDepsFromEnv(env, exec, { autoGithub: true });
+  const nativeReview = await factoryNativeReviewDepsFromEnv(env, exec, {
+    github: providers.github ?? null,
+  });
+  return { providers, nativeReview };
 }

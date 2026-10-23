@@ -161,7 +161,9 @@ RELAY_PROVIDER_GITHUB=off relay merge-check <task-id>
 
 The operator/daemon paths auto-detect an authenticated `gh` when
 `RELAY_PROVIDER_GITHUB` is **unset**; `RELAY_PROVIDER_GITHUB=gh` forces the
-reader and `RELAY_PROVIDER_GITHUB=off` disables it. There is no `--publish`:
+reader and `RELAY_PROVIDER_GITHUB=off` disables it. The Factory uses that same
+authenticated `gh` by default for PR binding and the native review (ISH-1133: no
+env is required), and `off` remains the explicit test opt-out. There is no `--publish`:
 Relay has no GitHub write path. See
 [`docs/ish-1140-merge-gate.md`](ish-1140-merge-gate.md) for the ISH-1140
 hosted-CI contract and the exact live-verification command.
