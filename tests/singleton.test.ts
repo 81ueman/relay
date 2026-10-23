@@ -6,7 +6,9 @@ import { join } from "node:path";
 import { openDb } from "../src/db";
 import { runDaemon } from "../src/daemon";
 import { MockRuntime } from "../src/runtime/runtime";
+import { attachSession } from "../src/sessions";
 import { startSocketServer, type SocketContext } from "../src/socket";
+import { registerWorker } from "../src/workers";
 import {
   acquireSupervisorLock,
   assertSocketFree,
@@ -335,6 +337,28 @@ function daemonEnv(dbPath: string, sockPath: string): Record<string, string | un
   };
 }
 
+/**
+ * Seed the smallest legal POLLED (codex) worker. A supervisor pass calls
+ * `runtime.agentStatus` for it (`pollPolledWorkers`), and the `daemon-once.ts`
+ * fixture blocks inside that call: a deterministic point at which one pass is
+ * provably in flight — and therefore holds the supervisor lock — without any
+ * wall-clock start alignment.
+ */
+function seedPolledWorker(dbPath: string): void {
+  const db = openDb(dbPath);
+  try {
+    registerWorker(db, "w-gate", { role: "worker", agentKind: "codex" });
+    attachSession(db, "01a0c405-70ba-7bf0-8522-98eba9dd5283", {
+      role: "worker",
+      workerId: "w-gate",
+      agentKind: "codex",
+      identity: { agent: "codex-gate", tabId: "tab-gate", paneId: "pane-gate", workspaceId: "ws-gate", agentKind: "codex" },
+    });
+  } finally {
+    db.close();
+  }
+}
+
 describe("daemon single-supervisor enforcement (subprocess)", () => {
   test("A/B: a second daemon is rejected and never unlinks the live socket", async () => {
     const dir = tempDir();
@@ -481,20 +505,45 @@ describe("daemon single-supervisor enforcement (subprocess)", () => {
     const dbPath = join(dir, "state.db");
     const sockPath = join(dir, "relay.sock");
     openDb(dbPath).close();
-    const startAt = Date.now() + 1200;
+    // Makes the pass call runtime.agentStatus, the fixture's in-pass rendezvous.
+    seedPolledWorker(dbPath);
+    const readyA = join(dir, "ready-a");
+    const readyB = join(dir, "ready-b");
+    const release = join(dir, "release");
 
-    const env = (): Record<string, string | undefined> => ({
+    const env = (ready: string): Record<string, string | undefined> => ({
       ...daemonEnv(dbPath, sockPath),
-      START_AT: String(startAt),
+      READY_FILE: ready,
+      RELEASE_FILE: release,
     });
-    const a = spawnFixture("daemon-once.ts", env());
-    const b = spawnFixture("daemon-once.ts", env());
-    const [codeA, codeB] = await Promise.all([a.exited, b.exited]);
-    const [errA, errB] = await Promise.all([streamOf(a.stderr), streamOf(b.stderr)]);
+    // Launch both runs together. There is deliberately NO wall-clock barrier:
+    // whichever one wins the supervisor lock pins its pass at `agentStatus` and
+    // stays there until we release it, so the other run's lock attempt is
+    // GUARANTEED to happen while the winner still owns the lock. (The old
+    // START_AT barrier only aligned process starts; one run's whole pass could
+    // finish before the other even reached the lock, and two sequential passes
+    // are legitimate — that was the flake.)
+    const a = spawnFixture("daemon-once.ts", env(readyA));
+    const b = spawnFixture("daemon-once.ts", env(readyB));
 
-    expect([codeA, codeB].filter((c) => c === 0).length).toBe(1);
+    await waitFor(async () => existsSync(readyA) || existsSync(readyB));
+    const winner = existsSync(readyA) ? a : b;
+    const loser = existsSync(readyA) ? b : a;
+
+    // The loser is refused WHILE the winner is provably still in its pass.
+    const loserCode = await exitWithin(loser);
+    const loserErr = await streamOf(loser.stderr);
+    expect(loserCode).not.toBe(0);
+    expect(loserErr).toMatch(/active supervisor|second supervisor|active daemon/);
+    expect(loserErr).not.toMatch(/daemon starting/);
+
+    writeFileSync(release, "release");
+    const winnerCode = await exitWithin(winner);
+    const winnerErr = await streamOf(winner.stderr);
+
+    expect(winnerCode).toBe(0);
     // Only one process ever reached the post-acquisition startup line.
-    expect((errA + errB).match(/daemon starting/g)?.length ?? 0).toBe(1);
+    expect(`${winnerErr}${loserErr}`.match(/daemon starting/g)?.length ?? 0).toBe(1);
   }, 20000);
 
   test("I: different DBs in the same directory run concurrently", async () => {
