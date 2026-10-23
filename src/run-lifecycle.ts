@@ -1161,6 +1161,7 @@ export function pinRunBrief(worktree: string, text: string): string {
 export interface LaunchRunOptions extends EnsureWorktreeOptions {
   /** Root for `<root>/<run-id>/`; default `<control-plane>/runs`. */
   outputRoot?: string;
+  /** dsh executable (default `$HOME/.dsh/bin/dsh-model` when executable, else `dsh`; `$RELAY_DSH_BIN` also overrides). */
   dshBin?: string;
   permissionMode?: string;
   timeoutMs?: number;

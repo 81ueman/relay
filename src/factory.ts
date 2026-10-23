@@ -91,7 +91,7 @@ export interface FactoryDeps {
    */
   prRepo?: string | null;
   worktreesRoot?: string;
-  /** Real dsh binary (default `dsh`); a fake path in tests. */
+  /** Real dsh binary (default `$HOME/.dsh/bin/dsh-model` when executable, else `dsh`); a fake path in tests. */
   dshBin?: string;
   outputRoot?: string;
   permissionMode?: string;
@@ -1043,8 +1043,8 @@ async function runFactoryTaskInner(
         // opts a binding-only fixture out.
         if ((deps.requireNativeReview ?? deps.prBinding !== undefined) && !deps.nativeReview) {
           const reason =
-            `${FACTORY_NATIVE_REVIEW_REQUIRED}: native GitHub review is required but not configured; ` +
-            `set RELAY_PROVIDER_GITHUB=gh and authenticate gh (RELAY_GITHUB_REVIEW_WRITE=0 disables the Factory's default grant)`;
+            `${FACTORY_NATIVE_REVIEW_REQUIRED}: native GitHub review is required but no read-only GitHub reader is configured; ` +
+            `authenticate the gh CLI (the Factory's default) or set RELAY_PROVIDER_GITHUB=gh. RELAY_GITHUB_REVIEW_WRITE=0 disables native review by design, and the Factory then blocks here`;
           push(`review:native-review-required`);
           logEvent(db, { source: "factory", taskId, type: "factory.native_review_required", payload: { head: reviewHead, reason } });
           return { taskId, outcome: "blocked", head: reviewHead, attempts, gate: null, reason, steps };

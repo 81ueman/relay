@@ -24,6 +24,15 @@ describe("ISH-904: CLI help documents the operator flags and preconditions", () 
     expect(out).toContain("no_checks");
   });
 
+  test("ISH-1133: `relay run factory --help` documents the no-env defaults and overrides", () => {
+    const out = help(["run", "factory"]);
+    expect(out).toContain("NO environment variable is required");
+    expect(out).toContain("$HOME/.dsh/bin/dsh-model");
+    expect(out).toContain("RELAY_PROVIDER_GITHUB=off");
+    expect(out).toContain("RELAY_REVIEW_TIMEOUT_MS");
+    expect(out).toContain("45 min / 2,700,000 ms");
+  });
+
   test("`relay task intake --help` documents --description", () => {
     const out = help(["task", "intake"]);
     expect(out).toContain("--description D");

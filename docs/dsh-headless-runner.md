@@ -19,6 +19,14 @@ relay run submit <run-id> [--evidence E] [--summary S]
 A one-shot headless attempt is launched directly by `src/dsh-runner.ts`; there
 is no long-lived `dsh web` bridge.
 
+## Coding binary (ISH-1133)
+
+The coding binary defaults to `$HOME/.dsh/bin/dsh-model` when it is an executable
+file (the wrapper applies the time-of-day model band), else `dsh` on PATH.
+`--dsh` / `RELAY_DSH_BIN` override. The chosen path and source
+(`option` / `env` / `dsh-model` / `path`) are recorded in the Run's
+`run.started` and durable `dsh.run.started` events.
+
 ## Pinned CLI contract (dsh 0.2.1-rc.2)
 
 Confirmed against the installed tool, not guessed. The pin is a single

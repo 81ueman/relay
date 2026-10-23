@@ -1,5 +1,6 @@
 import type { Database } from "bun:sqlite";
-import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
+import { accessSync, appendFileSync, constants, mkdirSync, statSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { defaultDbPath, now } from "./db";
 import { logEvent } from "./events";
@@ -68,6 +69,47 @@ export const DEFAULT_FAST_EXIT_MS = 1500;
 /** dsh's default permission mode: writes are confined to the Run cwd. */
 export const DEFAULT_PERMISSION_MODE = "workspace-write";
 
+/** ISH-1133: the time-of-day model-band wrapper, relative to `$HOME`. */
+export const DSH_MODEL_BIN_RELATIVE = join(".dsh", "bin", "dsh-model");
+
+export type DshBinSource = "option" | "env" | "dsh-model" | "path";
+
+export interface DshBinChoice {
+  bin: string;
+  /** Why this binary was chosen; recorded in the Run's events. */
+  source: DshBinSource;
+}
+
+function isExecutableFile(path: string): boolean {
+  try {
+    if (!statSync(path).isFile()) return false;
+    accessSync(path, constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * ISH-1133: the native dsh-binary default. `--dsh` / `RELAY_DSH_BIN` still win
+ * (the caller passes `--dsh` as `StartRunOptions.dshBin`); otherwise use
+ * `$HOME/.dsh/bin/dsh-model` when it is an executable file, else `dsh` on PATH.
+ * The wrapper applies the time-of-day model band, so selecting it by default is
+ * intentional; a machine without the wrapper keeps the old `dsh` behavior.
+ */
+export function resolveDshBin(
+  env: NodeJS.ProcessEnv = process.env,
+  opts: { home?: string; isExecutable?: (path: string) => boolean } = {}
+): DshBinChoice {
+  const fromEnv = (env.RELAY_DSH_BIN ?? "").trim();
+  if (fromEnv) return { bin: fromEnv, source: "env" };
+  const home = opts.home ?? (env.HOME?.trim() || homedir());
+  const wrapper = join(home, DSH_MODEL_BIN_RELATIVE);
+  const executable = opts.isExecutable ?? isExecutableFile;
+  if (executable(wrapper)) return { bin: wrapper, source: "dsh-model" };
+  return { bin: "dsh", source: "path" };
+}
+
 /** One line of the Run's own lifecycle JSONL (`events.jsonl`). */
 export interface RunEvent {
   t: string;
@@ -126,7 +168,10 @@ export interface StartRunOptions {
   prompt?: string;
   /** Root for `<root>/<run-id>/`; default `<control-plane>/runs`. */
   outputRoot?: string;
-  /** dsh executable (default `dsh`, or $RELAY_DSH_BIN). */
+  /**
+   * dsh executable (default: `$HOME/.dsh/bin/dsh-model` when executable, else
+   * `dsh`; `$RELAY_DSH_BIN` also overrides).
+   */
   dshBin?: string;
   /** Permission boundary passed as $DSH_PERMISSION_MODE. */
   permissionMode?: string;
@@ -451,7 +496,12 @@ export async function startDshRun(db: Database, opts: StartRunOptions): Promise<
   // insert below.
   assertNoActiveWriter(db, { cwd, branch });
 
-  const dshBin = opts.dshBin ?? process.env.RELAY_DSH_BIN ?? "dsh";
+  // ISH-1133: `--dsh` wins, then `$RELAY_DSH_BIN`, then the native
+  // `$HOME/.dsh/bin/dsh-model` wrapper when executable, else `dsh`.
+  const dshChoice: DshBinChoice = opts.dshBin
+    ? { bin: opts.dshBin, source: "option" }
+    : resolveDshBin(process.env);
+  const dshBin = dshChoice.bin;
   // ISH-869 fail-closed: the HOST Coding Worker must be the exact pinned dsh.
   // Probe `--version` BEFORE any Run row or spawn, so an old/mismatched build
   // (e.g. a 0.2.0-rc.2 `dsh` on PATH) can never be run as a normal success.
@@ -464,7 +514,7 @@ export async function startDshRun(db: Database, opts: StartRunOptions): Promise<
       source: "dsh-runner",
       taskId: task.id,
       type: "dsh.version_mismatch",
-      payload: { dshBin, want: PINNED_DSH_VERSION, got: hostDshVersion },
+      payload: { dshBin, dshBinSource: dshChoice.source, want: PINNED_DSH_VERSION, got: hostDshVersion },
     });
     throw new Error(message);
   }
@@ -510,12 +560,34 @@ export async function startDshRun(db: Database, opts: StartRunOptions): Promise<
     dshEventsPath,
   });
 
-  events({ t: "run.started", runId, taskId: task.id, phase, attempt: task.attempt, cwd, branch, baseHead: head, permissionMode });
+  events({
+    t: "run.started",
+    runId,
+    taskId: task.id,
+    phase,
+    attempt: task.attempt,
+    cwd,
+    branch,
+    baseHead: head,
+    permissionMode,
+    dshBin,
+    dshBinSource: dshChoice.source,
+  });
   logEvent(db, {
     source: "dsh-runner",
     taskId: task.id,
     type: "dsh.run.started",
-    payload: { runId, phase, attempt: task.attempt, cwd, branch, baseHead: head, permissionMode },
+    payload: {
+      runId,
+      phase,
+      attempt: task.attempt,
+      cwd,
+      branch,
+      baseHead: head,
+      permissionMode,
+      dshBin,
+      dshBinSource: dshChoice.source,
+    },
   });
 
   const argv = [dshBin, "--profile", "headless", "--json", prompt];
