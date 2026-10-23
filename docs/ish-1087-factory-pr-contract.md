@@ -16,7 +16,9 @@ only a branch. The old Factory:
 
 Evidence: ishiul `T243` / PR #928 and `T238` / PR #916. In the ishiul state DB the
 Runs and ReviewResults exist, the Tasks have `pr_url = NULL`, and the merge gate
-event is `BLOCKED: CHECKS_NOT_RUN+NO_PERMISSION+NO_PR`. The PR was created only at
+event is `BLOCKED: CHECKS_NOT_RUN+NO_PERMISSION+NO_PR` (recorded before ISH-1140;
+`CHECKS_NOT_RUN` no longer exists as a block reason — see
+[`ish-1140-merge-gate.md`](ish-1140-merge-gate.md)). The PR was created only at
 merge time by the Gateway.
 
 ## Who opens the PR

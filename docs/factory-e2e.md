@@ -303,6 +303,10 @@ projection. A non-`merge_ready` outcome exits non-zero.
   to the user's real control plane.)
 - **Old HEAD cannot advance.** Every result is bound to the revision it judged;
   the merge gate re-reads GitHub and refuses a PR head != `task.head_sha`.
+- **Hosted CI is informational (ISH-1140).** GitHub check runs are reported as
+  `hosted_ci` but are never a merge gate; READY comes from Relay's VERIFY +
+  head-pinned review. See
+  [`ish-1140-merge-gate.md`](ish-1140-merge-gate.md).
 - **MergeReady is read-only.** The Factory never pushes, merges, accepts,
   comments, labels or writes Linear. `task.merged_at`/`accepted_at`/`pr_url`
   stay `null`; the gate decision is recorded, not executed.

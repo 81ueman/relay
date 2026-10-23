@@ -197,8 +197,8 @@ export interface LinearReadOnly extends RateLimitAware {
 
 /**
  * One GitHub check run or commit status, normalized to the SAME bucket
- * vocabulary `gh pr checks` uses. `bucket` is the only thing the merge gate
- * reads: a required check that is `pending`/`fail`/`cancel` (or absent) BLOCKS.
+ * vocabulary `gh pr checks` uses. ISH-1140: the merge gate reports the roll-up
+ * as informational `hosted_ci`; it is never a merge gate.
  */
 export interface CheckRunView {
   name: string;
@@ -206,9 +206,10 @@ export interface CheckRunView {
 }
 
 /**
- * The read-only check reader. `listChecks` is pinned to an EXACT head so the
- * result can never be credited to a moved HEAD. A failed read returns `null`
- * ("unknown"), which the gate treats as NOT_RUN — never as "no checks, pass".
+ * The read-only check reader. `listChecks` is pinned to an EXACT head so an
+ * observation can never be credited to a moved HEAD. A failed read returns
+ * `null` ("unknown"); ISH-1140 reports that as `hosted_ci: not verified` and
+ * never blocks the merge gate on it.
  */
 export interface ChecksReadOnly extends RateLimitAware {
   readonly name: string;
@@ -216,7 +217,7 @@ export interface ChecksReadOnly extends RateLimitAware {
   listChecks(ref: PrRef, headSha: string): ProviderRead<CheckRunView[] | null>;
 }
 
-/** The roll-up the merge gate judges: required checks all concluded green. */
+/** The informational roll-up behind the merge gate's `hosted_ci` field. */
 export interface CheckRollup {
   total: number;
   passed: number;
@@ -225,9 +226,9 @@ export interface CheckRollup {
   skipped: string[];
   /**
    * True only when at least one check actually PASSED AND none is failing /
-   * pending / cancelled. A zero-check roll-up, and an all-skipped roll-up, are
-   * deliberately NOT passed: an unrun required gate (e.g. a CI credit outage, or
-   * every job skipped) must BLOCK, never PASS.
+   * pending / cancelled. A zero-check roll-up and an all-skipped roll-up are
+   * deliberately NOT passed: hosted CI did not verify this head. ISH-1140: this
+   * is INFORMATIONAL only; it never decides READY/BLOCKED.
    */
   requiredPassed: boolean;
 }
@@ -734,8 +735,9 @@ export class FakeGitHub implements GitHubReadOnly, ChecksReadOnly {
   }
 
   /**
-   * Pin checks to an exact head. `null` simulates a FAILED read (NOT_RUN); an
-   * empty array means the head genuinely reported no checks (also NOT_RUN).
+   * Pin checks to an exact head. `null` simulates a FAILED read; an empty array
+   * means the head genuinely reported no checks. Both are informational
+   * (`hosted_ci: not verified`, ISH-1140), never a gate.
    */
   putChecks(ref: PrRef, headSha: string, checks: CheckRunView[] | null): this {
     this.checks.set(`${this.key(ref)}@${headSha}`, checks);

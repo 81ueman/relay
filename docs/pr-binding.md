@@ -145,9 +145,12 @@ before crediting the merge. Relay still never performs a merge.
 relay pr bind <task-id>
 relay pr bind <task-id> --json
 
-# READ-ONLY HEAD-bound merge readiness (prints the bound PR).
+# READ-ONLY HEAD-bound merge readiness (prints the bound PR). ISH-1140:
+# hosted CI is informational only (`hosted_ci: not verified | passing | failing`);
+# it is never a gate. Use --authority merge to dry-run the READY verdict.
 relay merge-check <task-id>
 relay merge-check <task-id> --json
+relay merge-check <task-id> --authority merge
 
 # Explicit reader configuration (optional on a machine where `gh auth status`
 # succeeds — the operator/Factory paths auto-detect it; `off` disables):
@@ -158,7 +161,9 @@ RELAY_PROVIDER_GITHUB=off relay merge-check <task-id>
 The operator/daemon paths auto-detect an authenticated `gh` when
 `RELAY_PROVIDER_GITHUB` is **unset**; `RELAY_PROVIDER_GITHUB=gh` forces the
 reader and `RELAY_PROVIDER_GITHUB=off` disables it. There is no `--publish`:
-Relay has no GitHub write path.
+Relay has no GitHub write path. See
+[`docs/ish-1140-merge-gate.md`](ish-1140-merge-gate.md) for the ISH-1140
+hosted-CI contract and the exact live-verification command.
 
 ## Tests
 
