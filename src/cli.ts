@@ -200,7 +200,8 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
       "`--permission MODE` is forwarded to the headless dsh Run (default `workspace-write`). `--timeout` is the per-Run budget, `--max-attempts` the coding/review attempt cap (it also bounds a fresh IMPLEMENT Run issued for a repairable `NO_IMPLEMENTATION`/partial-commit failure; ENOSPC/resource/permission/auth/unknown failures are never auto-retried). " +
       "The task branch is cut from the SOURCE repo's freshly fetched `origin/main` (or the task's `pr_base`), and a resolved base behind `origin/main` is warned about, never silently accepted. " +
       "ISH-1013: every non-ready result carries a `failure` object: a minimal `class`, the concrete evidence-derived `cause`, the last Run/attempt/HEAD, bounded evidence references (`run show/logs`, check/review/evidence paths), and `next` (what to fix, what to read, the existing safe resume command, and the condition that permits resume). Classification never auto-unblocks: a HOLD, missing permission, live writer or stale/old HEAD stays blocked until an explicit `relay unblock` or a fresh HEAD-bound result. " +
-      "ISH-1128: a Task already parked by the OLD stale-HEAD refusal (a Run that amended and force-pushed its own head) is resumed at the parked Run's produced head WITHOUT re-implementing: `relay unblock <task-id>`, `relay claim <task-id> --worker <coordinator>`, then `relay result submit <task-id> --head <parked-run-produced-head> --evidence \"recovered from parked run <run-id>\" --worker <coordinator>` (see docs/run-lifecycle.md).",
+      "ISH-1128: a Task already parked by the OLD stale-HEAD refusal (a Run that amended and force-pushed its own head) is resumed at the parked Run's produced head WITHOUT re-implementing: `relay unblock <task-id>`, `relay claim <task-id> --worker <coordinator>`, then `relay result submit <task-id> --head <parked-run-produced-head> --evidence \"recovered from parked run <run-id>\" --worker <coordinator>` (see docs/run-lifecycle.md). " +
+      "ISH-1135/1143: `--review-rubric PATH` overrides the repo-owned rubric at the reviewed HEAD and `--review-output-contract PATH` overrides its companion contract; the two flags are a pair, so `--review-output-contract` without `--review-rubric` is REFUSED (never silently ignored). The brief points the reviewer at the committed blob (`git show <head>:<path>`), not the working-tree file.",
     usage: [
       "relay run factory <task-id> [--max-attempts N] [--dsh BIN] [--reviewer CMD] [--model M] [--permission MODE] [--timeout 30m] [--repo DIR] [--review-worktrees DIR] [--review-rubric PATH] [--review-output-contract PATH] [--json]",
     ],
@@ -1829,17 +1830,25 @@ async function main(): Promise<void> {
           }
           const timeoutRaw = flag(rest, "--timeout");
           const maxRaw = flag(rest, "--max-attempts");
+          // ISH-1135: the repo-owned rubric the reviewer must read at the
+          // reviewed HEAD. This flag overrides the per-repo resolver
+          // (RELAY_REVIEW_RUBRICS / RELAY_REVIEW_RUBRIC).
+          const rubricFlag = flag(rest, "--review-rubric");
+          const contractFlag = flag(rest, "--review-output-contract");
+          // ISH-1143: an output contract is the companion of an EXPLICIT rubric
+          // path for this invocation. Refuse it alone instead of silently
+          // ignoring it (the resolved env/default rubric is not overridden).
+          if (contractFlag && !rubricFlag) {
+            throw new Error(
+              "--review-output-contract requires --review-rubric: give both paths for this invocation, or use the resolved rubric's own output contract"
+            );
+          }
           const repoRoot = flag(rest, "--repo") ?? projectRoot();
           // ISH-1087: the live Factory path uses the operator deps, so an
           // authenticated gh is enough to read the PR and post/read back the
           // native review. No PR = the review stage blocks (never MergeReady).
           const providers = await operatorProviderDepsFromEnv();
           const nativeReview = await factoryNativeReviewDepsFromEnv();
-          // ISH-1135: the repo-owned rubric the reviewer must read at the
-          // reviewed HEAD. This flag overrides the per-repo resolver
-          // (RELAY_REVIEW_RUBRICS / RELAY_REVIEW_RUBRIC).
-          const rubricFlag = flag(rest, "--review-rubric");
-          const contractFlag = flag(rest, "--review-output-contract");
           const result = await runFactoryTask(db, id, {
             repo: flag(rest, "--repo") ?? undefined,
             prRepo: flag(rest, "--pr-repo") ?? undefined,

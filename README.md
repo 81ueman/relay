@@ -427,12 +427,16 @@ review rubric at the reviewed HEAD — by default
 `references/output-contract.md`, configurable per repo with
 `RELAY_REVIEW_RUBRICS` (JSON keyed by `owner/name`, bare repo name or `default`),
 `RELAY_REVIEW_RUBRIC` / `RELAY_REVIEW_OUTPUT_CONTRACT`, or
-`--review-rubric` / `--review-output-contract`. The file is checked in the
-reviewed COMMIT (not a mutable working tree); a missing rubric is stated in the
-brief, never silently skipped. Relay's structured JSON remains the machine
-contract: rubric `Act on` maps to `blocker`/`major`, while `Consider`/`Noted`
-become non-blocking `minor` and `Dismissed` becomes non-blocking `nit`, all kept
-in `findings` (the ISH-1086 read path). The VERIFY section says the required
+`--review-rubric` / `--review-output-contract`. **ISH-1143:** the two flags are
+a pair: `--review-output-contract` without `--review-rubric` is refused, never
+silently ignored. The file is checked in the reviewed COMMIT (not a mutable
+working tree) and the brief tells the reviewer to read the committed blob with
+`git show <head>:<path>`, so a dirty working tree cannot substitute a different
+rubric; a missing rubric is stated in the brief, never silently skipped. Relay's
+structured JSON remains the machine contract: rubric `Act on` maps to
+`blocker`/`major`, while `Consider`/`Noted` become non-blocking `minor` and
+`Dismissed` becomes non-blocking `nit`, all kept in `findings` (the ISH-1086 read
+path). The VERIFY section says the required
 checks already passed and not to re-run them **wholesale**; the reviewer is
 expected to execute the focused tests/commands/variants the diff's blast radius
 (and the rubric) call for and name them in `summary`, or write an explicit

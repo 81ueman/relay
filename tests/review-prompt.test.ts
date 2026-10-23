@@ -131,6 +131,38 @@ describe("ISH-1135: the review prompt loads the repo rubric and expects focused 
     expect(brief).not.toContain("present at the reviewed HEAD");
   });
 
+  test("a dirty working tree cannot substitute for the committed rubric blob", () => {
+    // ISH-1143: commit the rubric, then dirty the mutable-worktree fallback.
+    // HEAD is unchanged, so `rubricFileAtHead` stays true: the brief must point
+    // the reviewer at `git show <head>:<path>`, not the checkout file.
+    mkdirSync(join(repo, ".agents/skills/independent-pr-review/references"), { recursive: true });
+    writeFileSync(join(repo, RUBRIC_PATH), "# Rubric at HEAD\n\nAct on / Consider / Noted / Dismissed.\n");
+    writeFileSync(join(repo, CONTRACT_PATH), "# Contract at HEAD\n");
+    git(repo, "add", ".agents");
+    git(repo, "commit", "-q", "-m", "add the review rubric");
+    const head = git(repo, "rev-parse", "HEAD");
+
+    writeFileSync(join(repo, RUBRIC_PATH), "# DIRTY local rubric (not committed)\n");
+    writeFileSync(join(repo, CONTRACT_PATH), "# DIRTY local contract (not committed)\n");
+    expect(git(repo, "status", "--porcelain")).toContain(RUBRIC_PATH);
+    expect(rubricFileAtHead(repo, head, RUBRIC_PATH)).toBe(true);
+    expect(git(repo, "show", `${head}:${RUBRIC_PATH}`)).toContain("Rubric at HEAD");
+
+    const brief = buildReviewBrief(db, reviewTaskAt(head), {
+      head,
+      worktree: repo, // mutable-worktree fallback: no detached reviewWorktree
+      rubric: DEFAULT_REVIEW_RUBRIC,
+    });
+    expect(brief).toContain("reviewed COMMIT");
+    expect(brief).toContain(`git show ${head}:${RUBRIC_PATH}`);
+    expect(brief).toContain(`git show ${head}:${CONTRACT_PATH}`);
+    expect(brief).toContain("not the working-tree path");
+    // The old file-tool instruction is gone, and the dirty content is not read.
+    expect(brief).not.toContain("from THIS checkout");
+    expect(brief).not.toContain("use your file-reading tool");
+    expect(brief).not.toContain("DIRTY local rubric");
+  });
+
   test("the factory reviewer process receives that brief (the actual prompt)", async () => {
     mkdirSync(join(repo, ".agents/skills/independent-pr-review/references"), { recursive: true });
     writeFileSync(join(repo, RUBRIC_PATH), "# Rubric\n");
@@ -192,5 +224,28 @@ describe("ISH-1135: the rubric path is configurable per repository", () => {
     expect(reviewRubricFor("o/r", {} as NodeJS.ProcessEnv)).toEqual(DEFAULT_REVIEW_RUBRIC);
     // A malformed map never supplies a wrong path.
     expect(reviewRubricFor("o/r", { RELAY_REVIEW_RUBRICS: "{" } as NodeJS.ProcessEnv)).toEqual(DEFAULT_REVIEW_RUBRIC);
+  });
+});
+
+describe("ISH-1143: --review-output-contract without --review-rubric is refused", () => {
+  const cli = join(import.meta.dir, "..", "src", "cli.ts");
+
+  test("the CLI fails loudly instead of silently ignoring the orphan flag", () => {
+    const r = Bun.spawnSync(
+      ["bun", cli, "run", "factory", "ISH-1143", "--review-output-contract", "docs/contract.md"],
+      {
+        env: { ...process.env, RELAY_DB: join(dir, "cli-state.db") },
+        stdout: "pipe",
+        stderr: "pipe",
+      }
+    );
+    expect(r.exitCode).toBe(1);
+    expect(r.stderr.toString()).toContain("--review-output-contract requires --review-rubric");
+  });
+
+  test("the factory help documents the pairing", () => {
+    const r = Bun.spawnSync(["bun", cli, "run", "factory", "--help"], { stdout: "pipe", stderr: "pipe" });
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout.toString()).toContain("--review-output-contract` without `--review-rubric` is REFUSED");
   });
 });

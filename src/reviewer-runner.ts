@@ -149,8 +149,11 @@ export interface ReviewVerifyEvidence {
 /**
  * ISH-1135: the repo-owned review rubric. Paths are RELATIVE to the reviewed
  * checkout and are checked in the commit at the reviewed HEAD (never read from a
- * mutable working tree). The default is the ishiul `independent-pr-review`
- * skill layout; another repository can override it (see `reviewRubricFor`).
+ * mutable working tree). ISH-1143: the brief therefore points the reviewer at
+ * the committed blob (`git show <head>:<path>`), not the checkout path, because
+ * the mutable-worktree fallback can be dirty at a clean HEAD. The default is the
+ * ishiul `independent-pr-review` skill layout; another repository can override
+ * it (see `reviewRubricFor`).
  */
 export interface ReviewRubric {
   /** Repo-relative path to the rubric at the reviewed HEAD. */
@@ -222,6 +225,11 @@ export function reviewRubricFor(repo: string | null | undefined, env: NodeJS.Pro
 function isRepoRelativePath(path: string): boolean {
   const p = path.trim();
   return !!p && !p.startsWith("/") && !p.split("/").some((part) => part === "..") && !p.includes("\0");
+}
+
+/** Render one `git show` argument for the brief; quote only when the shell needs it. */
+function shellArg(value: string): string {
+  return /^[A-Za-z0-9_./:@%+=,-]+$/.test(value) ? value : `'${value.replace(/'/g, "'\\''")}'`;
 }
 
 /**
@@ -352,6 +360,14 @@ export function buildReviewBrief(
   const contractPath = rubric.outputContract;
   const rubricPresent = rubricFileAtHead(opts.worktree, opts.head, rubricPath);
   const contractPresent = contractPath ? rubricFileAtHead(opts.worktree, opts.head, contractPath) : false;
+  // ISH-1143: the reviewer must read the BLOB at the reviewed HEAD, not the
+  // checkout path. On the mutable-worktree fallback (`reviewWorktree` omitted)
+  // the working tree can be dirty while HEAD is unchanged, so a file read would
+  // judge a rubric the commit does not contain.
+  const blobReads = [
+    ...(rubricPresent ? [`git show ${shellArg(`${opts.head}:${rubricPath}`)}`] : []),
+    ...(contractPath && contractPresent ? [`git show ${shellArg(`${opts.head}:${contractPath}`)}`] : []),
+  ];
   const lines: string[] = [
     `# Independent review — Task ${task.id} (attempt ${task.attempt})`,
     "",
@@ -370,20 +386,36 @@ export function buildReviewBrief(
     "",
     "## Repo review rubric — READ THIS FIRST",
     "",
-    "This repository OWNS its review rubric. Before judging, read it from THIS",
-    `checkout at the reviewed HEAD \`${opts.head}\` (use your file-reading tool;`,
-    "reading is always allowed):",
+    "This repository OWNS its review rubric. Before judging, read it from the",
+    `reviewed COMMIT \`${opts.head}\`, NOT from the working tree: this checkout can`,
+    "be dirty even at a clean HEAD, so a file read could judge a rubric the commit",
+    "does not contain.",
     "",
+    ...(blobReads.length > 0
+      ? [
+          "Read the COMMITTED blob with git (from this checkout, or any checkout that",
+          "has the commit):",
+          "",
+          "```",
+          ...blobReads,
+          "```",
+          "",
+        ]
+      : [
+          "No rubric or contract blob is present at this HEAD; do not read a",
+          "working-tree copy or substitute another revision.",
+          "",
+        ]),
     `- \`${rubricPath}\` — ${
       rubricPresent
-        ? "present at the reviewed HEAD. Read it NOW, before the diff."
+        ? "present at the reviewed HEAD. Read it NOW from the committed blob above (not the working-tree path)."
         : `MISSING at the reviewed HEAD \`${opts.head}\`.`
     }`,
     ...(contractPath
       ? [
           `- \`${contractPath}\` — ${
             contractPresent
-              ? "present at the reviewed HEAD. Read it after the rubric."
+              ? "present at the reviewed HEAD. Read the committed blob above after the rubric."
               : `MISSING at the reviewed HEAD \`${opts.head}\` (Relay's output contract below still applies).`
           }`,
         ]
