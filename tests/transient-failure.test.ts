@@ -244,6 +244,7 @@ describe("ISH-1174: the transient failure class is evidence-derived", () => {
       SESSION,
       // turn 1 failed with a provider 500, then the Run continued…
       { type: "status", phase: "turn_end", turn: 1, reason: { kind: "error", error: { status: 500, message: "upstream 500" } } },
+      { type: "error", message: "fetch failed: read ECONNRESET" },
       { type: "status", phase: "step", turn: 2, step: 1 },
       // …and turn 2 is a genuine failure with NO transport/provider evidence.
       { type: "status", phase: "turn_end", turn: 2, reason: { kind: "error", error: { message: "the tool schema is invalid" } } },
@@ -251,6 +252,7 @@ describe("ISH-1174: the transient failure class is evidence-derived", () => {
     const run = runWith(lines);
     const ev = readRunProviderEvidence(run.dsh_events_path);
     expect(ev.statuses).toEqual([]); // the earlier 500 is replaced, not accumulated
+    expect(ev.errors).toEqual([]); // the earlier ECONNRESET is not terminal evidence
     expect(ev.turnEndCode).toBeNull();
     const res = classifyTransientRunFailure({ run, error: "CODING_FAILED: exit 1" });
     expect(res.transient).toBe(false);

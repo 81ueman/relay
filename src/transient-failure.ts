@@ -205,9 +205,11 @@ export function readRunProviderEvidence(path: string | null | undefined): RunPro
     const status = dshProviderStatus(event);
     if (event.type === "status" && event.phase === "turn_end") {
       // Only the Run's TERMINAL turn decides the class. Every turn_end
-      // REPLACES the previous turn's failure evidence, so a transient 5xx in
-      // an earlier turn cannot make a later, genuine failure look transient.
+      // REPLACES the previous turn's failure evidence, so a transient 5xx or
+      // ECONNRESET in an earlier turn cannot make a later, genuine failure
+      // look transient.
       out.statuses = status !== null ? [status] : [];
+      out.errors = [];
       const reason = event.reason;
       const kind = turnEndReason(event);
       if (kind) out.turnEnd = kind;
