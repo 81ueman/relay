@@ -120,7 +120,7 @@ Usage:
 
   relay run start <task-id> [--cwd DIR] [--prompt TEXT] [--permission MODE] [--timeout 30m] [--json]
   relay run launch <task-id> [--timeout 30m] [--permission MODE] [--json]   # ensure worktree + pin brief + ONE dsh Run
-  relay run factory <task-id> [--max-attempts N] [--dsh BIN] [--reviewer CMD] [--model M] [--permission MODE] [--timeout 30m] [--review-rubric PATH] [--json]  # code-change tasks only; dsh -> VERIFY -> Claude review -> MergeReady
+  relay run factory <task-id> [--max-attempts N] [--max-resumes N] [--transient-wait 60m] [--transient-backoff 30s] [--dsh BIN] [--reviewer CMD] [--model M] [--permission MODE] [--timeout 30m] [--review-rubric PATH] [--json]  # code-change tasks only; dsh -> VERIFY -> Claude review -> MergeReady
   relay run worktree <task-id> [--branch B] [--base REF] [--path DIR] [--json]
   relay run cleanup <task-id> [--abort REASON] [--apply] [--force] [--json]
   relay run list [--task <id>] [--json]
@@ -182,7 +182,7 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
     usage: [
       "relay run start <task-id> [--cwd DIR] [--prompt TEXT] [--permission MODE] [--timeout 30m] [--json]",
       "relay run launch <task-id> [--timeout 30m] [--permission MODE] [--json]",
-      "relay run factory <task-id> [--max-attempts N] [--dsh BIN] [--reviewer CMD] [--model M] [--permission MODE] [--timeout 30m] [--review-rubric PATH] [--review-output-contract PATH] [--json]",
+      "relay run factory <task-id> [--max-attempts N] [--max-resumes N] [--transient-wait 60m] [--transient-backoff 30s] [--dsh BIN] [--reviewer CMD] [--model M] [--permission MODE] [--timeout 30m] [--review-rubric PATH] [--review-output-contract PATH] [--json]",
       "relay run worktree <task-id> [--branch B] [--base REF] [--path DIR] [--json]",
       "relay run cleanup <task-id> [--abort REASON] [--apply] [--force] [--json]",
       "relay run list [--task <id>] [--limit N] [--json]",
@@ -202,9 +202,10 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
       "ISH-1133: NO environment variable is required. The read-only `gh` reader is the default for PR binding and the native review (an authenticated `gh` is required; `RELAY_PROVIDER_GITHUB=off` disables it, and the native-review requirement then blocks). The coding binary defaults to `$HOME/.dsh/bin/dsh-model` when it is an executable file, else `dsh` (`--dsh` / `RELAY_DSH_BIN` override; the choice is recorded in the Run's events). The headless-review budget defaults to 45 min / 2,700,000 ms (`RELAY_REVIEW_TIMEOUT_MS` overrides). " +
       "ISH-1013: every non-ready result carries a `failure` object: a minimal `class`, the concrete evidence-derived `cause`, the last Run/attempt/HEAD, bounded evidence references (`run show/logs`, check/review/evidence paths), and `next` (what to fix, what to read, the existing safe resume command, and the condition that permits resume). Classification never auto-unblocks: a HOLD, missing permission, live writer or stale/old HEAD stays blocked until an explicit `relay unblock` or a fresh HEAD-bound result. " +
       "ISH-1128: a Task already parked by the OLD stale-HEAD refusal (a Run that amended and force-pushed its own head) is resumed at the parked Run's produced head WITHOUT re-implementing: `relay unblock <task-id>`, `relay claim <task-id> --worker <coordinator>`, then `relay result submit <task-id> --head <parked-run-produced-head> --evidence \"recovered from parked run <run-id>\" --worker <coordinator>` (see docs/run-lifecycle.md). " +
-      "ISH-1135/1143: `--review-rubric PATH` overrides the repo-owned rubric at the reviewed HEAD and `--review-output-contract PATH` overrides its companion contract; the two flags are a pair, so `--review-output-contract` without `--review-rubric` is REFUSED (never silently ignored). The brief points the reviewer at the committed blob (`git show <head>:<path>`), not the working-tree file.",
+      "ISH-1135/1143: `--review-rubric PATH` overrides the repo-owned rubric at the reviewed HEAD and `--review-output-contract PATH` overrides its companion contract; the two flags are a pair, so `--review-output-contract` without `--review-rubric` is REFUSED (never silently ignored). The brief points the reviewer at the committed blob (`git show <head>:<path>`), not the working-tree file. " +
+      "ISH-1174 TRANSIENT RECOVERY: a TRANSIENT provider/network failure — dsh provider HTTP 5xx or 429, a connection reset/refused/timeout, or a `turn_end` provider/transport error — is WAITED OUT (reachability probe, 30 s doubling to 5 min, TOTAL cap 60 min, `factory.waiting_transient` events) and CONTINUED in the SAME worktree + dsh Session (`--session-id <failed id>`, a resume does NOT consume a factory attempt; default 3 resumes per attempt; `factory.run_resumed` events). An unadoptable Session falls back to a FRESH session in the same worktree whose brief carries the previous final text, `git status` and a diff summary. A transient `REVIEW_PROCESS_FAILED` is re-run at the SAME head under the same cap (`factory.review_resumed`). Auth, permission, ENOSPC/other resource and genuinely unknown failures stay fail-closed; the stale-head fence refuses a resume after another writer moved the worktree, and an explicit cancel/timeout is never resumed. Caps: `--max-resumes N` (default 3), `--transient-wait DUR` (default 60m), `--transient-backoff DUR` (default 30s; env `RELAY_TRANSIENT_MAX_RESUMES`, `RELAY_TRANSIENT_WAIT_MS`, `RELAY_TRANSIENT_BACKOFF_MS`, `RELAY_TRANSIENT_MAX_BACKOFF_MS`, `RELAY_PROVIDER_PROBE_URL`).",
     usage: [
-      "relay run factory <task-id> [--max-attempts N] [--dsh BIN] [--reviewer CMD] [--model M] [--permission MODE] [--timeout 30m] [--repo DIR] [--review-worktrees DIR] [--review-rubric PATH] [--review-output-contract PATH] [--json]",
+      "relay run factory <task-id> [--max-attempts N] [--max-resumes N] [--transient-wait 60m] [--transient-backoff 30s] [--dsh BIN] [--reviewer CMD] [--model M] [--permission MODE] [--timeout 30m] [--repo DIR] [--review-worktrees DIR] [--review-rubric PATH] [--review-output-contract PATH] [--json]",
     ],
   },
   db: {
@@ -642,6 +643,11 @@ const VALUE_FLAGS = new Set([
   "--timeout", "--prompt", "--tail",
   // ISH-760 worktree/cleanup flags.
   "--abort", "--path",
+  // ISH-1174 transient-recovery caps.
+  "--max-resumes", "--transient-wait", "--transient-backoff",
+  // Factory tuning value flags (so a value after one is never read as the id).
+  "--max-attempts", "--dsh", "--reviewer", "--model", "--review-rubric",
+  "--review-output-contract", "--pr-repo", "--review-worktrees", "--repo",
 ]);
 
 /** Positional args only, skipping flags and their (known) values, e.g. ["T12","reason"]. */
@@ -1826,7 +1832,7 @@ async function main(): Promise<void> {
           const id = positionals(rest)[0];
           if (!id) {
             throw new Error(
-              "usage: relay run factory <task-id> [--max-attempts N] [--dsh BIN] [--reviewer CMD] [--model M] [--permission MODE] [--timeout 30m] [--review-worktrees DIR] [--repo DIR] [--pr-repo OWNER/NAME] [--json]"
+              "usage: relay run factory <task-id> [--max-attempts N] [--max-resumes N] [--transient-wait 60m] [--transient-backoff 30s] [--dsh BIN] [--reviewer CMD] [--model M] [--permission MODE] [--timeout 30m] [--review-worktrees DIR] [--repo DIR] [--pr-repo OWNER/NAME] [--json]"
             );
           }
           const timeoutRaw = flag(rest, "--timeout");
@@ -1845,6 +1851,14 @@ async function main(): Promise<void> {
             );
           }
           const repoRoot = flag(rest, "--repo") ?? projectRoot();
+          // ISH-1174: transient provider/network recovery knobs. A malformed
+          // numeric cap is refused, never silently replaced by the default.
+          const maxResumesRaw = flag(rest, "--max-resumes");
+          if (maxResumesRaw !== undefined && !/^\d+$/.test(maxResumesRaw)) {
+            throw new Error(`--max-resumes must be a non-negative integer, got '${maxResumesRaw}'`);
+          }
+          const transientWaitRaw = flag(rest, "--transient-wait");
+          const transientBackoffRaw = flag(rest, "--transient-backoff");
           // ISH-1087/1133: the live Factory path uses ONE no-env GitHub
           // detection: an authenticated gh is the default reader for PR
           // binding AND the native review (off/rate-limit semantics are
@@ -1866,6 +1880,10 @@ async function main(): Promise<void> {
             timeoutMs: timeoutRaw ? parseDuration(timeoutRaw) : undefined,
             permissionMode: flag(rest, "--permission") ?? undefined,
             maxAttempts: maxRaw ? Number(maxRaw) : undefined,
+            // ISH-1174: bounded transient recovery (same-session resume).
+            maxResumes: maxResumesRaw !== undefined ? Number(maxResumesRaw) : undefined,
+            transientWaitMs: transientWaitRaw ? parseDuration(transientWaitRaw) : undefined,
+            transientBackoffMs: transientBackoffRaw ? parseDuration(transientBackoffRaw) : undefined,
             // ISH-904: surface a stale/behind base and a failed origin refresh.
             onWarning: (m) => console.error(`relay: warning: ${m}`),
             // ISH-829: the independent reviewer reads a detached read-only

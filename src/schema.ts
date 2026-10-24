@@ -412,6 +412,15 @@ export interface Run {
   exit_code: number | null;
   signal: string | null;
   session_id: string | null;
+  /**
+   * ISH-1174: the prior Run this Run RESUMES after a TRANSIENT provider/network
+   * failure. A resume run stays on the SAME Task phase/attempt (it never
+   * consumes the factory attempt budget); `resume_count` is its 1-based ordinal
+   * within that attempt (0 for the original Run). The pair makes the resume cap
+   * durable across a Factory restart.
+   */
+  resumed_from_run_id: string | null;
+  resume_count: number;
   stdout_path: string | null;
   stderr_path: string | null;
   events_path: string | null;
@@ -762,6 +771,9 @@ CREATE TABLE IF NOT EXISTS runs (
   exit_code INTEGER,
   signal TEXT,
   session_id TEXT,
+  -- ISH-1174: transient-failure resume lineage + durable per-attempt ordinal.
+  resumed_from_run_id TEXT,
+  resume_count INTEGER NOT NULL DEFAULT 0,
   stdout_path TEXT,
   stderr_path TEXT,
   events_path TEXT,

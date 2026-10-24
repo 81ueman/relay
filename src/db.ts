@@ -333,6 +333,14 @@ function migrate(db: Database): void {
   if (columnExists(db, "runs", "id") && !columnExists(db, "runs", "launcher_lstart")) {
     db.exec("ALTER TABLE runs ADD COLUMN launcher_lstart TEXT;");
   }
+  // ISH-1174: transient-failure resume lineage + durable per-attempt ordinal. A
+  // pre-existing Run row is the original one (no precursor, ordinal 0).
+  if (columnExists(db, "runs", "id") && !columnExists(db, "runs", "resumed_from_run_id")) {
+    db.exec("ALTER TABLE runs ADD COLUMN resumed_from_run_id TEXT;");
+  }
+  if (columnExists(db, "runs", "id") && !columnExists(db, "runs", "resume_count")) {
+    db.exec("ALTER TABLE runs ADD COLUMN resume_count INTEGER NOT NULL DEFAULT 0;");
+  }
   // Legacy (ISH-1098): retained so pre-existing DBs keep opening unchanged. New
   // Runs always leave it NULL; the Coding Sandbox execution path is removed.
   if (columnExists(db, "runs", "id") && !columnExists(db, "runs", "sandbox_name")) {
