@@ -10,8 +10,27 @@ import { isCanonicalToken, processPgid, spawnIdentityToken } from "./proc-identi
 import { defaultRunner, type CommandRunner } from "./verify";
 import { runMechanicalVerification, submitPhase, taskChecks, blockImplementFailure, recordImplementRecovery, linkTask } from "./workflow";
 import { findTaskResult, isResultWriteError, markTaskBlockedInternal } from "./results";
-import { acceptRunSubmission, getRun } from "./dsh-runner";
+import { acceptRunSubmission, getRun, startDshRun, type DshRunHandle } from "./dsh-runner";
 import { launchTaskRun, type LaunchRunOptions } from "./run-lifecycle";
+import {
+  classifyTransientRunFailure,
+  classifyTransientReviewerFailure,
+  classifyUnadoptableSession,
+  readRunProviderEvidence,
+  FACTORY_RUN_RESUMED,
+  FACTORY_REVIEW_RESUMED,
+  FACTORY_WAITING_TRANSIENT,
+  type TransientFailure,
+} from "./transient-failure";
+import {
+  buildFreshSessionResumePrompt,
+  buildSessionResumePrompt,
+  checkResumeFence,
+  defaultProviderProbe,
+  resolveTransientPolicy,
+  waitForProviderRecovery,
+  type TransientPolicy,
+} from "./transient-recovery";
 import {
   classifyImplementFailure,
   implementStopReason,
@@ -22,6 +41,7 @@ import {
 import {
   DEFAULT_REVIEWER_WORKER,
   runHeadlessReview,
+  type HeadlessReviewResult,
   type ReviewerSpawner,
   type ReviewerVerdict,
   type ReviewRubric,
@@ -158,6 +178,38 @@ export interface FactoryDeps {
    * them to stderr so a stale base is never silent.
    */
   onWarning?: (message: string) => void;
+  /**
+   * ISH-1174: transient provider/network recovery. A transient IMPLEMENT
+   * failure is waited out (probe + backoff) and continued in the SAME dsh
+   * Session/worktree; a transient REVIEW_PROCESS_FAILED is re-run at the same
+   * head. Caps default to 3 resumes per attempt and a 60 min wait.
+   */
+  maxResumes?: number;
+  transientWaitMs?: number;
+  transientBackoffMs?: number;
+  transientMaxBackoffMs?: number;
+  /**
+   * ISH-1174: provider reachability probe (default: HEAD the configured probe
+   * URL). Returning true means "resume now"; false keeps the bounded wait.
+   */
+  probeProvider?: (ctx: {
+    taskId: string;
+    cause: string | null;
+    phase: string;
+    attempt: number;
+    resumeCount: number;
+  }) => Promise<boolean>;
+  /**
+   * ISH-1174 test seam: called immediately before the resume fence is checked,
+   * so a test can simulate another writer moving the worktree HEAD/branch.
+   */
+  beforeResume?: (ctx: {
+    taskId: string;
+    fromRunId: string;
+    attempt: number;
+    resumeCount: number;
+    mode: "session" | "fresh";
+  }) => void | Promise<void>;
 }
 
 export interface FactoryAttempt {
@@ -756,6 +808,347 @@ export function reviewBlockedReason(r: {
   return `review blocked: ${detail}${r.evidenceRef ? ` (evidence: ${r.evidenceRef})` : ""}`;
 }
 
+/* -------------------------------------------------------------------------- */
+/* ISH-1174: transient provider/network recovery                               */
+/* -------------------------------------------------------------------------- */
+
+function transientPolicyFor(deps: FactoryDeps): TransientPolicy {
+  return resolveTransientPolicy({
+    maxResumes: deps.maxResumes,
+    waitMs: deps.transientWaitMs,
+    backoffMs: deps.transientBackoffMs,
+    maxBackoffMs: deps.transientMaxBackoffMs,
+  });
+}
+
+/**
+ * ISH-1174: a permanent/local failure (auth, disk, permission) ends transient
+ * recovery even when its text also looks like an unadoptable Session ("login
+ * session expired"). Those causes are fail-closed today and a resume would only
+ * repeat them.
+ */
+function permanentTransientVeto(veto: TransientFailure["veto"] | undefined): boolean {
+  return veto === "auth" || veto === "enospc" || veto === "permission";
+}
+
+/** The highest transient resume ordinal already recorded for one attempt. */
+function terminalResumeCount(db: Database, taskId: string, phase: string, attempt: number): number {
+  const row = db
+    .query(`SELECT MAX(resume_count) AS n FROM runs WHERE task_id = ? AND phase = ? AND attempt = ?`)
+    .get(taskId, phase, attempt) as { n: number | null } | null;
+  return typeof row?.n === "number" ? row.n : 0;
+}
+
+/** How many transient reviewer re-runs are already recorded at this head. */
+function reviewResumeCount(db: Database, taskId: string, attempt: number, head: string | null): number {
+  const rows = db
+    .query(`SELECT payload_json FROM events WHERE task_id = ? AND type = ?`)
+    .all(taskId, FACTORY_REVIEW_RESUMED) as { payload_json: string }[];
+  let n = 0;
+  for (const row of rows) {
+    try {
+      const p = JSON.parse(row.payload_json) as { attempt?: unknown; head?: unknown };
+      if (p.attempt === attempt && p.head === head) n++;
+    } catch {
+      /* a malformed historical payload is not a resume */
+    }
+  }
+  return n;
+}
+
+/**
+ * The tail of a resumed IMPLEMENT Run. Normally this is `finishImplement`, but a
+ * resume that exits 0 with nothing NEW to commit still has the interrupted
+ * Run's commit: submitting that head through the ordinary fence is correct and
+ * must not be reported as NO_IMPLEMENTATION.
+ */
+function finishResumeImplement(db: Database, run: Run, deps: FactoryDeps, priorProgress: boolean): ImplementResult {
+  if (run.state !== "exited" || run.exit_code !== 0) {
+    return { run, producedHead: run.head_sha, error: `${CODING_FAILED}: run ${run.id} is '${run.state}' (exit ${run.exit_code ?? "none"})` };
+  }
+  const unchanged = run.head_sha !== null && run.head_sha === run.base_head_sha;
+  if (!unchanged || !priorProgress) return finishImplement(db, run, deps);
+  try {
+    acceptRunSubmission(db, { runId: run.id });
+  } catch (e) {
+    if (isResultWriteError(e)) throw e;
+    return {
+      run,
+      producedHead: run.head_sha,
+      error: `${SUBMIT_REFUSED}: ${e instanceof Error ? e.message : String(e)}`,
+    };
+  }
+  return { run, producedHead: run.head_sha, error: null };
+}
+
+interface TransientImplementOutcome {
+  /** The last Run this recovery attempted (possibly the original failure). */
+  last: ImplementResult;
+  /** True when a resumed Run was cleanly submitted (the attempt may advance). */
+  submitted: boolean;
+  /** True when at least one resume was launched. */
+  resumed: boolean;
+  /**
+   * True when the Task moved/cancelled under the recovery: the caller must
+   * re-read the live Task instead of classifying the old Run.
+   */
+  taskMoved: boolean;
+  /** Why recovery stopped before a submission (cap/wait/fence), or null. */
+  stop: string | null;
+}
+
+/**
+ * ISH-1174: bounded transient recovery for a failed IMPLEMENT attempt.
+ *
+ * The resume is issued on the SAME Task/phase/attempt (it never consumes the
+ * factory attempt budget), in the SAME worktree. A session resume passes
+ * `--session-id <failed sessionId>`; when the Session cannot be adopted (or no
+ * id was recorded) the fallback is a FRESH session whose brief carries the
+ * previous final text, `git status` and a diff summary. Every launch is
+ * preceded by the stale-head fence and the resume cap.
+ */
+async function resumeTransientImplement(
+  db: Database,
+  taskId: string,
+  first: ImplementResult,
+  deps: FactoryDeps,
+  push: (step: string) => void
+): Promise<TransientImplementOutcome> {
+  const policy = transientPolicyFor(deps);
+  let current = first;
+  let resumed = false;
+  let resumeCount = terminalResumeCount(db, taskId, "implement", first.run?.attempt ?? 0);
+  let priorProgress =
+    !!first.run && first.run.head_sha !== null && first.run.base_head_sha !== null && first.run.head_sha !== first.run.base_head_sha;
+  // Carry the last non-empty final text across the resume chain: the IMMEDIATE
+  // failed Run may be the failed session-adoption attempt, which printed none.
+  let carryFinalText: string | null = readRunProviderEvidence(first.run?.dsh_events_path).finalText;
+  let waitDeadline: number | null = null;
+
+  for (;;) {
+    const task = getTask(db, taskId);
+    if (!task) return { last: current, submitted: false, resumed, taskMoved: true, stop: "task missing" };
+    if (!FACTORY_RUNNABLE_STATES.has(task.state) || task.state === "cancelled") {
+      return { last: current, submitted: false, resumed, taskMoved: true, stop: `task state ${task.state}` };
+    }
+    const run = current.run;
+    if (!run || task.phase !== "implement" || task.attempt !== run.attempt) {
+      return { last: current, submitted: false, resumed, taskMoved: true, stop: "task phase/attempt moved" };
+    }
+
+    const transient = classifyTransientRunFailure({ run, error: current.error });
+    const adoption = classifyUnadoptableSession({ run, error: current.error });
+    if (!transient.transient && !adoption.unadoptable) {
+      return { last: current, submitted: false, resumed, taskMoved: false, stop: null };
+    }
+    // An explicit cancel/timeout is a human/limit decision, never an outage.
+    if (
+      transient.veto === "cancelled" ||
+      transient.veto === "timeout" ||
+      run.state === "cancelled" ||
+      run.state === "timeout" ||
+      run.signal === "cancelled" ||
+      run.signal === "timeout"
+    ) {
+      return { last: current, submitted: false, resumed, taskMoved: false, stop: "explicit cancel/timeout" };
+    }
+    // ISH-1174 fail-closed: auth/ENOSPC/permission never resume — not even via
+    // the fresh-session fallback. `classifyUnadoptableSession` already ignores
+    // an original Run, but a SESSION-mode resume can fail with AUTH and a
+    // "login session expired" message; that is a permanent local cause.
+    if (permanentTransientVeto(transient.veto)) {
+      push(`implement:resume-vetoed@${task.attempt} ${transient.veto} ${transient.detail ?? ""}`);
+      return { last: current, submitted: false, resumed, taskMoved: false, stop: null };
+    }
+    if (resumeCount >= policy.maxResumes) {
+      push(
+        `implement:resume-cap@${task.attempt} (${resumeCount}/${policy.maxResumes}) ` +
+          `${transient.detail ?? adoption.detail ?? "transient failure"}`
+      );
+      logEvent(db, {
+        source: "factory",
+        taskId,
+        type: "factory.transient_resume_capped",
+        payload: {
+          attempt: task.attempt,
+          runId: run.id,
+          resumeCount,
+          maxResumes: policy.maxResumes,
+          cause: transient.detail ?? adoption.detail,
+        },
+      });
+      return { last: current, submitted: false, resumed, taskMoved: false, stop: "resume cap" };
+    }
+
+    // The Session to adopt: what this Run PASSED (a failed adoption reports no
+    // `session_id`), else what dsh reported for the original Run.
+    const adoptSessionId = run.resume_session_id ?? run.session_id;
+    const fresh = adoption.unadoptable || !adoptSessionId;
+    const cause =
+      (fresh
+        ? adoption.detail ?? (adoptSessionId ? transient.detail : "the previous dsh Session id was not recorded; starting a fresh session")
+        : transient.detail) ?? "transient provider/network interruption";
+    const nextCount = resumeCount + 1;
+
+    // A test seam to simulate another writer BEFORE the fence below.
+    await deps.beforeResume?.({
+      taskId,
+      fromRunId: run.id,
+      attempt: task.attempt,
+      resumeCount: nextCount,
+      mode: fresh ? "fresh" : "session",
+    });
+
+    // Wait for the provider/transport to come back. The TOTAL budget is shared
+    // across every wait inside this attempt (never a fresh hour per resume).
+    if (transient.transient) {
+      const waitUntil: number = waitDeadline ?? Date.now() + policy.waitMs;
+      waitDeadline = waitUntil;
+      const remaining = Math.max(0, waitUntil - Date.now());
+      if (remaining <= 0) {
+        push(`implement:transient-wait-expired@${task.attempt} after ${policy.waitMs}ms`);
+        logEvent(db, {
+          source: "factory",
+          taskId,
+          type: "factory.transient_wait_expired",
+          payload: { attempt: task.attempt, runId: run.id, capMs: policy.waitMs, cause },
+        });
+        return { last: current, submitted: false, resumed, taskMoved: false, stop: "wait cap" };
+      }
+      const waited = await waitForProviderRecovery({
+        probe: () =>
+          deps.probeProvider
+            ? Promise.resolve(deps.probeProvider({ taskId, cause, phase: "implement", attempt: task.attempt, resumeCount: nextCount }))
+            : defaultProviderProbe(policy.probeUrl, policy.probeTimeoutMs),
+        onWait: (e) => {
+          logEvent(db, {
+            source: "factory",
+            taskId,
+            type: FACTORY_WAITING_TRANSIENT,
+            payload: {
+              phase: e.phase,
+              attempt: e.attempt,
+              runId: e.runId,
+              cause: e.cause,
+              probe: e.probe,
+              delayMs: e.delayMs,
+              elapsedMs: e.elapsedMs,
+              capMs: e.capMs,
+              resumeCount: e.resumeCount,
+            },
+          });
+          push(
+            `implement:waiting-transient@${task.attempt} probe=${e.probe} delay=${e.delayMs}ms ` +
+              `elapsed=${e.elapsedMs}ms/${e.capMs}ms (${e.cause ?? "provider"})`
+          );
+        },
+        capMs: remaining,
+        backoffMs: policy.backoffMs,
+        maxBackoffMs: policy.maxBackoffMs,
+        context: {
+          taskId,
+          runId: run.id,
+          phase: "implement",
+          attempt: task.attempt,
+          cause,
+          resumeCount: nextCount,
+        },
+      });
+      if (!waited.recovered) {
+        push(`implement:transient-wait-expired@${task.attempt} after ${waited.elapsedMs}ms/${policy.waitMs}ms`);
+        logEvent(db, {
+          source: "factory",
+          taskId,
+          type: "factory.transient_wait_expired",
+          payload: { attempt: task.attempt, runId: run.id, capMs: policy.waitMs, elapsedMs: waited.elapsedMs, cause },
+        });
+        return { last: current, submitted: false, resumed, taskMoved: false, stop: "wait cap" };
+      }
+    }
+
+    // Re-read the Task AFTER the wait: a cancel/HOLD/attempt advance lands here.
+    const live = getTask(db, taskId);
+    if (
+      !live ||
+      !FACTORY_RUNNABLE_STATES.has(live.state) ||
+      live.state === "cancelled" ||
+      live.phase !== "implement" ||
+      live.attempt !== task.attempt
+    ) {
+      return { last: current, submitted: false, resumed, taskMoved: true, stop: "task moved during wait" };
+    }
+    // SAFETY: never resume into a worktree/branch another writer moved.
+    const fence = checkResumeFence(db, live, run);
+    if (!fence.ok) {
+      logEvent(db, {
+        source: "factory",
+        taskId,
+        type: "factory.resume_refused",
+        payload: { runId: run.id, attempt: task.attempt, cause, reason: fence.reason, resumeCount: nextCount },
+      });
+      push(`implement:resume-refused@${task.attempt} ${fence.reason}`);
+      return { last: current, submitted: false, resumed, taskMoved: false, stop: fence.reason };
+    }
+
+    const prompt = fresh
+      ? buildFreshSessionResumePrompt(live, run, cause, { cwd: run.cwd, finalText: carryFinalText })
+      : buildSessionResumePrompt(live, run, cause);
+    // A launch refusal (disk guard, pinned-version guard, DUPLICATE_WRITER) is
+    // the same environment error it is for the first Run: surface it, never
+    // swallow it as a transient resume.
+    const launched: DshRunHandle = await startDshRun(db, {
+      taskId,
+      cwd: run.cwd,
+      prompt,
+      outputRoot: deps.outputRoot,
+      dshBin: deps.dshBin,
+      permissionMode: deps.permissionMode,
+      timeoutMs: deps.timeoutMs,
+      fastExitMs: deps.fastExitMs,
+      env: deps.dshEnv,
+      ...(fresh ? {} : { resumeSessionId: adoptSessionId }),
+      resumedFromRunId: run.id,
+      resumeCount: nextCount,
+      resumeCause: cause,
+    });
+    resumed = true;
+    resumeCount = nextCount;
+    logEvent(db, {
+      source: "factory",
+      taskId,
+      type: FACTORY_RUN_RESUMED,
+      payload: {
+        runId: launched.id,
+        fromRunId: run.id,
+        attempt: task.attempt,
+        sessionId: fresh ? null : adoptSessionId,
+        cause,
+        resumeCount: nextCount,
+        mode: fresh ? "fresh" : "session",
+        cwd: run.cwd,
+        head: run.head_sha ?? run.base_head_sha,
+      },
+    });
+    push(
+      `implement:resume@${task.attempt} #${nextCount} -> ${launched.id} ` +
+        `(${fresh ? "fresh session" : `session ${adoptSessionId}`}) ${cause}`
+    );
+
+    const finished = await launched.wait();
+    priorProgress =
+      priorProgress ||
+      (finished.head_sha !== null && finished.base_head_sha !== null && finished.head_sha !== finished.base_head_sha);
+    const finishedFinal = readRunProviderEvidence(finished.dsh_events_path).finalText;
+    if (finishedFinal) carryFinalText = finishedFinal;
+    current = finishResumeImplement(db, finished, deps, priorProgress);
+    if (!current.error) {
+      return { last: current, submitted: true, resumed, taskMoved: false, stop: null };
+    }
+    // The resumed Run failed too: classify it on the next iteration. A non-
+    // transient failure falls through to the ordinary ISH-1012 policy.
+  }
+}
+
 /**
  * Run the whole factory for one Task. Returns a structured result; it NEVER
  * merges, accepts, pushes, or writes to a provider/Linear.
@@ -857,13 +1250,68 @@ async function runFactoryTaskInner(
     const phase = task.phase;
     switch (phase) {
       case "implement": {
-        const impl = await implementOnce(db, task, runDeps);
+        let impl = await implementOnce(db, task, runDeps);
         if (current) {
           current.runId = impl.run?.id ?? null;
           current.baseHead = impl.run?.base_head_sha ?? null;
           current.producedHead = impl.producedHead;
         }
         if (impl.error) {
+          // ISH-1174: a TRANSIENT provider/network failure is waited out and
+          // continued in the SAME Session/worktree BEFORE the attempt-consuming
+          // ISH-1012 policy. A resume never advances the factory attempt; only
+          // its cap/wait expiry falls back to the ordinary stop.
+          const preTransient = classifyTransientRunFailure({ run: impl.run, error: impl.error });
+          const preAdoption = classifyUnadoptableSession({ run: impl.run, error: impl.error });
+          // A permanent/local veto never enters recovery, not even when the
+          // message also names a dead Session (e.g. "login session expired").
+          const preRecoverable =
+            preTransient.transient || (preAdoption.unadoptable && !permanentTransientVeto(preTransient.veto));
+          if (preRecoverable) {
+            push(
+              `implement:transient@${task.attempt} ${preTransient.transient ? preTransient.cause : "session_unadoptable"} ` +
+                `${preTransient.detail ?? preAdoption.detail ?? ""}`
+            );
+            const recovered = await resumeTransientImplement(db, taskId, impl, runDeps, push);
+            impl = recovered.last;
+            if (current) {
+              current.runId = impl.run?.id ?? null;
+              current.baseHead = impl.run?.base_head_sha ?? null;
+              current.producedHead = impl.producedHead;
+            }
+            if (recovered.submitted) {
+              push(`implement:resumed-submitted@${task.attempt} run ${impl.run?.id ?? "none"} head ${impl.producedHead ?? "none"}`);
+              continue;
+            }
+            if (recovered.taskMoved) {
+              // A cancel/HOLD/attempt advance landed during recovery: re-read the
+              // Task at the top of the loop instead of classifying the old Run.
+              push(`implement:resume-task-moved@${task.attempt} ${recovered.stop ?? ""}`);
+              continue;
+            }
+            if (recovered.stop?.startsWith("STALE_HEAD:")) {
+              // The resume fence refused: another writer moved the worktree or
+              // the Task head. Never resume; stop at the recorded reason (the
+              // factory-failure projection classifies it as STALE_HEAD).
+              logEvent(db, {
+                source: "factory",
+                taskId,
+                type: "factory.stale_head_refused",
+                payload: { attempt: task.attempt, runId: impl.run?.id ?? null, reason: recovered.stop },
+              });
+              return {
+                taskId,
+                outcome: "coding_failed",
+                head: getTask(db, taskId)?.head_sha ?? null,
+                attempts,
+                gate: null,
+                reason: recovered.stop,
+                steps,
+              };
+            }
+            // resume cap / wait cap: fall through to today's stop classification
+            // (never a second attempt-consuming retry path).
+          }
           // ISH-1012: bounded recovery. Reuse the EXISTING Run evidence and the
           // ordinary phase/attempt transition; never start a new FSM.
           const decision = classifyImplementFailure({
@@ -939,7 +1387,8 @@ async function runFactoryTaskInner(
             const blocked = blockImplementFailure(db, taskId, reason, "factory");
             return { taskId, outcome: "blocked", head: blocked.head_sha, attempts, gate: null, reason, steps };
           }
-          const outcome: FactoryOutcome = impl.error.startsWith(NO_IMPLEMENTATION) ? "no_implementation" : "coding_failed";
+          const errorText = impl.error ?? "";
+          const outcome: FactoryOutcome = errorText.startsWith(NO_IMPLEMENTATION) ? "no_implementation" : "coding_failed";
           return { taskId, outcome, head: getTask(db, taskId)!.head_sha, attempts, gate: null, reason, steps };
         }
         push(`implement:run ${impl.run?.id ?? "none"} -> submitted (head ${impl.run?.head_sha ?? "none"})`);
@@ -1062,45 +1511,160 @@ async function runFactoryTaskInner(
         }
         // ISH-829: the independent reviewer reads a DETACHED read-only checkout
         // at the fixed head (when configured), never the writer's live worktree.
-        let reviewWorktree: string | undefined;
-        if (deps.reviewWorktreeRoot && reviewHead) {
-          // ISH-904: the Task workspace is a self-contained clone whose `origin`
-          // is the GitHub remote, so the Run's produced HEAD is not in this
-          // source repo yet. Import it first (local path fetch, no network).
-          const reviewSource = importHeadIntoSource(deps.repo ?? projectRoot(), task.worktree, reviewHead);
-          const ws = prepareReadOnlyReviewWorktree(
-            reviewSource,
-            reviewHead,
-            join(deps.reviewWorktreeRoot, `${taskId}-${task.attempt}-${reviewHead.slice(0, 10)}`)
-          );
-          if (!ws.ok) {
-            return { taskId, outcome: "blocked", head: reviewHead, attempts, gate: null, reason: `review workspace: ${ws.error}`, steps };
+        // ISH-1174: a transient REVIEW_PROCESS_FAILED is re-run here at the SAME
+        // head (fresh disposable checkout, same Task/attempt) under the resume
+        // cap; no operator re-run is needed for a short provider outage.
+        const runOneReview = async (): Promise<
+          { kind: "blocked"; reason: string } | { kind: "review"; r: HeadlessReviewResult }
+        > => {
+          let reviewWorktree: string | undefined;
+          if (deps.reviewWorktreeRoot && reviewHead) {
+            // ISH-904: the Task workspace is a self-contained clone whose `origin`
+            // is the GitHub remote, so the Run's produced HEAD is not in this
+            // source repo yet. Import it first (local path fetch, no network).
+            const reviewSource = importHeadIntoSource(deps.repo ?? projectRoot(), task.worktree, reviewHead);
+            const ws = prepareReadOnlyReviewWorktree(
+              reviewSource,
+              reviewHead,
+              join(deps.reviewWorktreeRoot, `${taskId}-${task.attempt}-${reviewHead.slice(0, 10)}`)
+            );
+            if (!ws.ok) return { kind: "blocked", reason: `review workspace: ${ws.error}` };
+            reviewWorktree = ws.path ?? undefined;
           }
-          reviewWorktree = ws.path ?? undefined;
-        }
-        let r;
-        try {
-          r = await runHeadlessReview(db, taskId, {
-            spawner: deps.reviewerSpawner,
-            command: deps.reviewerCommand,
-            model: deps.reviewerModel,
-            reviewerWorker,
-            reviewWorktree,
-            ...(deps.reviewRubric ? { reviewRubric: deps.reviewRubric } : {}),
-            nativeReview: deps.nativeReview,
-            // ISH-830e: give the host reviewer the VERIFY evidence so it need
-            // not re-run the required checks wholesale. Sourced from the
-            // DURABLE VerificationResult row (not process memory), so a resumed
-            // Factory still carries it.
-            ...(() => {
-              const evidence = durableVerifyEvidence(db, taskId, task.attempt, reviewHead);
-              return evidence ? { verifyEvidence: evidence } : {};
-            })(),
+          try {
+            const r = await runHeadlessReview(db, taskId, {
+              spawner: deps.reviewerSpawner,
+              command: deps.reviewerCommand,
+              model: deps.reviewerModel,
+              reviewerWorker,
+              reviewWorktree,
+              ...(deps.reviewRubric ? { reviewRubric: deps.reviewRubric } : {}),
+              nativeReview: deps.nativeReview,
+              // ISH-830e: give the host reviewer the VERIFY evidence so it need
+              // not re-run the required checks wholesale. Sourced from the
+              // DURABLE VerificationResult row (not process memory), so a resumed
+              // Factory still carries it.
+              ...(() => {
+                const evidence = durableVerifyEvidence(db, taskId, task.attempt, reviewHead);
+                return evidence ? { verifyEvidence: evidence } : {};
+              })(),
+            });
+            return { kind: "review", r };
+          } finally {
+            if (reviewWorktree) removeReviewWorktree(deps.repo ?? projectRoot(), reviewWorktree);
+          }
+        };
+
+        const reviewPolicy = transientPolicyFor(deps);
+        let reviewResumes = reviewResumeCount(db, taskId, task.attempt, reviewHead);
+        let reviewWaitDeadline: number | null = null;
+        let r: HeadlessReviewResult;
+        for (;;) {
+          const one = await runOneReview();
+          if (one.kind === "blocked") {
+            return { taskId, outcome: "blocked", head: reviewHead, attempts, gate: null, reason: one.reason, steps };
+          }
+          r = one.r;
+          if (current) current.reviewVerdict = r.outcome === "refused" ? "refused" : r.outcome;
+          if (r.outcome !== "refused") break;
+          const transient = classifyTransientReviewerFailure({
+            error: r.error,
+            raw: r.raw,
+            stderr: r.stderr,
+            stdout: r.stdout,
           });
-        } finally {
-          if (reviewWorktree) removeReviewWorktree(deps.repo ?? projectRoot(), reviewWorktree);
+          if (!transient.transient) break;
+          if (reviewResumes >= reviewPolicy.maxResumes) {
+            push(`review:resume-cap@${task.attempt} (${reviewResumes}/${reviewPolicy.maxResumes}) ${transient.detail ?? ""}`);
+            logEvent(db, {
+              source: "factory",
+              taskId,
+              type: "factory.review_resume_capped",
+              payload: { head: reviewHead, attempt: task.attempt, resumeCount: reviewResumes, maxResumes: reviewPolicy.maxResumes, cause: transient.detail },
+            });
+            break;
+          }
+          const nextCount = reviewResumes + 1;
+          // The reviewer's total wait budget is shared across its re-runs too.
+          const reviewWaitUntil: number = reviewWaitDeadline ?? Date.now() + reviewPolicy.waitMs;
+          reviewWaitDeadline = reviewWaitUntil;
+          const reviewWaitRemaining = Math.max(0, reviewWaitUntil - Date.now());
+          if (reviewWaitRemaining <= 0) {
+            push(`review:transient-wait-expired@${task.attempt} after ${reviewPolicy.waitMs}ms`);
+            logEvent(db, {
+              source: "factory",
+              taskId,
+              type: "factory.transient_wait_expired",
+              payload: { phase: "review", head: reviewHead, attempt: task.attempt, capMs: reviewPolicy.waitMs, cause: transient.detail },
+            });
+            break;
+          }
+          const waited = await waitForProviderRecovery({
+            probe: () =>
+              deps.probeProvider
+                ? Promise.resolve(deps.probeProvider({ taskId, cause: transient.detail, phase: "review", attempt: task.attempt, resumeCount: nextCount }))
+                : defaultProviderProbe(reviewPolicy.probeUrl, reviewPolicy.probeTimeoutMs),
+            onWait: (e) => {
+              logEvent(db, {
+                source: "factory",
+                taskId,
+                type: FACTORY_WAITING_TRANSIENT,
+                payload: {
+                  phase: e.phase,
+                  attempt: e.attempt,
+                  runId: e.runId,
+                  cause: e.cause,
+                  probe: e.probe,
+                  delayMs: e.delayMs,
+                  elapsedMs: e.elapsedMs,
+                  capMs: e.capMs,
+                  resumeCount: e.resumeCount,
+                  head: reviewHead,
+                },
+              });
+              push(
+                `review:waiting-transient@${task.attempt} probe=${e.probe} delay=${e.delayMs}ms ` +
+                  `elapsed=${e.elapsedMs}ms/${e.capMs}ms (${e.cause ?? "reviewer"})`
+              );
+            },
+            capMs: reviewWaitRemaining,
+            backoffMs: reviewPolicy.backoffMs,
+            maxBackoffMs: reviewPolicy.maxBackoffMs,
+            context: {
+              taskId,
+              runId: null,
+              phase: "review",
+              attempt: task.attempt,
+              cause: transient.detail,
+              resumeCount: nextCount,
+            },
+          });
+          if (!waited.recovered) {
+            push(`review:transient-wait-expired@${task.attempt} after ${waited.elapsedMs}ms/${reviewPolicy.waitMs}ms`);
+            logEvent(db, {
+              source: "factory",
+              taskId,
+              type: "factory.transient_wait_expired",
+              payload: { phase: "review", head: reviewHead, attempt: task.attempt, capMs: reviewPolicy.waitMs, elapsedMs: waited.elapsedMs, cause: transient.detail },
+            });
+            break;
+          }
+          reviewResumes = nextCount;
+          logEvent(db, {
+            source: "factory",
+            taskId,
+            type: FACTORY_REVIEW_RESUMED,
+            payload: {
+              head: reviewHead,
+              attempt: task.attempt,
+              sessionId: null,
+              cause: transient.detail,
+              resumeCount: nextCount,
+              error: r.error,
+            },
+          });
+          push(`review:resume@${task.attempt} #${nextCount} at head ${reviewHead?.slice(0, 10) ?? "none"} ${transient.detail ?? ""}`);
         }
-        if (current) current.reviewVerdict = r.outcome === "refused" ? "refused" : r.outcome;
         if (r.outcome === "refused") {
           return { taskId, outcome: "review_refused", head: getTask(db, taskId)!.head_sha, attempts, gate: null, reason: r.error, steps };
         }

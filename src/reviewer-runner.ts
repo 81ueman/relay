@@ -319,6 +319,19 @@ export interface HeadlessReviewResult {
   /** ISH-883: the verified native GitHub review, when native posting is enabled. */
   nativeReview: ReviewView | null;
   raw: string;
+  /**
+   * ISH-1174: the reviewer process's STDERR (bounded). The transient classifier
+   * reads this instead of free-text stdout, so a reviewer that merely QUOTES a
+   * provider error from the code under review is never auto-retried.
+   */
+  stderr?: string;
+  /**
+   * ISH-1174: the reviewer process's STDOUT. The classifier reads ONLY the
+   * structured `claude --output-format json` error envelope (`type:"result"`,
+   * `is_error:true`) from it: the default reviewer reports a provider failure
+   * there and leaves stderr empty.
+   */
+  stdout?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -1060,7 +1073,8 @@ export async function runHeadlessReview(
             structured: verdict,
             native,
             stdout: proc.stdout.slice(0, 32_768),
-            stderr: proc.stderr.slice(0, 8_192),
+            // The failing provider line is usually LAST; keep the tail.
+            stderr: proc.stderr.slice(-8_192),
           },
           null,
           2
@@ -1091,7 +1105,14 @@ export async function runHeadlessReview(
     return refusal(
       `${REVIEW_PROCESS_FAILED}: reviewer process exit ${proc.exitCode ?? "none"} signal ${proc.signal ?? "none"}`,
       task,
-      { verdict, evidenceRef: evidencePath, raw }
+      {
+        verdict,
+        evidenceRef: evidencePath,
+        raw,
+        // Keep the tail: a noisy stderr pushes the failing transport line last.
+        stderr: proc.stderr.slice(-8_192),
+        stdout: proc.stdout,
+      }
     );
   }
   if (!verdict) {

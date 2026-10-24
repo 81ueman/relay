@@ -33,6 +33,25 @@ describe("ISH-904: CLI help documents the operator flags and preconditions", () 
     expect(out).toContain("45 min / 2,700,000 ms");
   });
 
+  test("ISH-1174: `relay run factory --help` documents the transient class and the caps", () => {
+    const out = help(["run", "factory"]);
+    expect(out).toContain("TRANSIENT RECOVERY");
+    expect(out).toContain("provider HTTP 5xx or 429");
+    expect(out).toContain("--session-id");
+    expect(out).toContain("factory.waiting_transient");
+    expect(out).toContain("factory.run_resumed");
+    expect(out).toContain("factory.review_resumed");
+    expect(out).toContain("--max-resumes N");
+    expect(out).toContain("--transient-wait DUR");
+    expect(out).toContain("--transient-backoff DUR");
+    expect(out).toContain("default 3");
+    expect(out).toContain("60 min");
+    expect(out).toContain("RELAY_TRANSIENT_MAX_RESUMES");
+    expect(out).toContain("RELAY_PROVIDER_PROBE_URL");
+    // The top-level usage advertises the same caps.
+    expect(help([])).toContain("--max-resumes N");
+  });
+
   test("`relay task intake --help` documents --description", () => {
     const out = help(["task", "intake"]);
     expect(out).toContain("--description D");

@@ -138,6 +138,40 @@ An environment-class failure parks the Task `blocked_human` at `attempt+1`, so a
 explicit `unblock` starts a fresh attempt after the environment is fixed; it is
 not an automatic retry.
 
+## Transient provider/network recovery (ISH-1174)
+
+A short outage must not end the lane. `src/transient-failure.ts` classifies a
+terminal dsh Run from its EXISTING evidence (the Run row, its `dsh.jsonl` and
+stderr): a provider HTTP **5xx** or **429** (a structured `status`/`statusCode`
+on the failed `turn_end`, or a code such as `HTTP_500`), a `turn_end
+reason=error` code (`TIMEOUT`, `TRANSPORT`, `SERVER`, `RATE_LIMIT`, or a raw
+connection code such as `ECONNRESET`/`ECONNREFUSED`), the same `dsh: <CODE>:`
+line on stderr, or a connection/network error (timeout, DNS, socket) is
+**transient**. The terminal `dsh.run.*` event's `dsh.status` is the COUNT of
+status events — never an HTTP status — so it is not read by the classifier.
+Auth, permission, ENOSPC/other resource exhaustion, cancellation and genuinely
+unknown failures stay non-transient and keep the ISH-1012 policy above. The same
+evidence rule applies to a `REVIEW_PROCESS_FAILED` reviewer process: its stderr,
+or the structured `claude --output-format json` error envelope (`type:"result"`,
+`is_error:true`, with `result` / `api_error_status`) on stdout — never free-text
+stdout.
+
+| step | behaviour | evidence |
+| -- | -- | -- |
+| wait | provider reachability probe, 30 s doubling to 5 min, TOTAL 60 min | `factory.waiting_transient`; `src/transient-recovery.ts` |
+| resume | SAME worktree, `dsh --profile headless --json --session-id <failed id> <short continue prompt>` | `factory.run_resumed` (`runId`, `fromRunId`, `sessionId`, `cause`, `resumeCount`); `src/dsh-runner.ts` |
+| attempt budget | a resume does NOT consume a factory attempt; cap **3 resumes per attempt** | `runs.resumed_from_run_id` / `runs.resume_count`; `tests/factory.test.ts` |
+| fallback | an unknown/corrupt/missing Session starts a FRESH session in the SAME worktree with the previous final text, `git status` and a diff summary; the adoption check applies only to a session-mode resume (a Run that passed `--session-id`), and auth/ENOSPC/permission never resume — even when the message says "session expired" | `buildFreshSessionResumePrompt`; `classifyUnadoptableSession`; `tests/factory.test.ts` |
+| reviewer | a transient `REVIEW_PROCESS_FAILED` is re-run at the SAME head, capped | `factory.review_resumed`; `tests/factory.test.ts` |
+| safety | the stale-head fence re-checks the worktree branch/HEAD (and Task head) before any resume; cancel/timeout is never resumed | `checkResumeFence`; `tests/factory.test.ts` |
+
+Caps: `--max-resumes N` (default 3), `--transient-wait DUR` (default 60m),
+`--transient-backoff DUR` (default 30s); env `RELAY_TRANSIENT_MAX_RESUMES`,
+`RELAY_TRANSIENT_WAIT_MS`, `RELAY_TRANSIENT_BACKOFF_MS`,
+`RELAY_TRANSIENT_MAX_BACKOFF_MS`, `RELAY_PROVIDER_PROBE_URL`. On wait/cap
+expiry the Factory falls back to the ordinary ISH-1012 stop (never an unbounded
+resume loop).
+
 ## Repair exhaustion: classification and next action (ISH-1013)
 
 A non-ready Factory result now carries a `failure` projection derived **only**
