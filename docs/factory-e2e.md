@@ -151,7 +151,10 @@ line on stderr, or a connection/network error (timeout, DNS, socket) is
 status events — never an HTTP status — so it is not read by the classifier.
 Auth, permission, ENOSPC/other resource exhaustion, cancellation and genuinely
 unknown failures stay non-transient and keep the ISH-1012 policy above. The same
-evidence rule applies to a `REVIEW_PROCESS_FAILED` reviewer process.
+evidence rule applies to a `REVIEW_PROCESS_FAILED` reviewer process: its stderr,
+or the structured `claude --output-format json` error envelope (`type:"result"`,
+`is_error:true`, with `result` / `api_error_status`) on stdout — never free-text
+stdout.
 
 | step | behaviour | evidence |
 | -- | -- | -- |

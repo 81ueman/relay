@@ -471,23 +471,26 @@ event's `dsh.status` is a COUNT of status events, so it is **never** read as an
 HTTP status. Auth, permission, ENOSPC/other resource exhaustion and genuinely
 unknown causes stay fail-closed exactly as before. On a transient failure the
 Factory probes provider reachability with backoff — 30 s doubling to 5 min,
-**total cap 60 min** — writing `factory.waiting_transient` events while it waits,
-then continues
-the SAME worktree and dsh Session with `--session-id <failed sessionId>` and a
-short continue prompt naming the interruption cause. A resume **does not consume
-a factory attempt**; the cap is **3 resumes per attempt** (default), and each
-launch emits `factory.run_resumed` (new run id, from run, session id, cause,
-resume count). If the persisted Session cannot be adopted (unknown/corrupt, or
-no id was recorded), the Factory starts a **fresh session in the same worktree**
-whose brief carries the previous Run's final text, `git status` and a diff
-summary. The adoption check applies only to a session-mode resume (a Run that
-actually passed `--session-id`): an original Run's auth/ENOSPC/permission
-failure ends recovery even when its message says "session expired", and those
-permanent causes never start a fresh-session resume. A transient `REVIEW_PROCESS_FAILED` is re-run at the SAME head under the
-same cap (`factory.review_resumed`) with no operator action. Before every resume
-the existing stale-head fence re-checks the worktree branch/HEAD (and the Task
-head): another writer's move refuses the resume and the Factory stops as today,
-and an explicit cancel/timeout is never resumed. Caps/flags: `--max-resumes N`
+**total cap 60 min** — writing `factory.waiting_transient` events while it
+waits, then continues the SAME worktree and dsh Session with `--session-id
+<failed sessionId>` and a short continue prompt naming the interruption cause.
+A resume **does not consume a factory attempt**; the cap is **3 resumes per
+attempt** (default), and each launch emits `factory.run_resumed` (new run id,
+from run, session id, cause, resume count). If the persisted Session cannot be
+adopted (unknown/corrupt, or no id was recorded), the Factory starts a **fresh
+session in the same worktree** whose brief carries the previous Run's final
+text, `git status` and a diff summary. The adoption check applies only to a
+session-mode resume (a Run that actually passed `--session-id`): an original
+Run's auth/ENOSPC/permission failure ends recovery even when its message says
+"session expired", and those permanent causes never start a fresh-session
+resume. A transient `REVIEW_PROCESS_FAILED` is re-run at the SAME head under
+the same cap (`factory.review_resumed`) with no operator action; its evidence
+is the reviewer's stderr or the structured `claude --output-format json` error
+envelope (`is_error: true`) on stdout, never free-text stdout. Before every
+resume the existing stale-head fence re-checks the worktree branch/HEAD (and
+the Task head): another writer's move refuses the resume and the Factory stops
+as today, and an explicit cancel/timeout is never resumed. Caps/flags:
+`--max-resumes N`
 (default 3), `--transient-wait DUR` (default 60m), `--transient-backoff DUR`
 (default 30s); env `RELAY_TRANSIENT_MAX_RESUMES`, `RELAY_TRANSIENT_WAIT_MS`,
 `RELAY_TRANSIENT_BACKOFF_MS`, `RELAY_TRANSIENT_MAX_BACKOFF_MS`,

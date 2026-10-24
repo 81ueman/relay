@@ -1567,7 +1567,12 @@ async function runFactoryTaskInner(
           r = one.r;
           if (current) current.reviewVerdict = r.outcome === "refused" ? "refused" : r.outcome;
           if (r.outcome !== "refused") break;
-          const transient = classifyTransientReviewerFailure({ error: r.error, raw: r.raw, stderr: r.stderr });
+          const transient = classifyTransientReviewerFailure({
+            error: r.error,
+            raw: r.raw,
+            stderr: r.stderr,
+            stdout: r.stdout,
+          });
           if (!transient.transient) break;
           if (reviewResumes >= reviewPolicy.maxResumes) {
             push(`review:resume-cap@${task.attempt} (${reviewResumes}/${reviewPolicy.maxResumes}) ${transient.detail ?? ""}`);

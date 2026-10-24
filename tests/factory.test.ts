@@ -377,9 +377,16 @@ function reviewerHarness(plan: ReviewPlan[]): ReviewerHarness {
           stdout = JSON.stringify({ verdict: "pass", head, summary: "looks fine" });
           break;
         case "transient-exitfail":
-          // ISH-1174: a well-formed pass on stdout, but the reviewer process
-          // died with a provider 500 (a transient infrastructure failure).
-          stdout = JSON.stringify({ verdict: "pass", head, summary: "looks fine" });
+          // ISH-1174: the DEFAULT `claude -p --output-format json` shape of a
+          // provider failure — the error is a structured stdout envelope and
+          // stderr is EMPTY. The Factory must still classify it transient.
+          stdout = JSON.stringify({
+            type: "result",
+            subtype: "error_during_execution",
+            is_error: true,
+            api_error_status: 500,
+            result: "API Error: 500 Internal Server Error",
+          });
           break;
         case "signal":
           stdout = JSON.stringify({ verdict: "pass", head, summary: "looks fine" });
@@ -396,8 +403,7 @@ function reviewerHarness(plan: ReviewPlan[]): ReviewerHarness {
           stdout = JSON.stringify({ verdict: "pass", head, summary: "looks correct" });
       }
       if (p === "exitfail") return { exitCode: 1, signal: null, stdout, stderr: "reviewer crashed" };
-      if (p === "transient-exitfail")
-        return { exitCode: 1, signal: null, stdout, stderr: "API Error: 500 Internal Server Error" };
+      if (p === "transient-exitfail") return { exitCode: 1, signal: null, stdout, stderr: "" };
       if (p === "signal") return { exitCode: null, signal: "SIGKILL", stdout, stderr: "" };
       return { exitCode: 0, signal: null, stdout, stderr: "" };
     },

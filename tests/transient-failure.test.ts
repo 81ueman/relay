@@ -365,6 +365,7 @@ describe("ISH-1174: reviewer + session classification", () => {
       // The reviewer was reading this very code and quoted its markers; it then
       // crashed for an unrelated reason. Only stderr is process-failure evidence.
       raw: "src/transient-failure.ts mentions ECONNRESET and status: 500\nreviewer crashed",
+      stdout: "src/transient-failure.ts mentions ECONNRESET and status: 500\nreviewer crashed",
       stderr: "reviewer crashed",
     });
     expect(res.transient).toBe(false);
@@ -376,6 +377,71 @@ describe("ISH-1174: reviewer + session classification", () => {
       stderr: "API Error: 500 Internal Server Error",
     });
     expect(real.transient).toBe(true);
+  });
+
+  test("FIX: the default claude JSON error envelope on stdout (EMPTY stderr) is transient", () => {
+    // The default reviewer is `claude -p --output-format json`: a provider 500
+    // arrives ONLY as this structured stdout envelope, with stderr empty.
+    const stdout = JSON.stringify({
+      type: "result",
+      subtype: "error_during_execution",
+      is_error: true,
+      api_error_status: 500,
+      result: "API Error: 500 Internal Server Error",
+    });
+    const res = classifyTransientReviewerFailure({
+      error: "REVIEW_PROCESS_FAILED: reviewer process exit 1 signal none",
+      raw: stdout,
+      stdout,
+      stderr: "",
+    });
+    expect(res.transient).toBe(true);
+    expect(res.cause).toBe("provider_http_5xx");
+    expect(res.status).toBe(500);
+  });
+
+  test("FIX: a claude envelope reporting 429 without result text is transient", () => {
+    const stdout = JSON.stringify({ type: "result", is_error: true, api_error_status: "429", result: "" });
+    const res = classifyTransientReviewerFailure({
+      error: "REVIEW_PROCESS_FAILED: reviewer process exit 1 signal none",
+      raw: stdout,
+      stdout,
+      stderr: "",
+    });
+    expect(res.transient).toBe(true);
+    expect(res.cause).toBe("provider_http_429");
+    expect(res.status).toBe(429);
+  });
+
+  test("FIX: free-text / success-envelope stdout is still NOT reviewer evidence", () => {
+    const freeText = "API Error: 500 Internal Server Error\nreviewer crashed";
+    expect(
+      classifyTransientReviewerFailure({
+        error: "REVIEW_PROCESS_FAILED: reviewer process exit 1 signal none",
+        raw: freeText,
+        stdout: freeText,
+        stderr: "",
+      }).transient
+    ).toBe(false);
+    const success = JSON.stringify({ type: "result", is_error: false, result: "status: 500 in the code" });
+    expect(
+      classifyTransientReviewerFailure({
+        error: "REVIEW_PROCESS_FAILED: reviewer process exit 1 signal none",
+        raw: success,
+        stdout: success,
+        stderr: "",
+      }).transient
+    ).toBe(false);
+    // An auth error inside the structured envelope keeps the fail-closed veto.
+    const auth = JSON.stringify({ type: "result", is_error: true, result: "authentication failed: invalid api key" });
+    const res = classifyTransientReviewerFailure({
+      error: "REVIEW_PROCESS_FAILED: reviewer process exit 1 signal none",
+      raw: auth,
+      stdout: auth,
+      stderr: "",
+    });
+    expect(res.transient).toBe(false);
+    expect(res.veto).toBe("auth");
   });
 
   test("a non-process refusal (malformed verdict / head mismatch) is never transient", () => {

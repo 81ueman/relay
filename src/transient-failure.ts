@@ -512,27 +512,73 @@ export interface ReviewerTransientInput {
    * never be auto-retried.
    */
   stderr?: string;
+  /**
+   * ISH-1174 FIX: the reviewer process's STDOUT. Free text is never evidence,
+   * but the default reviewer is `claude -p --output-format json`, which reports
+   * a provider failure ONLY in its structured result envelope on stdout
+   * (`{"type":"result","is_error":true,"result":"API Error: 500 …"}`) and
+   * leaves stderr empty. That envelope — never arbitrary stdout prose — is read.
+   */
+  stdout?: string;
+}
+
+/**
+ * The provider evidence carried by a STRUCTURED `claude --output-format json`
+ * result envelope with `is_error: true`, or null when stdout is free text or a
+ * success envelope. Parsing the envelope (instead of scanning stdout) keeps a
+ * reviewer that merely QUOTES this code from being auto-retried.
+ */
+function reviewerEnvelopeEvidence(stdout: string | undefined): { text: string; statuses: number[] } | null {
+  if (!stdout) return null;
+  const candidates = [stdout.trim(), ...stdout.split("\n").map((line) => line.trim()).filter(Boolean)];
+  for (const candidate of candidates) {
+    if (!candidate.startsWith("{")) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(candidate);
+    } catch {
+      continue;
+    }
+    if (!isRecord(parsed) || parsed.type !== "result" || parsed.is_error !== true) continue;
+    const statuses: number[] = [];
+    const rawStatus = parsed.api_error_status;
+    const status =
+      typeof rawStatus === "number"
+        ? rawStatus
+        : typeof rawStatus === "string" && /^\d{3}$/.test(rawStatus.trim())
+          ? Number(rawStatus)
+          : null;
+    if (status !== null && Number.isInteger(status)) statuses.push(status);
+    const text = [parsed.result, parsed.error]
+      .filter((v): v is string => typeof v === "string" && v.length > 0)
+      .join("\n");
+    return { text, statuses };
+  }
+  return null;
 }
 
 /**
  * A reviewer process failure is transient ONLY when it is the process-level
- * `REVIEW_PROCESS_FAILED` refusal AND its stderr shows a provider/transport
- * cause. A malformed verdict, a HEAD mismatch or an independence refusal is a
- * judgement/authority problem and is never auto-retried.
+ * `REVIEW_PROCESS_FAILED` refusal AND its stderr (or its structured claude
+ * error envelope) shows a provider/transport cause. A malformed verdict, a
+ * HEAD mismatch or an independence refusal is a judgement/authority problem
+ * and is never auto-retried.
  */
 export function classifyTransientReviewerFailure(input: ReviewerTransientInput): TransientFailure {
   const error = input.error ?? "";
   if (!/^REVIEW_PROCESS_FAILED\b/.test(error)) return nonTransient({ veto: "unknown" });
   const evidence = input.stderr !== undefined ? input.stderr : input.raw;
-  const statuses: number[] = [];
+  const envelope = reviewerEnvelopeEvidence(input.stdout);
+  const statuses: number[] = [...(envelope?.statuses ?? [])];
   for (const m of evidence.matchAll(/\b(?:status|statusCode|httpStatus|code)"?\s*[:=]\s*"?(5\d\d|429)\b/gi)) {
     const n = Number(m[1]);
     if (Number.isInteger(n)) statuses.push(n);
   }
+  const text = [error, evidence, envelope?.text ?? ""].filter((s) => s.length > 0).join("\n");
   // A reviewer PROCESS failure is already a failed turn: a provider/transport
   // marker on its own (e.g. `overloaded_error`, "provider request failed") is
   // enough, so pass turnEnd="error" to the same evidence rule.
-  return classifyTransientEvidence({ text: `${error}\n${evidence}`, statuses, turnEnd: "error" });
+  return classifyTransientEvidence({ text, statuses, turnEnd: "error" });
 }
 
 export interface SessionAdoptionDecision {
