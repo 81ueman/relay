@@ -400,6 +400,25 @@ describe("ISH-1174: reviewer + session classification", () => {
     expect(res.status).toBe(500);
   });
 
+  test("FIX: the legacy raw-only probe shape still reads the structured envelope", () => {
+    // The attempt-1 review probed `{raw: <envelope>, stderr: ""}` (no stdout).
+    // `raw` is accepted only because it parses as the structured envelope.
+    const raw = JSON.stringify({
+      type: "result",
+      is_error: true,
+      result: "API Error: 500 Internal Server Error",
+      api_error_status: 500,
+    });
+    const res = classifyTransientReviewerFailure({
+      error: "REVIEW_PROCESS_FAILED: reviewer process exit 1 signal none",
+      raw,
+      stderr: "",
+    });
+    expect(res.transient).toBe(true);
+    expect(res.cause).toBe("provider_http_5xx");
+    expect(res.status).toBe(500);
+  });
+
   test("FIX: a claude envelope reporting 429 without result text is transient", () => {
     const stdout = JSON.stringify({ type: "result", is_error: true, api_error_status: "429", result: "" });
     const res = classifyTransientReviewerFailure({

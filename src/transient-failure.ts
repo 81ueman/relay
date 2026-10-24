@@ -568,7 +568,10 @@ export function classifyTransientReviewerFailure(input: ReviewerTransientInput):
   const error = input.error ?? "";
   if (!/^REVIEW_PROCESS_FAILED\b/.test(error)) return nonTransient({ veto: "unknown" });
   const evidence = input.stderr !== undefined ? input.stderr : input.raw;
-  const envelope = reviewerEnvelopeEvidence(input.stdout);
+  // Production passes the pure stdout; older callers only pass `raw`
+  // (stdout+stderr). `raw` is usable here ONLY when it parses as the structured
+  // envelope — free text is never accepted.
+  const envelope = reviewerEnvelopeEvidence(input.stdout ?? input.raw);
   const statuses: number[] = [...(envelope?.statuses ?? [])];
   for (const m of evidence.matchAll(/\b(?:status|statusCode|httpStatus|code)"?\s*[:=]\s*"?(5\d\d|429)\b/gi)) {
     const n = Number(m[1]);
