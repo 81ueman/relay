@@ -490,9 +490,8 @@ envelope (`is_error: true`) on stdout, never free-text stdout. Before every
 resume the existing stale-head fence re-checks the worktree branch/HEAD (and
 the Task head): another writer's move refuses the resume and the Factory stops
 as today, and an explicit cancel/timeout is never resumed. Caps/flags:
-`--max-resumes N`
-(default 3), `--transient-wait DUR` (default 60m), `--transient-backoff DUR`
-(default 30s); env `RELAY_TRANSIENT_MAX_RESUMES`, `RELAY_TRANSIENT_WAIT_MS`,
+`--max-resumes N` (default 3), `--transient-wait DUR` (default 60m),
+`--transient-backoff DUR` (default 30s); env `RELAY_TRANSIENT_MAX_RESUMES`, `RELAY_TRANSIENT_WAIT_MS`,
 `RELAY_TRANSIENT_BACKOFF_MS`, `RELAY_TRANSIENT_MAX_BACKOFF_MS`,
 `RELAY_PROVIDER_PROBE_URL` (see `src/transient-failure.ts`,
 `src/transient-recovery.ts`, and the classifier/resume tests in
