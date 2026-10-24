@@ -91,6 +91,16 @@ describe("ISH-1174: the transient failure class is evidence-derived", () => {
     expect(res.detail).toContain("ECONNRESET");
   });
 
+  test("a PROVIDER_ERROR turn_end code alone is transient", () => {
+    const run = runWith([
+      SESSION,
+      { type: "status", phase: "turn_end", reason: { kind: "error", error: { code: "PROVIDER_ERROR" } } },
+    ]);
+    const res = classifyTransientRunFailure({ run, error: "CODING_FAILED: exit 1" });
+    expect(res.transient).toBe(true);
+    expect(res.cause).toBe("turn_end_provider_error");
+  });
+
   test("a non-auth 4xx bad request is NON-transient", () => {
     const run = runWith([
       SESSION,

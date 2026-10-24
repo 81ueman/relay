@@ -74,7 +74,7 @@ const CONNECTION_MARKER =
 
 /** A provider/transport failure reported as a failed turn (not a bare "error"). */
 const PROVIDER_TRANSPORT_MARKER =
-  /\bprovider\b[^\n]{0,120}\b(?:error|failed|failure|unreachable|timeout|timed out|overloaded|unavailable)\b|\bupstream\b[^\n]{0,120}\b(?:error|failed|failure|unreachable|timeout|overloaded|unavailable)\b|\bstream (?:error|closed|reset|aborted)\b|\bAPI error\b|\bmodel (?:error|overloaded|unavailable)\b|\boverloaded_error\b|\bservice overloaded\b|\bprovider request failed\b|\brequest failed\b[^\n]{0,80}\b(?:provider|upstream|network|transport)\b/i;
+  /\bPROVIDER_(?:ERROR|FAILED|FAILURE|UNAVAILABLE|TIMEOUT|OVERLOADED)\b|\bprovider\b[^\n]{0,120}\b(?:error|failed|failure|unreachable|timeout|timed out|overloaded|unavailable)\b|\bupstream\b[^\n]{0,120}\b(?:error|failed|failure|unreachable|timeout|overloaded|unavailable)\b|\bstream (?:error|closed|reset|aborted)\b|\bAPI error\b|\bmodel (?:error|overloaded|unavailable)\b|\boverloaded_error\b|\bservice overloaded\b|\bprovider request failed\b|\brequest failed\b[^\n]{0,80}\b(?:provider|upstream|network|transport)\b/i;
 
 /** Evidence that a `--session-id` adoption was refused by dsh itself. */
 const SESSION_UNADOPTABLE_MARKER =
