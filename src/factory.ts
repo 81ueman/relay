@@ -20,6 +20,7 @@ import {
   FACTORY_RUN_RESUMED,
   FACTORY_REVIEW_RESUMED,
   FACTORY_WAITING_TRANSIENT,
+  type TransientFailure,
 } from "./transient-failure";
 import {
   buildFreshSessionResumePrompt,
@@ -820,6 +821,16 @@ function transientPolicyFor(deps: FactoryDeps): TransientPolicy {
   });
 }
 
+/**
+ * ISH-1174: a permanent/local failure (auth, disk, permission) ends transient
+ * recovery even when its text also looks like an unadoptable Session ("login
+ * session expired"). Those causes are fail-closed today and a resume would only
+ * repeat them.
+ */
+function permanentTransientVeto(veto: TransientFailure["veto"] | undefined): boolean {
+  return veto === "auth" || veto === "enospc" || veto === "permission";
+}
+
 /** The highest transient resume ordinal already recorded for one attempt. */
 function terminalResumeCount(db: Database, taskId: string, phase: string, attempt: number): number {
   const row = db
@@ -941,6 +952,14 @@ async function resumeTransientImplement(
     ) {
       return { last: current, submitted: false, resumed, taskMoved: false, stop: "explicit cancel/timeout" };
     }
+    // ISH-1174 fail-closed: auth/ENOSPC/permission never resume — not even via
+    // the fresh-session fallback. `classifyUnadoptableSession` already ignores
+    // an original Run, but a SESSION-mode resume can fail with AUTH and a
+    // "login session expired" message; that is a permanent local cause.
+    if (permanentTransientVeto(transient.veto)) {
+      push(`implement:resume-vetoed@${task.attempt} ${transient.veto} ${transient.detail ?? ""}`);
+      return { last: current, submitted: false, resumed, taskMoved: false, stop: null };
+    }
     if (resumeCount >= policy.maxResumes) {
       push(
         `implement:resume-cap@${task.attempt} (${resumeCount}/${policy.maxResumes}) ` +
@@ -961,10 +980,13 @@ async function resumeTransientImplement(
       return { last: current, submitted: false, resumed, taskMoved: false, stop: "resume cap" };
     }
 
-    const fresh = adoption.unadoptable || !run.session_id;
+    // The Session to adopt: what this Run PASSED (a failed adoption reports no
+    // `session_id`), else what dsh reported for the original Run.
+    const adoptSessionId = run.resume_session_id ?? run.session_id;
+    const fresh = adoption.unadoptable || !adoptSessionId;
     const cause =
       (fresh
-        ? adoption.detail ?? (run.session_id ? transient.detail : "the previous dsh Session id was not recorded; starting a fresh session")
+        ? adoption.detail ?? (adoptSessionId ? transient.detail : "the previous dsh Session id was not recorded; starting a fresh session")
         : transient.detail) ?? "transient provider/network interruption";
     const nextCount = resumeCount + 1;
 
@@ -1084,7 +1106,7 @@ async function resumeTransientImplement(
       timeoutMs: deps.timeoutMs,
       fastExitMs: deps.fastExitMs,
       env: deps.dshEnv,
-      ...(fresh ? {} : { resumeSessionId: run.session_id }),
+      ...(fresh ? {} : { resumeSessionId: adoptSessionId }),
       resumedFromRunId: run.id,
       resumeCount: nextCount,
       resumeCause: cause,
@@ -1099,7 +1121,7 @@ async function resumeTransientImplement(
         runId: launched.id,
         fromRunId: run.id,
         attempt: task.attempt,
-        sessionId: fresh ? null : run.session_id,
+        sessionId: fresh ? null : adoptSessionId,
         cause,
         resumeCount: nextCount,
         mode: fresh ? "fresh" : "session",
@@ -1109,7 +1131,7 @@ async function resumeTransientImplement(
     });
     push(
       `implement:resume@${task.attempt} #${nextCount} -> ${launched.id} ` +
-        `(${fresh ? "fresh session" : `session ${run.session_id}`}) ${cause}`
+        `(${fresh ? "fresh session" : `session ${adoptSessionId}`}) ${cause}`
     );
 
     const finished = await launched.wait();
@@ -1241,7 +1263,11 @@ async function runFactoryTaskInner(
           // its cap/wait expiry falls back to the ordinary stop.
           const preTransient = classifyTransientRunFailure({ run: impl.run, error: impl.error });
           const preAdoption = classifyUnadoptableSession({ run: impl.run, error: impl.error });
-          if (preTransient.transient || preAdoption.unadoptable) {
+          // A permanent/local veto never enters recovery, not even when the
+          // message also names a dead Session (e.g. "login session expired").
+          const preRecoverable =
+            preTransient.transient || (preAdoption.unadoptable && !permanentTransientVeto(preTransient.veto));
+          if (preRecoverable) {
             push(
               `implement:transient@${task.attempt} ${preTransient.transient ? preTransient.cause : "session_unadoptable"} ` +
                 `${preTransient.detail ?? preAdoption.detail ?? ""}`
@@ -1541,7 +1567,7 @@ async function runFactoryTaskInner(
           r = one.r;
           if (current) current.reviewVerdict = r.outcome === "refused" ? "refused" : r.outcome;
           if (r.outcome !== "refused") break;
-          const transient = classifyTransientReviewerFailure({ error: r.error, raw: r.raw });
+          const transient = classifyTransientReviewerFailure({ error: r.error, raw: r.raw, stderr: r.stderr });
           if (!transient.transient) break;
           if (reviewResumes >= reviewPolicy.maxResumes) {
             push(`review:resume-cap@${task.attempt} (${reviewResumes}/${reviewPolicy.maxResumes}) ${transient.detail ?? ""}`);

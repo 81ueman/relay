@@ -50,8 +50,10 @@ function runWith(
     error: null,
     dsh_events_path: dshEvents,
     stderr_path: stderr,
+    session_id: null,
     resumed_from_run_id: null,
     resume_count: 0,
+    resume_session_id: null,
     ...extra,
   };
 }
@@ -239,6 +241,38 @@ describe("ISH-1174: the transient failure class is evidence-derived", () => {
     expect(res.cause).toBeNull();
   });
 
+  test("REGRESSION: a later error turn with NO code does not inherit an earlier TIMEOUT code", () => {
+    const lines: Record<string, unknown>[] = [
+      SESSION,
+      // Turn 1 is a genuine provider timeout…
+      { type: "status", phase: "turn_end", turn: 1, reason: { kind: "error", error: { code: "TIMEOUT", message: "Request timed out." } } },
+      // …turn 2 fails with a message but NO code: it must not inherit TIMEOUT.
+      { type: "status", phase: "turn_end", turn: 2, reason: { kind: "error", error: { message: "tool loop exploded" } } },
+    ];
+    const run = runWith(lines);
+    const ev = readRunProviderEvidence(run.dsh_events_path);
+    expect(ev.turnEnd).toBe("error");
+    expect(ev.turnEndCode).toBeNull();
+    expect(ev.turnEndMessage).toBe("tool loop exploded");
+    expect(ev.turnEndStatus).toBeNull();
+    const res = classifyTransientRunFailure({ run, error: "CODING_FAILED: exit 1" });
+    expect(res.transient).toBe(false);
+    expect(res.veto).toBe("unknown");
+  });
+
+  test("REGRESSION: a completed turn after an error turn clears the failure evidence", () => {
+    const run = runWith([
+      SESSION,
+      { type: "status", phase: "turn_end", turn: 1, reason: { kind: "error", error: { code: "TIMEOUT", message: "Request timed out." } } },
+      { type: "status", phase: "turn_end", turn: 2, reason: { kind: "completed" } },
+    ]);
+    const ev = readRunProviderEvidence(run.dsh_events_path);
+    expect(ev.turnEnd).toBe("completed");
+    expect(ev.turnEndCode).toBeNull();
+    expect(ev.turnEndMessage).toBeNull();
+    expect(ev.turnEndStatus).toBeNull();
+  });
+
   test("an EARLIER transient turn does not make a later genuine failure transient", () => {
     const lines: Record<string, unknown>[] = [
       SESSION,
@@ -325,6 +359,25 @@ describe("ISH-1174: reviewer + session classification", () => {
     ).toBe(false);
   });
 
+  test("REGRESSION: provider words only QUOTED on reviewer stdout are not transient evidence", () => {
+    const res = classifyTransientReviewerFailure({
+      error: "REVIEW_PROCESS_FAILED: reviewer process exit 1 signal none",
+      // The reviewer was reading this very code and quoted its markers; it then
+      // crashed for an unrelated reason. Only stderr is process-failure evidence.
+      raw: "src/transient-failure.ts mentions ECONNRESET and status: 500\nreviewer crashed",
+      stderr: "reviewer crashed",
+    });
+    expect(res.transient).toBe(false);
+    expect(res.veto).toBe("unknown");
+    // Real stderr transport evidence still classifies.
+    const real = classifyTransientReviewerFailure({
+      error: "REVIEW_PROCESS_FAILED: reviewer process exit 1 signal none",
+      raw: "pass {}\n",
+      stderr: "API Error: 500 Internal Server Error",
+    });
+    expect(real.transient).toBe(true);
+  });
+
   test("a non-process refusal (malformed verdict / head mismatch) is never transient", () => {
     expect(
       classifyTransientReviewerFailure({
@@ -340,17 +393,49 @@ describe("ISH-1174: reviewer + session classification", () => {
     ).toBe(false);
   });
 
-  test("an unknown/corrupt --session-id adoption is detected for the fresh fallback", () => {
-    const run = runWith([SESSION], { resumed_from_run_id: "run-0", resume_count: 1 });
+  test("an unknown/corrupt --session-id adoption is detected ONLY for a session-mode resume", () => {
+    // A Run that never passed --session-id cannot have failed to adopt one.
+    const first = runWith([SESSION], { error: "dsh: unknown session session-1" });
+    expect(classifyUnadoptableSession({ run: first, error: "CODING_FAILED: exit 1" }).unadoptable).toBe(false);
+
+    const run = runWith([SESSION], {
+      resumed_from_run_id: "run-0",
+      resume_count: 1,
+      resume_session_id: "session-1",
+    });
     expect(classifyUnadoptableSession({ run, error: "CODING_FAILED: exit 1" }).unadoptable).toBe(false);
     const bad = runWith([SESSION], {
       resumed_from_run_id: "run-0",
       resume_count: 1,
+      resume_session_id: "session-1",
       error: "dsh: unknown session session-1",
     });
     const res = classifyUnadoptableSession({ run: bad, error: "CODING_FAILED: exit 1" });
     expect(res.unadoptable).toBe(true);
     expect(res.detail).toContain("unknown session");
+  });
+
+  test("REGRESSION: a FIRST-run auth failure that says 'session expired' is NOT an adoption failure", () => {
+    const run = runWith([SESSION], { error: "dsh: AUTH: login session expired; run dsh login" });
+    // The auth veto is fail-closed…
+    const transient = classifyTransientRunFailure({ run, error: "CODING_FAILED: exit 1" });
+    expect(transient.transient).toBe(false);
+    expect(transient.veto).toBe("auth");
+    // …and the phrase must not be mistaken for an unadoptable Session.
+    expect(classifyUnadoptableSession({ run, error: "CODING_FAILED: exit 1" }).unadoptable).toBe(false);
+  });
+
+  test("a session-mode resume with AUTH evidence is unadoptable-looking but still vetoed", () => {
+    const run = runWith([SESSION], {
+      resumed_from_run_id: "run-0",
+      resume_count: 1,
+      resume_session_id: "session-1",
+      error: "dsh: AUTH: login session expired; run dsh login",
+    });
+    expect(classifyUnadoptableSession({ run, error: "CODING_FAILED: exit 1" }).unadoptable).toBe(true);
+    const transient = classifyTransientRunFailure({ run, error: "CODING_FAILED: exit 1" });
+    expect(transient.transient).toBe(false);
+    expect(transient.veto).toBe("auth");
   });
 });
 

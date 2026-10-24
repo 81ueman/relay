@@ -158,7 +158,7 @@ evidence rule applies to a `REVIEW_PROCESS_FAILED` reviewer process.
 | wait | provider reachability probe, 30 s doubling to 5 min, TOTAL 60 min | `factory.waiting_transient`; `src/transient-recovery.ts` |
 | resume | SAME worktree, `dsh --profile headless --json --session-id <failed id> <short continue prompt>` | `factory.run_resumed` (`runId`, `fromRunId`, `sessionId`, `cause`, `resumeCount`); `src/dsh-runner.ts` |
 | attempt budget | a resume does NOT consume a factory attempt; cap **3 resumes per attempt** | `runs.resumed_from_run_id` / `runs.resume_count`; `tests/factory.test.ts` |
-| fallback | an unknown/corrupt/missing Session starts a FRESH session in the SAME worktree with the previous final text, `git status` and a diff summary | `buildFreshSessionResumePrompt`; `tests/factory.test.ts` |
+| fallback | an unknown/corrupt/missing Session starts a FRESH session in the SAME worktree with the previous final text, `git status` and a diff summary; the adoption check applies only to a session-mode resume (a Run that passed `--session-id`), and auth/ENOSPC/permission never resume — even when the message says "session expired" | `buildFreshSessionResumePrompt`; `classifyUnadoptableSession`; `tests/factory.test.ts` |
 | reviewer | a transient `REVIEW_PROCESS_FAILED` is re-run at the SAME head, capped | `factory.review_resumed`; `tests/factory.test.ts` |
 | safety | the stale-head fence re-checks the worktree branch/HEAD (and Task head) before any resume; cancel/timeout is never resumed | `checkResumeFence`; `tests/factory.test.ts` |
 

@@ -308,6 +308,8 @@ interface InsertRunInput {
   resumedFromRunId: string | null;
   /** ISH-1174: 1-based transient-resume ordinal within the attempt (0 = first). */
   resumeCount: number;
+  /** ISH-1174: the Session id passed as `--session-id` (null = a fresh Session). */
+  resumeSessionId: string | null;
 }
 
 function insertRun(db: Database, r: InsertRunInput): Run {
@@ -322,9 +324,9 @@ function insertRun(db: Database, r: InsertRunInput): Run {
     `INSERT INTO runs
        (id, task_id, phase, attempt, generation, cwd, branch, head_sha, base_head_sha, prompt,
         spec_path, output_dir, state, stdout_path, stderr_path, events_path, dsh_events_path,
-        resumed_from_run_id, resume_count, launcher_pid, launcher_lstart, fast_exit, started_at,
-        created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, 'starting', ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`
+        resumed_from_run_id, resume_count, resume_session_id, launcher_pid, launcher_lstart,
+        fast_exit, started_at, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, 'starting', ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`
   ).run(
     r.id,
     r.taskId,
@@ -343,6 +345,7 @@ function insertRun(db: Database, r: InsertRunInput): Run {
     r.dshEventsPath,
     r.resumedFromRunId,
     r.resumeCount,
+    r.resumeSessionId,
     launcher.launcher_pid,
     launcher.launcher_lstart,
     t,
@@ -584,6 +587,7 @@ export async function startDshRun(db: Database, opts: StartRunOptions): Promise<
     dshEventsPath,
     resumedFromRunId: opts.resumedFromRunId ?? null,
     resumeCount: opts.resumeCount ?? 0,
+    resumeSessionId: opts.resumeSessionId ?? null,
   });
 
   const resumeSessionId = opts.resumeSessionId ?? null;

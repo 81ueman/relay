@@ -421,6 +421,14 @@ export interface Run {
    */
   resumed_from_run_id: string | null;
   resume_count: number;
+  /**
+   * ISH-1174: the Session id this resume Run actually PASSED as
+   * `--session-id` (null = a fresh Session). `session_id` is what dsh
+   * REPORTED, which is null when an adoption is refused; this field is the
+   * durable proof that the Run was in session mode, so the fresh-session
+   * fallback is never taken for an original Run (or for a fresh resume).
+   */
+  resume_session_id: string | null;
   stdout_path: string | null;
   stderr_path: string | null;
   events_path: string | null;
@@ -774,6 +782,8 @@ CREATE TABLE IF NOT EXISTS runs (
   -- ISH-1174: transient-failure resume lineage + durable per-attempt ordinal.
   resumed_from_run_id TEXT,
   resume_count INTEGER NOT NULL DEFAULT 0,
+  -- The Session id this Run PASSED as --session-id (NULL = a fresh Session).
+  resume_session_id TEXT,
   stdout_path TEXT,
   stderr_path TEXT,
   events_path TEXT,

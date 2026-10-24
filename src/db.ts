@@ -341,6 +341,11 @@ function migrate(db: Database): void {
   if (columnExists(db, "runs", "id") && !columnExists(db, "runs", "resume_count")) {
     db.exec("ALTER TABLE runs ADD COLUMN resume_count INTEGER NOT NULL DEFAULT 0;");
   }
+  // The Session id a resume Run actually passed as `--session-id`; a
+  // pre-existing row never passed one (a fresh Session).
+  if (columnExists(db, "runs", "id") && !columnExists(db, "runs", "resume_session_id")) {
+    db.exec("ALTER TABLE runs ADD COLUMN resume_session_id TEXT;");
+  }
   // Legacy (ISH-1098): retained so pre-existing DBs keep opening unchanged. New
   // Runs always leave it NULL; the Coding Sandbox execution path is removed.
   if (columnExists(db, "runs", "id") && !columnExists(db, "runs", "sandbox_name")) {

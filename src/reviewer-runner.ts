@@ -319,6 +319,12 @@ export interface HeadlessReviewResult {
   /** ISH-883: the verified native GitHub review, when native posting is enabled. */
   nativeReview: ReviewView | null;
   raw: string;
+  /**
+   * ISH-1174: the reviewer process's STDERR (bounded). The transient classifier
+   * reads this instead of stdout, so a reviewer that merely QUOTES a provider
+   * error from the code under review is never auto-retried.
+   */
+  stderr?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -1091,7 +1097,7 @@ export async function runHeadlessReview(
     return refusal(
       `${REVIEW_PROCESS_FAILED}: reviewer process exit ${proc.exitCode ?? "none"} signal ${proc.signal ?? "none"}`,
       task,
-      { verdict, evidenceRef: evidencePath, raw }
+      { verdict, evidenceRef: evidencePath, raw, stderr: proc.stderr.slice(0, 8_192) }
     );
   }
   if (!verdict) {

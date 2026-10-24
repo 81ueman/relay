@@ -26,6 +26,7 @@ import { defaultRunner, gitHead, type CommandRunner } from "../src/verify";
 import { processPgid, spawnIdentityToken } from "../src/proc-identity";
 import { DEFAULT_INTEGRATOR_WORKER, FACTORY_NATIVE_REVIEW_REQUIRED, pidAlive, reviewBlockedReason, runFactoryTask, verifyChecksReason } from "../src/factory";
 import { findFactoryOutcomeForRun, latestFactoryOutcome } from "../src/factory-failure";
+import { classifyTransientRunFailure } from "../src/transient-failure";
 import type { GitHubReadOnly, GitHubReviewReader, PrView, ReviewView } from "../src/providers";
 import { FakeGitHub } from "../src/providers";
 import { requestRebase } from "../src/rebase";
@@ -236,6 +237,35 @@ exit 1
 /** ISH-1174: a plain transient 500 failure that never commits. */
 const TRANSIENT_500_DSH = `${CAPTURE_ARGV}
 echo '{"type":"session","sessionId":"session-ish1174-stale","cwd":"."}'
+echo '{"type":"status","phase":"turn_end","turn":1,"reason":{"kind":"error","error":{"status":500,"message":"upstream provider 500"}}}'
+exit 1
+`;
+
+/**
+ * ISH-1174 REGRESSION: the FIRST Run (never launched with `--session-id`) dies
+ * with AUTH and a message that also says "session expired". That phrase must not
+ * be mistaken for an unadoptable Session and start fresh-session resumes.
+ */
+const AUTH_SESSION_EXPIRED_DSH = `${CAPTURE_ARGV}
+echo '{"type":"session","sessionId":"session-ish1174-auth","cwd":"."}'
+echo '{"type":"status","phase":"turn_end","turn":1,"reason":{"kind":"error","error":{"message":"login session expired","code":"AUTH"}}}'
+echo "dsh: AUTH: login session expired; run dsh login" >&2
+exit 1
+`;
+
+/**
+ * ISH-1174 REGRESSION: a SESSION-mode resume is refused with AUTH whose message
+ * says "session expired". It is unadoptable-looking, but the permanent auth
+ * veto must end recovery — never a third, fresh-session Run.
+ */
+const AUTH_ON_SESSION_RESUME_DSH = `${CAPTURE_ARGV}
+for arg in "$@"; do
+  if [ "$arg" = "--session-id" ]; then
+    echo "dsh: AUTH: login session expired; run dsh login" >&2
+    exit 1
+  fi
+done
+echo '{"type":"session","sessionId":"session-ish1174-auth-resume","cwd":"."}'
 echo '{"type":"status","phase":"turn_end","turn":1,"reason":{"kind":"error","error":{"status":500,"message":"upstream provider 500"}}}'
 exit 1
 `;
@@ -1436,6 +1466,9 @@ describe("ISH-1174: transient provider/network recovery", () => {
     expect(resumed.branch).toBe(first.branch);
     expect(resumed.resumed_from_run_id).toBe(first.id);
     expect(resumed.session_id).toBe("session-ish1174-fixed");
+    // The durable proof that the resume PASSED --session-id (the failed Run's
+    // reported session id) is recorded even when dsh reports none back.
+    expect(resumed.resume_session_id).toBe("session-ish1174-fixed");
     expect(task.attempt).toBe(0);
 
     // The actual dsh argv proves the SAME session id was adopted.
@@ -1497,6 +1530,10 @@ describe("ISH-1174: transient provider/network recovery", () => {
     expect(first.state).toBe("failed");
     expect(bad.state).toBe("failed");
     expect(bad.resumed_from_run_id).toBe(first.id);
+    // The refused adoption really passed the recorded session id…
+    expect(bad.resume_session_id).toBe("session-ish1174-broken");
+    // …and the fallback is a FRESH session (no --session-id to persist).
+    expect(fresh.resume_session_id).toBeNull();
     // A submitted resume is recorded terminal `submitted` (exited + accepted);
     // either way it is the SAME attempt and the new head was submitted.
     expect(["exited", "submitted"]).toContain(fresh.state);
@@ -1588,6 +1625,69 @@ describe("ISH-1174: transient provider/network recovery", () => {
     expect(count.n).toBe(0);
     // It falls back to today's stop, not the transient policy.
     expect(res.reason).toContain("IMPLEMENT_RECOVERY/UNKNOWN_CAUSE");
+  });
+
+  test("REGRESSION: a FIRST-run AUTH failure that says 'session expired' is NOT resumed as a fresh session", async () => {
+    const caps = capturePaths("ish1174-auth-first");
+    const dsh = fakeDsh("dsh-1174-auth-first", AUTH_SESSION_EXPIRED_DSH);
+    const id = newTask();
+    const rev = reviewerHarness(["pass"]);
+
+    const res = await runFactoryTask(db, id, {
+      ...factoryDeps(dsh, rev.spawner),
+      dshEnv: { ARGS_FILE: caps.argsFile, PROMPT_FILE: caps.promptFile },
+      probeProvider: async () => true,
+      transientWaitMs: 500,
+      transientBackoffMs: 1,
+    });
+
+    expect(res.outcome).not.toBe("merge_ready");
+    // The original Run was never launched with --session-id, so its "session
+    // expired" phrase is not an adoption failure: no resume at all.
+    expect(listRuns(db, { taskId: id })).toHaveLength(1);
+    expect(capturedRuns(caps.argsFile)).toHaveLength(1);
+    expect(listRuns(db, { taskId: id })[0]!.resumed_from_run_id).toBeNull();
+    const count = db
+      .query(`SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'factory.run_resumed'`)
+      .get(id) as { n: number };
+    expect(count.n).toBe(0);
+    expect(res.steps.join("\n")).not.toContain("implement:resume");
+    // The transient class is auth (fail closed); the ordinary stop still runs.
+    const first = listRuns(db, { taskId: id })[0]!;
+    expect(classifyTransientRunFailure({ run: first, error: "CODING_FAILED" }).veto).toBe("auth");
+    expect(res.reason).toContain("IMPLEMENT_RECOVERY/");
+  });
+
+  test("REGRESSION: a session-mode resume refused with AUTH + 'session expired' never starts a fresh session", async () => {
+    const caps = capturePaths("ish1174-auth-resume");
+    const dsh = fakeDsh("dsh-1174-auth-resume", AUTH_ON_SESSION_RESUME_DSH);
+    const id = newTask();
+    const rev = reviewerHarness(["pass"]);
+
+    const res = await runFactoryTask(db, id, {
+      ...factoryDeps(dsh, rev.spawner),
+      dshEnv: { ARGS_FILE: caps.argsFile, PROMPT_FILE: caps.promptFile },
+      probeProvider: async () => true,
+      transientWaitMs: 500,
+      transientBackoffMs: 1,
+    });
+
+    expect(res.outcome).not.toBe("merge_ready");
+    // original + the one session-mode resume; the auth veto stops the fallback.
+    const runs = listRuns(db, { taskId: id });
+    expect(runs).toHaveLength(2);
+    const resumed = runs.find((r) => r.resume_count === 1)!;
+    expect(resumed.resume_session_id).toBe("session-ish1174-auth-resume");
+    expect(capturedRuns(caps.argsFile)).toHaveLength(2);
+    expect(capturedRuns(caps.argsFile)[1].includes("--session-id")).toBe(true);
+    const count = db
+      .query(`SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'factory.run_resumed'`)
+      .get(id) as { n: number };
+    expect(count.n).toBe(1); // only the session resume that was launched
+    expect(res.steps.join("\n")).toContain("implement:resume-vetoed@0 auth");
+    // The resumed Run's own evidence is the permanent auth veto.
+    expect(classifyTransientRunFailure({ run: resumed, error: "CODING_FAILED" }).veto).toBe("auth");
+    expect(res.reason).toContain("IMPLEMENT_RECOVERY/");
   });
 
   test("a transient REVIEW_PROCESS_FAILED is re-run at the SAME head without operator action", async () => {

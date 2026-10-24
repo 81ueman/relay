@@ -205,24 +205,24 @@ export function readRunProviderEvidence(path: string | null | undefined): RunPro
     const status = dshProviderStatus(event);
     if (event.type === "status" && event.phase === "turn_end") {
       // Only the Run's TERMINAL turn decides the class. Every turn_end
-      // REPLACES the previous turn's failure evidence, so a transient 5xx or
-      // ECONNRESET in an earlier turn cannot make a later, genuine failure
-      // look transient.
+      // REPLACES the previous turn's failure evidence WHOLESALE, so a transient
+      // 5xx/ECONNRESET/TIMEOUT in an earlier turn cannot make a later, genuine
+      // failure look transient. Reset BEFORE reading the new reason box: a later
+      // error turn with a message but NO code must not inherit the earlier
+      // turn's code.
       out.statuses = status !== null ? [status] : [];
       out.errors = [];
       const reason = event.reason;
       const kind = turnEndReason(event);
-      if (kind) out.turnEnd = kind;
+      out.turnEnd = kind;
+      out.turnEndCode = null;
+      out.turnEndStatus = null;
+      out.turnEndMessage = null;
       const error = isRecord(reason) ? reason.error : undefined;
       if (kind === "error" && isRecord(error)) {
         if (typeof error.code === "string" && error.code) out.turnEndCode = error.code;
         if (typeof error.message === "string" && error.message) out.turnEndMessage = error.message;
         out.turnEndStatus = status ?? statusFromCode(out.turnEndCode);
-      } else {
-        // A completed/aborted turn never inherits the previous turn's failure.
-        out.turnEndCode = null;
-        out.turnEndStatus = null;
-        out.turnEndMessage = null;
       }
       continue;
     }
@@ -441,8 +441,10 @@ export type TransientRun = Pick<
   | "error"
   | "dsh_events_path"
   | "stderr_path"
+  | "session_id"
   | "resumed_from_run_id"
   | "resume_count"
+  | "resume_session_id"
 >;
 
 export interface ClassifyRunTransientInput {
@@ -498,28 +500,39 @@ export function classifyTransientRunFailure(input: ClassifyRunTransientInput): T
 export interface ReviewerTransientInput {
   /** The HeadlessReviewResult error (`REVIEW_PROCESS_FAILED: …`) or null. */
   error: string | null;
-  /** The reviewer process's combined stdout+stderr (bounded upstream). */
+  /**
+   * The reviewer process's combined stdout+stderr. Used only when `stderr` is
+   * absent (older callers/tests): stdout is NOT evidence on its own.
+   */
   raw: string;
+  /**
+   * ISH-1174: the reviewer process's STDERR only. Preferred when present: a
+   * reviewer that exits non-zero for an unrelated reason but whose STDOUT
+   * merely QUOTES this code (e.g. while reviewing `transient-failure.ts`) must
+   * never be auto-retried.
+   */
+  stderr?: string;
 }
 
 /**
  * A reviewer process failure is transient ONLY when it is the process-level
- * `REVIEW_PROCESS_FAILED` refusal AND its output shows a provider/transport
+ * `REVIEW_PROCESS_FAILED` refusal AND its stderr shows a provider/transport
  * cause. A malformed verdict, a HEAD mismatch or an independence refusal is a
  * judgement/authority problem and is never auto-retried.
  */
 export function classifyTransientReviewerFailure(input: ReviewerTransientInput): TransientFailure {
   const error = input.error ?? "";
   if (!/^REVIEW_PROCESS_FAILED\b/.test(error)) return nonTransient({ veto: "unknown" });
+  const evidence = input.stderr !== undefined ? input.stderr : input.raw;
   const statuses: number[] = [];
-  for (const m of input.raw.matchAll(/\b(?:status|statusCode|httpStatus|code)"?\s*[:=]\s*"?(5\d\d|429)\b/gi)) {
+  for (const m of evidence.matchAll(/\b(?:status|statusCode|httpStatus|code)"?\s*[:=]\s*"?(5\d\d|429)\b/gi)) {
     const n = Number(m[1]);
     if (Number.isInteger(n)) statuses.push(n);
   }
   // A reviewer PROCESS failure is already a failed turn: a provider/transport
   // marker on its own (e.g. `overloaded_error`, "provider request failed") is
   // enough, so pass turnEnd="error" to the same evidence rule.
-  return classifyTransientEvidence({ text: `${error}\n${input.raw}`, statuses, turnEnd: "error" });
+  return classifyTransientEvidence({ text: `${error}\n${evidence}`, statuses, turnEnd: "error" });
 }
 
 export interface SessionAdoptionDecision {
@@ -528,17 +541,38 @@ export interface SessionAdoptionDecision {
 }
 
 /**
+ * ISH-1174: was this Run launched as a SESSION-mode resume, i.e. did it
+ * actually pass `--session-id`? Only such a Run can fail to ADOPT a Session.
+ * The first Run of an attempt (and a fresh-session fallback) never passed one,
+ * so a "session expired" phrase in its failure is not an adoption failure.
+ */
+export function isSessionModeResume(
+  run: Pick<TransientRun, "resumed_from_run_id" | "resume_session_id">
+): boolean {
+  return !!run.resumed_from_run_id && !!run.resume_session_id;
+}
+
+/**
  * Did dsh REFUSE the `--session-id` adoption (unknown/corrupt/session file
  * missing)? Such a Run is recoverable only by a FRESH session carrying the
  * previous final text/status/diff — never by retrying the same dead id.
+ *
+ * The check is GATED on a session-mode resume Run: an original Run never
+ * passed `--session-id`, so an auth failure that happens to say "login session
+ * expired" must not be mistaken for an unadoptable Session and start fresh
+ * resumes (that would bypass the fail-closed auth/ENOSPC/permission vetoes).
  */
 export function classifyUnadoptableSession(input: {
-  run: Pick<TransientRun, "id" | "error" | "dsh_events_path" | "stderr_path"> | null;
+  run: Pick<
+    TransientRun,
+    "id" | "error" | "dsh_events_path" | "stderr_path" | "resumed_from_run_id" | "resume_session_id"
+  > | null;
   error: string | null;
   readTail?: (path: string | null | undefined, maxBytes?: number) => string | null;
   readProvider?: (path: string | null | undefined) => RunProviderEvidence;
 }): SessionAdoptionDecision {
   if (!input.run) return { unadoptable: false, detail: null };
+  if (!isSessionModeResume(input.run)) return { unadoptable: false, detail: null };
   const readTail = input.readTail ?? readEvidenceTail;
   const readProvider = input.readProvider ?? readRunProviderEvidence;
   const ev = readProvider(input.run.dsh_events_path);

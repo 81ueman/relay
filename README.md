@@ -480,7 +480,10 @@ launch emits `factory.run_resumed` (new run id, from run, session id, cause,
 resume count). If the persisted Session cannot be adopted (unknown/corrupt, or
 no id was recorded), the Factory starts a **fresh session in the same worktree**
 whose brief carries the previous Run's final text, `git status` and a diff
-summary. A transient `REVIEW_PROCESS_FAILED` is re-run at the SAME head under the
+summary. The adoption check applies only to a session-mode resume (a Run that
+actually passed `--session-id`): an original Run's auth/ENOSPC/permission
+failure ends recovery even when its message says "session expired", and those
+permanent causes never start a fresh-session resume. A transient `REVIEW_PROCESS_FAILED` is re-run at the SAME head under the
 same cap (`factory.review_resumed`) with no operator action. Before every resume
 the existing stale-head fence re-checks the worktree branch/HEAD (and the Task
 head): another writer's move refuses the resume and the Factory stops as today,
