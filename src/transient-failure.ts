@@ -203,12 +203,16 @@ export function readRunProviderEvidence(path: string | null | undefined): RunPro
   if (!path) return out;
   for (const { event } of readDshEvents(path)) {
     const status = dshProviderStatus(event);
-    if (status !== null) out.statuses.push(status);
-    const kind = turnEndReason(event);
-    if (kind) out.turnEnd = kind;
-    if (event.type === "status" && event.phase === "turn_end" && isRecord(event.reason)) {
-      const error = event.reason.error;
-      if (event.reason.kind === "error" && isRecord(error)) {
+    if (event.type === "status" && event.phase === "turn_end") {
+      // Only the Run's TERMINAL turn decides the class. Every turn_end
+      // REPLACES the previous turn's failure evidence, so a transient 5xx in
+      // an earlier turn cannot make a later, genuine failure look transient.
+      out.statuses = status !== null ? [status] : [];
+      const reason = event.reason;
+      const kind = turnEndReason(event);
+      if (kind) out.turnEnd = kind;
+      const error = isRecord(reason) ? reason.error : undefined;
+      if (kind === "error" && isRecord(error)) {
         if (typeof error.code === "string" && error.code) out.turnEndCode = error.code;
         if (typeof error.message === "string" && error.message) out.turnEndMessage = error.message;
         out.turnEndStatus = status ?? statusFromCode(out.turnEndCode);
@@ -218,7 +222,9 @@ export function readRunProviderEvidence(path: string | null | undefined): RunPro
         out.turnEndStatus = null;
         out.turnEndMessage = null;
       }
+      continue;
     }
+    if (status !== null) out.statuses.push(status);
     if (event.type === "error") {
       const message = event.message ?? event.error ?? event.text;
       if (typeof message === "string" && message) out.errors.push(message);
