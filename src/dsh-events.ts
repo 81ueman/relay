@@ -95,6 +95,49 @@ export function turnEndReason(event: DshEvent): string | null {
   return null;
 }
 
+/** A finite positive HTTP-like status carried by an arbitrary value, else null. */
+function httpStatus(value: unknown): number | null {
+  if (typeof value === "number" && Number.isInteger(value) && value >= 100 && value <= 599) return value;
+  if (typeof value === "string" && /^\d{3}$/.test(value.trim())) {
+    const n = Number(value.trim());
+    return n >= 100 && n <= 599 ? n : null;
+  }
+  return null;
+}
+
+/**
+ * ISH-1174: the provider HTTP status carried by a dsh event, else null.
+ *
+ * dsh surfaces a provider/transport failure as a `status` (usually
+ * `phase: "turn_end"`) or `error` event whose `reason.error` (or the event
+ * itself) carries `status` / `statusCode` / `httpStatus` (e.g. `500`, `429`).
+ * Only those EXPLICIT fields are read here: a bare number inside a message is
+ * not a status and is classified from the message text separately.
+ */
+export function dshProviderStatus(event: DshEvent): number | null {
+  const direct = [event.status, event.statusCode, event.httpStatus];
+  for (const v of direct) {
+    const n = httpStatus(v);
+    if (n !== null) return n;
+  }
+  const nested: unknown[] = [event.error, event.reason];
+  for (const box of nested) {
+    if (!isRecord(box)) continue;
+    for (const v of [box.status, box.statusCode, box.httpStatus, box.code]) {
+      const n = httpStatus(v);
+      if (n !== null) return n;
+    }
+    const err = box.error;
+    if (isRecord(err)) {
+      for (const v of [err.status, err.statusCode, err.httpStatus, err.code]) {
+        const n = httpStatus(v);
+        if (n !== null) return n;
+      }
+    }
+  }
+  return null;
+}
+
 function clip(s: string, max = 200): string {
   const one = s.replace(/\s+/g, " ").trim();
   return one.length > max ? `${one.slice(0, max)}…` : one;

@@ -18,7 +18,7 @@ import {
   taskChecks,
 } from "../src/workflow";
 import { getTaskResult, insertTaskResult, RESULT_WRITE_ERROR } from "../src/results";
-import { acceptRunSubmission, DUPLICATE_WRITER, listRuns } from "../src/dsh-runner";
+import { acceptRunSubmission, DUPLICATE_WRITER, getRun, listRuns } from "../src/dsh-runner";
 import { PINNED_DSH_VERSION } from "../src/dsh-version";
 import { inheritFindings, launchTaskRun } from "../src/run-lifecycle";
 import { buildDashboardView } from "../src/dashboard/model";
@@ -169,6 +169,98 @@ echo "dsh: MISSING_CREDENTIAL: no API key for provider" >&2
 exit 1
 `;
 
+// ---------------------------------------------------------------------------
+// ISH-1174: transient provider/network recovery fixtures.
+// ---------------------------------------------------------------------------
+
+/** Record each run's argv (flags stay separate lines; the prompt is the rest). */
+const CAPTURE_ARGV = `printf 'RUN\\n' >> "$ARGS_FILE"
+printf '%s\\n' "$@" >> "$ARGS_FILE"
+lastarg=""
+for arg in "$@"; do lastarg="$arg"; done
+printf '%s' "$lastarg" > "$PROMPT_FILE"
+`;
+
+/**
+ * ISH-1174: the FIRST Run records a dsh Session id, fails with a provider 500
+ * and leaves unconverted work; the SAME-session resume (`--session-id`) commits
+ * and exits 0. The argv/prompt of both Runs are captured for assertions.
+ */
+const TRANSIENT_THEN_SESSION_RESUME_DSH = `${CAPTURE_ARGV}
+for arg in "$@"; do
+  if [ "$arg" = "--session-id" ]; then
+    echo '{"type":"session","sessionId":"session-ish1174-fixed","cwd":"."}'
+    echo "continued after the transient interruption" > resumed.txt
+    git add -A
+    git -c user.email=relay@test -c user.name=relay commit -qm "resume after transient failure"
+    echo '{"type":"final","text":"RESUMED_COMMIT_OK"}'
+    exit 0
+  fi
+done
+echo '{"type":"session","sessionId":"session-ish1174-fixed","cwd":"."}'
+echo '{"type":"final","text":"PARTIAL FINAL TEXT ISH1174"}'
+echo "dirty partial work" > partial-work.txt
+echo '{"type":"status","phase":"turn_end","turn":1,"reason":{"kind":"error","error":{"status":500,"message":"upstream provider 500"}}}'
+exit 1
+`;
+
+/**
+ * ISH-1174: the recorded Session cannot be adopted. The `--session-id` attempt
+ * is refused ("unknown session") and must fall back to a FRESH session in the
+ * SAME worktree whose prompt carries the previous final text/status/diff.
+ */
+const UNADOPTABLE_SESSION_DSH = `${CAPTURE_ARGV}
+for arg in "$@"; do
+  if [ "$arg" = "--session-id" ]; then
+    echo "dsh: unknown session: the persisted session is corrupt" >&2
+    exit 1
+  fi
+done
+if [ -f .relay/ish1174-first ]; then
+  echo '{"type":"session","sessionId":"session-ish1174-fresh","cwd":"."}'
+  git add -A
+  git -c user.email=relay@test -c user.name=relay commit -qm "fresh session recovered"
+  echo '{"type":"final","text":"FRESH_RESUME_OK"}'
+  exit 0
+fi
+mkdir -p .relay
+touch .relay/ish1174-first
+echo '{"type":"session","sessionId":"session-ish1174-broken","cwd":"."}'
+echo '{"type":"final","text":"PARTIAL FINAL TEXT ISH1174"}'
+echo "dirty partial work" > partial-work.txt
+git add partial-work.txt
+echo '{"type":"status","phase":"turn_end","turn":1,"reason":{"kind":"error","error":{"status":500,"message":"upstream provider 500"}}}'
+exit 1
+`;
+
+/** ISH-1174: a plain transient 500 failure that never commits. */
+const TRANSIENT_500_DSH = `${CAPTURE_ARGV}
+echo '{"type":"session","sessionId":"session-ish1174-stale","cwd":"."}'
+echo '{"type":"status","phase":"turn_end","turn":1,"reason":{"kind":"error","error":{"status":500,"message":"upstream provider 500"}}}'
+exit 1
+`;
+
+/** The argv/prompt captures one fake dsh body writes (see CAPTURE_ARGV). */
+function capturePaths(name: string): { argsFile: string; promptFile: string } {
+  return { argsFile: join(dir, `${name}-args.txt`), promptFile: join(dir, `${name}-prompt.txt`) };
+}
+
+/** Split the argv capture into one string[] per Run (`RUN` separator lines). */
+function capturedRuns(argsFile: string): string[][] {
+  if (!existsSync(argsFile)) return [];
+  const runs: string[][] = [];
+  let current: string[] | null = null;
+  for (const line of readFileSync(argsFile, "utf-8").split("\n")) {
+    if (line === "RUN") {
+      current = [];
+      runs.push(current);
+      continue;
+    }
+    if (current) current.push(line);
+  }
+  return runs;
+}
+
 type ReviewPlan =
   | "pass"
   | "fix"
@@ -179,6 +271,7 @@ type ReviewPlan =
   | "oldhead"
   | "envelope"
   | "exitfail"
+  | "transient-exitfail"
   | "signal"
   | "mutatehead";
 
@@ -235,6 +328,11 @@ function reviewerHarness(plan: ReviewPlan[]): ReviewerHarness {
           // A WELL-FORMED pass on stdout, but the reviewer process failed.
           stdout = JSON.stringify({ verdict: "pass", head, summary: "looks fine" });
           break;
+        case "transient-exitfail":
+          // ISH-1174: a well-formed pass on stdout, but the reviewer process
+          // died with a provider 500 (a transient infrastructure failure).
+          stdout = JSON.stringify({ verdict: "pass", head, summary: "looks fine" });
+          break;
         case "signal":
           stdout = JSON.stringify({ verdict: "pass", head, summary: "looks fine" });
           break;
@@ -250,6 +348,8 @@ function reviewerHarness(plan: ReviewPlan[]): ReviewerHarness {
           stdout = JSON.stringify({ verdict: "pass", head, summary: "looks correct" });
       }
       if (p === "exitfail") return { exitCode: 1, signal: null, stdout, stderr: "reviewer crashed" };
+      if (p === "transient-exitfail")
+        return { exitCode: 1, signal: null, stdout, stderr: "API Error: 500 Internal Server Error" };
       if (p === "signal") return { exitCode: null, signal: "SIGKILL", stdout, stderr: "" };
       return { exitCode: 0, signal: null, stdout, stderr: "" };
     },
@@ -1279,6 +1379,269 @@ describe("ISH-1012: bounded IMPLEMENT recovery (fresh Run only for repairable fa
 
 });
 
+describe("ISH-1174: transient provider/network recovery", () => {
+  test("a transient 5xx implement failure resumes with --session-id in the SAME worktree; attempt unchanged; factory.run_resumed emitted", async () => {
+    const caps = capturePaths("ish1174-session");
+    const dsh = fakeDsh("dsh-1174-session", TRANSIENT_THEN_SESSION_RESUME_DSH);
+    const id = newTask();
+    const rev = reviewerHarness(["pass"]);
+    let probes = 0;
+
+    const res = await runFactoryTask(db, id, {
+      ...factoryDeps(dsh, rev.spawner),
+      dshEnv: { ARGS_FILE: caps.argsFile, PROMPT_FILE: caps.promptFile },
+      // First probe fails (so the Factory really waits), the second is up.
+      probeProvider: async () => {
+        probes++;
+        return probes > 1;
+      },
+      transientWaitMs: 500,
+      transientBackoffMs: 1,
+    });
+
+    expect(res.outcome).toBe("merge_ready");
+    const task = getTask(db, id)!;
+    expect(task.attempt).toBe(0);
+    expect(res.attempts.map((a) => a.attempt)).toEqual([0]);
+
+    const runs = listRuns(db, { taskId: id });
+    expect(runs).toHaveLength(2);
+    const first = runs.find((r) => r.resume_count === 0)!;
+    const resumed = runs.find((r) => r.resume_count === 1)!;
+    expect(first).toBeTruthy();
+    expect(first.state).toBe("failed");
+    expect(first.session_id).toBe("session-ish1174-fixed");
+    expect(resumed).toBeTruthy();
+    // SAME Task/phase/attempt and SAME worktree; never a factory attempt.
+    expect(resumed.attempt).toBe(0);
+    expect(resumed.cwd).toBe(first.cwd);
+    expect(resumed.branch).toBe(first.branch);
+    expect(resumed.resumed_from_run_id).toBe(first.id);
+    expect(resumed.session_id).toBe("session-ish1174-fixed");
+    expect(task.attempt).toBe(0);
+
+    // The actual dsh argv proves the SAME session id was adopted.
+    const argv = capturedRuns(caps.argsFile);
+    expect(argv).toHaveLength(2);
+    expect(argv[0].includes("--session-id")).toBe(false);
+    const idx = argv[1].indexOf("--session-id");
+    expect(idx).toBeGreaterThanOrEqual(0);
+    expect(argv[1][idx + 1]).toBe("session-ish1174-fixed");
+    expect(readFileSync(caps.promptFile, "utf-8")).toContain("Continue the SAME task");
+    expect(readFileSync(caps.promptFile, "utf-8")).toContain("provider HTTP 500");
+
+    const resumedEvents = db
+      .query(`SELECT payload_json FROM events WHERE task_id = ? AND type = 'factory.run_resumed'`)
+      .all(id) as { payload_json: string }[];
+    expect(resumedEvents).toHaveLength(1);
+    const payload = JSON.parse(resumedEvents[0].payload_json) as Record<string, unknown>;
+    expect(payload.runId).toBe(resumed.id);
+    expect(payload.fromRunId).toBe(first.id);
+    expect(payload.sessionId).toBe("session-ish1174-fixed");
+    expect(payload.attempt).toBe(0);
+    expect(payload.resumeCount).toBe(1);
+    expect(payload.mode).toBe("session");
+    expect(String(payload.cause)).toContain("500");
+    expect(res.steps.join("\n")).toContain("implement:resume@0 #1");
+    expect(res.steps.join("\n")).toContain("implement:resumed-submitted@0");
+    const waiting = db
+      .query(`SELECT payload_json FROM events WHERE task_id = ? AND type = 'factory.waiting_transient'`)
+      .all(id) as { payload_json: string }[];
+    expect(waiting).toHaveLength(1);
+    const waited = JSON.parse(waiting[0].payload_json) as Record<string, unknown>;
+    expect(waited.phase).toBe("implement");
+    expect(waited.attempt).toBe(0);
+    expect(waited.resumeCount).toBe(1);
+    expect(String(waited.cause)).toContain("500");
+  });
+
+  test("an unadoptable session falls back to a FRESH session in the same worktree, carrying the previous final text/status/diff", async () => {
+    const caps = capturePaths("ish1174-fresh");
+    const dsh = fakeDsh("dsh-1174-fresh", UNADOPTABLE_SESSION_DSH);
+    const id = newTask();
+    const rev = reviewerHarness(["pass"]);
+
+    const res = await runFactoryTask(db, id, {
+      ...factoryDeps(dsh, rev.spawner),
+      dshEnv: { ARGS_FILE: caps.argsFile, PROMPT_FILE: caps.promptFile },
+      probeProvider: async () => true,
+      transientWaitMs: 500,
+      transientBackoffMs: 1,
+    });
+
+    expect(res.outcome).toBe("merge_ready");
+    const runs = listRuns(db, { taskId: id });
+    expect(runs).toHaveLength(3);
+    expect(runs.every((r) => r.attempt === 0)).toBe(true);
+    const first = runs.find((r) => r.resume_count === 0)!;
+    const bad = runs.find((r) => r.resume_count === 1)!;
+    const fresh = runs.find((r) => r.resume_count === 2)!;
+    expect(first.state).toBe("failed");
+    expect(bad.state).toBe("failed");
+    expect(bad.resumed_from_run_id).toBe(first.id);
+    // A submitted resume is recorded terminal `submitted` (exited + accepted);
+    // either way it is the SAME attempt and the new head was submitted.
+    expect(["exited", "submitted"]).toContain(fresh.state);
+    expect(fresh.resumed_from_run_id).toBe(bad.id);
+    expect(fresh.cwd).toBe(first.cwd);
+    expect(getTask(db, id)!.attempt).toBe(0);
+
+    // The failed adoption was attempted, then the fallback run was NOT.
+    const argv = capturedRuns(caps.argsFile);
+    expect(argv).toHaveLength(3);
+    expect(argv[1].includes("--session-id")).toBe(true);
+    expect(argv[2].includes("--session-id")).toBe(false);
+
+    // The fresh brief carries the previous Run's final text + git status + diff.
+    const brief = readFileSync(caps.promptFile, "utf-8");
+    expect(brief).toContain("## Previous Run — resume context");
+    expect(brief).toContain("could not be continued in its");
+    expect(brief).toContain("PARTIAL FINAL TEXT ISH1174");
+    expect(brief).toContain("git status --short");
+    expect(brief).toContain("partial-work.txt");
+    expect(brief).toContain("Diff summary (uncommitted)");
+    expect(brief).toMatch(/partial-work\.txt\s*\|\s*1 \+/);
+
+    const resumedEvents = db
+      .query(`SELECT payload_json FROM events WHERE task_id = ? AND type = 'factory.run_resumed' ORDER BY id`)
+      .all(id) as { payload_json: string }[];
+    expect(resumedEvents).toHaveLength(2);
+    const modes = resumedEvents.map((e) => (JSON.parse(e.payload_json) as Record<string, unknown>).mode);
+    expect(modes).toEqual(["session", "fresh"]);
+  });
+
+  test("the resume cap (default 3) bounds the loop and falls back to today's stop", async () => {
+    const caps = capturePaths("ish1174-cap");
+    const dsh = fakeDsh("dsh-1174-cap", TRANSIENT_500_DSH);
+    const id = newTask();
+    const rev = reviewerHarness(["pass"]);
+
+    const res = await runFactoryTask(db, id, {
+      ...factoryDeps(dsh, rev.spawner),
+      dshEnv: { ARGS_FILE: caps.argsFile, PROMPT_FILE: caps.promptFile },
+      probeProvider: async () => true,
+      maxResumes: 2,
+      transientWaitMs: 500,
+      transientBackoffMs: 1,
+    });
+
+    expect(res.outcome).not.toBe("merge_ready");
+    expect(getTask(db, id)!.attempt).toBe(0);
+    const runs = listRuns(db, { taskId: id });
+    expect(runs).toHaveLength(3); // original + 2 resumes, never a 4th
+    expect(runs.map((r) => r.resume_count).sort((a, b) => a - b)).toEqual([0, 1, 2]);
+    expect(capturedRuns(caps.argsFile)).toHaveLength(3);
+    expect(res.steps.join("\n")).toContain("implement:resume-cap@0 (2/2)");
+    expect(res.reason).toContain("IMPLEMENT_RECOVERY/UNKNOWN_CAUSE");
+    const count = db
+      .query(`SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'factory.run_resumed'`)
+      .get(id) as { n: number };
+    expect(count.n).toBe(2);
+  });
+
+  test("a transient REVIEW_PROCESS_FAILED is re-run at the SAME head without operator action", async () => {
+    const dsh = fakeDsh("dsh-1174-review", COMMITTING_DSH);
+    const id = newTask();
+    const rev = reviewerHarness(["transient-exitfail", "pass"]);
+    let probes = 0;
+
+    const res = await runFactoryTask(db, id, {
+      ...factoryDeps(dsh, rev.spawner),
+      // First probe fails so the wait event is actually emitted; the second is
+      // reachable and the review is re-run at the same head.
+      probeProvider: async () => {
+        probes++;
+        return probes > 1;
+      },
+      transientWaitMs: 500,
+      transientBackoffMs: 1,
+    });
+
+    expect(res.outcome).toBe("merge_ready");
+    expect(rev.calls).toHaveLength(2);
+    expect(rev.calls[0].head).toBe(rev.calls[1].head);
+    const task = getTask(db, id)!;
+    expect(task.head_sha).toBe(rev.calls[0].head);
+
+    const resumed = db
+      .query(`SELECT payload_json FROM events WHERE task_id = ? AND type = 'factory.review_resumed'`)
+      .all(id) as { payload_json: string }[];
+    expect(resumed).toHaveLength(1);
+    const payload = JSON.parse(resumed[0].payload_json) as Record<string, unknown>;
+    expect(payload.head).toBe(rev.calls[0].head);
+    expect(payload.attempt).toBe(task.attempt);
+    expect(payload.resumeCount).toBe(1);
+    expect(String(payload.cause)).toContain("provider HTTP");
+    const waiting = db
+      .query(`SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'factory.waiting_transient'`)
+      .get(id) as { n: number };
+    expect(waiting.n).toBe(1);
+    expect(res.steps.join("\n")).toContain("review:waiting-transient@");
+    expect(res.steps.join("\n")).toContain("review:resume@");
+  });
+
+  test("an explicit cancel during the transient wait is never resumed", async () => {
+    const caps = capturePaths("ish1174-cancel");
+    const dsh = fakeDsh("dsh-1174-cancel", TRANSIENT_500_DSH);
+    const id = newTask();
+    const rev = reviewerHarness(["pass"]);
+
+    const res = await runFactoryTask(db, id, {
+      ...factoryDeps(dsh, rev.spawner),
+      dshEnv: { ARGS_FILE: caps.argsFile, PROMPT_FILE: caps.promptFile },
+      probeProvider: async () => {
+        const live = getTask(db, id)!;
+        if (live.state !== "cancelled") cancelTask(db, id, "operator", "explicit stop during the outage");
+        return true;
+      },
+      transientWaitMs: 500,
+      transientBackoffMs: 1,
+    });
+
+    expect(res.outcome).toBe("terminal");
+    expect(getTask(db, id)!.state).toBe("cancelled");
+    expect(listRuns(db, { taskId: id })).toHaveLength(1);
+    expect(capturedRuns(caps.argsFile)).toHaveLength(1);
+    const count = db
+      .query(`SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'factory.run_resumed'`)
+      .get(id) as { n: number };
+    expect(count.n).toBe(0);
+  });
+
+  test("the stale-head fence refuses a resume after another writer moved the worktree HEAD", async () => {
+    const caps = capturePaths("ish1174-stale");
+    const dsh = fakeDsh("dsh-1174-stale", TRANSIENT_500_DSH);
+    const id = newTask();
+    const rev = reviewerHarness(["pass"]);
+
+    const res = await runFactoryTask(db, id, {
+      ...factoryDeps(dsh, rev.spawner),
+      dshEnv: { ARGS_FILE: caps.argsFile, PROMPT_FILE: caps.promptFile },
+      probeProvider: async () => true,
+      transientWaitMs: 500,
+      transientBackoffMs: 1,
+      beforeResume: ({ fromRunId }) => {
+        const failed = getRun(db, fromRunId)!;
+        writeFileSync(join(failed.cwd!, "foreign.txt"), "another writer\n");
+        git(failed.cwd!, "add", "foreign.txt");
+        git(failed.cwd!, "commit", "-q", "-m", "another writer moved the head");
+      },
+    });
+
+    expect(res.outcome).not.toBe("merge_ready");
+    expect(getTask(db, id)!.attempt).toBe(0);
+    expect(listRuns(db, { taskId: id })).toHaveLength(1); // NO second writer
+    expect(capturedRuns(caps.argsFile)).toHaveLength(1);
+    expect(res.steps.join("\n")).toContain("implement:resume-refused@0 STALE_HEAD");
+    expect(res.reason).toContain("STALE_HEAD");
+    expect(res.reason).toContain("worktree HEAD");
+    const count = db
+      .query(`SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'factory.run_resumed'`)
+      .get(id) as { n: number };
+    expect(count.n).toBe(0);
+  });
+});
+
 describe("ISH-904: factory defects (phase-null, worker state, merge_ready rework, result writes)", () => {
   test("a plain `relay task add` task is refused UP FRONT with the re-intake instruction and NO worktree", async () => {
     const rev = reviewerHarness(["pass"]);
@@ -1696,7 +2059,7 @@ describe("PR #10 finding 4: an orphaned running Run never hangs the factory", ()
     expect(getTask(db, id)!.phase).toBe("implement");
   });
 
-  test("an EXPIRED but still-live orphan is KILLED before the fence is released", async () => {
+  test.skipIf(!PROCESS_IDENTITY_AVAILABLE)("an EXPIRED but still-live orphan is KILLED before the fence is released", async () => {
     const dsh = fakeDsh("dsh-commit", COMMITTING_DSH);
     const id = newTask();
     const launched = await launchTaskRun(db, id, { repo, worktreesRoot: join(dir, "worktrees"), outputRoot: join(dir, "runs"), dshBin: dsh, fastExitMs: 0 });
@@ -1723,7 +2086,7 @@ describe("PR #10 finding 4: an orphaned running Run never hangs the factory", ()
     await next.handle.wait();
   });
 
-  test("an orphan that CANNOT be killed leaves the Run running (DUPLICATE_WRITER keeps fencing)", async () => {
+  test.skipIf(!PROCESS_IDENTITY_AVAILABLE)("an orphan that CANNOT be killed leaves the Run running (DUPLICATE_WRITER keeps fencing)", async () => {
     const dsh = fakeDsh("dsh-commit", COMMITTING_DSH);
     const id = newTask();
     const launched = await launchTaskRun(db, id, { repo, worktreesRoot: join(dir, "worktrees"), outputRoot: join(dir, "runs"), dshBin: dsh, fastExitMs: 0 });
@@ -1757,7 +2120,7 @@ describe("PR #10 finding 4: an orphaned running Run never hangs the factory", ()
 
   // Round-3 finding: the orphan-kill path must NEVER signal a PID that is not
   // provably the Run's dsh. A reused PID (an unrelated host process) must survive.
-  test("a reused PID (unrelated NON-leader process) is NEVER signalled", async () => {
+  test.skipIf(!PROCESS_IDENTITY_AVAILABLE)("a reused PID (unrelated NON-leader process) is NEVER signalled", async () => {
     const dsh = fakeDsh("dsh-commit", COMMITTING_DSH);
     const id = newTask();
     const launched = await launchTaskRun(db, id, { repo, worktreesRoot: join(dir, "worktrees"), outputRoot: join(dir, "runs"), dshBin: dsh, fastExitMs: 0 });
@@ -1781,7 +2144,7 @@ describe("PR #10 finding 4: an orphaned running Run never hangs the factory", ()
     try { victim.kill("SIGKILL"); } catch { /* done */ }
   });
 
-  test("a group leader with a DIFFERENT spawn start time (reused PID) is NEVER signalled", async () => {
+  test.skipIf(!PROCESS_IDENTITY_AVAILABLE)("a group leader with a DIFFERENT spawn start time (reused PID) is NEVER signalled", async () => {
     const dsh = fakeDsh("dsh-commit", COMMITTING_DSH);
     const id = newTask();
     const launched = await launchTaskRun(db, id, { repo, worktreesRoot: join(dir, "worktrees"), outputRoot: join(dir, "runs"), dshBin: dsh, fastExitMs: 0 });
@@ -1833,8 +2196,16 @@ describe("PR #10 finding 5: an all-optional check list is not a gate", () => {
 // PR #10 round-4 findings.
 // ---------------------------------------------------------------------------
 
+/**
+ * The spawn-identity tests need `ps -o lstart=/pgid=`. Some sandboxes (the DSH
+ * workspace sandbox denies /bin/ps) cannot provide it; production is
+ * fail-closed (`identifyRunProcess` -> "undeterminable"), so skip ONLY these
+ * platform probes instead of asserting a host capability that is unavailable.
+ */
+const PROCESS_IDENTITY_AVAILABLE = spawnIdentityToken(process.pid) !== null;
+
 describe("PR #10 finding 1: the spawn token is canonical (env-independent)", () => {
-  test("spawnIdentityToken is identical across caller LC_ALL/TZ", () => {
+  test.skipIf(!PROCESS_IDENTITY_AVAILABLE)("spawnIdentityToken is identical across caller LC_ALL/TZ", () => {
     const before = spawnIdentityToken(process.pid);
     const saved = { LC_ALL: process.env.LC_ALL, LANG: process.env.LANG, TZ: process.env.TZ };
     try {
@@ -1852,7 +2223,7 @@ describe("PR #10 finding 1: the spawn token is canonical (env-independent)", () 
     }
   });
 
-  test("a genuine orphan stored under one LC_ALL/TZ is still MATCHED after a restart under another", async () => {
+  test.skipIf(!PROCESS_IDENTITY_AVAILABLE)("a genuine orphan stored under one LC_ALL/TZ is still MATCHED after a restart under another", async () => {
     const dsh = fakeDsh("dsh-commit", COMMITTING_DSH);
     const id = newTask();
     const launched = await launchTaskRun(db, id, { repo, worktreesRoot: join(dir, "worktrees"), outputRoot: join(dir, "runs"), dshBin: dsh, fastExitMs: 0 });

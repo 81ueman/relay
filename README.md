@@ -459,6 +459,33 @@ PR head before review (a Task that records only a branch included), and
 `relay run factory` requires the ISH-883 native review at that head. No PR →
 `blocked`, never `merge_ready`; the merge gate reports the bound PR
 (`pr=owner/name#n@sha`). A merge with no bound PR is never credited by Relay.
+**ISH-1174 — transient provider/network recovery.** A short outage no longer
+ends a factory lane. A dsh Run failure is `transient` from the evidence the Run
+ALREADY recorded: a provider HTTP 5xx or 429 (structured `status`/`statusCode` in
+the dsh JSONL), a connection/network error (`ECONNRESET`/`ECONNREFUSED`/timeouts/
+DNS/socket), or a `turn_end reason=error` carrying a provider/transport error.
+Auth, permission, ENOSPC/other resource exhaustion and genuinely unknown causes
+stay fail-closed exactly as before. On a transient failure the Factory probes
+provider reachability with backoff — 30 s doubling to 5 min, **total cap 60
+min** — writing `factory.waiting_transient` events while it waits, then continues
+the SAME worktree and dsh Session with `--session-id <failed sessionId>` and a
+short continue prompt naming the interruption cause. A resume **does not consume
+a factory attempt**; the cap is **3 resumes per attempt** (default), and each
+launch emits `factory.run_resumed` (new run id, from run, session id, cause,
+resume count). If the persisted Session cannot be adopted (unknown/corrupt, or
+no id was recorded), the Factory starts a **fresh session in the same worktree**
+whose brief carries the previous Run's final text, `git status` and a diff
+summary. A transient `REVIEW_PROCESS_FAILED` is re-run at the SAME head under the
+same cap (`factory.review_resumed`) with no operator action. Before every resume
+the existing stale-head fence re-checks the worktree branch/HEAD (and the Task
+head): another writer's move refuses the resume and the Factory stops as today,
+and an explicit cancel/timeout is never resumed. Caps/flags: `--max-resumes N`
+(default 3), `--transient-wait DUR` (default 60m), `--transient-backoff DUR`
+(default 30s); env `RELAY_TRANSIENT_MAX_RESUMES`, `RELAY_TRANSIENT_WAIT_MS`,
+`RELAY_TRANSIENT_BACKOFF_MS`, `RELAY_TRANSIENT_MAX_BACKOFF_MS`,
+`RELAY_PROVIDER_PROBE_URL` (see `src/transient-failure.ts`,
+`src/transient-recovery.ts`, and the classifier/resume tests in
+`tests/transient-failure.test.ts` and `tests/factory.test.ts`).
 A non-ready result (`max_attempts`, `review_refused`, `blocked`, …) also carries
 the **ISH-1013 failure projection**: a minimal class (code rework exhausted /
 infra blocked / permission-or-human decision / missing-or-inconclusive evidence /

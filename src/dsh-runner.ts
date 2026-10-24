@@ -34,6 +34,7 @@ import {
   type DshEventCounts,
   parseDshLine,
   turnEndReason,
+  dshProviderStatus,
 } from "./dsh-events";
 
 /**
@@ -181,6 +182,22 @@ export interface StartRunOptions {
   fastExitMs?: number;
   /** Extra env for the child (merged over a small allowlist, never all of process.env). */
   env?: Record<string, string>;
+  /**
+   * ISH-1174: continue a persisted dsh Session instead of starting a new one.
+   * Passed verbatim as `--session-id <id>` BEFORE the prompt. The Session is
+   * per-worktree under `~/.dsh/sessions/<cwd-slug>/`; adopting it keeps the
+   * interrupted turn's context and uncommitted work in the SAME worktree.
+   */
+  resumeSessionId?: string | null;
+  /**
+   * ISH-1174: the prior Run this Run continues after a TRANSIENT failure. Stored
+   * on the Run row so the per-attempt resume cap survives a Factory restart.
+   */
+  resumedFromRunId?: string | null;
+  /** ISH-1174: 1-based resume ordinal within the Task/phase/attempt (0 = first). */
+  resumeCount?: number;
+  /** ISH-1174: the concrete interruption cause (recorded in the Run evidence). */
+  resumeCause?: string | null;
   /** ISH-1009: disk-space guard override (test/operator seam). */
   diskGuard?: DiskGuardOptions;
   /**
@@ -287,6 +304,10 @@ interface InsertRunInput {
   eventsPath: string;
   /** ISH-810: the per-Run path of the ORIGINAL dsh `--json` JSONL evidence. */
   dshEventsPath: string;
+  /** ISH-1174: the prior Run continued by this one (null = the original Run). */
+  resumedFromRunId: string | null;
+  /** ISH-1174: 1-based transient-resume ordinal within the attempt (0 = first). */
+  resumeCount: number;
 }
 
 function insertRun(db: Database, r: InsertRunInput): Run {
@@ -301,8 +322,9 @@ function insertRun(db: Database, r: InsertRunInput): Run {
     `INSERT INTO runs
        (id, task_id, phase, attempt, generation, cwd, branch, head_sha, base_head_sha, prompt,
         spec_path, output_dir, state, stdout_path, stderr_path, events_path, dsh_events_path,
-        launcher_pid, launcher_lstart, fast_exit, started_at, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, 'starting', ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`
+        resumed_from_run_id, resume_count, launcher_pid, launcher_lstart, fast_exit, started_at,
+        created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, 'starting', ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`
   ).run(
     r.id,
     r.taskId,
@@ -319,6 +341,8 @@ function insertRun(db: Database, r: InsertRunInput): Run {
     r.stderrPath,
     r.eventsPath,
     r.dshEventsPath,
+    r.resumedFromRunId,
+    r.resumeCount,
     launcher.launcher_pid,
     launcher.launcher_lstart,
     t,
@@ -558,8 +582,11 @@ export async function startDshRun(db: Database, opts: StartRunOptions): Promise<
     stderrPath,
     eventsPath,
     dshEventsPath,
+    resumedFromRunId: opts.resumedFromRunId ?? null,
+    resumeCount: opts.resumeCount ?? 0,
   });
 
+  const resumeSessionId = opts.resumeSessionId ?? null;
   events({
     t: "run.started",
     runId,
@@ -572,6 +599,15 @@ export async function startDshRun(db: Database, opts: StartRunOptions): Promise<
     permissionMode,
     dshBin,
     dshBinSource: dshChoice.source,
+    ...(opts.resumedFromRunId
+      ? {
+          resumedFromRunId: opts.resumedFromRunId,
+          resumeCount: opts.resumeCount ?? 0,
+          resumeSessionId,
+          resumeCause: opts.resumeCause ?? null,
+          resumeMode: resumeSessionId ? "session" : "fresh",
+        }
+      : {}),
   });
   logEvent(db, {
     source: "dsh-runner",
@@ -587,10 +623,29 @@ export async function startDshRun(db: Database, opts: StartRunOptions): Promise<
       permissionMode,
       dshBin,
       dshBinSource: dshChoice.source,
+      ...(opts.resumedFromRunId
+        ? {
+            resumedFromRunId: opts.resumedFromRunId,
+            resumeCount: opts.resumeCount ?? 0,
+            resumeSessionId,
+            resumeCause: opts.resumeCause ?? null,
+            resumeMode: resumeSessionId ? "session" : "fresh",
+          }
+        : {}),
     },
   });
 
-  const argv = [dshBin, "--profile", "headless", "--json", prompt];
+  // ISH-1174: a resume MUST adopt the persisted Session explicitly. Without
+  // `--session-id` dsh would start a fresh Session and silently discard the
+  // interrupted turn's context, so the flag is part of the argv (never env).
+  const argv = [
+    dshBin,
+    "--profile",
+    "headless",
+    "--json",
+    ...(resumeSessionId ? ["--session-id", resumeSessionId] : []),
+    prompt,
+  ];
   const env: Record<string, string> = {
     ...childEnv(process.env, opts.env),
     DSH_PERMISSION_MODE: permissionMode,
@@ -624,6 +679,8 @@ export async function startDshRun(db: Database, opts: StartRunOptions): Promise<
   let terminal: "final" | "error" | null = null;
   let terminalError: string | null = null;
   let turnReason: string | null = null;
+  /** ISH-1174: the last provider HTTP status carried by a dsh event, if any. */
+  let providerStatus: number | null = null;
 
   const onStdout = (line: string): void => {
     appendFileSync(stdoutPath, `${line}\n`);
@@ -638,6 +695,8 @@ export async function startDshRun(db: Database, opts: StartRunOptions): Promise<
       if (sid && !sessionId) sessionId = sid;
       const reason = turnEndReason(ev);
       if (reason) turnReason = reason;
+      const status = dshProviderStatus(ev);
+      if (status !== null) providerStatus = status;
       if (ev.type === "final") terminal = "final";
       if (ev.type === "error") {
         terminal = "error";
@@ -717,6 +776,7 @@ export async function startDshRun(db: Database, opts: StartRunOptions): Promise<
       baseHead: run.base_head_sha,
       producedHead,
       dsh: counts,
+      dshStatus: providerStatus,
       terminal,
       turnReason,
     });
@@ -751,6 +811,7 @@ export async function startDshRun(db: Database, opts: StartRunOptions): Promise<
         baseHead: run.base_head_sha,
         producedHead,
         dsh: counts,
+        dshStatus: providerStatus,
         terminal,
         turnReason,
       },
