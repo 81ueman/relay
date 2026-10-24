@@ -108,32 +108,42 @@ function httpStatus(value: unknown): number | null {
 /**
  * ISH-1174: the provider HTTP status carried by a dsh event, else null.
  *
- * dsh surfaces a provider/transport failure as a `status` (usually
- * `phase: "turn_end"`) or `error` event whose `reason.error` (or the event
- * itself) carries `status` / `statusCode` / `httpStatus` (e.g. `500`, `429`).
- * Only those EXPLICIT fields are read here: a bare number inside a message is
- * not a status and is classified from the message text separately.
+ * Only a FAILED terminal turn is evidence of a provider status: a `status`
+ * event with `phase: "turn_end"` and `reason.kind === "error"` (its
+ * `reason.error.status`/`statusCode`/`httpStatus`/numeric `code`), or an
+ * `error` event. A `tool_result.status` is a tool outcome and is ignored, and
+ * this NEVER reads the terminal `dsh.run.*` event's `dsh.status`, which is a
+ * COUNT of status events.
  */
 export function dshProviderStatus(event: DshEvent): number | null {
-  const direct = [event.status, event.statusCode, event.httpStatus];
-  for (const v of direct) {
-    const n = httpStatus(v);
-    if (n !== null) return n;
-  }
-  const nested: unknown[] = [event.error, event.reason];
-  for (const box of nested) {
-    if (!isRecord(box)) continue;
-    for (const v of [box.status, box.statusCode, box.httpStatus, box.code]) {
+  if (event.type === "status") {
+    if (event.phase !== "turn_end" || !isRecord(event.reason) || event.reason.kind !== "error") return null;
+    const reason = event.reason;
+    const direct = [reason.status, reason.statusCode, reason.httpStatus];
+    for (const v of direct) {
       const n = httpStatus(v);
       if (n !== null) return n;
     }
-    const err = box.error;
-    if (isRecord(err)) {
-      for (const v of [err.status, err.statusCode, err.httpStatus, err.code]) {
-        const n = httpStatus(v);
-        if (n !== null) return n;
+    if (!isRecord(reason.error)) return null;
+    return statusFromErrorBox(reason.error);
+  }
+  if (event.type === "error") {
+    if (event.error !== undefined) {
+      if (isRecord(event.error)) {
+        const nested = statusFromErrorBox(event.error);
+        if (nested !== null) return nested;
       }
     }
+    return statusFromErrorBox(event);
+  }
+  return null;
+}
+
+/** Explicit provider status fields of an error box (never a bare message number). */
+function statusFromErrorBox(box: Record<string, unknown>): number | null {
+  for (const v of [box.status, box.statusCode, box.httpStatus, box.code]) {
+    const n = httpStatus(v);
+    if (n !== null) return n;
   }
   return null;
 }

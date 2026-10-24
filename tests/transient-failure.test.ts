@@ -160,23 +160,93 @@ describe("ISH-1174: the transient failure class is evidence-derived", () => {
     ).toBe(false);
   });
 
-  test("the durable dsh.run.failed event's dsh.status is part of the evidence", () => {
+  test("the REAL 2026-10-24 outage evidence (turn_end TIMEOUT + `dsh: TIMEOUT:`) is transient", () => {
+    // Verbatim shapes from run-9de64bd1/run-baf6bcd8/run-168e8c81.
+    const run = runWith(
+      [
+        SESSION,
+        { type: "status", phase: "turn_end", turn: 1, reason: { kind: "error", error: { message: "Request timed out.", code: "TIMEOUT" } } },
+        { type: "final", text: "…" },
+      ],
+      { stderr: "dsh: TIMEOUT: Request timed out.\n" }
+    );
+    const res = classifyTransientRunFailure({ run, error: "CODING_FAILED: exit 1" });
+    expect(res.transient).toBe(true);
+    expect(res.cause).toBe("provider_transport");
+    expect(res.detail).toContain("TIMEOUT");
+    expect(res.evidence.join("\n")).toContain("code=TIMEOUT");
+  });
+
+  test("dsh provider-neutral codes TIMEOUT/TRANSPORT/SERVER/RATE_LIMIT are transient; AUTH/ENOSPC/unknown are not", () => {
+    const verdict = (code: string) =>
+      classifyTransientRunFailure({
+        run: runWith(
+          [
+            SESSION,
+            { type: "status", phase: "turn_end", turn: 1, reason: { kind: "error", error: { message: `failure ${code}`, code } } },
+          ],
+          { stderr: `dsh: ${code}: failure ${code}\n` }
+        ),
+        error: "CODING_FAILED: exit 1",
+      });
+    expect(verdict("TIMEOUT").transient).toBe(true);
+    expect(verdict("TIMEOUT").cause).toBe("provider_transport");
+    expect(verdict("TRANSPORT").transient).toBe(true);
+    expect(verdict("TRANSPORT").cause).toBe("provider_transport");
+    expect(verdict("SERVER").transient).toBe(true);
+    expect(verdict("SERVER").cause).toBe("provider_http_5xx");
+    expect(verdict("RATE_LIMIT").transient).toBe(true);
+    expect(verdict("RATE_LIMIT").cause).toBe("provider_http_429");
+    expect(verdict("ECONNRESET").transient).toBe(true);
+    expect(verdict("AUTH").transient).toBe(false);
+    expect(verdict("AUTH").veto).toBe("auth");
+    expect(verdict("ENOSPC").transient).toBe(false);
+    expect(verdict("ENOSPC").veto).toBe("enospc");
+    expect(verdict("INVALID_REQUEST").transient).toBe(false);
+    expect(verdict("PI_AI_ERROR").transient).toBe(false);
+  });
+
+  test("REGRESSION: a long Run (500+ status events) with a non-transient error is NOT an HTTP 5xx", () => {
+    const lines: Record<string, unknown>[] = [SESSION];
+    for (let i = 0; i < 500; i++) lines.push({ type: "status", phase: "step", turn: 1, step: i });
+    lines.push({
+      type: "status",
+      phase: "turn_end",
+      turn: 1,
+      reason: { kind: "error", error: { message: "invalid tool schema", code: "INVALID_REQUEST" } },
+    });
+    const run = runWith(lines, { stderr: "dsh: INVALID_REQUEST: invalid tool schema\n" });
+    // The JSONL really carries 500+ status events…
+    const ev = readRunProviderEvidence(run.dsh_events_path);
+    expect(ev.statuses).toEqual([]);
+    expect(ev.turnEndCode).toBe("INVALID_REQUEST");
+    // …and the terminal `dsh.run.failed` event's `dsh.status` is that COUNT
+    // (500), not an HTTP status. It must NOT make a genuine coding failure look
+    // like a provider outage.
     const db = openDb(join(tmp(), "state.db"));
     try {
       logEvent(db, {
         source: "dsh-runner",
         taskId: "T1",
         type: "dsh.run.failed",
-        payload: { runId: "run-1", error: "exit 1", dsh: { status: 500, total: 3 } },
+        payload: { runId: "run-1", error: "exit 1", dsh: { status: 500, total: 502, text: 0 } },
       });
-      const run = runWith(null, { id: "run-1", state: "failed", error: null });
-      const res = classifyTransientRunFailure({ run, error: "CODING_FAILED: exit 1", db });
-      expect(res.transient).toBe(true);
-      expect(res.cause).toBe("provider_http_5xx");
-      expect(res.status).toBe(500);
     } finally {
       db.close();
     }
+    const res = classifyTransientRunFailure({ run, error: "CODING_FAILED: exit 1" });
+    expect(res.transient).toBe(false);
+    expect(res.cause).toBeNull();
+  });
+
+  test("REGRESSION: a real ECONNRESET is not vetoed by a 401-shaped status event count", () => {
+    const lines: Record<string, unknown>[] = [SESSION];
+    for (let i = 0; i < 401; i++) lines.push({ type: "status", phase: "step", turn: 1, step: i });
+    const run = runWith(lines, { stderr: "fetch failed: read ECONNRESET\n" });
+    const res = classifyTransientRunFailure({ run, error: "CODING_FAILED: exit 1" });
+    expect(res.transient).toBe(true);
+    expect(res.cause).toBe("provider_transport");
+    expect(res.veto).toBeUndefined();
   });
 
   test("readRunProviderEvidence reads structured statuses/codes from the dsh JSONL", () => {
@@ -188,11 +258,14 @@ describe("ISH-1174: the transient failure class is evidence-derived", () => {
         JSON.stringify(SESSION),
         JSON.stringify({ type: "status", phase: "turn_end", reason: { kind: "error", error: { status: 503, code: "OVERLOADED" } } }),
         JSON.stringify({ type: "error", statusCode: 429, message: "slow down" }),
+        // A successful tool_result status is NOT a provider status.
+        JSON.stringify({ type: "tool_result", status: "completed", result: "ok" }),
       ].join("\n") + "\n"
     );
     const ev = readRunProviderEvidence(path);
     expect(ev.turnEnd).toBe("error");
     expect(ev.turnEndCode).toBe("OVERLOADED");
+    expect(ev.turnEndStatus).toBe(503);
     expect(ev.statuses).toEqual([503, 429]);
   });
 });

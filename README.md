@@ -461,13 +461,18 @@ PR head before review (a Task that records only a branch included), and
 (`pr=owner/name#n@sha`). A merge with no bound PR is never credited by Relay.
 **ISH-1174 — transient provider/network recovery.** A short outage no longer
 ends a factory lane. A dsh Run failure is `transient` from the evidence the Run
-ALREADY recorded: a provider HTTP 5xx or 429 (structured `status`/`statusCode` in
-the dsh JSONL), a connection/network error (`ECONNRESET`/`ECONNREFUSED`/timeouts/
-DNS/socket), or a `turn_end reason=error` carrying a provider/transport error.
-Auth, permission, ENOSPC/other resource exhaustion and genuinely unknown causes
-stay fail-closed exactly as before. On a transient failure the Factory probes
-provider reachability with backoff — 30 s doubling to 5 min, **total cap 60
-min** — writing `factory.waiting_transient` events while it waits, then continues
+ALREADY recorded: a provider HTTP 5xx or 429 (a structured `status`/`statusCode`
+on the failed `turn_end`, or an `HTTP_<n>` code), a `turn_end reason=error` code
+such as `TIMEOUT`/`TRANSPORT`/`SERVER`/`RATE_LIMIT` (or a raw connection code
+such as `ECONNRESET`/`ECONNREFUSED`), the same code on the `dsh: <CODE>:`
+stderr line, or a connection/network error
+(`ECONNRESET`/`ECONNREFUSED`/timeouts/DNS/socket). The terminal `dsh.run.*`
+event's `dsh.status` is a COUNT of status events, so it is **never** read as an
+HTTP status. Auth, permission, ENOSPC/other resource exhaustion and genuinely
+unknown causes stay fail-closed exactly as before. On a transient failure the
+Factory probes provider reachability with backoff — 30 s doubling to 5 min,
+**total cap 60 min** — writing `factory.waiting_transient` events while it waits,
+then continues
 the SAME worktree and dsh Session with `--session-id <failed sessionId>` and a
 short continue prompt naming the interruption cause. A resume **does not consume
 a factory attempt**; the cap is **3 resumes per attempt** (default), and each

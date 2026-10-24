@@ -142,9 +142,13 @@ not an automatic retry.
 
 A short outage must not end the lane. `src/transient-failure.ts` classifies a
 terminal dsh Run from its EXISTING evidence (the Run row, its `dsh.jsonl` and
-stderr): a provider HTTP **5xx** or **429** (`status`/`statusCode`), a
-connection/network error (`ECONNRESET`, `ECONNREFUSED`, timeout, DNS, socket), or
-a `turn_end reason=error` with a provider/transport error is **transient**.
+stderr): a provider HTTP **5xx** or **429** (a structured `status`/`statusCode`
+on the failed `turn_end`, or a code such as `HTTP_500`), a `turn_end
+reason=error` code (`TIMEOUT`, `TRANSPORT`, `SERVER`, `RATE_LIMIT`, or a raw
+connection code such as `ECONNRESET`/`ECONNREFUSED`), the same `dsh: <CODE>:`
+line on stderr, or a connection/network error (timeout, DNS, socket) is
+**transient**. The terminal `dsh.run.*` event's `dsh.status` is the COUNT of
+status events — never an HTTP status — so it is not read by the classifier.
 Auth, permission, ENOSPC/other resource exhaustion, cancellation and genuinely
 unknown failures stay non-transient and keep the ISH-1012 policy above. The same
 evidence rule applies to a `REVIEW_PROCESS_FAILED` reviewer process.

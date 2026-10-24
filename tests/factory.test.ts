@@ -240,6 +240,24 @@ echo '{"type":"status","phase":"turn_end","turn":1,"reason":{"kind":"error","err
 exit 1
 `;
 
+/**
+ * ISH-1174 REGRESSION: 500+ status EVENTS with a genuine non-transient failure.
+ * The terminal `dsh.run.failed` event records `dsh.status: 500` as that COUNT;
+ * treating it as an HTTP 500 used to auto-resume a real coding failure.
+ */
+const LONG_NON_TRANSIENT_DSH = `${CAPTURE_ARGV}
+echo '{"type":"session","sessionId":"session-ish1174-long","cwd":"."}'
+i=0
+while [ "$i" -lt 500 ]; do
+  echo '{"type":"status","phase":"step","turn":1,"step":'"$i"'}'
+  i=$((i+1))
+done
+echo '{"type":"status","phase":"turn_end","turn":1,"reason":{"kind":"error","error":{"message":"invalid tool schema","code":"INVALID_REQUEST"}}}'
+echo '{"type":"final","text":"NOT A TRANSIENT FAILURE"}'
+echo "dsh: INVALID_REQUEST: invalid tool schema" >&2
+exit 1
+`;
+
 /** The argv/prompt captures one fake dsh body writes (see CAPTURE_ARGV). */
 function capturePaths(name: string): { argsFile: string; promptFile: string } {
   return { argsFile: join(dir, `${name}-args.txt`), promptFile: join(dir, `${name}-prompt.txt`) };
@@ -1537,6 +1555,39 @@ describe("ISH-1174: transient provider/network recovery", () => {
       .query(`SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'factory.run_resumed'`)
       .get(id) as { n: number };
     expect(count.n).toBe(2);
+  });
+
+  test("REGRESSION: a long Run (500 status events) with a genuine non-transient error is NOT auto-resumed", async () => {
+    const caps = capturePaths("ish1174-long");
+    const dsh = fakeDsh("dsh-1174-long", LONG_NON_TRANSIENT_DSH);
+    const id = newTask();
+    const rev = reviewerHarness(["pass"]);
+
+    const res = await runFactoryTask(db, id, {
+      ...factoryDeps(dsh, rev.spawner),
+      dshEnv: { ARGS_FILE: caps.argsFile, PROMPT_FILE: caps.promptFile },
+      probeProvider: async () => true,
+      transientWaitMs: 500,
+      transientBackoffMs: 1,
+    });
+
+    expect(res.outcome).not.toBe("merge_ready");
+    // The Run really recorded 500+ status events (the old false-5xx trigger).
+    const first = listRuns(db, { taskId: id })[0]!;
+    const dshEvents = readFileSync(first.dsh_events_path!, "utf-8")
+      .split("\n")
+      .filter(Boolean)
+      .map((l) => JSON.parse(l) as Record<string, unknown>);
+    expect(dshEvents.filter((e) => e.type === "status")).toHaveLength(501);
+    // No resume at all: no resumed Run, no factory.run_resumed event.
+    expect(listRuns(db, { taskId: id })).toHaveLength(1);
+    expect(listRuns(db, { taskId: id })[0]!.resumed_from_run_id).toBeNull();
+    const count = db
+      .query(`SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'factory.run_resumed'`)
+      .get(id) as { n: number };
+    expect(count.n).toBe(0);
+    // It falls back to today's stop, not the transient policy.
+    expect(res.reason).toContain("IMPLEMENT_RECOVERY/UNKNOWN_CAUSE");
   });
 
   test("a transient REVIEW_PROCESS_FAILED is re-run at the SAME head without operator action", async () => {

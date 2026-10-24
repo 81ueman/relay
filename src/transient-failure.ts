@@ -15,7 +15,6 @@
  * the fail-closed classification it has today.
  */
 
-import type { Database } from "bun:sqlite";
 import type { Run } from "./schema";
 import { dshProviderStatus, readDshEvents, turnEndReason } from "./dsh-events";
 import { readEvidenceTail } from "./implement-recovery";
@@ -76,6 +75,87 @@ const CONNECTION_MARKER =
 const PROVIDER_TRANSPORT_MARKER =
   /\bPROVIDER_(?:ERROR|FAILED|FAILURE|UNAVAILABLE|TIMEOUT|OVERLOADED)\b|\bprovider\b[^\n]{0,120}\b(?:error|failed|failure|unreachable|timeout|timed out|overloaded|unavailable)\b|\bupstream\b[^\n]{0,120}\b(?:error|failed|failure|unreachable|timeout|overloaded|unavailable)\b|\bstream (?:error|closed|reset|aborted)\b|\bAPI error\b|\bmodel (?:error|overloaded|unavailable)\b|\boverloaded_error\b|\bservice overloaded\b|\bprovider request failed\b|\brequest failed\b[^\n]{0,80}\b(?:provider|upstream|network|transport)\b/i;
 
+/**
+ * dsh's own provider-neutral failure codes (`LlmFailure.code`,
+ * packages/llm/llm/src/error.ts + retry-policy.ts) that mean the provider or
+ * the transport was unavailable. The `turn_end` event and the `dsh: <CODE>:`
+ * stderr line carry exactly these codes — never an HTTP status counter.
+ */
+const TRANSIENT_DSH_CODES = new Set([
+  "TIMEOUT",
+  "TRANSPORT",
+  "SERVER",
+  "RATE_LIMIT",
+  "OVERLOADED",
+  // Older/provider-specific spellings Relay has recorded.
+  "PROVIDER_ERROR",
+  "PROVIDER_FAILED",
+  "PROVIDER_FAILURE",
+  "PROVIDER_UNAVAILABLE",
+  "PROVIDER_TIMEOUT",
+  "PROVIDER_OVERLOADED",
+  // Raw transport errno codes, when dsh surfaces one as the failure code.
+  "ECONNRESET",
+  "ECONNREFUSED",
+  "ECONNABORTED",
+  "ETIMEDOUT",
+  "EPIPE",
+  "ENETUNREACH",
+  "ENETDOWN",
+  "EAI_AGAIN",
+]);
+
+/** Stable dsh codes that are permanent/local: auto-resuming would repeat them. */
+const NON_TRANSIENT_DSH_CODES: Record<string, NonNullable<TransientFailure["veto"]>> = {
+  AUTH: "auth",
+  MISSING_CREDENTIAL: "auth",
+  INVALID_CREDENTIAL: "auth",
+  FORBIDDEN: "auth",
+  PERMISSION: "permission",
+  EACCES: "permission",
+  EPERM: "permission",
+  ENOSPC: "enospc",
+  QUOTA: "enospc",
+  ACCOUNT_QUOTA: "enospc",
+  CONTEXT_WINDOW_EXCEEDED: "unknown",
+  INVALID_REQUEST: "unknown",
+  PI_AI_ERROR: "unknown",
+  UNKNOWN: "unknown",
+};
+
+/**
+ * The trailing HTTP status of a dsh code such as `HTTP_500` / `PROVIDER_HTTP_503`,
+ * or of a bare `"429"` string. Null when the code is not status-shaped.
+ */
+function statusFromCode(code: string | null): number | null {
+  if (!code) return null;
+  const c = code.trim().toUpperCase();
+  const m = /^(?:PROVIDER_)?HTTP[_-]?(\d{3})$/.exec(c);
+  if (m) {
+    const n = Number(m[1]);
+    return n >= 100 && n <= 599 ? n : null;
+  }
+  if (/^\d{3}$/.test(c)) {
+    const n = Number(c);
+    return n >= 100 && n <= 599 ? n : null;
+  }
+  return null;
+}
+
+/**
+ * The `dsh: <CODE>: <message>` stderr line dsh writes for a failed terminal
+ * turn (`packages/bundle/headless/src/index.ts`). A lowercase `dsh: warning:`
+ * or a path-like `dsh: profile …` never matches because the code must be an
+ * upper-case identifier immediately followed by a colon.
+ */
+function dshStderrCode(text: string): string | null {
+  for (const line of text.split("\n")) {
+    const m = /^\s*dsh:\s*([A-Z][A-Z0-9_]*)\s*:/.exec(line);
+    if (m) return m[1];
+  }
+  return null;
+}
+
 /** Evidence that a `--session-id` adoption was refused by dsh itself. */
 const SESSION_UNADOPTABLE_MARKER =
   /unknown session|no such session|unrecognized (?:option|argument|flag)s?[^\n]{0,80}--session-id|--session-id[^\n]{0,80}(?:unrecognized|unsupported|invalid|unknown)|session (?:id )?(?:is )?(?:not found|does not exist|invalid|corrupt|expired|unreadable|failed to load|failed to resume)|invalid session|cannot (?:resume|load|open|adopt) (?:the )?session|could not (?:find|load|open|resume)[^\n]{0,60}session|failed to (?:read|load|open|resume) (?:the )?session|\bsession\b[^\n]{0,80}\bENOENT\b/i;
@@ -96,6 +176,7 @@ export interface RunProviderEvidence {
   statuses: number[];
   turnEnd: string | null;
   turnEndCode: string | null;
+  turnEndStatus: number | null;
   turnEndMessage: string | null;
   errors: string[];
   finalText: string | null;
@@ -114,6 +195,7 @@ export function readRunProviderEvidence(path: string | null | undefined): RunPro
     statuses: [],
     turnEnd: null,
     turnEndCode: null,
+    turnEndStatus: null,
     turnEndMessage: null,
     errors: [],
     finalText: null,
@@ -126,9 +208,15 @@ export function readRunProviderEvidence(path: string | null | undefined): RunPro
     if (kind) out.turnEnd = kind;
     if (event.type === "status" && event.phase === "turn_end" && isRecord(event.reason)) {
       const error = event.reason.error;
-      if (isRecord(error)) {
+      if (event.reason.kind === "error" && isRecord(error)) {
         if (typeof error.code === "string" && error.code) out.turnEndCode = error.code;
         if (typeof error.message === "string" && error.message) out.turnEndMessage = error.message;
+        out.turnEndStatus = status ?? statusFromCode(out.turnEndCode);
+      } else {
+        // A completed/aborted turn never inherits the previous turn's failure.
+        out.turnEndCode = null;
+        out.turnEndStatus = null;
+        out.turnEndMessage = null;
       }
     }
     if (event.type === "error") {
@@ -145,19 +233,98 @@ export function readRunProviderEvidence(path: string | null | undefined): RunPro
 export interface TransientEvidenceInput {
   /** Bounded error/transport text (Factory error, Run error, stderr, turn error). */
   text: string;
-  /** Structured HTTP statuses from dsh events (if any). */
+  /** Structured provider statuses from dsh events (if any). NEVER event counts. */
   statuses?: readonly number[];
   /** The last dsh `turn_end` reason kind. */
   turnEnd?: string | null;
+  /** The last `turn_end reason=error` code (`TIMEOUT`, `SERVER`, `ECONNRESET`, …). */
+  turnEndCode?: string | null;
+  /** An explicit provider HTTP status on the `turn_end` error box, if any. */
+  turnEndStatus?: number | null;
+}
+
+/**
+ * Classify one dsh failure CODE (from `turn_end reason.error.code` or the
+ * `dsh: <CODE>:` stderr line). Returns null for a code Relay does not know, so
+ * the message/transport evidence can still decide. The structured code is
+ * authoritative when present: a `TIMEOUT` is never vetoed by an unrelated
+ * number in the message, and an `AUTH` code is never overridden by a transient
+ * marker.
+ */
+function classifyDshCode(code: string | null): TransientFailure | null {
+  if (!code) return null;
+  const c = code.trim().toUpperCase();
+  const status = statusFromCode(c);
+  if (status !== null) {
+    if (status === 401 || status === 403) {
+      return nonTransient({ veto: "auth", evidence: [`status=${status}`] });
+    }
+    if (status === 429) {
+      return {
+        transient: true,
+        cause: "provider_http_429",
+        status: 429,
+        detail: `provider HTTP ${status} (too many requests)`,
+        evidence: bounded([`status=${status}`]),
+      };
+    }
+    if (status >= 500 && status <= 599) {
+      return {
+        transient: true,
+        cause: "provider_http_5xx",
+        status,
+        detail: `provider HTTP ${status} (server error)`,
+        evidence: bounded([`status=${status}`]),
+      };
+    }
+    if (status === 408) {
+      return {
+        transient: true,
+        cause: "provider_transport",
+        status,
+        detail: `provider HTTP ${status} (request timeout)`,
+        evidence: bounded([`status=${status}`]),
+      };
+    }
+    if (status >= 400) {
+      return nonTransient({ veto: "unknown", evidence: [`status=${status}`] });
+    }
+  }
+  const veto = NON_TRANSIENT_DSH_CODES[c];
+  if (veto) return nonTransient({ veto, evidence: [`code=${c}`] });
+  if (TRANSIENT_DSH_CODES.has(c)) {
+    const cause: TransientCause =
+      c === "RATE_LIMIT"
+        ? "provider_http_429"
+        : c === "SERVER" || c === "OVERLOADED"
+          ? "provider_http_5xx"
+          : c.startsWith("PROVIDER_")
+            ? "turn_end_provider_error"
+            : "provider_transport";
+    return {
+      transient: true,
+      cause,
+      status: null,
+      detail: `dsh error code ${c}`,
+      evidence: bounded([`code=${c}`]),
+    };
+  }
+  return null;
 }
 
 /**
  * Classify one body of evidence. Pure: the SAME input always yields the SAME
  * class, so the Factory and its tests can reason about it without a process.
  *
- * The non-transient vetoes are checked FIRST: an authorization/permission/disk
- * failure is never auto-resumed even when the message also mentions a retryable
- * status (a 401 is permanent, a full disk is local).
+ * The terminal `turn_end reason=error` CODE and its explicit HTTP status are
+ * the strongest evidence and are consulted first. The non-transient text
+ * vetoes are checked next: an authorization/permission/disk failure is never
+ * auto-resumed even when the message also mentions a retryable status (a 401
+ * is permanent, a full disk is local).
+ *
+ * IMPORTANT: the `dsh` object Relay records on a terminal `dsh.run.*` event is
+ * a per-type EVENT-COUNT histogram (`status` = how many status events ran),
+ * not an HTTP status. It is deliberately NOT an input here.
  */
 export function classifyTransientEvidence(input: TransientEvidenceInput): TransientFailure {
   const text = input.text ?? "";
@@ -165,6 +332,17 @@ export function classifyTransientEvidence(input: TransientEvidenceInput): Transi
   const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
   const match = (re: RegExp): string | null => lines.find((l) => re.test(l)) ?? (re.test(text) ? text.trim().slice(0, 300) : null);
 
+  // 1. Structured terminal failure code/status (never an event count).
+  const code = input.turnEndCode?.trim() || dshStderrCode(text);
+  const codeVerdict = classifyDshCode(code);
+  if (codeVerdict) return codeVerdict;
+  const structuredStatus = input.turnEndStatus ?? statusFromCode(code);
+  if (structuredStatus !== null) {
+    const statusVerdict = classifyDshCode(String(structuredStatus));
+    if (statusVerdict) return statusVerdict;
+  }
+
+  // 2. Local/permanent text vetoes.
   if (statuses.some((s) => s === 401 || s === 403) || AUTH_MARKER.test(text)) {
     return nonTransient({ veto: "auth", evidence: bounded([match(AUTH_MARKER)]) });
   }
@@ -239,45 +417,13 @@ function bounded(lines: (string | null)[]): string[] {
 }
 
 /**
- * The provider statuses Relay already wrote into the Run's terminal `dsh.run.*`
- * event (the T294 evidence shape: `"dsh":{… "status":500 …}`). The per-Run JSONL
- * is the primary source, but the event is a durable second record after a
- * partial terminal write, so it is read too.
+ * The bounded Run fields this classifier reads (the existing evidence only).
+ *
+ * The terminal `dsh.run.*` event is deliberately NOT an input: its `dsh` object
+ * is a histogram of dsh EVENT COUNTS (`status` = number of status events), so a
+ * long Run with 500 status events would otherwise look like an HTTP 500. The
+ * per-Run JSONL is the only structured source.
  */
-export function readDshRunEventStatuses(db: Database, runId: string): number[] {
-  const rows = db
-    .query(
-      `SELECT payload_json FROM events
-        WHERE type IN ('dsh.run.failed','dsh.run.exited','dsh.run.timeout','dsh.run.cancelled')
-          AND json_extract(payload_json, '$.runId') = ?
-        ORDER BY id DESC LIMIT 8`
-    )
-    .all(runId) as { payload_json: string }[];
-  const out: number[] = [];
-  const visit = (value: unknown, depth: number): void => {
-    if (depth > 4 || !value || typeof value !== "object") return;
-    if (Array.isArray(value)) {
-      for (const v of value) visit(v, depth + 1);
-      return;
-    }
-    for (const [key, v] of Object.entries(value as Record<string, unknown>)) {
-      if (key === "status" || key === "statusCode" || key === "httpStatus" || key === "dshStatus") {
-        if (typeof v === "number" && Number.isInteger(v) && v >= 100 && v <= 599) out.push(v);
-      }
-      visit(v, depth + 1);
-    }
-  };
-  for (const row of rows) {
-    try {
-      visit(JSON.parse(row.payload_json), 0);
-    } catch {
-      /* malformed historical payload: ignore */
-    }
-  }
-  return out;
-}
-
-/** The bounded Run fields this classifier reads (the existing evidence only). */
 export type TransientRun = Pick<
   Run,
   | "id"
@@ -295,11 +441,6 @@ export interface ClassifyRunTransientInput {
   run: TransientRun | null;
   /** The Factory error string (`CODING_FAILED: …`). */
   error: string | null;
-  /**
-   * The live DB, when available, so the Run's durable terminal
-   * `dsh.run.*` event (`dsh.status`) is part of the evidence too.
-   */
-  db?: Database;
   /** Test seam (default: the real per-Run files). */
   readTail?: (path: string | null | undefined, maxBytes?: number) => string | null;
   readProvider?: (path: string | null | undefined) => RunProviderEvidence;
@@ -333,11 +474,13 @@ export function classifyTransientRunFailure(input: ClassifyRunTransientInput): T
   ]
     .filter((s) => s.length > 0)
     .join("\n");
-  const statuses = [
-    ...evidence.statuses,
-    ...(input.db ? readDshRunEventStatuses(input.db, run.id) : []),
-  ];
-  const result = classifyTransientEvidence({ text, statuses, turnEnd: evidence.turnEnd });
+  const result = classifyTransientEvidence({
+    text,
+    statuses: evidence.statuses,
+    turnEnd: evidence.turnEnd,
+    turnEndCode: evidence.turnEndCode,
+    turnEndStatus: evidence.turnEndStatus,
+  });
   if (result.transient) {
     result.evidence = bounded([`run ${run.id}: ${run.state} (exit ${run.exit_code ?? "none"})`, ...result.evidence]);
   }

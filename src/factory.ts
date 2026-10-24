@@ -925,7 +925,7 @@ async function resumeTransientImplement(
       return { last: current, submitted: false, resumed, taskMoved: true, stop: "task phase/attempt moved" };
     }
 
-    const transient = classifyTransientRunFailure({ run, error: current.error, db });
+    const transient = classifyTransientRunFailure({ run, error: current.error });
     const adoption = classifyUnadoptableSession({ run, error: current.error });
     if (!transient.transient && !adoption.unadoptable) {
       return { last: current, submitted: false, resumed, taskMoved: false, stop: null };
@@ -1239,7 +1239,7 @@ async function runFactoryTaskInner(
           // continued in the SAME Session/worktree BEFORE the attempt-consuming
           // ISH-1012 policy. A resume never advances the factory attempt; only
           // its cap/wait expiry falls back to the ordinary stop.
-          const preTransient = classifyTransientRunFailure({ run: impl.run, error: impl.error, db });
+          const preTransient = classifyTransientRunFailure({ run: impl.run, error: impl.error });
           const preAdoption = classifyUnadoptableSession({ run: impl.run, error: impl.error });
           if (preTransient.transient || preAdoption.unadoptable) {
             push(
