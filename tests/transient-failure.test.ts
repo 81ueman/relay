@@ -280,6 +280,16 @@ describe("ISH-1174: reviewer + session classification", () => {
     expect(res.cause).toBe("provider_http_5xx");
   });
 
+  test("REVIEW_PROCESS_FAILED with the dsh-style TIMEOUT code is transient", () => {
+    const res = classifyTransientReviewerFailure({
+      error: "REVIEW_PROCESS_FAILED: reviewer process exit 1 signal none",
+      raw: "dsh: TIMEOUT: Request timed out.\n",
+    });
+    expect(res.transient).toBe(true);
+    expect(res.cause).toBe("provider_transport");
+    expect(res.detail).toContain("TIMEOUT");
+  });
+
   test("a REVIEW_PROCESS_FAILED with auth/unknown evidence is NON-transient", () => {
     expect(
       classifyTransientReviewerFailure({
