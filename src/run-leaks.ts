@@ -5,10 +5,12 @@ import { defaultDbPath, now, projectRoot, STATE_DIR } from "./db";
 import { isTerminalTaskState, type TaskState } from "./schema";
 import { findActiveWriter } from "./dsh-runner";
 import { defaultRunsRoot, pathSizeBytes, scratchPathSegment } from "./scratch";
-import { dindVolumeNamesForWorkspace } from "./devcontainer-id";
+import { dindVolumeNamesForWorkspace, dindVolumeNamesFromContainerLabels, workspacePathVariants } from "./devcontainer-id";
 import {
   controlPlaneNamespace,
   disabledRunResourceDocker,
+  isStoppedDevcontainer,
+  type DevcontainerContainer,
   type RunResourceDocker,
 } from "./run-resources";
 
@@ -21,15 +23,18 @@ import {
  *   - per-Run / per-review scratch roots (with a recursive size);
  *   - Task and disposable review worktrees (with a size);
  *   - Relay-labelled containers;
+ *   - devcontainer containers attributed by their exact `devcontainer.local_folder`
+ *     label on a Relay-owned worktree path (ISH-1224);
  *   - Relay-labelled volumes + the exact devcontainer `dind-var-lib-docker-*`
- *     named volumes derived from a Run's recorded workspace, with Docker's
- *     reported size.
+ *     named volumes derived from a Run's recorded workspace or a holding
+ *     devcontainer's labels, with Docker's reported size.
  *
- * It never lists an unlabelled container or an unrecorded/unrelated volume
- * (other projects share the host) and has no image path at all. The
- * `relay.plane` namespace is authoritative: another control plane's
- * `relay.task=T1` is NOT reported as this plane's orphan (Task ids repeat across
- * checkouts). `relay run list --leaks` renders this for the gateway patrol.
+ * It never lists an unlabelled container/volume unless a devcontainer container
+ * is attributable by its EXACT `devcontainer.local_folder` label on a Relay-owned
+ * worktree path (ISH-1224; a dind volume held by such a container is listed with
+ * the holder and its size). `relay.plane` is authoritative: another control
+ * plane's `relay.task=T1` is NOT reported as this plane's orphan (Task ids repeat
+ * across checkouts). `relay run list --leaks` renders this for the gateway patrol.
  */
 
 export type LeakKind =
@@ -142,14 +147,30 @@ export function scanRunLeaks(db: Database, opts: LeakScanOptions = {}): LeakRepo
     return !!writer;
   };
 
-  // ISH-1222: every exact dind name a Run's recorded workspace can own. Only
-  // Relay-owned roots are considered (a devcontainer in the main checkout or a
-  // human workspace is not a Task resource). The first (run-scoped) owner wins;
-  // a Task worktree fallback covers a Task whose Run row is gone.
-  const dindOwners = new Map<string, { taskId: string | null; runId: string | null }>();
-  const addDindName = (name: string, taskId: string | null, runId: string | null): void => {
+  // ISH-1222/1224: every exact dind name a Run's recorded workspace can own.
+  // Only Relay-owned roots are considered (a devcontainer in the main checkout or
+  // a human workspace is not a Task resource). The first (run-scoped) owner wins;
+  // a Task worktree fallback covers a Task whose Run row is gone. A dind volume's
+  // identity is per-WORKSPACE, so the owner records every path spelling that
+  // derives the name (a FIX attempt reuses the same worktree).
+  interface DindOwner {
+    taskId: string | null;
+    runId: string | null;
+    workspaces: Set<string>;
+  }
+  const dindOwners = new Map<string, DindOwner>();
+  /** workspace path variant -> first owner (used for devcontainer containers). */
+  const workspaceOwners = new Map<string, { taskId: string | null; runId: string | null }>();
+  /** Every Relay-owned workspace spelling passed to the Docker seam. */
+  const relayWorkspaces = new Set<string>();
+  const addDindName = (name: string, taskId: string | null, runId: string | null, variants: string[]): void => {
     if (!name.startsWith("dind-var-lib-docker-")) return;
-    if (!dindOwners.has(name)) dindOwners.set(name, { taskId, runId });
+    let owner = dindOwners.get(name);
+    if (!owner) {
+      owner = { taskId, runId, workspaces: new Set() };
+      dindOwners.set(name, owner);
+    }
+    for (const variant of variants) owner.workspaces.add(variant);
   };
   const addDindOwner = (
     path: string,
@@ -158,8 +179,15 @@ export function scanRunLeaks(db: Database, opts: LeakScanOptions = {}): LeakRepo
     recorded: string[] = []
   ): void => {
     if (!isUnder(path, worktreesRoot) && !isUnder(path, reviewWorktreesRoot)) return;
-    for (const name of recorded) addDindName(name, taskId, runId);
-    for (const name of dindVolumeNamesForWorkspace(path, { recorded: true })) addDindName(name, taskId, runId);
+    const variants = workspacePathVariants(path);
+    for (const variant of variants) {
+      relayWorkspaces.add(variant);
+      if (!workspaceOwners.has(variant)) workspaceOwners.set(variant, { taskId, runId });
+    }
+    for (const name of recorded) addDindName(name, taskId, runId, variants);
+    for (const name of dindVolumeNamesForWorkspace(path, { recorded: true })) {
+      addDindName(name, taskId, runId, variants);
+    }
   };
   for (const run of runs) {
     addDindOwner(run.cwd, run.task_id, run.id, parseRecordedDind(run.devcontainer_volumes));
@@ -167,6 +195,9 @@ export function scanRunLeaks(db: Database, opts: LeakScanOptions = {}): LeakRepo
   for (const task of tasks) {
     if (task.worktree) addDindOwner(task.worktree, task.id, null);
   }
+  const liveWorkspaces = new Set(
+    runs.filter((r) => LIVE_RUN_STATES.has(r.state)).flatMap((r) => workspacePathVariants(r.cwd))
+  );
 
   // 1. Per-Run scratch: a terminal Run's scratch is orphaned by definition.
   for (const run of runs) {
@@ -262,12 +293,13 @@ export function scanRunLeaks(db: Database, opts: LeakScanOptions = {}): LeakRepo
   }
 
   // 5. Relay-labelled containers/volumes + exact derived dind volumes. Only a
-  // label or the EXACT derived dind name is evidence; an unrelated unlabelled
-  // volume is never listed or touched.
+  // label, an exact derived dind name, or an exact `devcontainer.local_folder`
+  // path is evidence; an unrelated unlabelled resource is never listed/touched.
   let snapshot;
   try {
     snapshot = (opts.docker ?? disabledRunResourceDocker()).snapshot({
       dindVolumeNames: [...dindOwners.keys()],
+      devcontainerWorkspaces: [...relayWorkspaces],
     });
   } catch (e) {
     report.dockerErrors.push(e instanceof Error ? e.message : String(e));
@@ -276,6 +308,8 @@ export function scanRunLeaks(db: Database, opts: LeakScanOptions = {}): LeakRepo
   if (snapshot.containerError) report.dockerErrors.push(`containers: ${snapshot.containerError}`);
   if (snapshot.volumeError) report.dockerErrors.push(`volumes: ${snapshot.volumeError}`);
   if (snapshot.sizeError) report.dockerErrors.push(`volume sizes: ${snapshot.sizeError}`);
+  if (snapshot.devcontainerError) report.dockerErrors.push(`devcontainers: ${snapshot.devcontainerError}`);
+  const listedContainers = new Set<string>();
   for (const c of snapshot.containers) {
     // No Relay label at all -> not Relay's resource: never list or touch it.
     if (!c.taskId && !c.runId) continue;
@@ -288,6 +322,7 @@ export function scanRunLeaks(db: Database, opts: LeakScanOptions = {}): LeakRepo
     const runIsLive = !!run && LIVE_RUN_STATES.has(run.state);
     const orphan = !task || (isTerminalTaskState(task.state) && !liveTaskIds.has(task.id)) || (run !== null && !runIsLive);
     if (!orphan) continue;
+    listedContainers.add(c.id);
     addEntry(report, {
       kind: "container",
       id: c.id,
@@ -320,11 +355,73 @@ export function scanRunLeaks(db: Database, opts: LeakScanOptions = {}): LeakRepo
       detail: null,
     });
   }
+
+  // ISH-1224: stopped devcontainer containers are unlabelled by Relay, but their
+  // exact `devcontainer.local_folder` label points at a Relay-owned workspace.
+  // Only an exact path match is attributed (never a name/prefix scan), and the
+  // container is listed only when that workspace has no live Run. A listed
+  // holder is what lets the dind entry name its container even when Docker's
+  // `Links` count is > 0 (the old `inUse` skip hid the leaks this issue is for).
+  const holdersByVolume = new Map<string, DevcontainerContainer[]>();
+  for (const c of snapshot.devcontainerContainers ?? []) {
+    // Only a stopped holder is a leak; a running/paused one may be in active use.
+    if (!isStoppedDevcontainer(c.state)) continue;
+    const variants = workspacePathVariants(c.localFolder);
+    const workspaceKey = variants.find((path) => workspaceOwners.has(path));
+    if (!workspaceKey) continue; // not a Relay-owned workspace of this plane
+    const owner = workspaceOwners.get(workspaceKey)!;
+    const run = owner.runId ? runById.get(owner.runId) ?? null : null;
+    const task = owner.taskId ? taskById.get(owner.taskId) ?? null : run ? taskById.get(run.task_id) ?? null : null;
+    const taskId = owner.taskId ?? run?.task_id ?? null;
+    const workspaceIsLive = variants.some((path) => liveWorkspaces.has(path));
+    const runIsLive = !!run && LIVE_RUN_STATES.has(run.state);
+    const orphan = !task || (isTerminalTaskState(task.state) && !liveTaskIds.has(task.id)) || (run !== null && !runIsLive);
+    if (!orphan || workspaceIsLive) continue;
+    const held = new Set(dindVolumeNamesFromContainerLabels(c.localFolder, c.configFile));
+    if (held.size === 0) {
+      // No config label and no live config file: fall back to the exact names
+      // already attributed to this SAME Relay-owned path (never a glob).
+      for (const [name, volumeOwner] of dindOwners) {
+        if ([...volumeOwner.workspaces].some((variant) => variants.includes(variant))) held.add(name);
+      }
+    }
+    for (const name of held) {
+      if (!name.startsWith("dind-var-lib-docker-")) continue;
+      const volumeOwner = dindOwners.get(name);
+      if (!volumeOwner) {
+        dindOwners.set(name, { taskId, runId: owner.runId, workspaces: new Set(variants) });
+      } else {
+        for (const variant of variants) volumeOwner.workspaces.add(variant);
+      }
+      const holders = holdersByVolume.get(name) ?? [];
+      holders.push(c);
+      holdersByVolume.set(name, holders);
+    }
+    if (listedContainers.has(c.id)) continue;
+    listedContainers.add(c.id);
+    addEntry(report, {
+      kind: "container",
+      id: c.id,
+      taskId,
+      runId: owner.runId,
+      path: null,
+      sizeBytes: c.sizeBytes,
+      detail: [
+        c.name ? `name=${c.name}` : null,
+        c.state ? `state=${c.state}` : null,
+        `devcontainer local_folder=${c.localFolder}`,
+      ]
+        .filter(Boolean)
+        .join(" "),
+    });
+  }
+
   // ISH-1222: the devcontainer dind named volumes. They are normally unlabelled,
-  // so attribution is the EXACT name derived from the Run's recorded workspace;
-  // an unrelated `dind-var-lib-docker-*` volume is not in `dindOwners` and never
-  // appears here. A volume still referenced by the (unlabelled) devcontainer is
-  // not orphaned yet; Docker's Links count comes from `system df -v`.
+  // so attribution is the EXACT name derived from the Run's recorded workspace
+  // (or the holding devcontainer's labels); an unrelated
+  // `dind-var-lib-docker-*` volume is not in `dindOwners` and never appears here.
+  // ISH-1224: a volume held by an ATTRIBUTED stopped devcontainer is reported
+  // with that holder (and its size), instead of being hidden by `Links` > 0.
   for (const v of snapshot.dindVolumes) {
     if (listedVolumes.has(v.name)) continue;
     const owner = dindOwners.get(v.name);
@@ -332,9 +429,19 @@ export function scanRunLeaks(db: Database, opts: LeakScanOptions = {}): LeakRepo
     const run = owner.runId ? runById.get(owner.runId) ?? null : null;
     const task = owner.taskId ? taskById.get(owner.taskId) ?? null : run ? taskById.get(run.task_id) ?? null : null;
     const taskId = owner.taskId ?? run?.task_id ?? null;
+    const workspaceIsLive = [...owner.workspaces].some((path) => liveWorkspaces.has(path));
     const runIsLive = !!run && LIVE_RUN_STATES.has(run.state);
     const orphan = !task || (isTerminalTaskState(task.state) && !liveTaskIds.has(task.id)) || (run !== null && !runIsLive);
-    if (!orphan || v.inUse) continue;
+    if (!orphan || workspaceIsLive) continue;
+    const holders = holdersByVolume.get(v.name) ?? [];
+    // An in-use volume with no attributable holder is still not provably a leak:
+    // it may be a running devcontainer of another Task/project. Keep the old
+    // conservative skip; an attributed holder is reclaimed by cleanup first.
+    if (v.inUse && holders.length === 0) continue;
+    const holderDetail =
+      holders.length > 0
+        ? `held by container ${holders.map((h) => `${h.id}${h.name ? ` (${h.name})` : ""}`).join(", ")}`
+        : null;
     addEntry(report, {
       kind: "dind-volume",
       id: v.name,
@@ -342,7 +449,7 @@ export function scanRunLeaks(db: Database, opts: LeakScanOptions = {}): LeakRepo
       runId: owner.runId,
       path: null,
       sizeBytes: v.sizeBytes,
-      detail: "dind (derived devcontainer volume)",
+      detail: ["dind (derived devcontainer volume)", holderDetail].filter(Boolean).join("; "),
     });
   }
   return report;

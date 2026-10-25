@@ -26,10 +26,11 @@ import { issueKeyForTask, resolveTaskPrTarget } from "./pr-target";
 import { resolveTaskPrRef } from "./pr-binding";
 import { removeReviewWorktree } from "./review-workspace";
 import { defaultRunsRoot, reviewScratchTaskRoot, removeScratchRoot } from "./scratch";
-import { dindVolumeNamesForWorkspace } from "./devcontainer-id";
+import { dindVolumeNamesForWorkspace, dindVolumeNamesFromContainerLabels, workspacePathVariants } from "./devcontainer-id";
 import {
   controlPlaneNamespace,
   disabledRunResourceDocker,
+  isStoppedDevcontainer,
   type RunResourceDocker,
 } from "./run-resources";
 import { taskHeadOvertakenByOtherWriter } from "./run-owner";
@@ -1354,6 +1355,14 @@ export interface CleanupOptions {
 export interface CleanupContainer {
   id: string;
   name: string;
+  /**
+   * ISH-1224: true when the container is an unlabelled devcontainer attributed by
+   * its exact `devcontainer.local_folder` label on this Task's Relay-owned
+   * workspace (not by a Relay label).
+   */
+  devcontainer?: boolean;
+  /** Exact dind named volumes this devcontainer container is removing with it. */
+  dindVolumes?: string[];
 }
 
 export interface CleanupVolume {
@@ -1537,9 +1546,12 @@ function saveCleanupPatch(taskId: string, worktree: string, patchesRoot: string 
  *
  * The `runs` rows and their output directories are RETAINED as evidence. Only
  * the per-Run `scratch` subtrees, disposable review worktrees,
- * Relay-labelled containers/volumes and each Run's exact derived devcontainer
- * `dind-var-lib-docker-*` named volume are reclaimed (ISH-1222; the dind name is
- * derived, never discovered by a prefix scan, and an in-use one is left alone).
+ * Relay-labelled containers/volumes, devcontainer containers attributed by their
+ * exact `devcontainer.local_folder` label (ISH-1224), and each Run's exact
+ * derived devcontainer `dind-var-lib-docker-*` named volume are reclaimed
+ * (ISH-1222; the dind name is derived, never discovered by a prefix scan). An
+ * attributed holder is removed before its volume; any OTHER in-use holder keeps
+ * the conservative warning.
  */
 export async function planWorkspaceCleanup(
   db: Database,
@@ -1578,41 +1590,63 @@ export async function planWorkspaceCleanup(
   };
   if (existsSync(reviewScratch)) plan.scratchDirs.push(reviewScratch);
 
-  // ISH-1222: the devcontainer dind volume is NAMED and (normally) unlabelled, so
-  // it is attributed by the exact id derived from a Relay-owned workspace path.
-  // The Run rows record their cwd durably, so this still works after a worktree
-  // was nulled/removed. Only Relay-owned roots are considered: a devcontainer a
-  // human started in the main checkout must never be attributed to a Task.
+  // ISH-1222/1224: the devcontainer dind volume is NAMED and (normally)
+  // unlabelled, so it is attributed by the exact id derived from a Relay-owned
+  // workspace path. The Run rows record their cwd durably, so this still works
+  // after a worktree was nulled/removed. Only Relay-owned roots are considered: a
+  // devcontainer a human started in the main checkout must never be attributed
+  // to a Task. The same exact paths are handed to the Docker seam so an
+  // unlabelled devcontainer CONTAINER can be attributed by its
+  // `devcontainer.local_folder` label (ISH-1224).
   const wtRoot = taskWorktreesRoot(opts.worktreesRoot);
   const dindNames = new Set<string>();
+  const devcontainerWorkspaces = new Set<string>();
+  const dindNamesByWorkspace = new Map<string, Set<string>>();
+  const addPathNames = (path: string, names: Iterable<string>): void => {
+    const variants = workspacePathVariants(path);
+    for (const variant of variants) devcontainerWorkspaces.add(variant);
+    for (const name of names) {
+      if (!name.startsWith("dind-var-lib-docker-")) continue;
+      dindNames.add(name);
+      for (const variant of variants) {
+        const set = dindNamesByWorkspace.get(variant) ?? new Set<string>();
+        set.add(name);
+        dindNamesByWorkspace.set(variant, set);
+      }
+    }
+  };
   const addDindWorkspace = (path: string | null): void => {
     if (!path) return;
     if (!isUnder(path, wtRoot) && !isUnder(path, reviewRoot)) return;
-    for (const name of dindVolumeNamesForWorkspace(path, { recorded: true })) dindNames.add(name);
+    addPathNames(path, dindVolumeNamesForWorkspace(path, { recorded: true }));
   };
   addDindWorkspace(worktree);
   for (const r of runs) {
     // The exact names recorded at launch survive a deleted worktree and cover a
     // named `.devcontainer/<name>/devcontainer.json`; re-derive for legacy rows.
     if (!isUnder(r.cwd, wtRoot) && !isUnder(r.cwd, reviewRoot)) continue;
-    for (const name of recordedDindNames(r.devcontainer_volumes)) dindNames.add(name);
+    addPathNames(r.cwd, recordedDindNames(r.devcontainer_volumes));
     addDindWorkspace(r.cwd);
   }
   for (const path of plan.reviewWorktrees) addDindWorkspace(path);
 
-  // Docker inventory: Relay-labelled resources plus the EXACT dind names derived
-  // above (never a `dind-*` scan).
+  // Docker inventory: Relay-labelled resources, the EXACT dind names derived
+  // above (never a `dind-*` scan), and devcontainer containers whose exact
+  // `devcontainer.local_folder` label is one of the paths above.
   let snapshot: ReturnType<RunResourceDocker["snapshot"]> = {
     containers: [],
     volumes: [],
     dindVolumes: [],
+    devcontainerContainers: [],
     containerError: null,
     volumeError: null,
     sizeError: null,
+    devcontainerError: null,
   };
   try {
     snapshot = (opts.docker ?? disabledRunResourceDocker()).snapshot({
       dindVolumeNames: [...dindNames],
+      devcontainerWorkspaces: [...devcontainerWorkspaces],
     });
   } catch (e) {
     warnings.push(`docker inventory failed: ${e instanceof Error ? e.message : String(e)}`);
@@ -1620,17 +1654,47 @@ export async function planWorkspaceCleanup(
   if (snapshot.containerError) warnings.push(`container inventory unavailable: ${snapshot.containerError}`);
   if (snapshot.volumeError) warnings.push(`volume inventory unavailable: ${snapshot.volumeError}`);
   if (snapshot.sizeError) warnings.push(`volume sizes unavailable: ${snapshot.sizeError}`);
+  if (snapshot.devcontainerError) warnings.push(`devcontainer inventory unavailable: ${snapshot.devcontainerError}`);
   plan.containers = snapshot.containers
     .filter((c) => resourceBelongsToTask(c, plane, taskId, runIds))
     .map((c) => ({ id: c.id, name: c.name }));
+  // ISH-1224: a stopped devcontainer is unlabelled by Relay, so it is admitted
+  // ONLY by an exact local_folder match against this Task's Relay-owned
+  // workspaces. The exact dind name implied by its labels is added to
+  // `dindNames` (the real seam already inspected it) so cleanup can remove the
+  // holder first and then the named volume in one `--apply`.
+  const plannedContainerIds = new Set(plan.containers.map((c) => c.id));
+  for (const c of snapshot.devcontainerContainers ?? []) {
+    if (plannedContainerIds.has(c.id)) continue;
+    // ISH-1224: reclaim a STOPPED holder only. A running/paused devcontainer may
+    // still be in use by a human/editor; its volume stays with the in-use warning.
+    if (!isStoppedDevcontainer(c.state)) continue;
+    const variants = workspacePathVariants(c.localFolder);
+    if (!variants.some((path) => devcontainerWorkspaces.has(path))) continue;
+    const derived = dindVolumeNamesFromContainerLabels(c.localFolder, c.configFile);
+    // The real seam derived and inspected these exact names from the holder's
+    // labels; admit them so the volume can be reclaimed in the same apply.
+    for (const name of derived) dindNames.add(name);
+    const held = new Set(derived);
+    if (held.size === 0) {
+      // No config label (or a legacy name not derived above): the exact names
+      // already attributed to this same Relay-owned path are the safe fallback.
+      for (const path of variants) {
+        for (const name of dindNamesByWorkspace.get(path) ?? []) held.add(name);
+      }
+    }
+    plan.containers.push({ id: c.id, name: c.name, devcontainer: true, dindVolumes: [...held] });
+    plannedContainerIds.add(c.id);
+  }
   const byVolume = new Map<string, CleanupVolume>();
   for (const v of snapshot.volumes) {
     if (!resourceBelongsToTask(v, plane, taskId, runIds)) continue;
     byVolume.set(v.name, { name: v.name, dind: false, inUse: v.inUse });
   }
   for (const v of snapshot.dindVolumes) {
-    // The real seam only resolves names the caller derived for THIS Task, but
-    // re-check the exact set here so a custom seam cannot smuggle in a glob.
+    // The real seam only resolves names the caller derived for THIS Task (or a
+    // holder's exact labels), but re-check the exact set here so a custom seam
+    // cannot smuggle in a glob.
     if (!dindNames.has(v.name) || byVolume.has(v.name)) continue;
     byVolume.set(v.name, { name: v.name, dind: true, inUse: v.inUse });
   }
@@ -1890,17 +1954,26 @@ export async function applyWorkspaceCleanup(
   }
 
   const docker = opts.docker ?? disabledRunResourceDocker();
+  const removedContainerIds = new Set<string>();
   for (const c of plan.containers) {
     const r = docker.removeContainer(c.id);
-    if (r.ok) plan.removedResources.push(`container ${c.id}${c.name ? ` (${c.name})` : ""}`);
-    else plan.warnings.push(`container ${c.id} not removed: ${r.error}`);
+    if (r.ok) {
+      removedContainerIds.add(c.id);
+      plan.removedResources.push(`container ${c.id}${c.name ? ` (${c.name})` : ""}`);
+    } else {
+      plan.warnings.push(`container ${c.id} not removed: ${r.error}`);
+    }
   }
   for (const v of plan.volumes) {
-    // ISH-1222: a dind named volume is only reclaimed when no container still
-    // references it. The devcontainer container is NOT Relay-labelled, so Relay
-    // never removes it; stop/remove it first and re-run cleanup. `docker volume
-    // rm` has no `-f` here, so Docker would refuse anyway — say why up front.
-    if (v.dind && v.inUse) {
+    // ISH-1222/1224: a dind named volume is reclaimed only when no container
+    // still references it. A volume held by a devcontainer container that this
+    // plan just removed is free; any OTHER holder (unknown/unrelated) keeps the
+    // conservative warning. `docker volume rm` has no `-f` here, so Docker would
+    // refuse anyway — say why up front.
+    const heldByRemoved = plan.containers.some(
+      (c) => removedContainerIds.has(c.id) && c.dindVolumes?.includes(v.name)
+    );
+    if (v.dind && v.inUse && !heldByRemoved) {
       plan.warnings.push(
         `dind volume ${v.name} is still referenced by a container; stop/remove the devcontainer (\`docker rm -v <devcontainer>\`) and re-run cleanup`
       );
@@ -1956,6 +2029,7 @@ export async function applyWorkspaceCleanup(
       scratchDirs: plan.scratchDirs,
       reviewWorktrees: plan.reviewWorktrees,
       containers: plan.containers.map((c) => c.id),
+      devcontainerContainers: plan.containers.filter((c) => c.devcontainer).map((c) => c.id),
       volumes: plan.volumes.map((v) => v.name),
       dindVolumes: plan.volumes.filter((v) => v.dind).map((v) => v.name),
       removedResources: plan.removedResources,

@@ -12,10 +12,15 @@ import { getRun, type DshProcess, type DshSpawner } from "../src/dsh-runner";
 import { PINNED_DSH_VERSION } from "../src/dsh-version";
 import { applyWorkspaceCleanup, planWorkspaceCleanup } from "../src/run-lifecycle";
 import type { GitHubReadOnly, PrView } from "../src/providers";
-import type { RunContainer, RunResourceDocker, RunVolume, SnapshotOptions } from "../src/run-resources";
+import type { DevcontainerContainer, RunContainer, RunResourceDocker, RunVolume, SnapshotOptions } from "../src/run-resources";
 import { controlPlaneId, realRunResourceDocker } from "../src/run-resources";
 import { scanRunLeaks } from "../src/run-leaks";
-import { devcontainerId, dindVolumeName, dindVolumeNamesForWorkspace } from "../src/devcontainer-id";
+import {
+  devcontainerId,
+  dindVolumeName,
+  dindVolumeNamesForWorkspace,
+  workspacePathVariants,
+} from "../src/devcontainer-id";
 import { reviewScratchTaskRoot } from "../src/scratch";
 
 /**
@@ -70,6 +75,8 @@ class FakeDocker implements RunResourceDocker {
   volumes: RunVolume[] = [];
   /** ISH-1222: unlabelled dind volumes, attributed only by the exact derived name. */
   dindVolumes: RunVolume[] = [];
+  /** ISH-1224: devcontainer containers, attributed by exact local_folder. */
+  devcontainerContainers: DevcontainerContainer[] = [];
   removedContainers: string[] = [];
   removedVolumes: string[] = [];
   /** Images are hand-imported; the seam has no path to touch them. */
@@ -77,16 +84,22 @@ class FakeDocker implements RunResourceDocker {
   containerError: string | null = null;
   volumeError: string | null = null;
   sizeError: string | null = null;
+  devcontainerError: string | null = null;
 
   snapshot(opts: SnapshotOptions = {}) {
     const wanted = new Set(opts.dindVolumeNames ?? []);
+    const workspaces = new Set((opts.devcontainerWorkspaces ?? []).flatMap((p) => workspacePathVariants(p)));
     return {
       containers: [...this.containers],
       volumes: [...this.volumes],
       dindVolumes: this.dindVolumes.filter((v) => wanted.has(v.name)).map((v) => ({ ...v })),
+      devcontainerContainers: this.devcontainerContainers
+        .filter((c) => workspacePathVariants(c.localFolder).some((p) => workspaces.has(p)))
+        .map((c) => ({ ...c })),
       containerError: this.containerError,
       volumeError: this.volumeError,
       sizeError: this.sizeError,
+      devcontainerError: this.devcontainerError,
     };
   }
   removeContainer(id: string) {
@@ -256,16 +269,51 @@ function dindVolumeFor(worktree: string, opts: { sizeBytes?: number; inUse?: boo
  * A real `docker` CLI shim on PATH: Relay's production seam (`realDockerExec`)
  * runs it, so the test exercises `relay run cleanup`/`run list --leaks` end to
  * end without touching host Docker. It knows exactly two dind volumes (this
- * Task's + an unrelated one) and logs every mutating command.
+ * Task's + an unrelated one) and logs every mutating command. With `held`, it
+ * also reports a stopped devcontainer container (whose exact local_folder label
+ * points at the Task worktree) plus an unrelated devcontainer; the Task volume's
+ * `Links` count is then > 0.
  */
-function writeDockerShim(taskDind: string, unrelatedDind: string): { bin: string; log: string; env: Record<string, string> } {
+function writeDockerShim(
+  taskDind: string,
+  unrelatedDind: string,
+  held?: { container: DevcontainerContainer; taskLinks: number }
+): { bin: string; log: string; env: Record<string, string> } {
   const bin = join(dir, "bin");
   mkdirSync(bin, { recursive: true });
   const log = join(dir, "docker-mutations.log");
+  const containerRow = held
+    ? JSON.stringify({
+        ID: held.container.id,
+        Names: held.container.name,
+        Labels: [
+          `devcontainer.local_folder=${held.container.localFolder}`,
+          held.container.configFile ? `devcontainer.config_file=${held.container.configFile}` : null,
+        ]
+          .filter(Boolean)
+          .join(","),
+        State: held.container.state ?? "exited",
+        Size: "12MB",
+      })
+    : "";
+  const unrelatedRow = held
+    ? JSON.stringify({
+        ID: "devcontainer-unrelated",
+        Names: "unrelated-devcontainer",
+        Labels: [
+          "devcontainer.local_folder=/unrelated/project",
+          "devcontainer.config_file=/unrelated/project/.devcontainer/devcontainer.json",
+        ].join(","),
+        State: "exited",
+        Size: "9MB",
+      })
+    : "";
   const env = {
     RELAY_TEST_TASK_DIND: taskDind,
     RELAY_TEST_UNRELATED_DIND: unrelatedDind,
     RELAY_TEST_DOCKER_LOG: log,
+    RELAY_TEST_TASK_LINKS: String(held?.taskLinks ?? 0),
+    ...(held ? { RELAY_TEST_DEVCONTAINER_JSON: containerRow, RELAY_TEST_UNRELATED_DEVCONTAINER_JSON: unrelatedRow } : {}),
   };
   const script = `#!/bin/sh
 set -eu
@@ -273,7 +321,19 @@ cmd="\${1:-}"
 if [ $# -gt 0 ]; then shift; fi
 log="\${RELAY_TEST_DOCKER_LOG:?}"
 case "$cmd" in
-  ps) exit 0 ;;
+  ps)
+    filter=""
+    prev=""
+    for arg in "$@"; do
+      if [ "$prev" = "--filter" ]; then filter="$arg"; fi
+      prev="$arg"
+    done
+    if [ "$filter" = "label=devcontainer.local_folder" ]; then
+      if [ -n "\${RELAY_TEST_DEVCONTAINER_JSON:-}" ]; then printf '%s\\n' "\${RELAY_TEST_DEVCONTAINER_JSON}"; fi
+      if [ -n "\${RELAY_TEST_UNRELATED_DEVCONTAINER_JSON:-}" ]; then printf '%s\\n' "\${RELAY_TEST_UNRELATED_DEVCONTAINER_JSON}"; fi
+    fi
+    exit 0
+    ;;
   volume)
     sub="\${1:-}"
     if [ $# -gt 0 ]; then shift; fi
@@ -297,8 +357,8 @@ case "$cmd" in
     exit 0
     ;;
   system)
-    printf '{"Volumes":[{"Name":"%s","Size":"2.7GB","Links":"0"},{"Name":"%s","Size":"1.1GB","Links":"0"}]}\\n' \\
-      "\${RELAY_TEST_TASK_DIND:?}" "\${RELAY_TEST_UNRELATED_DIND:?}"
+    printf '{"Volumes":[{"Name":"%s","Size":"2.7GB","Links":"%s"},{"Name":"%s","Size":"1.1GB","Links":"1"}]}\\n' \\
+      "\${RELAY_TEST_TASK_DIND:?}" "\${RELAY_TEST_TASK_LINKS:-0}" "\${RELAY_TEST_UNRELATED_DIND:?}"
     exit 0
     ;;
   rm)
@@ -647,6 +707,72 @@ describe("ISH-1221: run scratch + labelled resource reclamation", () => {
     expect(flat).not.toMatch(/\brmi\b|image\s+prune/);
   });
 
+  test("the real Docker seam attributes a devcontainer container by exact local_folder and derives its dind volume", () => {
+    const workspace = "/relay/worktrees/T1";
+    const config = `${workspace}/.devcontainer/devcontainer.json`;
+    const dind = dindVolumeName(devcontainerId(workspace, config));
+    const unrelatedWorkspace = "/unrelated/project";
+    const unrelatedConfig = `${unrelatedWorkspace}/.devcontainer/devcontainer.json`;
+    const unrelatedDind = dindVolumeName(devcontainerId(unrelatedWorkspace, unrelatedConfig));
+    const argv: string[][] = [];
+    const docker = realRunResourceDocker((args) => {
+      argv.push(args);
+      if (args[0] === "ps") {
+        if (args.includes("label=devcontainer.local_folder")) {
+          const row = (id: string, localFolder: string, configFile: string) => ({
+            ID: id,
+            Names: id,
+            Labels: `devcontainer.local_folder=${localFolder},devcontainer.config_file=${configFile}`,
+            State: "exited",
+            Size: "1MB",
+          });
+          return {
+            ok: true,
+            stdout: [
+              JSON.stringify(row("held", workspace, config)),
+              JSON.stringify(row("unrelated", unrelatedWorkspace, unrelatedConfig)),
+            ].join("\n"),
+            stderr: "",
+          };
+        }
+        return { ok: true, stdout: "", stderr: "" };
+      }
+      if (args[0] === "volume" && args[1] === "ls") return { ok: true, stdout: "", stderr: "" };
+      if (args[0] === "system") {
+        return {
+          ok: true,
+          stdout: JSON.stringify({
+            Volumes: [
+              { Name: dind, Size: "2.7GB", Links: "1" },
+              { Name: unrelatedDind, Size: "1.1GB", Links: "1" },
+            ],
+          }),
+          stderr: "",
+        };
+      }
+      if (args[0] === "volume" && args[1] === "inspect") {
+        const name = args[args.length - 1];
+        if (name === dind) return { ok: true, stdout: JSON.stringify({ Labels: null }), stderr: "" };
+        return { ok: false, stdout: "", stderr: "no such volume" };
+      }
+      return { ok: true, stdout: "", stderr: "" };
+    });
+    const snapshot = docker.snapshot({ devcontainerWorkspaces: [workspace] });
+    expect(snapshot.devcontainerContainers.map((c) => c.id)).toEqual(["held"]);
+    expect(snapshot.devcontainerContainers[0].localFolder).toBe(workspace);
+    expect(snapshot.devcontainerContainers[0].configFile).toBe(config);
+    // The exact name derived from the holder's labels is inspected even though
+    // the caller only passed the workspace path.
+    expect(snapshot.dindVolumes.map((v) => v.name)).toEqual([dind]);
+    expect(snapshot.dindVolumes[0].sizeBytes).toBe(Math.round(2.7 * 1024 ** 3));
+    expect(snapshot.dindVolumes[0].inUse).toBe(true);
+    const inspected = argv
+      .filter((a) => a[0] === "volume" && a[1] === "inspect")
+      .map((a) => a[a.length - 1]);
+    expect(inspected).toEqual([dind]);
+    expect(inspected).not.toContain(unrelatedDind);
+  });
+
   test("merged cleanup removes this Run's derived dind named volume and no other", async () => {
     commitDevcontainerConfig();
     const id = newTask();
@@ -851,6 +977,79 @@ describe("ISH-1221: run scratch + labelled resource reclamation", () => {
     expect(report.entries.map((e) => e.id)).not.toContain(unrelated.name);
   });
 
+  test("a live FIX Run on the same worktree keeps a detached dind volume out of the leak report", async () => {
+    commitDevcontainerConfig();
+    const id = newTask();
+    await launchedRun(id);
+    const worktree = getTask(db, id)!.worktree!;
+    // Detached devcontainer: Docker says no container is referencing the volume.
+    const dind = dindVolumeFor(worktree, { inUse: false });
+    const docker = new FakeDocker();
+    docker.dindVolumes = [dind];
+
+    // With only the finished Run, the dind volume has a dead owner and is listed.
+    const before = scanRunLeaks(db, {
+      repo,
+      outputRoot: outputRoot(),
+      worktreesRoot: worktreesRoot(),
+      docker,
+    });
+    expect(before.entries.find((e) => e.kind === "dind-volume" && e.id === dind.name)).toBeDefined();
+
+    // A FIX attempt is a NEW live Run on the SAME worktree (per-workspace dind
+    // identity). The first Run still owns the name in `dindOwners`, so only a
+    // live-workspace check stops the false leak.
+    const { launchTaskRun } = await import("../src/run-lifecycle");
+    const spawner = new FakeSpawner();
+    const fix = await launchTaskRun(db, id, {
+      repo,
+      worktreesRoot: worktreesRoot(),
+      outputRoot: outputRoot(),
+      spawner,
+      fastExitMs: 0,
+    });
+    expect(getRun(db, fix.run.id)!.state).toBe("running");
+    const after = scanRunLeaks(db, {
+      repo,
+      outputRoot: outputRoot(),
+      worktreesRoot: worktreesRoot(),
+      docker,
+    });
+    expect(after.entries.find((e) => e.kind === "dind-volume" && e.id === dind.name)).toBeUndefined();
+
+    spawner.procs[0].finish(0);
+    await fix.handle.wait();
+  });
+
+  test("a RUNNING devcontainer holder is left alone; only a stopped holder is a leak", async () => {
+    commitDevcontainerConfig();
+    const id = newTask();
+    await launchedRun(id);
+    const worktree = getTask(db, id)!.worktree!;
+    const dind = dindVolumeFor(worktree, { inUse: true });
+    db.query(`UPDATE tasks SET state='cancelled' WHERE id=?`).run(id);
+    const docker = new FakeDocker();
+    docker.dindVolumes = [dind];
+    docker.devcontainerContainers = [
+      {
+        id: "devcontainer-live",
+        name: "relay-devcontainer-live",
+        state: "running",
+        sizeBytes: 4096,
+        localFolder: worktree,
+        configFile: join(worktree, ".devcontainer", "devcontainer.json"),
+      },
+    ];
+    const report = scanRunLeaks(db, {
+      repo,
+      outputRoot: outputRoot(),
+      worktreesRoot: worktreesRoot(),
+      docker,
+    });
+    expect(report.entries.map((e) => e.id)).not.toContain("devcontainer-live");
+    expect(report.entries.find((e) => e.kind === "dind-volume" && e.id === dind.name)).toBeUndefined();
+  });
+
   test("an unverifiable live PR refusal names the exact operator next step", async () => {
     const id = newTask({ prUrl: "https://github.com/o/r/pull/1" });
     await launchedRun(id);
@@ -964,6 +1163,83 @@ describe("ISH-1221: run scratch + labelled resource reclamation", () => {
       expect(plan.removedResources).toContain(`volume ${taskDind} (dind)`);
       const mutations = readFileSync(shim.log, "utf8");
       expect(mutations).toContain(`volume rm ${taskDind}`);
+      expect(mutations).not.toContain(unrelated);
+      expect(mutations).not.toMatch(/FORBIDDEN|\brmi\b|image/);
+      // Evidence is retained.
+      expect(getRun(db, runId)).not.toBeNull();
+      expect(existsSync(join(outputRoot(), runId))).toBe(true);
+    });
+  }
+
+  for (const mode of ["merged", "cancelled"] as const) {
+    test(`the CLI lists and reclaims a stopped devcontainer's held dind volume on a ${mode} Task (docker shim)`, async () => {
+      commitDevcontainerConfig();
+      const id = newTask();
+      const { runId } = await launchedRun(id);
+      const worktree = getTask(db, id)!.worktree!;
+      const configFile = join(worktree, ".devcontainer", "devcontainer.json");
+      const taskDind = dindVolumeName(devcontainerId(worktree, configFile));
+      const unrelated = dindVolumeName("r".repeat(52));
+      if (mode === "merged") {
+        db.query(`UPDATE tasks SET state='done', accepted_at=?, merged_at=? WHERE id=?`).run(Date.now(), Date.now(), id);
+      } else {
+        db.query(`UPDATE tasks SET state='cancelled' WHERE id=?`).run(id);
+      }
+      const holder: DevcontainerContainer = {
+        id: "devcontainer-task",
+        name: "relay-devcontainer-task",
+        state: "exited",
+        sizeBytes: 12 * 1024 ** 2,
+        localFolder: worktree,
+        configFile,
+      };
+      // The shim reports the holder and Docker's Links=1: the old patrol hid
+      // exactly this case because the named volume was "in use".
+      const shim = writeDockerShim(taskDind, unrelated, { container: holder, taskLinks: 1 });
+      const cli = join(import.meta.dir, "..", "src", "cli.ts");
+      const env = {
+        ...process.env,
+        RELAY_DB: process.env.RELAY_DB!,
+        RELAY_MIN_FREE_DISK_BYTES: "0",
+        RELAY_DOCKER_RESOURCES: "on",
+        PATH: `${shim.bin}:${process.env.PATH}`,
+        ...shim.env,
+      };
+
+      const leakOut = execFileSync(process.execPath, [cli, "run", "list", "--leaks", "--repo", repo, "--json"], {
+        encoding: "utf8",
+        env,
+      });
+      const report = JSON.parse(leakOut);
+      const dindEntry = report.entries.find(
+        (e: { kind: string; id: string }) => e.kind === "dind-volume" && e.id === taskDind
+      );
+      expect(dindEntry).toBeTruthy();
+      expect(dindEntry.sizeBytes).toBe(Math.round(2.7 * 1024 ** 3));
+      expect(dindEntry.taskId).toBe(id);
+      expect(dindEntry.detail).toContain(`held by container ${holder.id} (${holder.name})`);
+      const holderEntry = report.entries.find(
+        (e: { kind: string; id: string }) => e.kind === "container" && e.id === holder.id
+      );
+      expect(holderEntry).toBeTruthy();
+      expect(holderEntry.sizeBytes).toBe(12 * 1024 ** 2);
+      expect(holderEntry.detail).toContain("devcontainer local_folder=");
+      const leakedIds = report.entries.map((e: { id: string }) => e.id);
+      expect(leakedIds).not.toContain(unrelated);
+      expect(leakedIds).not.toContain("devcontainer-unrelated");
+
+      const out = execFileSync(process.execPath, [cli, "run", "cleanup", id, "--apply", "--repo", repo, "--json"], {
+        encoding: "utf8",
+        env,
+      });
+      const plan = JSON.parse(out);
+      expect(plan.removed).toBe(true);
+      expect(plan.removedResources).toContain(`container ${holder.id} (${holder.name})`);
+      expect(plan.removedResources).toContain(`volume ${taskDind} (dind)`);
+      const mutations = readFileSync(shim.log, "utf8");
+      expect(mutations).toContain(`rm -f -v ${holder.id}`);
+      expect(mutations).toContain(`volume rm ${taskDind}`);
+      expect(mutations).not.toContain("devcontainer-unrelated");
       expect(mutations).not.toContain(unrelated);
       expect(mutations).not.toMatch(/FORBIDDEN|\brmi\b|image/);
       // Evidence is retained.

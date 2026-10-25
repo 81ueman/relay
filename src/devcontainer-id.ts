@@ -67,6 +67,16 @@ function unique(values: string[]): string[] {
 }
 
 /**
+ * The logical and physical spellings of a workspace path. A devcontainer label
+ * may record either form (`/tmp/x` vs `/private/tmp/x` on macOS), while Relay's
+ * recorded Run cwd uses the other. Matching BOTH is what keeps attribution exact
+ * without a prefix scan: a path only matches when it is the same directory.
+ */
+export function workspacePathVariants(path: string): string[] {
+  return unique([resolve(path), realpathOf(path)]);
+}
+
+/**
  * The devcontainer config files the CLI resolves for a default
  * `devcontainer up --workspace-folder <workspace>`: the two root locations plus
  * a named config under `.devcontainer/<name>/` (used with `--config`). Only
@@ -128,4 +138,23 @@ export function dindVolumeNamesForWorkspace(
     }
   }
   return unique(out);
+}
+
+/**
+ * The exact dind volume name implied by a devcontainer container's OWN labels.
+ *
+ * A stopped devcontainer is unlabelled by Relay but carries
+ * `devcontainer.local_folder` and (when the CLI resolved a config)
+ * `devcontainer.config_file`. Those are exactly the two inputs the CLI hashes, so
+ * the volume is attributable even after the worktree (and its config file) is
+ * gone. With no config label, fall back to the workspace's default config
+ * candidates; an absent workspace then yields no name, never a glob.
+ */
+export function dindVolumeNamesFromContainerLabels(
+  localFolder: string,
+  configFile?: string | null
+): string[] {
+  const config = (configFile ?? "").trim();
+  if (config) return [dindVolumeName(devcontainerId(localFolder, config))];
+  return dindVolumeNamesForWorkspace(localFolder);
 }
