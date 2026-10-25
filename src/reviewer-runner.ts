@@ -510,7 +510,10 @@ export function buildReviewBrief(
     "Relay-owned per-review paths, never `/tmp/<name>`. Any container or volume you",
     "start MUST carry `--label \"$RELAY_DOCKER_LABEL_PLANE\"`,",
     "`--label \"$RELAY_DOCKER_LABEL_TASK\"` and `--label \"$RELAY_DOCKER_LABEL_RUN\"`",
-    "so Relay can reclaim it; a missing plane label makes the resource untraceable."
+    "so Relay can reclaim it; a missing plane label makes the resource untraceable.",
+    "A devcontainer `dind-var-lib-docker-*` volume is NAMED: `docker rm -v` does not",
+    "remove it. Start the devcontainer with `--workspace-folder <this worktree>` and",
+    "its default config, and Relay derives the exact volume name for reclamation."
   );
   if (findings.length > 0) {
     lines.push("", `## Prior findings @ attempt ${token(task)} (context — verify they are actually fixed)`);

@@ -1,18 +1,24 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { resolve } from "node:path";
 import { defaultDbPath } from "./db";
+import { canonicalizeDbPath } from "./singleton";
 
 /**
- * ISH-1221 — Relay-labelled container/volume inventory and reclamation.
+ * ISH-1221/1222 — Relay-labelled container/volume inventory and reclamation.
  *
  * Relay itself does not start containers; the worker/reviewer processes it
  * launches do. Relay therefore hands them the label values
  * (`RELAY_DOCKER_LABEL_PLANE` / `RELAY_DOCKER_LABEL_TASK` /
  * `RELAY_DOCKER_LABEL_RUN`) and reclaims exactly those labels. It NEVER lists,
- * stops or deletes an unlabelled container or volume (other projects share the
- * host) and NEVER has an image-removal path (the cEOS/NOS images are
+ * stops or deletes an untraceable unlabelled container/volume (other projects
+ * share the host) and NEVER has an image-removal path (the cEOS/NOS images are
  * hand-imported and cannot be re-pulled).
+ *
+ * The ONE unlabelled exception is the devcontainer `dind-var-lib-docker-*`
+ * volume: the feature cannot label it, so Relay derives its exact name from the
+ * Run's recorded workspace/config (`src/devcontainer-id.ts`). Only that exact
+ * recorded name is inspected/removed — never a `dind-*` scan — and only when no
+ * container still references it.
  *
  * `relay.task=T1` is NOT globally unique: every control plane numbers its own
  * Tasks from T1 (`src/tasks.ts`). The `relay.plane=<hash>` label namespaces the
@@ -27,10 +33,17 @@ export const RELAY_RUN_LABEL = "relay.run";
 
 /**
  * Stable control-plane namespace from the DB path (12 hex chars of SHA-256).
- * `resolve` (not realpath) keeps the id stable for the same configured path.
+ *
+ * ISH-1222: hash the CANONICAL path, not the configured spelling. On macOS
+ * `/tmp` is a symlink to `/private/tmp`; if the daemon and the CLI reached the
+ * same DB through those two spellings, the old `resolve`-only id differed and
+ * cleanup silently skipped every labelled resource (fail-safe, but a leak).
+ * `canonicalizeDbPath` realpaths the file (or its existing parent directory) and
+ * falls back to `resolve` for a not-yet-created path, mirroring the daemon's
+ * singleton identity.
  */
 export function controlPlaneId(dbPath: string = defaultDbPath()): string {
-  return createHash("sha256").update(resolve(dbPath)).digest("hex").slice(0, 12);
+  return createHash("sha256").update(canonicalizeDbPath(dbPath)).digest("hex").slice(0, 12);
 }
 
 /**
@@ -58,17 +71,41 @@ export interface RunVolume {
   plane: string | null;
   taskId: string | null;
   runId: string | null;
-  /** Docker has no cheap per-volume size; the leak report shows `-`. */
+  /**
+   * Docker's reported volume size (`docker system df -v`), when available. A
+   * missing size is `null`, never a guess; the leak report renders `-`.
+   */
   sizeBytes: number | null;
+  /** Docker reports at least one container referencing this volume. */
+  inUse: boolean;
 }
 
 export interface RunResourceSnapshot {
   containers: RunContainer[];
+  /** Volumes carrying a Relay label (`relay.task`/`relay.run`). */
   volumes: RunVolume[];
+  /**
+   * ISH-1222: exact `dind-var-lib-docker-*` volumes derived from a Run's
+   * recorded devcontainer id. They are usually UNLABELLED (the devcontainer
+   * feature does not support labels), so they are attributed by exact derived
+   * name, never by a prefix/pattern scan.
+   */
+  dindVolumes: RunVolume[];
   /** Non-null when the container inventory could not be read (docker absent/down). */
   containerError: string | null;
-  /** Non-null when the volume inventory could not be read. */
+  /** Non-null when the labelled volume inventory could not be read. */
   volumeError: string | null;
+  /** Non-null when the optional volume-size probe failed (sizes then stay null). */
+  sizeError: string | null;
+}
+
+export interface SnapshotOptions {
+  /**
+   * Exact, already-derived dind volume names to resolve (deduped by the caller).
+   * This is NOT a search pattern: the real implementation only `inspect`s these
+   * names and never enumerates other `dind-var-lib-docker-*` volumes.
+   */
+  dindVolumeNames?: readonly string[];
 }
 
 export interface ExecResult {
@@ -80,8 +117,8 @@ export interface ExecResult {
 export type DockerExec = (argv: string[], timeoutMs?: number) => ExecResult;
 
 export interface RunResourceDocker {
-  /** Every container/volume carrying a Relay label (`relay.plane`/`relay.task`/`relay.run`). */
-  snapshot(): RunResourceSnapshot;
+  /** Relay-labelled resources + the exact dind names in `opts`. */
+  snapshot(opts?: SnapshotOptions): RunResourceSnapshot;
   removeContainer(id: string): { ok: boolean; error: string };
   removeVolume(name: string): { ok: boolean; error: string };
 }
@@ -108,7 +145,14 @@ export function disabledRunResourceDocker(
   reason = "docker inventory disabled: no RunResourceDocker seam was passed"
 ): RunResourceDocker {
   return {
-    snapshot: () => ({ containers: [], volumes: [], containerError: reason, volumeError: reason }),
+    snapshot: () => ({
+      containers: [],
+      volumes: [],
+      dindVolumes: [],
+      containerError: reason,
+      volumeError: reason,
+      sizeError: null,
+    }),
     removeContainer: () => ({ ok: false, error: reason }),
     removeVolume: () => ({ ok: false, error: reason }),
   };
@@ -213,7 +257,55 @@ function readContainers(exec: DockerExec): { containers: RunContainer[]; error: 
   return { containers: [...byId.values()], error: errors.length > 0 ? errors.join("; ") : null };
 }
 
-function readVolumes(exec: DockerExec): { volumes: RunVolume[]; error: string | null } {
+/**
+ * ISH-1222: per-volume sizes + reference counts from `docker system df -v`.
+ * Docker has no per-volume size in `volume inspect`; this is the one read that
+ * reports it. Best-effort: a failed/older probe leaves sizes null (the leak
+ * report renders `-`) and is surfaced separately, never as a reason to remove
+ * anything. `Links` > 0 means a container (possibly the unlabelled devcontainer)
+ * still references the volume, so cleanup must leave it alone.
+ */
+function readVolumeUsage(exec: DockerExec): {
+  sizeBytes: Map<string, number>;
+  inUse: Map<string, boolean>;
+  error: string | null;
+} {
+  const sizeBytes = new Map<string, number>();
+  const inUse = new Map<string, boolean>();
+  const r = exec(["system", "df", "-v", "--format", "json"], 60_000);
+  if (!r.ok) {
+    return {
+      sizeBytes,
+      inUse,
+      error: (r.stderr || r.stdout || "docker system df -v failed").slice(0, 300),
+    };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(r.stdout);
+  } catch {
+    return { sizeBytes, inUse, error: "docker system df -v returned non-JSON output" };
+  }
+  const rows =
+    parsed && typeof parsed === "object" && Array.isArray((parsed as { Volumes?: unknown }).Volumes)
+      ? ((parsed as { Volumes: unknown[] }).Volumes)
+      : [];
+  for (const row of rows) {
+    if (!row || typeof row !== "object") continue;
+    const name = String((row as { Name?: unknown }).Name ?? "").trim();
+    if (!name) continue;
+    const size = parseDockerSize((row as { Size?: unknown }).Size);
+    if (size !== null) sizeBytes.set(name, size);
+    const links = Number((row as { Links?: unknown }).Links);
+    if (Number.isFinite(links)) inUse.set(name, links > 0);
+  }
+  return { sizeBytes, inUse, error: null };
+}
+
+function readVolumes(
+  exec: DockerExec,
+  usage: { sizeBytes: Map<string, number>; inUse: Map<string, boolean> }
+): { volumes: RunVolume[]; error: string | null } {
   const names = new Set<string>();
   const errors: string[] = [];
   for (const label of [RELAY_TASK_LABEL, RELAY_RUN_LABEL]) {
@@ -236,28 +328,62 @@ function readVolumes(exec: DockerExec): { volumes: RunVolume[]; error: string | 
       const rows = parseJsonLines(inspected.stdout);
       if (rows[0]) labels = labelMap((rows[0] as { Labels?: unknown }).Labels);
     }
-    volumes.push({ name, plane: labels.plane, taskId: labels.taskId, runId: labels.runId, sizeBytes: null });
+    volumes.push({
+      name,
+      plane: labels.plane,
+      taskId: labels.taskId,
+      runId: labels.runId,
+      sizeBytes: usage.sizeBytes.get(name) ?? null,
+      inUse: usage.inUse.get(name) ?? false,
+    });
   }
   return { volumes, error: errors.length > 0 ? errors.join("; ") : null };
 }
 
-/** The production Docker inventory/removal implementation. */
+/**
+ * The production Docker inventory/removal implementation.
+ *
+ * `dindVolumeNames` is the ONLY way a dind volume enters the inventory: the
+ * caller derives it from a Run's recorded workspace, and this function merely
+ * checks whether that exact name exists. There is no `volume ls dind-*` scan, so
+ * an unrelated devcontainer volume is never listed, sized for removal, or rm'd.
+ */
 export function realRunResourceDocker(exec: DockerExec = realDockerExec()): RunResourceDocker {
   return {
-    snapshot() {
+    snapshot(opts: SnapshotOptions = {}) {
       const c = readContainers(exec);
-      const v = readVolumes(exec);
+      const usage = readVolumeUsage(exec);
+      const v = readVolumes(exec, usage);
+      const labelled = new Set(v.volumes.map((x) => x.name));
+      const dindVolumes: RunVolume[] = [];
+      for (const name of [...new Set(opts.dindVolumeNames ?? [])]) {
+        if (labelled.has(name)) continue;
+        const inspected = exec(["volume", "inspect", "--format", "{{json .}}", name]);
+        if (!inspected.ok) continue; // absent (or unreadable): nothing to reclaim
+        const rows = parseJsonLines(inspected.stdout);
+        const labels = rows[0] ? labelMap((rows[0] as { Labels?: unknown }).Labels) : { plane: null, taskId: null, runId: null };
+        dindVolumes.push({
+          name,
+          plane: labels.plane,
+          taskId: labels.taskId,
+          runId: labels.runId,
+          sizeBytes: usage.sizeBytes.get(name) ?? null,
+          inUse: usage.inUse.get(name) ?? false,
+        });
+      }
       return {
         containers: c.containers,
         volumes: v.volumes,
+        dindVolumes,
         containerError: c.error,
         volumeError: v.error,
+        sizeError: usage.error,
       };
     },
     removeContainer(id) {
-      // `-v` also removes the ANONYMOUS volumes of this container (the 2–5 GB
-      // `dind-var-lib-docker-*` ones named in ISH-1221). It cannot touch a
-      // named/unlabelled volume owned by another container.
+      // ISH-1222 correction: `-v` removes only a container's ANONYMOUS volumes.
+      // The devcontainer `dind-var-lib-docker-*` volume is NAMED, so it is
+      // reclaimed explicitly by its derived name, never by this flag.
       const r = exec(["rm", "-f", "-v", id]);
       return { ok: r.ok, error: r.ok ? "" : (r.stderr || r.stdout || "docker rm failed").slice(0, 300) };
     },

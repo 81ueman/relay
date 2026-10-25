@@ -157,6 +157,12 @@ relay merge-check <task-id> --authority merge
 # succeeds — the operator/Factory paths auto-detect it; `off` disables):
 RELAY_PROVIDER_GITHUB=gh relay pr bind <task-id>
 RELAY_PROVIDER_GITHUB=off relay merge-check <task-id>
+
+# EXPLICIT operator override (ISH-1222): clear a stale PR binding when the live
+# state cannot be read (`gh` down) and a failed-closed cleanup must proceed. It
+# logs task.pr_unbound with the cleared identity; it never runs implicitly and
+# never clears the produced head/branch/worktree.
+relay pr unbind <task-id> --reason "PR was closed; gh unavailable"
 ```
 
 The operator/daemon paths auto-detect an authenticated `gh` when

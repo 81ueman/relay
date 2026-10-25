@@ -1,20 +1,21 @@
 import { describe, expect, test, beforeEach, afterEach } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { Database } from "bun:sqlite";
 import { openDb } from "../src/db";
-import { getTask } from "../src/tasks";
+import { getTask, unbindTaskPr } from "../src/tasks";
 import { registerWorker } from "../src/workers";
 import { intakeTask } from "../src/workflow";
 import { getRun, type DshProcess, type DshSpawner } from "../src/dsh-runner";
 import { PINNED_DSH_VERSION } from "../src/dsh-version";
 import { applyWorkspaceCleanup, planWorkspaceCleanup } from "../src/run-lifecycle";
 import type { GitHubReadOnly, PrView } from "../src/providers";
-import type { RunContainer, RunResourceDocker, RunVolume } from "../src/run-resources";
+import type { RunContainer, RunResourceDocker, RunVolume, SnapshotOptions } from "../src/run-resources";
 import { controlPlaneId, realRunResourceDocker } from "../src/run-resources";
 import { scanRunLeaks } from "../src/run-leaks";
+import { devcontainerId, dindVolumeName, dindVolumeNamesForWorkspace } from "../src/devcontainer-id";
 import { reviewScratchTaskRoot } from "../src/scratch";
 
 /**
@@ -64,21 +65,28 @@ class FakeSpawner implements DshSpawner {
 }
 
 class FakeDocker implements RunResourceDocker {
+  /** Relay-labelled containers/volumes. */
   containers: RunContainer[] = [];
   volumes: RunVolume[] = [];
+  /** ISH-1222: unlabelled dind volumes, attributed only by the exact derived name. */
+  dindVolumes: RunVolume[] = [];
   removedContainers: string[] = [];
   removedVolumes: string[] = [];
   /** Images are hand-imported; the seam has no path to touch them. */
   images = ["ceos:4.31.2f", "frr:9.1"];
   containerError: string | null = null;
   volumeError: string | null = null;
+  sizeError: string | null = null;
 
-  snapshot() {
+  snapshot(opts: SnapshotOptions = {}) {
+    const wanted = new Set(opts.dindVolumeNames ?? []);
     return {
       containers: [...this.containers],
       volumes: [...this.volumes],
+      dindVolumes: this.dindVolumes.filter((v) => wanted.has(v.name)).map((v) => ({ ...v })),
       containerError: this.containerError,
       volumeError: this.volumeError,
+      sizeError: this.sizeError,
     };
   }
   removeContainer(id: string) {
@@ -88,9 +96,12 @@ class FakeDocker implements RunResourceDocker {
     return { ok: true, error: "" };
   }
   removeVolume(name: string) {
-    if (!this.volumes.some((v) => v.name === name)) return { ok: false, error: "no such volume" };
+    const known =
+      this.volumes.some((v) => v.name === name) || this.dindVolumes.some((v) => v.name === name);
+    if (!known) return { ok: false, error: "no such volume" };
     this.removedVolumes.push(name);
     this.volumes = this.volumes.filter((v) => v.name !== name);
+    this.dindVolumes = this.dindVolumes.filter((v) => v.name !== name);
     return { ok: true, error: "" };
   }
 }
@@ -211,12 +222,99 @@ function labelledDocker(taskId: string, runId: string, otherTask = "T999"): Fake
     { id: "c-unlabelled", name: "human", plane: null, taskId: null, runId: null, state: "running", sizeBytes: 4096 },
   ];
   docker.volumes = [
-    { name: "v-task", plane, taskId, runId, sizeBytes: null },
-    { name: "v-other", plane, taskId: otherTask, runId: "run-other", sizeBytes: null },
-    { name: "v-cross-plane", plane: "0123456789ab", taskId, runId: "run-foreign", sizeBytes: null },
-    { name: "v-unlabelled", plane: null, taskId: null, runId: null, sizeBytes: null },
+    { name: "v-task", plane, taskId, runId, sizeBytes: null, inUse: false },
+    { name: "v-other", plane, taskId: otherTask, runId: "run-other", sizeBytes: null, inUse: false },
+    { name: "v-cross-plane", plane: "0123456789ab", taskId, runId: "run-foreign", sizeBytes: null, inUse: false },
+    { name: "v-unlabelled", plane: null, taskId: null, runId: null, sizeBytes: null, inUse: true },
   ];
   return docker;
+}
+
+/** Commit a devcontainer config so Relay can derive the exact dind volume id. */
+function commitDevcontainerConfig(): void {
+  mkdirSync(join(repo, ".devcontainer"), { recursive: true });
+  writeFileSync(join(repo, ".devcontainer", "devcontainer.json"), '{"image":"mcr.microsoft.com/devcontainers/base:ubuntu"}\n');
+  git(repo, "add", ".devcontainer/devcontainer.json");
+  git(repo, "commit", "-q", "-m", "add devcontainer config");
+}
+
+/** The exact dind volume this worktree's devcontainer creates, unlabelled. */
+function dindVolumeFor(worktree: string, opts: { sizeBytes?: number; inUse?: boolean } = {}): RunVolume {
+  const names = dindVolumeNamesForWorkspace(worktree);
+  expect(names.length).toBeGreaterThan(0);
+  return {
+    name: names[0],
+    plane: null,
+    taskId: null,
+    runId: null,
+    sizeBytes: opts.sizeBytes ?? Math.round(2.7 * 1024 ** 3),
+    inUse: opts.inUse ?? false,
+  };
+}
+
+/**
+ * A real `docker` CLI shim on PATH: Relay's production seam (`realDockerExec`)
+ * runs it, so the test exercises `relay run cleanup`/`run list --leaks` end to
+ * end without touching host Docker. It knows exactly two dind volumes (this
+ * Task's + an unrelated one) and logs every mutating command.
+ */
+function writeDockerShim(taskDind: string, unrelatedDind: string): { bin: string; log: string; env: Record<string, string> } {
+  const bin = join(dir, "bin");
+  mkdirSync(bin, { recursive: true });
+  const log = join(dir, "docker-mutations.log");
+  const env = {
+    RELAY_TEST_TASK_DIND: taskDind,
+    RELAY_TEST_UNRELATED_DIND: unrelatedDind,
+    RELAY_TEST_DOCKER_LOG: log,
+  };
+  const script = `#!/bin/sh
+set -eu
+cmd="\${1:-}"
+if [ $# -gt 0 ]; then shift; fi
+log="\${RELAY_TEST_DOCKER_LOG:?}"
+case "$cmd" in
+  ps) exit 0 ;;
+  volume)
+    sub="\${1:-}"
+    if [ $# -gt 0 ]; then shift; fi
+    case "$sub" in
+      ls) exit 0 ;;
+      inspect)
+        # args: --format '{{json .}}' <name>
+        name="\${3:-}"
+        if [ "$name" = "\${RELAY_TEST_TASK_DIND:?}" ] || [ "$name" = "\${RELAY_TEST_UNRELATED_DIND:?}" ]; then
+          printf '{"Name":"%s","Labels":null,"Mountpoint":"/tmp/dind"}\\n' "$name"
+          exit 0
+        fi
+        printf 'Error response from daemon: no such volume: %s\\n' "$name" >&2
+        exit 1
+        ;;
+      rm)
+        printf 'volume rm %s\\n' "\${1:-}" >> "$log"
+        exit 0
+        ;;
+    esac
+    exit 0
+    ;;
+  system)
+    printf '{"Volumes":[{"Name":"%s","Size":"2.7GB","Links":"0"},{"Name":"%s","Size":"1.1GB","Links":"0"}]}\\n' \\
+      "\${RELAY_TEST_TASK_DIND:?}" "\${RELAY_TEST_UNRELATED_DIND:?}"
+    exit 0
+    ;;
+  rm)
+    printf 'rm %s\\n' "$*" >> "$log"
+    exit 0
+    ;;
+  rmi|image|prune)
+    printf 'FORBIDDEN %s %s\\n' "$cmd" "$*" >> "$log"
+    exit 1
+    ;;
+esac
+exit 0
+`;
+  writeFileSync(join(bin, "docker"), script);
+  chmodSync(join(bin, "docker"), 0o755);
+  return { bin, log, env };
 }
 
 describe("ISH-1221: run scratch + labelled resource reclamation", () => {
@@ -429,7 +527,8 @@ describe("ISH-1221: run scratch + labelled resource reclamation", () => {
     expect(flat).not.toMatch(/\brmi\b|image\s+prune|system\s+prune/);
     expect(flat).toContain("label=relay.task");
     expect(flat).toContain("label=relay.run");
-    // `-v` reclaims the labelled container's anonymous dind volumes too.
+    // `-v` reclaims only ANONYMOUS volumes; the named dind volume is derived
+    // and removed explicitly (ISH-1222), never by this flag.
     expect(flat).toContain("rm -f -v abc");
   });
 
@@ -492,4 +591,384 @@ describe("ISH-1221: run scratch + labelled resource reclamation", () => {
     expect(plan.volumes).toEqual([]);
     expect(plan.warnings.join(" ")).toMatch(/docker inventory disabled/);
   });
+
+  // --- ISH-1222: devcontainer dind named volumes ---
+
+  test("the devcontainer id and dind name match @devcontainers/cli", () => {
+    // Independent fixture: sha256(JSON.stringify({config_file, local_folder}))
+    // -> base32(0-9a-v), left-padded to 52 chars.
+    const id = devcontainerId("/workspaces/demo", "/workspaces/demo/.devcontainer/devcontainer.json");
+    expect(id).toBe("0vhg70gun28ie7ilcg66ls827mfr9belol5p1b61mq4bj2o6n67d");
+    expect(dindVolumeName(id)).toBe(
+      "dind-var-lib-docker-0vhg70gun28ie7ilcg66ls827mfr9belol5p1b61mq4bj2o6n67d"
+    );
+    // Only configs that actually exist are candidates.
+    expect(dindVolumeNamesForWorkspace("/workspaces/demo")).toEqual([]);
+  });
+
+  test("the real Docker seam resolves only the exact derived dind name, with its size", () => {
+    const argv: string[][] = [];
+    const dind = dindVolumeName("a".repeat(52));
+    const unrelated = dindVolumeName("b".repeat(52));
+    const docker = realRunResourceDocker((args) => {
+      argv.push(args);
+      if (args[0] === "ps") return { ok: true, stdout: "", stderr: "" };
+      if (args[0] === "volume" && args[1] === "ls") return { ok: true, stdout: "", stderr: "" };
+      if (args[0] === "system") {
+        return {
+          ok: true,
+          stdout: JSON.stringify({
+            Volumes: [
+              { Name: dind, Size: "2.7GB", Links: "0" },
+              { Name: unrelated, Size: "1.1GB", Links: "0" },
+            ],
+          }),
+          stderr: "",
+        };
+      }
+      if (args[0] === "volume" && args[1] === "inspect") {
+        const name = args[args.length - 1];
+        if (name === dind) return { ok: true, stdout: JSON.stringify({ Labels: null }), stderr: "" };
+        return { ok: false, stdout: "", stderr: "no such volume" };
+      }
+      return { ok: true, stdout: "", stderr: "" };
+    });
+    const snapshot = docker.snapshot({ dindVolumeNames: [dind] });
+    expect(snapshot.dindVolumes.map((v) => v.name)).toEqual([dind]);
+    expect(snapshot.dindVolumes[0].sizeBytes).toBe(Math.round(2.7 * 1024 ** 3));
+    expect(snapshot.dindVolumes[0].inUse).toBe(false);
+    expect(snapshot.volumes).toEqual([]);
+    // The unrelated dind volume is never even inspected.
+    const inspected = argv
+      .filter((a) => a[0] === "volume" && a[1] === "inspect")
+      .map((a) => a[a.length - 1]);
+    expect(inspected).toEqual([dind]);
+    const flat = argv.map((a) => a.join(" ")).join("\n");
+    expect(flat).not.toMatch(/\brmi\b|image\s+prune/);
+  });
+
+  test("merged cleanup removes this Run's derived dind named volume and no other", async () => {
+    commitDevcontainerConfig();
+    const id = newTask();
+    const { runId } = await launchedRun(id);
+    const worktree = getTask(db, id)!.worktree!;
+    const dind = dindVolumeFor(worktree);
+    const unrelated: RunVolume = {
+      name: dindVolumeName("z".repeat(52)),
+      plane: null,
+      taskId: null,
+      runId: null,
+      sizeBytes: 123,
+      inUse: false,
+    };
+    db.query(`UPDATE tasks SET state='done', accepted_at=?, merged_at=? WHERE id=?`).run(Date.now(), Date.now(), id);
+    const docker = labelledDocker(id, runId);
+    docker.dindVolumes = [dind, unrelated];
+
+    const plan = await applyWorkspaceCleanup(db, id, {
+      apply: true,
+      repo,
+      worktreesRoot: worktreesRoot(),
+      outputRoot: outputRoot(),
+      docker,
+    });
+    expect(plan.remove).toBe(true);
+    expect(plan.removed).toBe(true);
+    expect(plan.volumes).toContainEqual({ name: dind.name, dind: true, inUse: false });
+    expect(docker.removedVolumes).toContain(dind.name);
+    expect(docker.removedVolumes).not.toContain(unrelated.name);
+    expect(docker.dindVolumes.map((v) => v.name)).toEqual([unrelated.name]);
+    expect(docker.images).toEqual(["ceos:4.31.2f", "frr:9.1"]);
+  });
+
+  test("cancelled cleanup removes this Run's derived dind named volume and no other", async () => {
+    commitDevcontainerConfig();
+    const id = newTask();
+    const { runId } = await launchedRun(id);
+    const worktree = getTask(db, id)!.worktree!;
+    const dind = dindVolumeFor(worktree);
+    const unrelated: RunVolume = {
+      name: dindVolumeName("y".repeat(52)),
+      plane: null,
+      taskId: null,
+      runId: null,
+      sizeBytes: 456,
+      inUse: false,
+    };
+    db.query(`UPDATE tasks SET state='cancelled' WHERE id=?`).run(id);
+    const docker = labelledDocker(id, runId);
+    docker.dindVolumes = [dind, unrelated];
+
+    const plan = await applyWorkspaceCleanup(db, id, {
+      apply: true,
+      repo,
+      worktreesRoot: worktreesRoot(),
+      outputRoot: outputRoot(),
+      docker,
+    });
+    expect(plan.remove).toBe(true);
+    expect(docker.removedVolumes).toContain(dind.name);
+    expect(docker.removedVolumes).not.toContain(unrelated.name);
+    expect(docker.images).toEqual(["ceos:4.31.2f", "frr:9.1"]);
+  });
+
+  test("a recorded Run cwd still reclaims/leaks the dind volume after the worktree is gone", async () => {
+    commitDevcontainerConfig();
+    const id = newTask();
+    const { runId } = await launchedRun(id);
+    const worktree = getTask(db, id)!.worktree!;
+    const dind = dindVolumeFor(worktree);
+    // An earlier (pre-fix) cleanup removed the worktree but left the named volume.
+    rmSync(worktree, { recursive: true, force: true });
+    db.query(`UPDATE tasks SET worktree=NULL, state='done', accepted_at=?, merged_at=? WHERE id=?`).run(
+      Date.now(),
+      Date.now(),
+      id
+    );
+    const docker = new FakeDocker();
+    docker.dindVolumes = [dind];
+
+    // The leak patrol derives the exact volume from runs.cwd even though the
+    // workspace/config no longer exists.
+    const report = scanRunLeaks(db, {
+      repo,
+      outputRoot: outputRoot(),
+      worktreesRoot: worktreesRoot(),
+      docker,
+    });
+    const entry = report.entries.find((e) => e.kind === "dind-volume");
+    expect(entry).toBeDefined();
+    expect(entry!.id).toBe(dind.name);
+    expect(entry!.runId).toBe(runId);
+
+    const plan = await applyWorkspaceCleanup(db, id, {
+      apply: true,
+      repo,
+      worktreesRoot: worktreesRoot(),
+      outputRoot: outputRoot(),
+      docker,
+    });
+    expect(plan.remove).toBe(true);
+    expect(plan.removedResources).toContain(`volume ${dind.name} (dind)`);
+    expect(docker.removedVolumes).toEqual([dind.name]);
+  });
+
+  test("a Run records a NAMED devcontainer's exact dind volume and reclaims it after the worktree is gone", async () => {
+    commitDevcontainerConfig();
+    mkdirSync(join(repo, ".devcontainer", "ci"), { recursive: true });
+    writeFileSync(join(repo, ".devcontainer", "ci", "devcontainer.json"), '{"image":"ubuntu:24.04"}\n');
+    git(repo, "add", ".devcontainer/ci/devcontainer.json");
+    git(repo, "commit", "-q", "-m", "add named devcontainer config");
+
+    const id = newTask();
+    const { runId } = await launchedRun(id);
+    const worktree = getTask(db, id)!.worktree!;
+    const namedConfig = join(worktree, ".devcontainer", "ci", "devcontainer.json");
+    const namedDind = dindVolumeName(devcontainerId(worktree, namedConfig));
+
+    // The Run row records the exact name at launch, while the config exists.
+    const run = getRun(db, runId)!;
+    const recorded = JSON.parse(run.devcontainer_volumes ?? "[]") as string[];
+    expect(recorded).toContain(namedDind);
+
+    // A later cleanup cannot re-derive a NAMED config from a deleted worktree
+    // (only the two default paths are guessed); the record is what saves it.
+    rmSync(worktree, { recursive: true, force: true });
+    db.query(`UPDATE tasks SET worktree=NULL, state='done', accepted_at=?, merged_at=? WHERE id=?`).run(
+      Date.now(),
+      Date.now(),
+      id
+    );
+    const docker = new FakeDocker();
+    docker.dindVolumes = [
+      { name: namedDind, plane: null, taskId: null, runId: null, sizeBytes: 777, inUse: false },
+    ];
+    const plan = await applyWorkspaceCleanup(db, id, {
+      apply: true,
+      repo,
+      worktreesRoot: worktreesRoot(),
+      outputRoot: outputRoot(),
+      docker,
+    });
+    expect(plan.remove).toBe(true);
+    expect(plan.removedResources).toContain(`volume ${namedDind} (dind)`);
+    expect(docker.removedVolumes).toEqual([namedDind]);
+  });
+
+  test("an in-use derived dind volume is left alone with a next-step warning", async () => {
+    commitDevcontainerConfig();
+    const id = newTask();
+    const { runId } = await launchedRun(id);
+    const worktree = getTask(db, id)!.worktree!;
+    const dind = dindVolumeFor(worktree, { inUse: true });
+    db.query(`UPDATE tasks SET state='cancelled' WHERE id=?`).run(id);
+    const docker = new FakeDocker();
+    docker.dindVolumes = [dind];
+
+    const plan = await applyWorkspaceCleanup(db, id, {
+      apply: true,
+      repo,
+      worktreesRoot: worktreesRoot(),
+      outputRoot: outputRoot(),
+      docker,
+    });
+    expect(docker.removedVolumes).toEqual([]);
+    expect(plan.warnings.join(" ")).toMatch(/still referenced by a container/);
+    expect(plan.warnings.join(" ")).toMatch(/docker rm -v <devcontainer>/);
+  });
+
+  test("the leak report lists an orphaned dind volume with Docker's size", async () => {
+    commitDevcontainerConfig();
+    const id = newTask();
+    const { runId } = await launchedRun(id);
+    const worktree = getTask(db, id)!.worktree!;
+    const dind = dindVolumeFor(worktree);
+    const unrelated: RunVolume = {
+      name: dindVolumeName("x".repeat(52)),
+      plane: null,
+      taskId: null,
+      runId: null,
+      sizeBytes: 999,
+      inUse: false,
+    };
+    db.query(`UPDATE tasks SET state='cancelled' WHERE id=?`).run(id);
+    const docker = new FakeDocker();
+    docker.dindVolumes = [dind, unrelated];
+
+    const report = scanRunLeaks(db, {
+      repo,
+      outputRoot: outputRoot(),
+      worktreesRoot: worktreesRoot(),
+      docker,
+    });
+    const entry = report.entries.find((e) => e.kind === "dind-volume");
+    expect(entry).toBeDefined();
+    expect(entry!.id).toBe(dind.name);
+    expect(entry!.taskId).toBe(id);
+    expect(entry!.runId).toBe(runId);
+    expect(entry!.sizeBytes).toBe(dind.sizeBytes);
+    expect(report.totalBytes).toBeGreaterThanOrEqual(dind.sizeBytes!);
+    expect(report.entries.map((e) => e.id)).not.toContain(unrelated.name);
+  });
+
+  test("an unverifiable live PR refusal names the exact operator next step", async () => {
+    const id = newTask({ prUrl: "https://github.com/o/r/pull/1" });
+    await launchedRun(id);
+    db.query(`UPDATE tasks SET state='cancelled', pr_repo='o/r' WHERE id=?`).run(id);
+    // No github reader -> the live state is unknown: fail CLOSED, but explain.
+    const plan = await planWorkspaceCleanup(db, id, {
+      repo,
+      worktreesRoot: worktreesRoot(),
+      outputRoot: outputRoot(),
+    });
+    expect(plan.remove).toBe(false);
+    const message = plan.reasons.join(" ");
+    expect(message).toMatch(/live state could not be re-read/);
+    expect(message).toContain("gh auth status");
+    expect(message).toContain("RELAY_PROVIDER_GITHUB=gh");
+    expect(message).toContain(`relay pr unbind ${id} --reason`);
+    // It is advice, not a silent override: nothing was removed.
+    expect(plan.removed).toBe(false);
+  });
+
+  test("relay pr unbind clears the PR binding and logs the explicit override", () => {
+    const id = newTask({ prUrl: "https://github.com/o/r/pull/1" });
+    db.query(`UPDATE tasks SET pr_repo='o/r', pr_base='main', pr_base_sha='b', pr_diff='d' WHERE id=?`).run(id);
+    const t = unbindTaskPr(db, id, "PR closed by operator");
+    expect(t.pr_url).toBeNull();
+    expect(t.pr_repo).toBeNull();
+    expect(t.pr_base).toBeNull();
+    expect(t.pr_base_sha).toBeNull();
+    expect(t.pr_diff).toBeNull();
+    const ev = db
+      .query(`SELECT payload_json FROM events WHERE task_id = ? AND type = 'task.pr_unbound' ORDER BY id DESC LIMIT 1`)
+      .get(id) as { payload_json: string } | null;
+    expect(ev).not.toBeNull();
+    expect(JSON.parse(ev!.payload_json).reason).toBe("PR closed by operator");
+    // A second unbind has nothing to clear and says so instead of silently succeeding.
+    expect(() => unbindTaskPr(db, id)).toThrow(/no PR binding/);
+  });
+
+  test("the CLI `relay pr unbind` clears the binding through the operator command", () => {
+    const id = newTask({ prUrl: "https://github.com/o/r/pull/1" });
+    db.query(`UPDATE tasks SET pr_repo='o/r' WHERE id=?`).run(id);
+    const cli = join(import.meta.dir, "..", "src", "cli.ts");
+    const out = execFileSync(process.execPath, [cli, "pr", "unbind", id, "--reason", "PR closed"], {
+      encoding: "utf8",
+      env: { ...process.env, RELAY_DB: process.env.RELAY_DB! },
+    });
+    expect(out).toContain("PR binding cleared");
+    expect(getTask(db, id)!.pr_url).toBeNull();
+    expect(getTask(db, id)!.pr_repo).toBeNull();
+  });
+
+  test("controlPlaneId is stable across symlinked DB paths", () => {
+    const realDir = join(dir, "real-plane");
+    mkdirSync(realDir, { recursive: true });
+    const linkedDir = join(dir, "linked-plane");
+    symlinkSync(realDir, linkedDir, "dir");
+    const realDb = join(realDir, "state.db");
+    writeFileSync(realDb, "");
+    expect(controlPlaneId(join(linkedDir, "state.db"))).toBe(controlPlaneId(realDb));
+    // A FILE symlink (the `/tmp` -> `/private/tmp` style) canonicalizes too.
+    const linkedFile = join(dir, "linked-state.db");
+    symlinkSync(realDb, linkedFile);
+    expect(controlPlaneId(linkedFile)).toBe(controlPlaneId(realDb));
+    // A not-yet-created DB canonicalizes its existing parent directory too.
+    expect(controlPlaneId(join(linkedDir, "not-yet.db"))).toBe(controlPlaneId(join(realDir, "not-yet.db")));
+    // Different physical DBs still differ.
+    expect(controlPlaneId(realDb)).not.toBe(controlPlaneId(join(realDir, "other.db")));
+  });
+
+  for (const mode of ["merged", "cancelled"] as const) {
+    test(`the CLI run cleanup --apply reclaims the dind volume on a ${mode} Task (docker shim)`, async () => {
+      commitDevcontainerConfig();
+      const id = newTask();
+      const { runId } = await launchedRun(id);
+      const worktree = getTask(db, id)!.worktree!;
+      const taskDind = dindVolumeNamesForWorkspace(worktree)[0];
+      const unrelated = dindVolumeName("q".repeat(52));
+      if (mode === "merged") {
+        db.query(`UPDATE tasks SET state='done', accepted_at=?, merged_at=? WHERE id=?`).run(Date.now(), Date.now(), id);
+      } else {
+        db.query(`UPDATE tasks SET state='cancelled' WHERE id=?`).run(id);
+      }
+      const shim = writeDockerShim(taskDind, unrelated);
+      const cli = join(import.meta.dir, "..", "src", "cli.ts");
+      const env = {
+        ...process.env,
+        RELAY_DB: process.env.RELAY_DB!,
+        RELAY_MIN_FREE_DISK_BYTES: "0",
+        RELAY_DOCKER_RESOURCES: "on",
+        PATH: `${shim.bin}:${process.env.PATH}`,
+        ...shim.env,
+      };
+      // The leak patrol (before cleanup) lists the exact dind volume with size,
+      // and never the unrelated one.
+      const leakOut = execFileSync(process.execPath, [cli, "run", "list", "--leaks", "--repo", repo, "--json"], {
+        encoding: "utf8",
+        env,
+      });
+      const report = JSON.parse(leakOut);
+      const entry = report.entries.find((e: { kind: string; id: string }) => e.kind === "dind-volume" && e.id === taskDind);
+      expect(entry).toBeTruthy();
+      expect(entry.sizeBytes).toBe(Math.round(2.7 * 1024 ** 3));
+      expect(report.entries.map((e: { id: string }) => e.id)).not.toContain(unrelated);
+
+      const out = execFileSync(process.execPath, [cli, "run", "cleanup", id, "--apply", "--repo", repo, "--json"], {
+        encoding: "utf8",
+        env,
+      });
+      const plan = JSON.parse(out);
+      expect(plan.removed).toBe(true);
+      expect(plan.removedResources).toContain(`volume ${taskDind} (dind)`);
+      const mutations = readFileSync(shim.log, "utf8");
+      expect(mutations).toContain(`volume rm ${taskDind}`);
+      expect(mutations).not.toContain(unrelated);
+      expect(mutations).not.toMatch(/FORBIDDEN|\brmi\b|image/);
+      // Evidence is retained.
+      expect(getRun(db, runId)).not.toBeNull();
+      expect(existsSync(join(outputRoot(), runId))).toBe(true);
+    });
+  }
 });

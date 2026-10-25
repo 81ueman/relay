@@ -262,6 +262,45 @@ export function setTaskPlan(db: Database, taskId: string, planId: string | null)
   return getTask(db, taskId)!;
 }
 
+/**
+ * ISH-1222: deliberately clear a Task's PR binding.
+ *
+ * This is the explicit operator escape hatch when the live PR state cannot be
+ * re-read (`gh` unavailable) and a failed-closed cleanup must proceed, e.g.
+ * `relay run cleanup <T> --abort "..."` after the PR was really closed. It is
+ * never called implicitly: `--abort` still refuses first and points here.
+ *
+ * It clears ONLY the recorded PR identity/base/diff (and the poll tombstones
+ * derived from it). The produced `head_sha`, branch, worktree, results and
+ * events are untouched, and the previous values are logged so the override is
+ * auditable.
+ */
+export function unbindTaskPr(db: Database, taskId: string, reason: string | null = null): Task {
+  const task = getTask(db, taskId);
+  if (!task) throw new Error(`unknown task: ${taskId}`);
+  if (!task.pr_url && !task.pr_repo) throw new Error(`task ${taskId} has no PR binding to clear`);
+  db.query(
+    `UPDATE tasks
+        SET pr_url = NULL, pr_repo = NULL, pr_base = NULL, pr_base_sha = NULL, pr_diff = NULL,
+            pr_updated_at = NULL, pr_settled_at = NULL, updated_at = ?
+      WHERE id = ?`
+  ).run(now(), taskId);
+  logEvent(db, {
+    source: "cli",
+    taskId,
+    type: "task.pr_unbound",
+    payload: {
+      prUrl: task.pr_url,
+      prRepo: task.pr_repo,
+      prBase: task.pr_base,
+      prBaseSha: task.pr_base_sha,
+      prDiff: task.pr_diff,
+      reason,
+    },
+  });
+  return getTask(db, taskId)!;
+}
+
 // ---------------------------------------------------------------------------
 // Task tree: reparenting (T324)
 // ---------------------------------------------------------------------------

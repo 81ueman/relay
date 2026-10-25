@@ -436,6 +436,13 @@ export interface Run {
    * Relay's own `events.jsonl`). */
   dsh_events_path: string | null;
   /**
+   * ISH-1222: exact `dind-var-lib-docker-*` volume names derived at launch from
+   * this Run's workspace + devcontainer config (JSON string[]), or NULL on a
+   * legacy Run. Cleanup/leaks use these recorded names (only when the Run's cwd
+   * is under a Relay-owned worktree root) and also re-derive for old rows.
+   */
+  devcontainer_volumes: string | null;
+  /**
    * Retained for compatibility with existing control-plane DBs. The Coding
    * Sandbox execution path was removed (ISH-1098); every new Run leaves this
    * NULL and the value is never read.
@@ -788,6 +795,11 @@ CREATE TABLE IF NOT EXISTS runs (
   stderr_path TEXT,
   events_path TEXT,
   dsh_events_path TEXT,
+  -- ISH-1222: exact dind-var-lib-docker-* named volume names derived from the
+  -- Run workspace + devcontainer config at launch (JSON string[]). This is the
+  -- durable "recorded devcontainer id" used by cleanup/leaks even after the
+  -- worktree is gone; NULL on legacy Runs (they fall back to deriving from cwd).
+  devcontainer_volumes TEXT,
   -- Legacy (ISH-1098): kept so pre-existing DBs open unchanged. New Runs always
   -- leave it NULL; the Coding Sandbox execution path is removed.
   sandbox_name TEXT,

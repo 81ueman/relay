@@ -17,6 +17,7 @@ import {
 import { childEnv } from "./child-env";
 import { ensureScratchRoot, runScratchRoot, scratchEnv } from "./scratch";
 import { controlPlaneNamespace } from "./run-resources";
+import { dindVolumeNamesForWorkspace } from "./devcontainer-id";
 import { isPinnedDsh, PINNED_DSH_VERSION, readDshVersion } from "./dsh-version";
 import { assertLaunchDiskSpace, type DiskGuardOptions } from "./disk-guard";
 import { gitHead } from "./verify";
@@ -312,6 +313,8 @@ interface InsertRunInput {
   resumeCount: number;
   /** ISH-1174: the Session id passed as `--session-id` (null = a fresh Session). */
   resumeSessionId: string | null;
+  /** ISH-1222: exact derived devcontainer dind volume names (JSON string[]). */
+  devcontainerVolumes: string[];
 }
 
 function insertRun(db: Database, r: InsertRunInput): Run {
@@ -326,9 +329,9 @@ function insertRun(db: Database, r: InsertRunInput): Run {
     `INSERT INTO runs
        (id, task_id, phase, attempt, generation, cwd, branch, head_sha, base_head_sha, prompt,
         spec_path, output_dir, state, stdout_path, stderr_path, events_path, dsh_events_path,
-        resumed_from_run_id, resume_count, resume_session_id, launcher_pid, launcher_lstart,
-        fast_exit, started_at, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, 'starting', ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`
+        resumed_from_run_id, resume_count, resume_session_id, devcontainer_volumes,
+        launcher_pid, launcher_lstart, fast_exit, started_at, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, 'starting', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`
   ).run(
     r.id,
     r.taskId,
@@ -348,6 +351,7 @@ function insertRun(db: Database, r: InsertRunInput): Run {
     r.resumedFromRunId,
     r.resumeCount,
     r.resumeSessionId,
+    r.devcontainerVolumes.length > 0 ? JSON.stringify(r.devcontainerVolumes) : null,
     launcher.launcher_pid,
     launcher.launcher_lstart,
     t,
@@ -466,6 +470,12 @@ export function buildTaskPrompt(task: Task): string {
     "All THREE labels are required: the plane label namespaces this control plane",
     "(Task ids repeat across checkouts) and an unlabelled or partially labelled",
     "resource is never reclaimed.",
+    "",
+    "A devcontainer `dind-var-lib-docker-*` volume is NAMED, so `docker rm -v` does",
+    "NOT remove it. Relay derives its exact name from this Run's workspace and the",
+    "workspace's `.devcontainer/devcontainer.json` (or `.devcontainer.json`). Run",
+    "`devcontainer up --workspace-folder .` from the worktree root (do not override",
+    "the workspace or config path), and Relay will reclaim it at cleanup.",
     "```"
   );
   return lines.join("\n");
@@ -590,6 +600,11 @@ export async function startDshRun(db: Database, opts: StartRunOptions): Promise<
     appendFileSync(eventsPath, `${JSON.stringify({ ts: now(), ...e })}\n`);
   };
 
+  // ISH-1222: record the exact devcontainer dind volume names while the
+  // workspace/config still exist, so cleanup can reclaim them even after the
+  // worktree is gone (and for a named `.devcontainer/<name>/devcontainer.json`).
+  const devcontainerVolumes = dindVolumeNamesForWorkspace(cwd);
+
   const run = insertRunIfNoActiveWriter(db, {
     id: runId,
     taskId: task.id,
@@ -609,6 +624,7 @@ export async function startDshRun(db: Database, opts: StartRunOptions): Promise<
     resumedFromRunId: opts.resumedFromRunId ?? null,
     resumeCount: opts.resumeCount ?? 0,
     resumeSessionId: opts.resumeSessionId ?? null,
+    devcontainerVolumes,
   });
 
   // ISH-1221: create the Relay-owned per-Run scratch root only AFTER the Run row
@@ -630,6 +646,7 @@ export async function startDshRun(db: Database, opts: StartRunOptions): Promise<
     dshBin,
     dshBinSource: dshChoice.source,
     scratchRoot,
+    devcontainerVolumes,
     ...(opts.resumedFromRunId
       ? {
           resumedFromRunId: opts.resumedFromRunId,
@@ -655,6 +672,7 @@ export async function startDshRun(db: Database, opts: StartRunOptions): Promise<
       dshBin,
       dshBinSource: dshChoice.source,
       scratchRoot,
+      devcontainerVolumes,
       ...(opts.resumedFromRunId
         ? {
             resumedFromRunId: opts.resumedFromRunId,

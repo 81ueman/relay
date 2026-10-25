@@ -22,7 +22,7 @@ import type { Task } from "./schema";
 import {
   addTask, approveTask, blockTask, cancelTask, claimNext, claimTask, claimableRunnableTasks, getNotes, getTask,
   listTasks, notesClaimingApproval, notYetRunnableTasks, rejectTask, releaseTask, reviewHeldByLiveReviewer, runnableTasks, setTaskDependencies,
-  submitTask, taskCounts, taskDependencies, taskChildren, setTaskParent, unblockTask,
+  submitTask, taskCounts, taskDependencies, taskChildren, setTaskParent, unblockTask, unbindTaskPr,
   unclaimableRunnableTasks, addNote, setTaskPlan, waitTask,
 } from "./tasks";
 import { acceptTask, confirmMerged, intakeTask, recordReview, recordVerification, runMechanicalVerification, submitPhase, taskChecks } from "./workflow";
@@ -126,6 +126,7 @@ Usage:
   relay verify <task-id> [--cwd <dir>] [--head SHA]   # mechanical verify (Relay runs the commands)
   relay merge-check <task-id> [--json] [--authority merge]   # read-only HEAD-bound merge readiness (dry-run; hosted CI is informational)
   relay pr bind <task-id> [--json]   # READ-ONLY: bind the produced commit (task.head_sha) to a real PR the Agent created (re-read/verify; Relay never writes to GitHub)
+  relay pr unbind <task-id> [--reason R]   # EXPLICIT operator override: clear a stale PR binding when the live state cannot be read (logged; no silent cleanup override)
 
   relay next [--worker <id>] [--role <r>] [--any-role]
   relay claim <task-id> [--worker <id>] [--role <r>] [--any-role]
@@ -196,7 +197,7 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
   run: {
     about:
       "ISH-803/ISH-810 one-shot headless dsh Runs: 1 Run = 1 `dsh --profile headless --json` process = 1 coding attempt, in the Task's worktree, with NO Herdr pane/TUI/`dsh web`/wake/attach. Under <control-plane>/runs/<run-id>/: stdout.log (raw dsh JSONL), stderr.log (reasoning/errors), dsh.jsonl (the ORIGINAL dsh session/status/text/tool_call/tool_result/final events, per-Run evidence) and events.jsonl (Relay's own lifecycle log, kept distinct). A process `exit 0` or a terminal `final` does NOT complete anything — only `relay run submit` (a structured submission bound to the Run/Task/phase/attempt/branch/HEAD) advances the Task. `start` waits for the Run to reach a terminal state (there is no detached mode yet). Permissions are the worktree: $DSH_PERMISSION_MODE=workspace-write by default. " +
-      "ISH-760 adds the Task lifecycle: `launch` owns ONE branch+worktree per Task, pins the task spec + verification steps + prior findings into the worktree BEFORE launch, and runs ONE disposable dsh Run per phase/attempt (a FIX is the SAME worktree + findings + a NEW Run). A second writer on the same worktree/branch is refused until the previous Run ends; different worktrees/branches may run in parallel. `worktree` creates/selects the worktree; `cleanup` reclaims it only when safe (merged/accepted/cancelled or --abort, live PR not OPEN, no active writer, no uncommitted changes, relay-owned) and retains the run logs; it also removes the per-Run scratch root and Relay-labelled containers/volumes. `relay run list --leaks` reports orphaned scratch dirs, worktrees and Relay-labelled containers/volumes with sizes (read-only patrol). `relay run logs <run-id>` renders the read-only dsh session/status/text/tool_call/tool_result/final chronology from the per-Run dsh.jsonl (no TUI/Web UI needed). " +
+      "ISH-760 adds the Task lifecycle: `launch` owns ONE branch+worktree per Task, pins the task spec + verification steps + prior findings into the worktree BEFORE launch, and runs ONE disposable dsh Run per phase/attempt (a FIX is the SAME worktree + findings + a NEW Run). A second writer on the same worktree/branch is refused until the previous Run ends; different worktrees/branches may run in parallel. `worktree` creates/selects the worktree; `cleanup` reclaims it only when safe (merged/accepted/cancelled or --abort, live PR not OPEN, no active writer, no uncommitted changes, relay-owned) and retains the run logs; it also removes the per-Run scratch root, Relay-labelled containers/volumes, and the Run's devcontainer `dind-var-lib-docker-*` named volume (derived from the Run's recorded workspace id; `docker rm -v` alone does NOT remove a named volume). `relay run list --leaks` reports orphaned scratch dirs, worktrees, Relay-labelled containers/volumes and derived dind volumes with sizes (read-only patrol). `relay run logs <run-id>` renders the read-only dsh session/status/text/tool_call/tool_result/final chronology from the per-Run dsh.jsonl (no TUI/Web UI needed). " +
       "ISH-762 adds `relay run factory <task-id>`: the whole factory for ONE Task with no hand-driven pane for the coding — a real headless dsh Run implements, Relay mechanically VERIFYs the recorded HEAD, an INDEPENDENT headless Claude reviewer (`claude -p --output-format json`) returns a structured FIX/PASS (FIX = the SAME worktree + findings + a FRESH Run), and a PASS reaches read-only MergeReady. It never pushes, merges, accepts or writes a provider." +
       " ISH-1013: a non-ready Factory outcome is classified from the EXISTING rows (code rework exhausted / infra blocked / permission-or-human decision / missing-or-inconclusive evidence / stale head / unknown) with the last Run/attempt/HEAD, failing check/review/log references and a concrete next action. The same projection is stored as a durable `factory.outcome` event and shown by `relay run show` / `relay run logs` and `relay task show`; `relay run factory --json` carries it as `failure`.",
     usage: [
@@ -359,8 +360,11 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
   },
   pr: {
     about:
-      "ISH-880/885/1087 READ-ONLY Task↔PR check. Bridges a produced commit to a real GitHub PR and binds the PR's CURRENT remote HEAD to the SAME Task/attempt — by READING GitHub only. The head is ALWAYS the Task's produced commit (`task.head_sha`, a full 40-hex SHA) — there is no caller-supplied head. It re-reads an already-recorded PR (owner/repo#n) or adopts an existing PR for the task's (repo, branch), and requires its live head to equal the produced commit; a moved/unreadable PR, a different/fork repo, or no identity/adoptable PR is BLOCKED (never a fake pass). The repo is resolved from the Task's recorded identity, else the Task workspace's `origin`, so a Task that records only a branch still binds its PR. Relay NEVER writes to GitHub — no push, no create/update, no review; the Coding Agent performs those with normal `git`/`gh`, then Relay observes. The read-only `gh` reader is auto-detected when RELAY_PROVIDER_GITHUB is unset; `off` disables it.",
-    usage: ["relay pr bind <task-id> [--repo R] [--json]"],
+      "ISH-880/885/1087 READ-ONLY Task↔PR check. Bridges a produced commit to a real GitHub PR and binds the PR's CURRENT remote HEAD to the SAME Task/attempt — by READING GitHub only. The head is ALWAYS the Task's produced commit (`task.head_sha`, a full 40-hex SHA) — there is no caller-supplied head. It re-reads an already-recorded PR (owner/repo#n) or adopts an existing PR for the task's (repo, branch), and requires its live head to equal the produced commit; a moved/unreadable PR, a different/fork repo, or no identity/adoptable PR is BLOCKED (never a fake pass). The repo is resolved from the Task's recorded identity, else the Task workspace's `origin`, so a Task that records only a branch still binds its PR. Relay NEVER writes to GitHub — no push, no create/update, no review; the Coding Agent performs those with normal `git`/`gh`, then Relay observes. The read-only `gh` reader is auto-detected when RELAY_PROVIDER_GITHUB is unset; `off` disables it. ISH-1222 adds `pr unbind` as the EXPLICIT operator escape hatch for a stale binding when the live PR state cannot be read; it logs `task.pr_unbound` and never runs implicitly (cleanup still fails closed and points here).",
+    usage: [
+      "relay pr bind <task-id> [--repo R] [--json]",
+      "relay pr unbind <task-id> [--reason R]",
+    ],
   },
   "task list": { about: "List tasks (id, state, priority, role, assignee, plan, depends, title).", usage: ["relay task list [--state <state>]"] },
   "task show": { about: "Print one task as JSON (includes depends_on). Notes go to stderr so stdout stays parseable; --json emits ONE document with the task, its dependencies and its notes.", usage: ["relay task show <id> [--json]"] },
@@ -1408,7 +1412,18 @@ async function main(): Promise<void> {
         // Agent pushes and creates/updates the PR with normal `git`/`gh` first.
         const rest = argv.slice(1);
         const sub = rest[0];
-        if (sub !== "bind") throw new Error("usage: relay pr bind <task-id> [--repo R] [--json]");
+        if (sub === "unbind") {
+          // ISH-1222: the EXPLICIT operator escape hatch when a bound PR cannot
+          // be re-read (`gh` down). Cleanup still fails closed; this command is
+          // the auditable way to clear the stale binding, never a silent override.
+          const args = rest.slice(1);
+          const id = positionals(args)[0];
+          if (!id) throw new Error("usage: relay pr unbind <task-id> [--reason R]");
+          const t = unbindTaskPr(db, id, flag(args, "--reason") ?? null);
+          console.log(`${t.id} pr=- head=${t.head_sha ?? "-"} (PR binding cleared; logged as task.pr_unbound)`);
+          break;
+        }
+        if (sub !== "bind") throw new Error("usage: relay pr bind <task-id> [--repo R] [--json] | relay pr unbind <task-id> [--reason R]");
         const args = rest.slice(1);
         const id = positionals(args)[0];
         if (!id) throw new Error("usage: relay pr bind <task-id> [--repo R] [--json]");
@@ -2014,7 +2029,8 @@ async function main(): Promise<void> {
           if (plan.scratchDirs.length) console.log(`  scratch: ${plan.scratchDirs.join(", ")}`);
           if (plan.reviewWorktrees.length) console.log(`  review worktrees: ${plan.reviewWorktrees.join(", ")}`);
           if (plan.containers.length) console.log(`  containers: ${plan.containers.map((c) => c.id).join(", ")}`);
-          if (plan.volumes.length) console.log(`  volumes: ${plan.volumes.map((v) => v.name).join(", ")}`);
+          if (plan.volumes.length)
+            console.log(`  volumes: ${plan.volumes.map((v) => `${v.name}${v.dind ? " (dind)" : ""}`).join(", ")}`);
           if (plan.savedPatch) console.log(`  saved patch: ${plan.savedPatch}`);
           for (const warning of plan.warnings) console.log(`  warning: ${warning}`);
           for (const reason of plan.reasons) console.log(`  skip: ${reason}`);
