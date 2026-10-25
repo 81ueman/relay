@@ -31,8 +31,18 @@ The process also receives `RELAY_DOCKER_LABEL_PLANE`,
 `RELAY_DOCKER_LABEL_TASK` and `RELAY_DOCKER_LABEL_RUN`; any container/volume it
 starts must carry all three so `relay run cleanup` can attribute it to this
 Task in this control plane.
-`relay run list --leaks` reports orphaned scratch roots, worktrees and
-Relay-labelled containers/volumes with sizes.
+The devcontainer docker-in-docker `dind-var-lib-docker-*` volume is **named**, so
+`docker rm -v` does not remove it. Relay derives its exact id from the Run's
+recorded workspace and the workspace's `.devcontainer/devcontainer.json` (or
+`.devcontainer.json`), records the exact name on the Run row
+(`runs.devcontainer_volumes`), and reclaims that recorded volume at cleanup /
+lists it in the patrol when orphaned. Start the devcontainer with
+`devcontainer up --workspace-folder <this worktree>`; overriding the workspace or
+config path changes the id and makes the volume untraceable (Relay never scans
+for `dind-*`).
+`relay run list --leaks` reports orphaned scratch roots, worktrees,
+Relay-labelled containers/volumes and exact derived dind volumes with Docker's
+reported size.
 
 ## Coding binary (ISH-1133)
 

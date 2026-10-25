@@ -346,10 +346,47 @@ plane label is required because Task ids repeat across checkouts: `T55` exists
 in every control plane's own DB, so `relay.task=T55` alone cannot distinguish
 the relay host from the ishiul host. A resource with no plane label is matched
 only through its globally unique Run id. Relay never starts containers itself
-and never removes an unlabelled (or other-control-plane) resource or any image.
+and never removes an image or an untraceable/unrecorded resource. The one
+unlabelled case is a Run's **derived** devcontainer dind volume (next section),
+matched by its exact `devcontainerId`, never by a `dind-*` wildcard.
 
 The Run's `stdout.log`, `stderr.log`, `dsh.jsonl` and `events.jsonl` live next to
 `scratch/` and are **retained**; cleanup removes only the scratch subtree.
+
+### Devcontainer dind named volume (ISH-1222)
+
+The docker-in-docker devcontainer feature mounts `/var/lib/docker` from a
+**named** volume:
+
+```
+dind-var-lib-docker-<devcontainerId>
+```
+
+`docker rm -v` removes only **anonymous** volumes, so this named volume survives
+a normal devcontainer teardown — the 2–5 GB leak observed on the Ishiul host.
+Relay does not create the devcontainer, so instead of relying on a label it
+reproduces the devcontainer CLI's deterministic id from the Run's **recorded**
+workspace (`runs.cwd`, or `tasks.worktree`) plus the workspace's
+`.devcontainer/devcontainer.json` / `.devcontainer.json`
+(`src/devcontainer-id.ts`). The exact resulting name is the Run's recorded dind
+volume.
+
+The Run row records the exact names at launch (`runs.devcontainer_volumes`), so
+a named `.devcontainer/<name>/devcontainer.json` is covered even after the
+worktree is gone. `runs.cwd` is durable too, so this also recovers a volume left
+by a **pre-ISH-1222 cleanup** that already deleted the worktree: for legacy Runs
+without a recorded column, the two default config paths are tried from the
+recorded cwd even when the directory/config no longer exists. That is what lets
+the first post-deploy cleanup reclaim the existing Ishiul leaks instead of only
+future ones.
+
+Cleanup removes that exact name only when Docker reports **no container**
+referencing it (`docker system df -v` `Links`); a still-running/stopped
+devcontainer is NOT Relay-labelled, so Relay never removes the container. Stop
+and remove it first (`docker rm -v <devcontainer>`, which still leaves the named
+volume), then re-run cleanup. An unrelated project's
+`dind-var-lib-docker-*` volume has a different id and is never listed or
+removed.
 
 ## Safe workspace cleanup (evidence-retaining)
 
@@ -363,8 +400,11 @@ guard passes:
   read-only GitHub reader for every non-merged reclaim (cancelled, accepted and
   `--abort` included), never inferred from the stale binding. A CLOSED PR (and a
   branch-only Task with no recorded PR identity) does not refuse cleanup; an
-  unverifiable bound PR fails closed and says so. `--abort` overrides the
-  merge-authorization, NOT the live-PR hazard;
+  unverifiable bound PR fails closed and names the next step — restore the reader
+  (`gh auth status` must succeed, or `RELAY_PROVIDER_GITHUB=gh`) or clear the
+  binding deliberately with `relay pr unbind <task> --reason "..."` (logged as
+  `task.pr_unbound`). `--abort` overrides the merge-authorization, NOT the
+  live-PR hazard and never silently overrides an unreadable PR;
 - no Run still holds the worktree/branch;
 - the worktree is **relay-owned** (under the Relay worktrees root, never the main
   checkout or a human workspace);
@@ -381,21 +421,26 @@ For a merged/accepted/cancelled Task, cleanup also removes:
 - containers/volumes that carry this Task's Relay label **and this control
   plane's `relay.plane` label** (or a Relay Run id belonging to this Task, which
   is globally unique). Another control plane's identically numbered Task is
-  never touched.
+  never touched;
+- the Run's devcontainer `dind-var-lib-docker-<devcontainerId>` named volume,
+  derived from each Run's recorded workspace + config file. Only the exact
+  derived name is inspected; an in-use volume is left with a warning naming
+  `docker rm -v <devcontainer>` as the next step.
 
 The library default is a DISABLED Docker seam: `planWorkspaceCleanup` /
 `applyWorkspaceCleanup` / `scanRunLeaks` reach host Docker only when the caller
 passes `realRunResourceDocker()`. The CLI is that caller; set
 `RELAY_DOCKER_RESOURCES=off` (or `0`) to skip Docker entirely on a host where it
 is unavailable or managed separately. This is why the test suite cannot remove a
-host container by accident. `docker rm -f -v` reclaims a removed container's
-anonymous volumes (the dind `dind-var-lib-docker-*` case) — named or unlabelled
-volumes of other containers are not affected.
+host container by accident. `docker rm -f -v` removes only a container's
+**anonymous** volumes; it does NOT reclaim the NAMED
+`dind-var-lib-docker-*` volume (ISH-1222 does that explicitly, above). Named or
+unlabelled volumes of other containers are not affected.
 
 The `runs` rows and their output directories are **never** deleted by cleanup —
 they are the evidence. The Task row and its structured results survive too.
 
-## Leak patrol (ISH-1221)
+## Leak patrol (ISH-1221/1222)
 
 `relay run list --leaks` is the read-only patrol the gateway can call. It lists
 resources attributable to Relay whose Run/Task is over (or whose Task row is
@@ -403,14 +448,19 @@ gone), with sizes:
 
 - per-Run and per-review scratch roots;
 - Task worktrees and disposable review worktrees;
-- Relay-labelled containers (Docker's reported size) and volumes.
+- Relay-labelled containers and volumes (Docker's reported size);
+- the exact derived devcontainer `dind-var-lib-docker-*` named volumes, with the
+  size Docker reports (`docker system df -v`; rendered `-` when the probe fails).
 
-It never lists an unlabelled container/volume, another control plane's
-`relay.plane` resources, or any image. Docker being absent/down is reported as
-`docker unchecked: ...`, not hidden; with no seam (or
-`RELAY_DOCKER_RESOURCES=off`) the container/volume section says the inventory is
-disabled rather than silently claiming zero. `--json` returns the same report as
-structured data.
+It never lists an unrelated/unrecorded dind volume, any other unlabelled
+container/volume, another control plane's `relay.plane` resources, or any image.
+Docker being absent/down is reported as `docker unchecked: ...`, not hidden; with
+no seam (or `RELAY_DOCKER_RESOURCES=off`) the container/volume section says the
+inventory is disabled rather than silently claiming zero. `--json` returns the
+same report as structured data.
+
+A dind volume still referenced by its (unlabelled) devcontainer is not reported
+as orphaned: stop/remove the devcontainer first, then re-run the patrol/cleanup.
 
 A self-contained clone workspace is removed as a directory (`rm -rf`), so the
 SOURCE repo's `.git` is never touched (a linked `git worktree remove` would have
@@ -441,8 +491,17 @@ evidence, and asserts every rejection case.
 per-Run `TMPDIR`/`CARGO_TARGET_DIR`, merged and cancelled cleanup, a CLOSED-PR
 cancelled Task vs a live-OPEN PR refusal, the dirty-worktree saved patch,
 labelled container/volume removal vs unlabelled resources/images, and the leak
-report. `tests/factory.test.ts` proves a reviewer's focused check writes into the
-Relay review scratch root, not `/tmp`.
+report. ISH-1222 adds a real `docker` CLI shim (on `PATH`) proving that
+`relay run cleanup <T> --apply` on a merged and a cancelled Task removes that
+Run's **unlabelled** derived `dind-var-lib-docker-*` volume while leaving an
+unrelated dind volume and all images untouched; the same shim proves the leak
+report lists the orphaned dind volume with Docker's size. It also covers the
+devcontainer-id fixture, the recorded-cwd fallback after a worktree was already
+removed, a recorded NAMED config reclaimed after its worktree is gone, in-use
+dind refusal, the unknown-PR refusal message (`gh auth status` / `relay pr unbind
+<T> --reason`), and the symlinked-DB `controlPlaneId`. `tests/factory.test.ts`
+proves a reviewer's focused check writes into the Relay review scratch root, not
+`/tmp`.
 
 ## Verified / not verified
 
@@ -454,10 +513,16 @@ Relay review scratch root, not `/tmp`.
   submitter binding
   (moved head, superseded/late Run); safe cleanup (merge, abort, open PR, dirty,
   human workspace) with evidence retention; the CLI paths `run worktree|launch|
-  cleanup`; and the ISH-1009 pre-launch disk guard (threshold refusal, fail-closed
+  cleanup`; the ISH-1009 pre-launch disk guard (threshold refusal, fail-closed
   probe error, and the same queued Task launching after space is freed) surfaced
-  in `relay status` and the dashboard.
+  in `relay status` and the dashboard; and ISH-1222's devcontainer-id fixture,
+  merged/cancelled dind reclaim via a real `docker` CLI shim, orphan-size leak
+  entry, in-use refusal, unknown-PR refusal message and symlinked-DB plane id.
 - **NOT verified here**: launching the **real** `dsh` binary (see
   [`dsh-headless-runner.md`](dsh-headless-runner.md), the opt-in
-  `RELAY_DSH_SMOKE=1` smoke); deleting the old Herdr coding-runner path
-  (ISH-805); and any provider write (Relay creates no push/merge authority).
+  `RELAY_DSH_SMOKE=1` smoke); creating a **live** devcontainer against the host
+  Docker (the test's `docker` shim models the exact CLI commands, and the
+  devcontainer-id algorithm is pinned by a fixture plus the live Ishiul volumes);
+  the first post-deploy cleanup showing a real dind volume reclaimed (the
+  gateway's deploy check); deleting the old Herdr coding-runner path (ISH-805);
+  and any provider write (Relay creates no push/merge authority).

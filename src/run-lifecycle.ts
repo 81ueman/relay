@@ -26,6 +26,7 @@ import { issueKeyForTask, resolveTaskPrTarget } from "./pr-target";
 import { resolveTaskPrRef } from "./pr-binding";
 import { removeReviewWorktree } from "./review-workspace";
 import { defaultRunsRoot, reviewScratchTaskRoot, removeScratchRoot } from "./scratch";
+import { dindVolumeNamesForWorkspace } from "./devcontainer-id";
 import {
   controlPlaneNamespace,
   disabledRunResourceDocker,
@@ -1355,6 +1356,19 @@ export interface CleanupContainer {
   name: string;
 }
 
+export interface CleanupVolume {
+  name: string;
+  /**
+   * ISH-1222: true for an UNLABELLED devcontainer `dind-var-lib-docker-*` volume
+   * attributed by the exact id derived from this Task's Run workspace. It is
+   * never discovered by a prefix scan; another project's dind volume is absent
+   * from the plan.
+   */
+  dind: boolean;
+  /** Docker reported a container still referencing it (leave it alone). */
+  inUse: boolean;
+}
+
 export interface CleanupPlan {
   taskId: string;
   worktree: string | null;
@@ -1373,8 +1387,8 @@ export interface CleanupPlan {
   reviewWorktrees: string[];
   /** Relay-labelled containers attributable to this Task. */
   containers: CleanupContainer[];
-  /** Relay-labelled volumes attributable to this Task. */
-  volumes: { name: string }[];
+  /** Relay-labelled volumes + exact derived dind named volumes for this Task. */
+  volumes: CleanupVolume[];
   /** A saved patch when a dirty worktree blocks removal (never silent loss). */
   savedPatch: string | null;
   /** Non-fatal inventory/removal problems (docker absent, volume busy, ...). */
@@ -1433,11 +1447,30 @@ async function observeTaskPr(task: Task, opts: CleanupOptions): Promise<Observed
   return { state: "unknown", url: task.pr_url, source: "unverified" };
 }
 
-function runRowsForTask(db: Database, taskId: string): { id: string; output_dir: string }[] {
-  return db.query(`SELECT id, output_dir FROM runs WHERE task_id = ? ORDER BY created_at ASC`).all(taskId) as {
-    id: string;
-    output_dir: string;
-  }[];
+function runRowsForTask(
+  db: Database,
+  taskId: string
+): { id: string; output_dir: string; cwd: string; devcontainer_volumes: string | null }[] {
+  return db
+    .query(
+      `SELECT id, output_dir, cwd, devcontainer_volumes FROM runs WHERE task_id = ? ORDER BY created_at ASC`
+    )
+    .all(taskId) as { id: string; output_dir: string; cwd: string; devcontainer_volumes: string | null }[];
+}
+
+/** Parse the exact dind names recorded on a Run (never trust a non-dind string). */
+function recordedDindNames(raw: string | null | undefined): string[] {
+  if (!raw) return [];
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter((v): v is string => typeof v === "string")
+      .map((v) => v.trim())
+      .filter((v) => v.startsWith("dind-var-lib-docker-"));
+  } catch {
+    return [];
+  }
 }
 
 function reviewWorktreesForTask(root: string, taskId: string): string[] {
@@ -1503,8 +1536,10 @@ function saveCleanupPatch(taskId: string, worktree: string, patchesRoot: string 
  * every commit on it is on a remote or copied back into the source repo.
  *
  * The `runs` rows and their output directories are RETAINED as evidence. Only
- * the per-Run `scratch` subtrees, disposable review worktrees and Relay-labelled
- * containers/volumes are reclaimed.
+ * the per-Run `scratch` subtrees, disposable review worktrees,
+ * Relay-labelled containers/volumes and each Run's exact derived devcontainer
+ * `dind-var-lib-docker-*` named volume are reclaimed (ISH-1222; the dind name is
+ * derived, never discovered by a prefix scan, and an in-use one is left alone).
  */
 export async function planWorkspaceCleanup(
   db: Database,
@@ -1543,26 +1578,63 @@ export async function planWorkspaceCleanup(
   };
   if (existsSync(reviewScratch)) plan.scratchDirs.push(reviewScratch);
 
-  // Docker inventory: only resources carrying a Relay label are ever considered.
+  // ISH-1222: the devcontainer dind volume is NAMED and (normally) unlabelled, so
+  // it is attributed by the exact id derived from a Relay-owned workspace path.
+  // The Run rows record their cwd durably, so this still works after a worktree
+  // was nulled/removed. Only Relay-owned roots are considered: a devcontainer a
+  // human started in the main checkout must never be attributed to a Task.
+  const wtRoot = taskWorktreesRoot(opts.worktreesRoot);
+  const dindNames = new Set<string>();
+  const addDindWorkspace = (path: string | null): void => {
+    if (!path) return;
+    if (!isUnder(path, wtRoot) && !isUnder(path, reviewRoot)) return;
+    for (const name of dindVolumeNamesForWorkspace(path, { recorded: true })) dindNames.add(name);
+  };
+  addDindWorkspace(worktree);
+  for (const r of runs) {
+    // The exact names recorded at launch survive a deleted worktree and cover a
+    // named `.devcontainer/<name>/devcontainer.json`; re-derive for legacy rows.
+    if (!isUnder(r.cwd, wtRoot) && !isUnder(r.cwd, reviewRoot)) continue;
+    for (const name of recordedDindNames(r.devcontainer_volumes)) dindNames.add(name);
+    addDindWorkspace(r.cwd);
+  }
+  for (const path of plan.reviewWorktrees) addDindWorkspace(path);
+
+  // Docker inventory: Relay-labelled resources plus the EXACT dind names derived
+  // above (never a `dind-*` scan).
   let snapshot: ReturnType<RunResourceDocker["snapshot"]> = {
     containers: [],
     volumes: [],
+    dindVolumes: [],
     containerError: null,
     volumeError: null,
+    sizeError: null,
   };
   try {
-    snapshot = (opts.docker ?? disabledRunResourceDocker()).snapshot();
+    snapshot = (opts.docker ?? disabledRunResourceDocker()).snapshot({
+      dindVolumeNames: [...dindNames],
+    });
   } catch (e) {
     warnings.push(`docker inventory failed: ${e instanceof Error ? e.message : String(e)}`);
   }
   if (snapshot.containerError) warnings.push(`container inventory unavailable: ${snapshot.containerError}`);
   if (snapshot.volumeError) warnings.push(`volume inventory unavailable: ${snapshot.volumeError}`);
+  if (snapshot.sizeError) warnings.push(`volume sizes unavailable: ${snapshot.sizeError}`);
   plan.containers = snapshot.containers
     .filter((c) => resourceBelongsToTask(c, plane, taskId, runIds))
     .map((c) => ({ id: c.id, name: c.name }));
-  plan.volumes = snapshot.volumes
-    .filter((v) => resourceBelongsToTask(v, plane, taskId, runIds))
-    .map((v) => ({ name: v.name }));
+  const byVolume = new Map<string, CleanupVolume>();
+  for (const v of snapshot.volumes) {
+    if (!resourceBelongsToTask(v, plane, taskId, runIds)) continue;
+    byVolume.set(v.name, { name: v.name, dind: false, inUse: v.inUse });
+  }
+  for (const v of snapshot.dindVolumes) {
+    // The real seam only resolves names the caller derived for THIS Task, but
+    // re-check the exact set here so a custom seam cannot smuggle in a glob.
+    if (!dindNames.has(v.name) || byVolume.has(v.name)) continue;
+    byVolume.set(v.name, { name: v.name, dind: true, inUse: v.inUse });
+  }
+  plan.volumes = [...byVolume.values()];
 
   const merged = task.merged_at !== null;
   const accepted = task.accepted_at !== null;
@@ -1585,8 +1657,13 @@ export async function planWorkspaceCleanup(
     if (pr.state === "open") {
       reasons.push(`open PR ${pr.url ?? task.pr_url ?? "(bound PR)"}`);
     } else if (pr.state === "unknown") {
+      // ISH-1222: still fail CLOSED, but name the operator's next step. `--abort`
+      // is not a silent override: restore the reader, or clear the binding with
+      // the explicit `relay pr unbind` command (which logs what it cleared).
       reasons.push(
-        `open PR ${pr.url ?? task.pr_url ?? "(bound PR)"} (live state could not be re-read; refusing until the PR can be checked)`
+        `open PR ${pr.url ?? task.pr_url ?? "(bound PR)"} (live state could not be re-read; refusing until the PR can be checked). ` +
+          `Next: restore the read-only GitHub reader (\`gh auth status\` must succeed, or set RELAY_PROVIDER_GITHUB=gh) and re-run this cleanup; ` +
+          `if the PR is really closed, clear the binding deliberately with \`relay pr unbind ${taskId} --reason "PR closed"\` and re-run.`
       );
     }
   }
@@ -1819,8 +1896,18 @@ export async function applyWorkspaceCleanup(
     else plan.warnings.push(`container ${c.id} not removed: ${r.error}`);
   }
   for (const v of plan.volumes) {
+    // ISH-1222: a dind named volume is only reclaimed when no container still
+    // references it. The devcontainer container is NOT Relay-labelled, so Relay
+    // never removes it; stop/remove it first and re-run cleanup. `docker volume
+    // rm` has no `-f` here, so Docker would refuse anyway — say why up front.
+    if (v.dind && v.inUse) {
+      plan.warnings.push(
+        `dind volume ${v.name} is still referenced by a container; stop/remove the devcontainer (\`docker rm -v <devcontainer>\`) and re-run cleanup`
+      );
+      continue;
+    }
     const r = docker.removeVolume(v.name);
-    if (r.ok) plan.removedResources.push(`volume ${v.name}`);
+    if (r.ok) plan.removedResources.push(`volume ${v.name}${v.dind ? " (dind)" : ""}`);
     else plan.warnings.push(`volume ${v.name} not removed: ${r.error}`);
   }
   for (const path of plan.scratchDirs) {
@@ -1870,6 +1957,7 @@ export async function applyWorkspaceCleanup(
       reviewWorktrees: plan.reviewWorktrees,
       containers: plan.containers.map((c) => c.id),
       volumes: plan.volumes.map((v) => v.name),
+      dindVolumes: plan.volumes.filter((v) => v.dind).map((v) => v.name),
       removedResources: plan.removedResources,
       warnings: plan.warnings,
     },

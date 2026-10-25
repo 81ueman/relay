@@ -64,6 +64,14 @@ describe("ISH-904: CLI help documents the operator flags and preconditions", () 
     expect(out).toContain("--permission MODE");
     expect(out).toContain("relay task intake --provider P --issue ID");
     expect(out).toContain("--description D");
+    expect(out).toContain("relay pr unbind <task-id>");
+  });
+
+  test("ISH-1222: `relay pr --help` documents the explicit unbind override", () => {
+    const out = help(["pr"]);
+    expect(out).toContain("relay pr unbind <task-id>");
+    expect(out).toContain("task.pr_unbound");
+    expect(out).toContain("never runs implicitly");
   });
 });
 

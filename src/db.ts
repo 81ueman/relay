@@ -351,6 +351,10 @@ function migrate(db: Database): void {
   if (columnExists(db, "runs", "id") && !columnExists(db, "runs", "sandbox_name")) {
     db.exec("ALTER TABLE runs ADD COLUMN sandbox_name TEXT;");
   }
+  // ISH-1222: durable derived devcontainer dind volume names (JSON string[]).
+  if (columnExists(db, "runs", "id") && !columnExists(db, "runs", "devcontainer_volumes")) {
+    db.exec("ALTER TABLE runs ADD COLUMN devcontainer_volumes TEXT;");
+  }
   db.exec("CREATE INDEX IF NOT EXISTS idx_runs_sandbox ON runs(sandbox_name);");
   // NOTE: (worker_id, generation) is kept unique by application logic (the
   // monotonic `nextGeneration` helper), not by a DB constraint. Legacy rows may

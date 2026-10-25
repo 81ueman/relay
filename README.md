@@ -623,10 +623,14 @@ cleanup` reclaims a worktree only when it is **safe** (a real merge, a cancelled
 Task, or `--abort`; no live-OPEN PR — the PR is re-read, never inferred from the
 stale binding — no active writer, no uncommitted changes, relay-owned). It also
 removes the per-Run scratch root and the containers/volumes carrying this control
-plane's `relay.plane`/`relay.task`/`relay.run` labels, and always **retains the
-run logs** as evidence. `relay run list --leaks` is the read-only orphan patrol
-(scratch, worktrees, labelled containers/volumes with sizes). See
-[`docs/run-lifecycle.md`](docs/run-lifecycle.md).
+plane's `relay.plane`/`relay.task`/`relay.run` labels, plus the Run's devcontainer
+`dind-var-lib-docker-*` **named** volume (derived from the Run's recorded
+workspace; `docker rm -v` alone does not remove a named volume), and always
+**retains the run logs** as evidence. `relay run list --leaks` is the read-only
+orphan patrol (scratch, worktrees, labelled containers/volumes and derived dind
+volumes with Docker's size). An unreadable live PR still fails closed; the
+refusal names the next step (`gh auth status` or `relay pr unbind <task>
+--reason ...`). See [`docs/run-lifecycle.md`](docs/run-lifecycle.md).
 
 **Pre-launch disk guard (ISH-1009).** Before a Run row is created, and before a
 Task workspace is created, Relay measures free space on the worktrees root and
