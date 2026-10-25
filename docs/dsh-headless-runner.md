@@ -36,13 +36,17 @@ The devcontainer docker-in-docker `dind-var-lib-docker-*` volume is **named**, s
 recorded workspace and the workspace's `.devcontainer/devcontainer.json` (or
 `.devcontainer.json`), records the exact name on the Run row
 (`runs.devcontainer_volumes`), and reclaims that recorded volume at cleanup /
-lists it in the patrol when orphaned. Start the devcontainer with
-`devcontainer up --workspace-folder <this worktree>`; overriding the workspace or
-config path changes the id and makes the volume untraceable (Relay never scans
-for `dind-*`).
+lists it in the patrol when orphaned. A stopped devcontainer's own exact
+`devcontainer.local_folder` + `devcontainer.config_file` labels are a second
+source (ISH-1224): the container is attributed only on a Relay-owned worktree
+path, listed as the holder of its dind volume (even when Docker reports
+`Links` > 0), and removed before that volume by `relay run cleanup --apply`.
+Start the devcontainer with `devcontainer up --workspace-folder <this worktree>`;
+overriding the workspace or config path changes the id and makes the volume
+untraceable (Relay never scans for `dind-*`).
 `relay run list --leaks` reports orphaned scratch roots, worktrees,
-Relay-labelled containers/volumes and exact derived dind volumes with Docker's
-reported size.
+Relay-labelled containers/volumes, attributed stopped devcontainers and exact
+derived dind volumes (with the holding container) with Docker's reported size.
 
 ## Coding binary (ISH-1133)
 

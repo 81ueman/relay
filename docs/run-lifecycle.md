@@ -364,12 +364,14 @@ dind-var-lib-docker-<devcontainerId>
 
 `docker rm -v` removes only **anonymous** volumes, so this named volume survives
 a normal devcontainer teardown — the 2–5 GB leak observed on the Ishiul host.
-Relay does not create the devcontainer, so instead of relying on a label it
-reproduces the devcontainer CLI's deterministic id from the Run's **recorded**
-workspace (`runs.cwd`, or `tasks.worktree`) plus the workspace's
-`.devcontainer/devcontainer.json` / `.devcontainer.json`
-(`src/devcontainer-id.ts`). The exact resulting name is the Run's recorded dind
-volume.
+Relay does not create the devcontainer, so it reproduces the devcontainer CLI's
+deterministic id from the Run's **recorded** workspace (`runs.cwd`, or
+`tasks.worktree`) plus the workspace's `.devcontainer/devcontainer.json` /
+`.devcontainer.json` (`src/devcontainer-id.ts`). The exact resulting name is the
+Run's recorded dind volume. A stopped devcontainer's own exact
+`devcontainer.local_folder` + `devcontainer.config_file` labels are a second,
+equally exact source (ISH-1224): they recover a volume whose worktree/config is
+already gone, without a `dind-*` scan.
 
 The Run row records the exact names at launch (`runs.devcontainer_volumes`), so
 a named `.devcontainer/<name>/devcontainer.json` is covered even after the
@@ -380,13 +382,16 @@ recorded cwd even when the directory/config no longer exists. That is what lets
 the first post-deploy cleanup reclaim the existing Ishiul leaks instead of only
 future ones.
 
-Cleanup removes that exact name only when Docker reports **no container**
-referencing it (`docker system df -v` `Links`); a still-running/stopped
-devcontainer is NOT Relay-labelled, so Relay never removes the container. Stop
-and remove it first (`docker rm -v <devcontainer>`, which still leaves the named
-volume), then re-run cleanup. An unrelated project's
-`dind-var-lib-docker-*` volume has a different id and is never listed or
-removed.
+A stopped devcontainer is NOT Relay-labelled. ISH-1224 attributes a STOPPED
+container by its exact `devcontainer.local_folder` label on a Relay-owned
+worktree (and `devcontainer.config_file` when present); a running/paused/
+restarting one is deliberately left alone. The patrol therefore lists the
+stopped holder as the holder of the named volume — including when Docker's
+`Links` is > 0 — with the holder and the volume's size, and cleanup removes that
+holder BEFORE the volume in one `--apply`. A dind volume whose holder cannot be
+attributed this way (or is still running) keeps the conservative in-use warning.
+An unrelated project's `dind-var-lib-docker-*` volume has a different id and is
+never listed or removed.
 
 ## Safe workspace cleanup (evidence-retaining)
 
@@ -422,9 +427,13 @@ For a merged/accepted/cancelled Task, cleanup also removes:
   plane's `relay.plane` label** (or a Relay Run id belonging to this Task, which
   is globally unique). Another control plane's identically numbered Task is
   never touched;
+- devcontainer containers attributed by their exact `devcontainer.local_folder`
+  label on this Task's Relay-owned worktree/review path (ISH-1224; no
+  label-prefix or name scan). The holder is removed before its volume;
 - the Run's devcontainer `dind-var-lib-docker-<devcontainerId>` named volume,
-  derived from each Run's recorded workspace + config file. Only the exact
-  derived name is inspected; an in-use volume is left with a warning naming
+  derived from each Run's recorded workspace + config file, or from the exact
+  labels of an attributed holder. Only an exact derived name is inspected; an
+  in-use volume with no attributed holder is left with a warning naming
   `docker rm -v <devcontainer>` as the next step.
 
 The library default is a DISABLED Docker seam: `planWorkspaceCleanup` /
@@ -449,8 +458,13 @@ gone), with sizes:
 - per-Run and per-review scratch roots;
 - Task worktrees and disposable review worktrees;
 - Relay-labelled containers and volumes (Docker's reported size);
+- stopped devcontainer containers whose exact `devcontainer.local_folder` label
+  resolves to a Relay-owned worktree/review path of a terminal Task (ISH-1224),
+  with Docker's size;
 - the exact derived devcontainer `dind-var-lib-docker-*` named volumes, with the
   size Docker reports (`docker system df -v`; rendered `-` when the probe fails).
+  An attributed holder is named in the entry (`held by container <id> (name)`),
+  including when Docker's `Links` is > 0.
 
 It never lists an unrelated/unrecorded dind volume, any other unlabelled
 container/volume, another control plane's `relay.plane` resources, or any image.
@@ -459,8 +473,11 @@ no seam (or `RELAY_DOCKER_RESOURCES=off`) the container/volume section says the
 inventory is disabled rather than silently claiming zero. `--json` returns the
 same report as structured data.
 
-A dind volume still referenced by its (unlabelled) devcontainer is not reported
-as orphaned: stop/remove the devcontainer first, then re-run the patrol/cleanup.
+A dind volume whose holder is NOT attributable (no exact
+`devcontainer.local_folder` label on a Relay-owned path) is not reported as
+orphaned: stop/remove that container first, then re-run the patrol/cleanup. A dind
+volume whose owner Run is finished but whose workspace has a LIVE Run (for
+example a FIX attempt reusing the worktree) is never reported (ISH-1224).
 
 A self-contained clone workspace is removed as a directory (`rm -rf`), so the
 SOURCE repo's `.git` is never touched (a linked `git worktree remove` would have
@@ -495,13 +512,18 @@ report. ISH-1222 adds a real `docker` CLI shim (on `PATH`) proving that
 `relay run cleanup <T> --apply` on a merged and a cancelled Task removes that
 Run's **unlabelled** derived `dind-var-lib-docker-*` volume while leaving an
 unrelated dind volume and all images untouched; the same shim proves the leak
-report lists the orphaned dind volume with Docker's size. It also covers the
-devcontainer-id fixture, the recorded-cwd fallback after a worktree was already
-removed, a recorded NAMED config reclaimed after its worktree is gone, in-use
-dind refusal, the unknown-PR refusal message (`gh auth status` / `relay pr unbind
-<T> --reason`), and the symlinked-DB `controlPlaneId`. `tests/factory.test.ts`
-proves a reviewer's focused check writes into the Relay review scratch root, not
-`/tmp`.
+report lists the orphaned dind volume with Docker's size. ISH-1224 adds a FIX
+attempt with a new live Run on the same worktree (detached devcontainer, so no
+false leak), and a stopped devcontainer attributed by its exact
+`devcontainer.local_folder` label: the patrol lists the holder and the held dind
+volume with size, and one `cleanup --apply` removes the holder and then the
+volume while an unrelated devcontainer/volume and all images stay untouched. It
+also covers the devcontainer-id fixture, the recorded-cwd fallback after a
+worktree was already removed, a recorded NAMED config reclaimed after its
+worktree is gone, in-use dind refusal when no holder is attributable, the
+unknown-PR refusal message (`gh auth status` / `relay pr unbind <T> --reason`),
+and the symlinked-DB `controlPlaneId`. `tests/factory.test.ts` proves a
+reviewer's focused check writes into the Relay review scratch root, not `/tmp`.
 
 ## Verified / not verified
 
@@ -517,7 +539,9 @@ proves a reviewer's focused check writes into the Relay review scratch root, not
   probe error, and the same queued Task launching after space is freed) surfaced
   in `relay status` and the dashboard; and ISH-1222's devcontainer-id fixture,
   merged/cancelled dind reclaim via a real `docker` CLI shim, orphan-size leak
-  entry, in-use refusal, unknown-PR refusal message and symlinked-DB plane id.
+  entry, in-use refusal, unknown-PR refusal message and symlinked-DB plane id;
+  ISH-1224's live-FIX suppression plus stopped-holder leak/reclaim through the
+  `docker` shim (unrelated container/volume and images untouched).
 - **NOT verified here**: launching the **real** `dsh` binary (see
   [`dsh-headless-runner.md`](dsh-headless-runner.md), the opt-in
   `RELAY_DSH_SMOKE=1` smoke); creating a **live** devcontainer against the host
