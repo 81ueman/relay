@@ -10,8 +10,9 @@ import { REVIEWER_ROLE } from "./schema";
 import type { Task } from "./schema";
 import { gitHead } from "./verify";
 import { hostGit } from "./review-workspace";
-import { ensureScratchRoot, scratchEnv } from "./scratch";
+import { ensureScratchRoot, scratchEnv, taskCargoTarget } from "./scratch";
 import { controlPlaneNamespace } from "./run-resources";
+import { findActiveWriterRow } from "./run-owner";
 import { recordReview, taskChecks } from "./workflow";
 import { ensureHeadlessWorker, getWorker, HEADLESS_AGENT_KIND } from "./workers";
 import {
@@ -62,6 +63,12 @@ export const REVIEW_NOT_INDEPENDENT = "REVIEW_NOT_INDEPENDENT";
 export const REVIEW_NOT_IN_REVIEW = "REVIEW_NOT_IN_REVIEW";
 /** The reviewer process itself failed (non-zero exit / a signal): never a verdict. */
 export const REVIEW_PROCESS_FAILED = "REVIEW_PROCESS_FAILED";
+/**
+ * ISH-1225: a live worker Run still owns the Task worktree. The reviewer shares
+ * the Task build cache, so it must never start while a writer could be writing
+ * that directory. This is checked before the reviewer process is spawned.
+ */
+export const REVIEW_WRITER_ACTIVE = "REVIEW_WRITER_ACTIVE";
 /** ISH-883: no bound PR to post a native review to (fail closed). */
 export const REVIEW_NATIVE_NO_PR = "REVIEW_NATIVE_NO_PR";
 /** ISH-883: the reviewer posted no matching native review at the reviewed HEAD. */
@@ -301,8 +308,10 @@ export interface HeadlessReviewDeps {
   reviewRubric?: ReviewRubric;
   /**
    * ISH-1221: a Relay-owned per-review scratch root. When set, the reviewer
-   * process gets TMPDIR/TMP/TEMP/CARGO_TARGET_DIR under it, so a focused check
-   * writes there instead of shared `/tmp/<name>`. The root is created here.
+   * process gets TMPDIR/TMP/TEMP under it, so a focused check writes there
+   * instead of shared `/tmp/<name>`. The root is created here. ISH-1225: the
+   * Cargo build cache is NOT per-review; `CARGO_TARGET_DIR` always points at the
+   * Task worktree's `target/` (the same directory the worker/VERIFY use).
    */
   scratchRoot?: string;
   /**
@@ -506,8 +515,10 @@ export function buildReviewBrief(
     "explicit `no execution needed because <concrete reason>`) — silence is not enough.",
     "A blocking claim should carry the repro command/output, or an unambiguous code trace.",
     "",
-    "Use `$TMPDIR` for scratch and `$CARGO_TARGET_DIR` for build output: they are",
-    "Relay-owned per-review paths, never `/tmp/<name>`. Any container or volume you",
+    "Use `$TMPDIR` for scratch; it is a Relay-owned per-review path, never",
+    "`/tmp/<name>`. `$CARGO_TARGET_DIR` is the Task's shared build cache and may",
+    "already be warm from the implementation/VERIFY: reuse it, do not delete or",
+    "clean it. Any container or volume you",
     "start MUST carry `--label \"$RELAY_DOCKER_LABEL_PLANE\"`,",
     "`--label \"$RELAY_DOCKER_LABEL_TASK\"` and `--label \"$RELAY_DOCKER_LABEL_RUN\"`",
     "so Relay can reclaim it; a missing plane label makes the resource untraceable.",
@@ -1005,6 +1016,25 @@ export async function runHeadlessReview(
     );
   }
 
+  // ISH-1225: the reviewer shares the Task worktree's `target/` with the coding
+  // worker and mechanical VERIFY. A reviewer must never write into a build cache
+  // a live worker Run is still using, so refuse BEFORE pinning the brief or
+  // spawning the reviewer. The Factory calls this only after awaiting the
+  // implement Run's terminal row; a manual/replayed review cannot bypass that.
+  if (task.worktree) {
+    const writer = findActiveWriterRow(db, { cwd: task.worktree, branch: task.branch });
+    if (writer) {
+      const reason = `${REVIEW_WRITER_ACTIVE}: run ${writer.id} is '${writer.state}' in the Task worktree ${task.worktree}; refuse to share its build cache`;
+      logEvent(db, {
+        source: "factory",
+        taskId,
+        type: "factory.review_refused",
+        payload: { reason: REVIEW_WRITER_ACTIVE, reviewer: deps.reviewerWorker ?? DEFAULT_REVIEWER_WORKER, writerRunId: writer.id },
+      });
+      return refusal(reason, task);
+    }
+  }
+
   const reviewerWorker = deps.reviewerWorker ?? DEFAULT_REVIEWER_WORKER;
   // Register ONLY when absent: an existing worker keeps its own role, so a
   // non-reviewer principal is refused by `recordReview` (never silently promoted).
@@ -1050,9 +1080,13 @@ export async function runHeadlessReview(
   });
 
   const spawner = deps.spawner ?? bunReviewerSpawner(deps.command ?? DEFAULT_REVIEW_COMMAND);
-  // ISH-1221: the reviewer gets its OWN Relay-owned scratch root, overriding an
-  // inherited host TMPDIR. The root is removed when the Task is reclaimed.
+  // ISH-1221: the reviewer gets its OWN Relay-owned scratch root for TMPDIR,
+  // overriding an inherited host TMPDIR. The root is removed with the Task.
   const scratchRoot = deps.scratchRoot ? ensureScratchRoot(deps.scratchRoot) : null;
+  // ISH-1225: the Task-level Cargo cache. Use the durable worktree even when the
+  // review runs in a detached read-only checkout; the fallback only applies when
+  // a Task has no recorded worktree (legacy/direct use).
+  const cargoTargetDir = taskCargoTarget(task.worktree ?? worktree);
   const reviewRunId = `review-${task.id}-${task.attempt}-${head.slice(0, 10)}`;
   const proc = await spawner.run({
     cwd: worktree,
@@ -1060,9 +1094,17 @@ export async function runHeadlessReview(
     env: {
       ...(deps.env ?? {}),
       ...(scratchRoot
-        ? scratchEnv(scratchRoot, { plane: controlPlaneNamespace(db), taskId: task.id, runId: reviewRunId })
+        ? scratchEnv(
+            scratchRoot,
+            { plane: controlPlaneNamespace(db), taskId: task.id, runId: reviewRunId },
+            { cargoTargetDir }
+          )
         : {}),
       ...(native?.spawnEnv ?? {}),
+      // Relay-owned values WIN over inherited/native ones (as in ISH-1221).
+      CARGO_TARGET_DIR: cargoTargetDir,
+      RELAY_CARGO_TARGET_DIR: cargoTargetDir,
+      RELAY_TASK_CARGO_TARGET_DIR: cargoTargetDir,
     },
     timeoutMs: deps.timeoutMs ?? reviewTimeoutMs(),
     model: deps.model,

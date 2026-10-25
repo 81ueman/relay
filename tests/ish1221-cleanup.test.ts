@@ -21,7 +21,7 @@ import {
   dindVolumeNamesForWorkspace,
   workspacePathVariants,
 } from "../src/devcontainer-id";
-import { reviewScratchTaskRoot } from "../src/scratch";
+import { reviewScratchTaskRoot, taskCargoTarget } from "../src/scratch";
 
 /**
  * ISH-1221: run-scoped resource reclamation. A real throwaway repo + a fake dsh
@@ -378,12 +378,12 @@ exit 0
 }
 
 describe("ISH-1221: run scratch + labelled resource reclamation", () => {
-  test("a worker Run gets a per-Run TMPDIR/CARGO_TARGET_DIR under its output dir", async () => {
+  test("a worker Run gets a per-Run TMPDIR and the Task-level CARGO_TARGET_DIR", async () => {
     const id = newTask();
     const { scratch } = await launchedRun(id);
     const { launchTaskRun } = await import("../src/run-lifecycle");
     const spawner = new FakeSpawner();
-    // A second Task/Run proves the root is per-Run, not a shared constant.
+    // A second Task proves TMPDIR is per-Run while the build cache is per-Task.
     const other = newTask();
     const launched = await launchTaskRun(db, other, {
       repo,
@@ -395,10 +395,16 @@ describe("ISH-1221: run scratch + labelled resource reclamation", () => {
     spawner.procs[0].finish(0);
     const run = await launched.handle.wait();
     const env = spawner.envs[0];
+    const worktree = getTask(db, other)!.worktree!;
     expect(env.TMPDIR).toBe(join(run.output_dir, "scratch", "tmp"));
     expect(env.TMP).toBe(env.TMPDIR);
     expect(env.TEMP).toBe(env.TMPDIR);
-    expect(env.CARGO_TARGET_DIR).toBe(join(run.output_dir, "scratch", "cargo-target"));
+    // ISH-1225: the build cache is the Task worktree's target, shared with VERIFY.
+    expect(env.CARGO_TARGET_DIR).toBe(taskCargoTarget(worktree));
+    expect(env.RELAY_CARGO_TARGET_DIR).toBe(env.CARGO_TARGET_DIR);
+    expect(env.RELAY_TASK_CARGO_TARGET_DIR).toBe(env.CARGO_TARGET_DIR);
+    // ISH-1225: a Run no longer creates a per-Run cargo-target directory.
+    expect(existsSync(join(run.output_dir, "scratch", "cargo-target"))).toBe(false);
     expect(env.RELAY_SCRATCH_DIR).toBe(join(run.output_dir, "scratch"));
     expect(env.RELAY_DOCKER_LABEL_PLANE).toBe(`relay.plane=${thisPlane()}`);
     expect(env.RELAY_DOCKER_LABEL_TASK).toBe(`relay.task=${other}`);
@@ -411,6 +417,10 @@ describe("ISH-1221: run scratch + labelled resource reclamation", () => {
     const { runId, outputDir, scratch } = await launchedRun(id);
     const worktree = getTask(db, id)!.worktree!;
     expect(existsSync(worktree)).toBe(true);
+    // ISH-1225: the shared Task build cache is removed with the Task.
+    const build = taskCargoTarget(worktree);
+    mkdirSync(build, { recursive: true });
+    writeFileSync(join(build, "warm-marker"), "compiled\n");
     db.query(`UPDATE tasks SET state='done', accepted_at=?, merged_at=? WHERE id=?`).run(Date.now(), Date.now(), id);
     const docker = labelledDocker(id, runId);
 
@@ -423,6 +433,9 @@ describe("ISH-1221: run scratch + labelled resource reclamation", () => {
     });
     expect(plan.remove).toBe(true);
     expect(plan.removed).toBe(true);
+    expect(plan.buildDir).toBe(build);
+    expect(plan.removedResources).toContain(`build ${build}`);
+    expect(existsSync(build)).toBe(false);
     expect(getTask(db, id)!.worktree).toBeNull();
     expect(existsSync(worktree)).toBe(false);
     expect(existsSync(scratch)).toBe(false);

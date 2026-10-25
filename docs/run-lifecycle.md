@@ -324,17 +324,33 @@ phase guards still apply: this works only for an `implement` Task whose current
 attempt has no `TaskSubmitted` yet (the stale Run never recorded one). A Task
 parked for any other reason keeps its ordinary `relay unblock` path.
 
-## Per-Run scratch (ISH-1221)
+## Per-Run TMPDIR and the Task build cache (ISH-1221, ISH-1225)
 
 Every headless Run and every headless review gets a **Relay-owned scratch root**
-under the control plane, and the process receives it as environment:
+under the control plane for disposable `TMPDIR`:
 
 ```
 <control-plane>/runs/<run-id>/scratch/        # a coding Run
   tmp/                 $TMPDIR, $TMP, $TEMP
-  cargo-target/        $CARGO_TARGET_DIR
-<control-plane>/runs/reviews/<task>/<attempt>-<head>/scratch/
+<control-plane>/runs/reviews/<task>/<attempt>-<head>/scratch/tmp/
 ```
+
+The Cargo build cache is scoped to the **Task**, not the Run: all
+implement/FIX Runs, mechanical VERIFY and the reviewer use
+`CARGO_TARGET_DIR=<task-worktree>/target` (`src/scratch.ts:71` `taskCargoTarget`;
+Run env `src/dsh-runner.ts:639,706-716`; VERIFY `src/workflow.ts:1174-1182`;
+reviewer `src/reviewer-runner.ts:1089-1107`). This is Cargo's natural in-worktree
+default, so VERIFY sees the cache the worker warmed, and a second Run of the
+same Task does not create another target directory. `relay run cleanup` removes
+the build dir and the worktree together
+(`src/run-lifecycle.ts:2008-2011`, with the target excluded from the dirty guard
+at `src/run-lifecycle.ts:1775`); `relay run list --leaks` reports the `build`
+entry only for a terminal Task with no live writer
+(`src/run-leaks.ts:246-292`). The reviewer uses the same target only when
+`runHeadlessReview` proves no live worker Run holds the Task worktree
+(`REVIEW_WRITER_ACTIVE`, `src/reviewer-runner.ts:1024-1035`); the Factory also
+awaits the implement Run's terminal row before VERIFY/review, so the two phases
+cannot write the target concurrently.
 
 The Relay values **win** over an inherited host `TMPDIR` (`src/scratch.ts`), so
 an ad-hoc `/tmp/<name>` directory is no longer needed. The prompts also tell the
@@ -351,7 +367,8 @@ unlabelled case is a Run's **derived** devcontainer dind volume (next section),
 matched by its exact `devcontainerId`, never by a `dind-*` wildcard.
 
 The Run's `stdout.log`, `stderr.log`, `dsh.jsonl` and `events.jsonl` live next to
-`scratch/` and are **retained**; cleanup removes only the scratch subtree.
+`scratch/` and are **retained**; cleanup removes only the scratch subtree plus
+the Task worktree (which contains the Task build cache).
 
 ### Devcontainer dind named volume (ISH-1222)
 
@@ -456,6 +473,8 @@ resources attributable to Relay whose Run/Task is over (or whose Task row is
 gone), with sizes:
 
 - per-Run and per-review scratch roots;
+- the Task-scoped Cargo build dir (`<worktree>/target`, ISH-1225), reported only
+  for a terminal Task with no live writer;
 - Task worktrees and disposable review worktrees;
 - Relay-labelled containers and volumes (Docker's reported size);
 - stopped devcontainer containers whose exact `devcontainer.local_folder` label
@@ -504,8 +523,14 @@ no Herdr): worktree create/select → launch (pin brief) → duplicate writer re
 the findings → submit → review PASS → observed merge → safe cleanup with retained
 evidence, and asserts every rejection case.
 
+`tests/ish1225-task-build-cache.test.ts` proves the Task-level build cache: two
+consecutive Runs and VERIFY see the same `CARGO_TARGET_DIR` and no per-Run
+`scratch/cargo-target` is created, a reviewer receives the same target only with
+no live writer (and is refused with `REVIEW_WRITER_ACTIVE` otherwise), cleanup
+removes the build dir, and the leak patrol reports it only for a terminal Task.
+
 `tests/ish1221-cleanup.test.ts` covers the run-scoped resource reclamation: the
-per-Run `TMPDIR`/`CARGO_TARGET_DIR`, merged and cancelled cleanup, a CLOSED-PR
+per-Run `TMPDIR` and Task-level `CARGO_TARGET_DIR`, merged and cancelled cleanup, a CLOSED-PR
 cancelled Task vs a live-OPEN PR refusal, the dirty-worktree saved patch,
 labelled container/volume removal vs unlabelled resources/images, and the leak
 report. ISH-1222 adds a real `docker` CLI shim (on `PATH`) proving that

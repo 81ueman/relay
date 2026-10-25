@@ -1,10 +1,11 @@
 import { existsSync, mkdirSync, readdirSync, lstatSync, rmSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { defaultDbPath } from "./db";
 import { RELAY_PLANE_LABEL } from "./run-resources";
 
 /**
  * ISH-1221 — Relay-owned, per-Run scratch.
+ * ISH-1225 — the build cache is scoped to the TASK, not the Run.
  *
  * A headless Run and a headless review are both coding processes that write
  * build scratch somewhere. If they use the host default (`/tmp/<name>`,
@@ -14,18 +15,38 @@ import { RELAY_PLANE_LABEL } from "./run-resources";
  *
  *   <control-plane>/runs/<run-id>/scratch/
  *     tmp/                 $TMPDIR / $TMP / $TEMP
- *     cargo-target/        $CARGO_TARGET_DIR
  *
  * Reviews use `<control-plane>/runs/reviews/<task>/<attempt>-<head>/scratch`.
+ * `TMPDIR` stays per-execution: it is small and disposable.
+ *
+ * The Cargo build cache must be reusable across phases instead. Every
+ * implement/FIX Run, the mechanical VERIFY and the reviewer use the SAME
+ * Task-scoped directory:
+ *
+ *   <task-worktree>/target        $CARGO_TARGET_DIR
+ *
+ * The worktree is Relay-created/owned and is removed by `relay run cleanup`
+ * with the Task, so the build cache is reclaimed exactly when the Task's
+ * workspace is. `target/` is inside the Run's writable workspace (a
+ * `workspace-write` Run can write it) and is the natural Cargo default, so
+ * VERIFY and a FIX Run reuse the artifacts the IMPLEMENT Run just built.
  *
  * The Run's stdout/stderr/dsh.jsonl and events.jsonl stay in
  * `<control-plane>/runs/<run-id>/` as RETAINED evidence; cleanup removes only
- * the `scratch` subtree. Nothing here ever uses a shared `/tmp` path.
+ * the `scratch` subtree (plus the Task worktree/target). Nothing here ever
+ * uses a shared `/tmp` path.
  */
 
 export const SCRATCH_DIR_NAME = "scratch";
 export const SCRATCH_TMP_DIR = "tmp";
+/**
+ * ISH-1221's legacy per-Run cargo target directory name. ISH-1225 creates no
+ * runtime path from it (a scratch root written by an older Relay is still
+ * removed whole by cleanup).
+ */
 export const SCRATCH_CARGO_DIR = "cargo-target";
+/** The Task-scoped Cargo build directory inside the Task worktree. */
+export const TASK_CARGO_DIR = "target";
 
 /** The default `<control-plane>/runs` root (same default as `startDshRun`). */
 export function defaultRunsRoot(): string {
@@ -40,6 +61,15 @@ export function scratchPathSegment(id: string): string {
 /** One Run's scratch root: `<run output dir>/scratch`. */
 export function runScratchRoot(runOutputDir: string): string {
   return join(runOutputDir, SCRATCH_DIR_NAME);
+}
+
+/**
+ * ISH-1225: the ONE Cargo build directory a Task shares across every phase.
+ * It lives inside the Task worktree so a `workspace-write` Run can write it,
+ * VERIFY's natural Cargo default finds it, and Task cleanup removes it.
+ */
+export function taskCargoTarget(worktree: string): string {
+  return join(worktree, TASK_CARGO_DIR);
 }
 
 /** One review's scratch root under the same Relay-owned runs root. */
@@ -58,10 +88,13 @@ export function reviewScratchTaskRoot(outputRoot: string | undefined, taskId: st
   return join(outputRoot ?? defaultRunsRoot(), "reviews", scratchPathSegment(taskId));
 }
 
-/** Create the scratch root + its TMPDIR/CARGO_TARGET_DIR children. Idempotent. */
+/**
+ * Create the per-execution scratch root + its TMPDIR child. Idempotent.
+ * ISH-1225: no `cargo-target/` is created here — the build cache belongs to the
+ * Task worktree (see `taskCargoTarget`), so a second Run must not mint one.
+ */
 export function ensureScratchRoot(root: string): string {
   mkdirSync(join(root, SCRATCH_TMP_DIR), { recursive: true });
-  mkdirSync(join(root, SCRATCH_CARGO_DIR), { recursive: true });
   return root;
 }
 
@@ -74,27 +107,36 @@ export function ensureScratchRoot(root: string): string {
  * `plane` namespaces the labels to THIS control plane. `relay.task=T1` alone is
  * ambiguous on a shared host (every checkout numbers its own Tasks from T1), so
  * a resource missing the plane label is only matched through its Run id.
+ *
+ * `cargoTargetDir` is the Task-level build cache shared with VERIFY and the
+ * reviewer (ISH-1225). It is NOT derived from the per-Run scratch root: a caller
+ * that omits it gets no `CARGO_TARGET_DIR` from Relay (never a fresh per-Run
+ * target), and production callers always pass the Task worktree's `target/`.
  */
 export function scratchEnv(
   root: string,
-  ids: { plane: string; taskId: string; runId: string }
+  ids: { plane: string; taskId: string; runId: string },
+  opts: { cargoTargetDir?: string } = {}
 ): Record<string, string> {
   const tmp = join(root, SCRATCH_TMP_DIR);
-  const cargo = join(root, SCRATCH_CARGO_DIR);
-  return {
+  const env: Record<string, string> = {
     TMPDIR: tmp,
     TMP: tmp,
     TEMP: tmp,
-    CARGO_TARGET_DIR: cargo,
     RELAY_SCRATCH_DIR: root,
     RELAY_TMPDIR: tmp,
-    RELAY_CARGO_TARGET_DIR: cargo,
     RELAY_TASK_ID: ids.taskId,
     RELAY_RUN_ID: ids.runId,
     RELAY_DOCKER_LABEL_PLANE: `${RELAY_PLANE_LABEL}=${ids.plane}`,
     RELAY_DOCKER_LABEL_TASK: `relay.task=${ids.taskId}`,
     RELAY_DOCKER_LABEL_RUN: `relay.run=${ids.runId}`,
   };
+  if (opts.cargoTargetDir) {
+    env.CARGO_TARGET_DIR = opts.cargoTargetDir;
+    env.RELAY_CARGO_TARGET_DIR = opts.cargoTargetDir;
+    env.RELAY_TASK_CARGO_TARGET_DIR = opts.cargoTargetDir;
+  }
+  return env;
 }
 
 /** Remove a scratch root; true when something was actually removed. */
@@ -108,13 +150,18 @@ export function removeScratchRoot(root: string): boolean {
  * Recursive on-disk size for the leak report. Symlinks are counted by their own
  * link size and never followed (a worktree can contain a link back to the
  * source checkout). A missing/unreadable path is `null`, never a throw.
+ *
+ * `exclude` lets the leak report size a worktree and its Task build directory
+ * separately without double-counting the same bytes (ISH-1225).
  */
-export function pathSizeBytes(path: string): number | null {
+export function pathSizeBytes(path: string, exclude: readonly string[] = []): number | null {
   let total = 0;
+  const skip = new Set(exclude.map((p) => resolve(p)));
   const stack = [path];
   try {
     while (stack.length > 0) {
       const cur = stack.pop()!;
+      if (skip.has(resolve(cur))) continue;
       const st = lstatSync(cur);
       if (st.isDirectory()) {
         total += st.size;

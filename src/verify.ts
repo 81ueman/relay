@@ -39,9 +39,20 @@ export interface ExecutedCheck {
   durationMs: number;
 }
 
+/** Options for one check. `env` is merged over the inherited environment. */
+export interface CommandRunOptions {
+  cwd: string;
+  /**
+   * ISH-1225: Relay-owned environment for the command. VERIFY passes the Task's
+   * shared `CARGO_TARGET_DIR` here so it reuses the worker's build cache instead
+   * of falling back to an inherited host value.
+   */
+  env?: Record<string, string>;
+}
+
 /** Runs ONE check. Read-only w.r.t. the repo: it only observes the exit code. */
 export interface CommandRunner {
-  run(spec: CheckSpec, opts: { cwd: string }): Promise<ExecutedCheck>;
+  run(spec: CheckSpec, opts: CommandRunOptions): Promise<ExecutedCheck>;
 }
 
 export const DEFAULT_CHECK_TIMEOUT_MS = 600000;
@@ -131,13 +142,16 @@ function notRunCheck(name: string, output: string): ExecutedCheck {
  * output pipes once the timeout fires.
  */
 export const defaultRunner: CommandRunner = {
-  async run(spec, { cwd }) {
+  async run(spec, { cwd, env }) {
     const timeoutMs = spec.timeoutMs ?? DEFAULT_CHECK_TIMEOUT_MS;
     const started = Date.now();
     let proc: ReturnType<typeof Bun.spawn>;
     try {
       proc = Bun.spawn(["bash", "-lc", spec.command], {
         cwd,
+        // ISH-1225: an explicit Relay env overrides a host default. When no env
+        // is supplied Bun inherits process.env, preserving the old behaviour.
+        ...(env ? { env: { ...process.env, ...env } } : {}),
         stdout: "pipe",
         stderr: "pipe",
         // New session/process group: the shell and its descendants share a pgid
@@ -201,11 +215,13 @@ export const defaultRunner: CommandRunner = {
 export async function runChecks(
   checks: CheckSpec[],
   runner: CommandRunner,
-  cwd: string
+  cwd: string,
+  opts: { env?: Record<string, string> } = {}
 ): Promise<{ outcome: CheckOutcome; checks: ExecutedCheck[] }> {
   const executed: ExecutedCheck[] = [];
   for (const spec of checks) {
-    const r = await runner.run(spec, { cwd }).catch(
+    const runOpts: CommandRunOptions = { cwd, ...(opts.env ? { env: opts.env } : {}) };
+    const r = await runner.run(spec, runOpts).catch(
       (e): ExecutedCheck => ({
         name: spec.name,
         required: spec.required !== false,

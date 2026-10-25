@@ -19,14 +19,27 @@ relay run submit <run-id> [--evidence E] [--summary S]
 A one-shot headless attempt is launched directly by `src/dsh-runner.ts`; there
 is no long-lived `dsh web` bridge.
 
-## Per-Run scratch (ISH-1221)
+## Per-Run TMPDIR and the Task build cache (ISH-1221, ISH-1225)
 
 Each Run owns `<control-plane>/runs/<run-id>/scratch/` and receives
-`TMPDIR`/`TMP`/`TEMP` = `scratch/tmp` and `CARGO_TARGET_DIR` =
-`scratch/cargo-target` (see `src/scratch.ts`). The Relay values override an
-inherited host `TMPDIR`, so a focused check writes into the Run's root instead
-of shared `/tmp/<name>`. The Run logs stay in `<control-plane>/runs/<run-id>/`
-as retained evidence; cleanup removes only the `scratch` subtree.
+`TMPDIR`/`TMP`/`TEMP` = `scratch/tmp` (see `src/scratch.ts`). The Relay values
+override an inherited host `TMPDIR`, so a focused check writes into the Run's
+root instead of shared `/tmp/<name>`. The Run logs stay in
+`<control-plane>/runs/<run-id>/` as retained evidence; cleanup removes only the
+`scratch` subtree.
+
+`CARGO_TARGET_DIR` is **not** per-Run. ISH-1225 scopes the Cargo build cache to
+the Task: every implement/FIX Run, mechanical VERIFY and the reviewer receive
+`CARGO_TARGET_DIR=<task-worktree>/target` (`taskCargoTarget` in
+`src/scratch.ts:71`; the Run env is assembled in `src/dsh-runner.ts:639,706-716`,
+VERIFY passes the same value in `src/workflow.ts:1174-1182`, and the reviewer in
+`src/reviewer-runner.ts:1089-1107`). A second Run of the same Task therefore
+reuses the warm cache instead of creating another tree, and the directory is
+reclaimed with the Task worktree by `relay run cleanup`. The reviewer shares
+that directory only after `runHeadlessReview` has proved there is no live writer
+on the Task worktree (`REVIEW_WRITER_ACTIVE`, `src/reviewer-runner.ts:1024-1035`):
+the Factory also awaits the implement Run's terminal row before VERIFY/review,
+so a review and a worker cannot write the same target concurrently.
 The process also receives `RELAY_DOCKER_LABEL_PLANE`,
 `RELAY_DOCKER_LABEL_TASK` and `RELAY_DOCKER_LABEL_RUN`; any container/volume it
 starts must carry all three so `relay run cleanup` can attribute it to this
@@ -44,9 +57,12 @@ path, listed as the holder of its dind volume (even when Docker reports
 Start the devcontainer with `devcontainer up --workspace-folder <this worktree>`;
 overriding the workspace or config path changes the id and makes the volume
 untraceable (Relay never scans for `dind-*`).
-`relay run list --leaks` reports orphaned scratch roots, worktrees,
-Relay-labelled containers/volumes, attributed stopped devcontainers and exact
-derived dind volumes (with the holding container) with Docker's reported size.
+`relay run list --leaks` reports orphaned scratch roots, Task build dirs,
+worktrees, Relay-labelled containers/volumes, attributed stopped devcontainers
+and exact derived dind volumes (with the holding container) with Docker's
+reported size. The `build` entry is emitted only for a terminal Task with no
+live writer; the worktree entry excludes those bytes so they are not counted
+twice (`src/run-leaks.ts`).
 
 ## Coding binary (ISH-1133)
 

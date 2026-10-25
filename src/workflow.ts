@@ -41,6 +41,7 @@ import {
   type CommandRunner,
   type ExecutedCheck,
 } from "./verify";
+import { taskCargoTarget } from "./scratch";
 
 /**
  * ISH-758 minimal event-driven workflow core.
@@ -1166,7 +1167,18 @@ export async function runMechanicalVerification(
       { name: "head-binding", required: true, outcome: "not_run", exitCode: null, output: bindingError, durationMs: 0 },
     ];
   } else {
-    const run = await runChecks(opts.checks, opts.runner, opts.cwd);
+    // ISH-1225: VERIFY runs in the Task worktree and MUST use the SAME Task-level
+    // Cargo cache as the implement/FIX Runs, even if the daemon inherited a host
+    // CARGO_TARGET_DIR. The worktree's `target/` is Cargo's natural default, so
+    // this is also what an unmodified check command would use.
+    const cargoTargetDir = taskCargoTarget(opts.cwd);
+    const run = await runChecks(opts.checks, opts.runner, opts.cwd, {
+      env: {
+        CARGO_TARGET_DIR: cargoTargetDir,
+        RELAY_CARGO_TARGET_DIR: cargoTargetDir,
+        RELAY_TASK_CARGO_TARGET_DIR: cargoTargetDir,
+      },
+    });
     outcome = run.outcome;
     checks = run.checks;
   }

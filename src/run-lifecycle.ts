@@ -25,7 +25,7 @@ import { readEvidenceTail, terminalImplementRunSignature } from "./implement-rec
 import { issueKeyForTask, resolveTaskPrTarget } from "./pr-target";
 import { resolveTaskPrRef } from "./pr-binding";
 import { removeReviewWorktree } from "./review-workspace";
-import { defaultRunsRoot, reviewScratchTaskRoot, removeScratchRoot } from "./scratch";
+import { defaultRunsRoot, reviewScratchTaskRoot, removeScratchRoot, taskCargoTarget } from "./scratch";
 import { dindVolumeNamesForWorkspace, dindVolumeNamesFromContainerLabels, workspacePathVariants } from "./devcontainer-id";
 import {
   controlPlaneNamespace,
@@ -1382,6 +1382,12 @@ export interface CleanupPlan {
   taskId: string;
   worktree: string | null;
   branch: string | null;
+  /**
+   * ISH-1225: the Task-level Cargo build directory (`<worktree>/target`) that
+   * every implement/FIX Run, VERIFY and the reviewer share. It is removed with
+   * the Task (and with the worktree when that is reclaimed).
+   */
+  buildDir: string | null;
   /** True when every safety guard passed (removal is allowed). */
   remove: boolean;
   apply: boolean;
@@ -1571,10 +1577,16 @@ export async function planWorkspaceCleanup(
   const reviewRoot =
     opts.reviewWorktreesRoot ?? join(opts.repo ?? projectRoot(), STATE_DIR, "review-worktrees");
   const reviewScratch = reviewScratchTaskRoot(outputRoot, taskId);
+  // ISH-1225: the Task build cache lives in the worktree and is reclaimed with
+  // it. Keep it explicit in the plan so cleanup/`--json` names the build dir and
+  // so a worktree-less ledger never hides one.
+  const taskBuildDir = worktree ? taskCargoTarget(worktree) : null;
+  const buildDir = taskBuildDir && existsSync(taskBuildDir) ? taskBuildDir : null;
   const plan: CleanupPlan = {
     taskId,
     worktree,
     branch,
+    buildDir,
     remove: false,
     apply: opts.apply === true,
     reasons,
@@ -1756,7 +1768,11 @@ export async function planWorkspaceCleanup(
     const owned = isUnder(worktree, wtRoot) && resolve(worktree) !== resolve(projectRoot());
     if (!owned && !opts.force) reasons.push(`worktree is not relay-owned (not under ${wtRoot})`);
 
-    const dirty = gitRun(worktree, ["status", "--porcelain"]);
+    // ISH-1225: the Task-scoped Cargo build cache is Relay-owned scratch, not a
+    // user change. Exclude it from the dirty guard so a worktree whose repo does
+    // not gitignore `target/` can still be reclaimed (and a patch never carries
+    // gigabytes of build output).
+    const dirty = gitRun(worktree, ["status", "--porcelain", "--", ".", ":(exclude)target"]);
     if (!dirty.ok) {
       reasons.push("worktree is not a readable git checkout");
     } else if (dirty.out) {
@@ -1789,6 +1805,7 @@ export async function planWorkspaceCleanup(
   const hasWorktree = !!worktree;
   const hasResources =
     hasWorktree ||
+    plan.buildDir !== null ||
     plan.scratchDirs.length > 0 ||
     plan.reviewWorktrees.length > 0 ||
     plan.containers.length > 0 ||
@@ -1986,6 +2003,12 @@ export async function applyWorkspaceCleanup(
   for (const path of plan.scratchDirs) {
     if (removeScratchRoot(path)) plan.removedResources.push(`scratch ${path}`);
   }
+  // ISH-1225: reclaim the shared Task build cache explicitly. It is removed
+  // before the worktree; the worktree removal that follows is the normal owner.
+  if (plan.buildDir) {
+    if (removeScratchRoot(plan.buildDir)) plan.removedResources.push(`build ${plan.buildDir}`);
+    else plan.warnings.push(`build dir ${plan.buildDir} could not be removed`);
+  }
   for (const path of plan.reviewWorktrees) {
     const r = reclaimReviewWorktree(opts.repo ?? projectRoot(), path);
     if (r.ok) plan.removedResources.push(`review worktree ${path}`);
@@ -2023,6 +2046,7 @@ export async function applyWorkspaceCleanup(
     payload: {
       worktree: plan.worktree,
       branch: plan.branch,
+      buildDir: plan.buildDir,
       abort: opts.abort ?? null,
       merged: getTask(db, taskId)?.merged_at !== null,
       retainedRuns: plan.retainedRuns,
