@@ -28,6 +28,7 @@ import {
   taskHeadOvertakenByOtherWriter,
   type ActiveWriterQuery as ActiveWriterRowQuery,
 } from "./run-owner";
+import { assertNoReviewInFlight } from "./review-fence";
 import { runObservedOwnHeads } from "./run-heads";
 import {
   countDshLine,
@@ -374,6 +375,10 @@ function insertRunIfNoActiveWriter(db: Database, r: InsertRunInput): Run {
   return db
     .transaction(() => {
       assertNoActiveWriter(db, { cwd: r.cwd, branch: r.branch });
+      // ISH-1226: a headless review is not a `runs` row, so its durable fence is
+      // the only thing that makes this guard see it. Same BEGIN IMMEDIATE as the
+      // INSERT, so a writer cannot slip between the check and the row.
+      assertNoReviewInFlight(db, { taskId: r.taskId, cwd: r.cwd, branch: r.branch });
       return insertRun(db, r);
     })
     .immediate();
@@ -528,6 +533,12 @@ export async function startDshRun(db: Database, opts: StartRunOptions): Promise<
   if (task.code_change !== 1) {
     throw new Error(`task ${task.id} is not a code-change task; a headless Run implements a code task`);
   }
+  // ISH-1226: the reviewer shares the Task worktree's `target/` but is not a
+  // `runs` row. Refuse a writer while a review of THIS Task is in flight, before
+  // the phase gate: even a manual `relay run start` names the real holder
+  // instead of a generic phase refusal. The authoritative check is inside the
+  // BEGIN IMMEDIATE insert below.
+  assertNoReviewInFlight(db, { taskId: task.id });
   const phase = task.phase;
   if (phase !== "implement" && phase !== "integration") {
     throw new Error(`task ${task.id} is in phase '${phase ?? "none"}' (a Run starts in implement/integration)`);
@@ -556,6 +567,9 @@ export async function startDshRun(db: Database, opts: StartRunOptions): Promise<
   // pre-check only; the authoritative race-free guard is the BEGIN IMMEDIATE
   // insert below.
   assertNoActiveWriter(db, { cwd, branch });
+  // ISH-1226: also fence the Task/worktree by path/branch, so a writer for a
+  // DIFFERENT Task aimed at the same checkout cannot share the reviewer's target.
+  assertNoReviewInFlight(db, { taskId: task.id, cwd, branch });
 
   // ISH-1133: `--dsh` wins, then `$RELAY_DSH_BIN`, then the native
   // `$HOME/.dsh/bin/dsh-model` wrapper when executable, else `dsh`.

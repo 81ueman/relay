@@ -25,7 +25,7 @@ import { readEvidenceTail, terminalImplementRunSignature } from "./implement-rec
 import { issueKeyForTask, resolveTaskPrTarget } from "./pr-target";
 import { resolveTaskPrRef } from "./pr-binding";
 import { removeReviewWorktree } from "./review-workspace";
-import { defaultRunsRoot, reviewScratchTaskRoot, removeScratchRoot, taskCargoTarget } from "./scratch";
+import { defaultRunsRoot, reviewScratchTaskRoot, removeScratchRoot, TASK_CARGO_DIR, taskCargoTarget } from "./scratch";
 import { dindVolumeNamesForWorkspace, dindVolumeNamesFromContainerLabels, workspacePathVariants } from "./devcontainer-id";
 import {
   controlPlaneNamespace,
@@ -34,6 +34,7 @@ import {
   type RunResourceDocker,
 } from "./run-resources";
 import { taskHeadOvertakenByOtherWriter } from "./run-owner";
+import { assertNoReviewInFlight } from "./review-fence";
 
 /**
  * ISH-760 — Task Worktree + disposable dsh Run lifecycle, single-writer.
@@ -140,6 +141,18 @@ export function isSelfContainedWorkspace(dir: string): boolean {
   if (!dirs) return false;
   const root = realpathOf(dir);
   return isUnder(dirs.gitDir, root) && isUnder(dirs.commonDir, root);
+}
+
+/**
+ * ISH-1226: `target/` is Relay's build cache ONLY when the repo tracks nothing
+ * under it. `true` = tracked, `false` = untracked, `null` = unknown (not a
+ * readable checkout). Unknown is never treated as untracked: cleanup must fail
+ * closed rather than hide (or reclaim) a directory the repo owns.
+ */
+function targetTracked(worktree: string): boolean | null {
+  const r = gitRun(worktree, ["ls-files", "--", TASK_CARGO_DIR]);
+  if (!r.ok) return null;
+  return r.out.length > 0;
 }
 
 /** The source repo's `origin` URL (what a Run push must target), or null. */
@@ -1211,6 +1224,11 @@ export async function launchTaskRun(db: Database, taskId: string, opts: LaunchRu
     throw new Error(`${WORKTREE_ERROR}: task ${taskId} is not a code-change task`);
   }
 
+  // ISH-1226: refuse before touching/pinning the worktree while a review of this
+  // Task is in flight (the reviewer shares its `target/`). The race-free check
+  // inside `startDshRun` stays authoritative.
+  assertNoReviewInFlight(db, { taskId });
+
   // ISH-1009: measure BEFORE creating/selecting/pinning the worktree, so a
   // low-disk refusal writes nothing and the Task stays queued. `startDshRun`
   // would run the same guard centrally; this early call also avoids creating a
@@ -1229,6 +1247,7 @@ export async function launchTaskRun(db: Database, taskId: string, opts: LaunchRu
   // Run owns (the brief must keep matching the Run that holds the worktree). The
   // race-free BEGIN IMMEDIATE guard inside `startDshRun` stays authoritative.
   assertNoActiveWriter(db, { cwd: binding.worktree, branch: binding.branch });
+  assertNoReviewInFlight(db, { taskId, cwd: binding.worktree, branch: binding.branch });
 
   const fresh = getTask(db, taskId)!;
   const findings = inheritFindings(db, fresh);
@@ -1579,9 +1598,13 @@ export async function planWorkspaceCleanup(
   const reviewScratch = reviewScratchTaskRoot(outputRoot, taskId);
   // ISH-1225: the Task build cache lives in the worktree and is reclaimed with
   // it. Keep it explicit in the plan so cleanup/`--json` names the build dir and
-  // so a worktree-less ledger never hides one.
+  // so a worktree-less ledger never hides one. ISH-1226: only an UNTRACKED
+  // `target/` is Relay-owned scratch; a repo that tracks files under it owns the
+  // directory, so cleanup must not reclaim it as a build dir (the dirty guard
+  // then also sees uncommitted edits there).
+  const targetTrackedState = worktree ? targetTracked(worktree) : null;
   const taskBuildDir = worktree ? taskCargoTarget(worktree) : null;
-  const buildDir = taskBuildDir && existsSync(taskBuildDir) ? taskBuildDir : null;
+  const buildDir = targetTrackedState === false && taskBuildDir && existsSync(taskBuildDir) ? taskBuildDir : null;
   const plan: CleanupPlan = {
     taskId,
     worktree,
@@ -1772,7 +1795,16 @@ export async function planWorkspaceCleanup(
     // user change. Exclude it from the dirty guard so a worktree whose repo does
     // not gitignore `target/` can still be reclaimed (and a patch never carries
     // gigabytes of build output).
-    const dirty = gitRun(worktree, ["status", "--porcelain", "--", ".", ":(exclude)target"]);
+    // ISH-1226: ONLY when the repo does not track anything under `target/`. In a
+    // repo that tracks `target/`, uncommitted edits there are real work: the
+    // guard must see them (and the apply path must not reclaim the directory).
+    const dirty = gitRun(worktree, [
+      "status",
+      "--porcelain",
+      "--",
+      ".",
+      ...(targetTrackedState === false ? [":(exclude)target"] : []),
+    ]);
     if (!dirty.ok) {
       reasons.push("worktree is not a readable git checkout");
     } else if (dirty.out) {
