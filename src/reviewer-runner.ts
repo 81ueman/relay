@@ -13,6 +13,7 @@ import { hostGit } from "./review-workspace";
 import { ensureScratchRoot, scratchEnv, taskCargoTarget } from "./scratch";
 import { controlPlaneNamespace } from "./run-resources";
 import { findActiveWriterRow } from "./run-owner";
+import { beginReviewFence, releaseReviewFence, REVIEW_WRITER_ACTIVE, ReviewFenceRefused } from "./review-fence";
 import { recordReview, taskChecks } from "./workflow";
 import { ensureHeadlessWorker, getWorker, HEADLESS_AGENT_KIND } from "./workers";
 import {
@@ -64,11 +65,12 @@ export const REVIEW_NOT_IN_REVIEW = "REVIEW_NOT_IN_REVIEW";
 /** The reviewer process itself failed (non-zero exit / a signal): never a verdict. */
 export const REVIEW_PROCESS_FAILED = "REVIEW_PROCESS_FAILED";
 /**
- * ISH-1225: a live worker Run still owns the Task worktree. The reviewer shares
- * the Task build cache, so it must never start while a writer could be writing
- * that directory. This is checked before the reviewer process is spawned.
+ * ISH-1225/1226: a live worker Run still owns the Task worktree. The reviewer
+ * shares the Task build cache, so it must never start while a writer could be
+ * writing that directory. Declared in `review-fence.ts` because the durable
+ * review fence is the other half of the same cross-process exclusion.
  */
-export const REVIEW_WRITER_ACTIVE = "REVIEW_WRITER_ACTIVE";
+export { REVIEW_WRITER_ACTIVE };
 /** ISH-883: no bound PR to post a native review to (fail closed). */
 export const REVIEW_NATIVE_NO_PR = "REVIEW_NATIVE_NO_PR";
 /** ISH-883: the reviewer posted no matching native review at the reviewed HEAD. */
@@ -1016,11 +1018,12 @@ export async function runHeadlessReview(
     );
   }
 
-  // ISH-1225: the reviewer shares the Task worktree's `target/` with the coding
-  // worker and mechanical VERIFY. A reviewer must never write into a build cache
-  // a live worker Run is still using, so refuse BEFORE pinning the brief or
-  // spawning the reviewer. The Factory calls this only after awaiting the
-  // implement Run's terminal row; a manual/replayed review cannot bypass that.
+  // ISH-1225/1226: the reviewer shares the Task worktree's `target/` with the
+  // coding worker and mechanical VERIFY. A reviewer must never write into a build
+  // cache a live worker Run is still using, so refuse BEFORE pinning the brief or
+  // spawning the reviewer. This is the fast pre-check; `beginReviewFence` below
+  // re-checks the writer and inserts the durable fence in one BEGIN IMMEDIATE
+  // transaction, so a writer that appears in between is still refused.
   if (task.worktree) {
     const writer = findActiveWriterRow(db, { cwd: task.worktree, branch: task.branch });
     if (writer) {
@@ -1088,28 +1091,68 @@ export async function runHeadlessReview(
   // a Task has no recorded worktree (legacy/direct use).
   const cargoTargetDir = taskCargoTarget(task.worktree ?? worktree);
   const reviewRunId = `review-${task.id}-${task.attempt}-${head.slice(0, 10)}`;
-  const proc = await spawner.run({
-    cwd: worktree,
-    brief,
-    env: {
-      ...(deps.env ?? {}),
-      ...(scratchRoot
-        ? scratchEnv(
-            scratchRoot,
-            { plane: controlPlaneNamespace(db), taskId: task.id, runId: reviewRunId },
-            { cargoTargetDir }
-          )
-        : {}),
-      ...(native?.spawnEnv ?? {}),
-      // Relay-owned values WIN over inherited/native ones (as in ISH-1221).
-      CARGO_TARGET_DIR: cargoTargetDir,
-      RELAY_CARGO_TARGET_DIR: cargoTargetDir,
-      RELAY_TASK_CARGO_TARGET_DIR: cargoTargetDir,
-    },
-    timeoutMs: deps.timeoutMs ?? reviewTimeoutMs(),
-    model: deps.model,
-    ...(native?.allowedTools ? { allowedTools: native.allowedTools } : {}),
-  });
+  const timeoutMs = deps.timeoutMs ?? reviewTimeoutMs();
+  // ISH-1226: the reviewer is not a `runs` row, so `startDshRun` cannot see it
+  // through the ISH-760 guard. Take the durable review fence in the SAME
+  // transaction that re-checks the writer, immediately before spawning: after
+  // this commits, a writer Run is refused until the fence is released (or its
+  // timeout+grace expires, which is the fail-closed crash path).
+  let fence: ReturnType<typeof beginReviewFence>;
+  try {
+    fence = beginReviewFence(db, {
+      taskId,
+      worktree: task.worktree ?? worktree,
+      branch: task.branch,
+      headSha: head,
+      timeoutMs,
+    });
+  } catch (e) {
+    if (!(e instanceof ReviewFenceRefused)) throw e;
+    logEvent(db, {
+      source: "factory",
+      taskId,
+      type: "factory.review_refused",
+      payload: {
+        reason: e.code,
+        head,
+        reviewer: reviewerWorker,
+        writerRunId: e.writerRunId,
+        fence: e.fence?.token ?? null,
+      },
+    });
+    return refusal(e.message, task);
+  }
+  let proc: ReviewerProcess;
+  try {
+    proc = await spawner.run({
+      cwd: worktree,
+      brief,
+      env: {
+        ...(deps.env ?? {}),
+        ...(scratchRoot
+          ? scratchEnv(
+              scratchRoot,
+              { plane: controlPlaneNamespace(db), taskId: task.id, runId: reviewRunId },
+              { cargoTargetDir }
+            )
+          : {}),
+        ...(native?.spawnEnv ?? {}),
+        // Relay-owned values WIN over inherited/native ones (as in ISH-1221).
+        CARGO_TARGET_DIR: cargoTargetDir,
+        RELAY_CARGO_TARGET_DIR: cargoTargetDir,
+        RELAY_TASK_CARGO_TARGET_DIR: cargoTargetDir,
+      },
+      timeoutMs,
+      model: deps.model,
+      ...(native?.allowedTools ? { allowedTools: native.allowedTools } : {}),
+    });
+  } finally {
+    // The reviewer process is the only thing that writes the shared target/;
+    // release as soon as it returns so a normal FIX can start immediately. A
+    // crash inside the spawner still releases; a crashed FACTORY leaves the
+    // fence to expire (fail closed).
+    releaseReviewFence(db, fence.token);
+  }
   const raw = `${proc.stdout}\n${proc.stderr}`;
   // ISH-904: parse the FIRST balanced verdict object even when the reviewer
   // wrapped it in prose; keep the concrete parse error for the refusal reason.

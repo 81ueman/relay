@@ -832,6 +832,21 @@ CREATE TABLE IF NOT EXISTS run_observed_heads (
   PRIMARY KEY (run_id, head_sha)
 );
 CREATE INDEX IF NOT EXISTS idx_run_observed_heads_head ON run_observed_heads(head_sha);
+-- ISH-1226: one headless review in flight per Task. The reviewer is not a
+-- runs row (it has no dsh process), so this durable fence is what startDshRun
+-- checks before admitting a writer that would share the Task worktree target.
+-- expires_at = the reviewer's hard timeout + grace; a crashed Factory/reviewer
+-- therefore fails CLOSED until the fence expires.
+CREATE TABLE IF NOT EXISTS review_fences (
+  task_id TEXT PRIMARY KEY,
+  token TEXT NOT NULL UNIQUE,
+  worktree TEXT NOT NULL,
+  branch TEXT,
+  head_sha TEXT NOT NULL,
+  started_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_review_fences_expires ON review_fences(expires_at);
 -- NOTE: idx_runs_sandbox (runs.sandbox_name) is created by migrate(), NOT here.
 -- SCHEMA runs before migrate() (see openDb), and a pre-ISH-1098 runs table has
 -- no sandbox_name column yet, so an index on it here would break opening every

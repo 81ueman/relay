@@ -338,19 +338,31 @@ under the control plane for disposable `TMPDIR`:
 The Cargo build cache is scoped to the **Task**, not the Run: all
 implement/FIX Runs, mechanical VERIFY and the reviewer use
 `CARGO_TARGET_DIR=<task-worktree>/target` (`src/scratch.ts:71` `taskCargoTarget`;
-Run env `src/dsh-runner.ts:639,706-716`; VERIFY `src/workflow.ts:1174-1182`;
-reviewer `src/reviewer-runner.ts:1089-1107`). This is Cargo's natural in-worktree
+Run env `src/dsh-runner.ts:653,720-731`; VERIFY `src/workflow.ts:1174-1181`;
+reviewer `src/reviewer-runner.ts:1092`). This is Cargo's natural in-worktree
 default, so VERIFY sees the cache the worker warmed, and a second Run of the
 same Task does not create another target directory. `relay run cleanup` removes
 the build dir and the worktree together
-(`src/run-lifecycle.ts:2008-2011`, with the target excluded from the dirty guard
-at `src/run-lifecycle.ts:1775`); `relay run list --leaks` reports the `build`
+(`src/run-lifecycle.ts:2040-2043`), but only an **untracked** `target/` is the
+build cache: in a repo that tracks files under it, the directory is repo content,
+so the dirty guard sees uncommitted edits there (`src/run-lifecycle.ts:152,
+1801-1807`) and the apply path does not name it as a build dir
+(`src/run-lifecycle.ts:1605-1607`). The whole worktree is still removed when the
+Task is reclaimable; the dirty guard is what refuses while tracked content under
+`target/` is uncommitted. `relay run list --leaks` reports the `build`
 entry only for a terminal Task with no live writer
-(`src/run-leaks.ts:246-292`). The reviewer uses the same target only when
-`runHeadlessReview` proves no live worker Run holds the Task worktree
-(`REVIEW_WRITER_ACTIVE`, `src/reviewer-runner.ts:1024-1035`); the Factory also
-awaits the implement Run's terminal row before VERIFY/review, so the two phases
-cannot write the target concurrently.
+(`src/run-leaks.ts:246-292`).
+
+The reviewer uses the same target only when `runHeadlessReview` proves no live
+worker Run holds the Task worktree (`REVIEW_WRITER_ACTIVE`,
+`src/reviewer-runner.ts:1027-1039`) and takes a durable `review_fences` row in
+the same `BEGIN IMMEDIATE` transaction (`src/review-fence.ts:116-165`).
+`startDshRun` checks that fence inside its own `BEGIN IMMEDIATE` insert
+transaction and refuses a writer with `REVIEW_IN_FLIGHT`
+(`src/dsh-runner.ts:374-382`), so Relay-started writers and a review cannot
+write the target concurrently. Cargo's build-directory lock remains the
+safeguard for two builds racing for any other reason (for example, a manual
+`cargo` invocation in the worktree).
 
 The Relay values **win** over an inherited host `TMPDIR` (`src/scratch.ts`), so
 an ad-hoc `/tmp/<name>` directory is no longer needed. The prompts also tell the
@@ -528,6 +540,13 @@ consecutive Runs and VERIFY see the same `CARGO_TARGET_DIR` and no per-Run
 `scratch/cargo-target` is created, a reviewer receives the same target only with
 no live writer (and is refused with `REVIEW_WRITER_ACTIVE` otherwise), cleanup
 removes the build dir, and the leak patrol reports it only for a terminal Task.
+
+`tests/ish1226-tracked-target-and-review-fence.test.ts` covers the ISH-1225
+follow-ups: a tracked `target/` with an uncommitted edit refuses `cleanup
+--apply` (saved patch, nothing deleted) while an untracked `target/` is still
+reclaimed; `startDshRun` refuses a writer with `REVIEW_IN_FLIGHT` while the
+Task's review fence is live; and `runHeadlessReview` takes the fence before the
+reviewer process starts and releases it when the process returns.
 
 `tests/ish1221-cleanup.test.ts` covers the run-scoped resource reclamation: the
 per-Run `TMPDIR` and Task-level `CARGO_TARGET_DIR`, merged and cancelled cleanup, a CLOSED-PR

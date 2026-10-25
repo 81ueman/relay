@@ -580,7 +580,10 @@ binary and its source. `relay run start` waits for a terminal state. `TMPDIR` is
 per-Run scratch under `<control-plane>/runs/<run-id>/scratch/tmp`, but
 `CARGO_TARGET_DIR` is the **Task** worktree's `target/`, shared by every
 implement/FIX Run, VERIFY and the reviewer (ISH-1225) so a FIX never cold-builds
-another copy; it is removed with the worktree by `relay run cleanup`.
+another copy; it is removed with the worktree by `relay run cleanup` only when
+the repo does not track it (ISH-1226 — a tracked `target/` stays under the dirty
+guard). The reviewer holds a durable review fence for the process, so a writer
+Run cannot start alongside it (`REVIEW_IN_FLIGHT`).
 Cancel/timeout kill the whole process group. Permissions stay in the worktree
 (`DSH_PERMISSION_MODE=workspace-write`). A process `exit 0` or a terminal `final`
 event is **not** a submission — only a structured `relay run submit` bound to the
@@ -619,7 +622,12 @@ previous Run's end/cancel row exists. The existence check and the Run INSERT are
 one `BEGIN IMMEDIATE` transaction, so the guard is **atomic across processes**
 (two concurrent `relay run launch`/`start` processes cannot both be admitted), and
 `launchTaskRun` refuses **before** pinning the brief so a rejected launch never
-touches the live writer's worktree. **Different** worktrees/branches may run in
+touches the live writer's worktree. A headless review is not a `runs` row: it
+takes a durable `review_fences` row in the same kind of transaction, and
+`startDshRun` refuses a writer with `REVIEW_IN_FLIGHT` while a review of that
+Task/worktree is in flight (`src/review-fence.ts`), so the reviewer and a coding
+Run cannot share the worktree's `target/` concurrently. **Different**
+worktrees/branches may run in
 parallel, even on the same files. A Run is **not** a submission: `relay run
 submit` is the only thing that advances the Task, and it refuses a stale/late/
 superseded Run (by Task/phase/attempt/**generation**/branch/HEAD). `relay run
@@ -627,7 +635,9 @@ cleanup` reclaims a worktree only when it is **safe** (a real merge, a cancelled
 Task, or `--abort`; no live-OPEN PR — the PR is re-read, never inferred from the
 stale binding — no active writer, no uncommitted changes, relay-owned). It also
 removes the per-Run scratch root, the Task build cache (`<worktree>/target`,
-ISH-1225) and the containers/volumes carrying this control plane's
+ISH-1225; only when the repo does not track it — a tracked `target/` is repo
+content, so its uncommitted edits block cleanup like any other dirty path) and
+the containers/volumes carrying this control plane's
 `relay.plane`/`relay.task`/`relay.run` labels, a stopped devcontainer attributed
 by its exact `devcontainer.local_folder` label on the Task worktree, plus the
 Run's devcontainer `dind-var-lib-docker-*` **named** volume (derived from the

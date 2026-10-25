@@ -31,15 +31,30 @@ root instead of shared `/tmp/<name>`. The Run logs stay in
 `CARGO_TARGET_DIR` is **not** per-Run. ISH-1225 scopes the Cargo build cache to
 the Task: every implement/FIX Run, mechanical VERIFY and the reviewer receive
 `CARGO_TARGET_DIR=<task-worktree>/target` (`taskCargoTarget` in
-`src/scratch.ts:71`; the Run env is assembled in `src/dsh-runner.ts:639,706-716`,
-VERIFY passes the same value in `src/workflow.ts:1174-1182`, and the reviewer in
-`src/reviewer-runner.ts:1089-1107`). A second Run of the same Task therefore
-reuses the warm cache instead of creating another tree, and the directory is
-reclaimed with the Task worktree by `relay run cleanup`. The reviewer shares
-that directory only after `runHeadlessReview` has proved there is no live writer
-on the Task worktree (`REVIEW_WRITER_ACTIVE`, `src/reviewer-runner.ts:1024-1035`):
-the Factory also awaits the implement Run's terminal row before VERIFY/review,
-so a review and a worker cannot write the same target concurrently.
+`src/scratch.ts:71`; the Run env is assembled in `src/dsh-runner.ts:653,720-731`,
+VERIFY passes the same value in `src/workflow.ts:1174-1181`, and the reviewer in
+`src/reviewer-runner.ts:1092`). A second Run of the same Task therefore reuses
+the warm cache instead of creating another tree, and the directory is reclaimed
+with the Task worktree by `relay run cleanup`. ISH-1226 makes that reclamation
+conditional: only an **untracked** `target/` is Relay-owned scratch. In a repo
+that tracks files under `target/`, it is repo content — cleanup's dirty guard
+sees uncommitted edits there (`git ls-files -- target`,
+`src/run-lifecycle.ts:152,1801-1807`) and the apply path does not name it as a
+build dir (`src/run-lifecycle.ts:1605-1607`). The whole worktree is still
+removed when the Task is reclaimable; the dirty guard is what refuses while
+tracked content under `target/` is uncommitted.
+
+The reviewer shares the target only after `runHeadlessReview` has proved there
+is no live writer on the Task worktree (`REVIEW_WRITER_ACTIVE`,
+`src/reviewer-runner.ts:1027-1039`) and has taken a durable `review_fences` row
+in the same `BEGIN IMMEDIATE` transaction (`src/review-fence.ts:116-165`,
+`src/schema.ts:840`). `startDshRun` checks that fence inside its own
+`BEGIN IMMEDIATE` insert transaction and refuses a writer with
+`REVIEW_IN_FLIGHT` (`src/dsh-runner.ts:374-382`), so Relay-started writers and a
+review cannot run concurrently. Cargo's build-directory lock is the remaining
+safeguard for two builds racing for any other reason (for example, a manual
+`cargo` invocation in the worktree).
+
 The process also receives `RELAY_DOCKER_LABEL_PLANE`,
 `RELAY_DOCKER_LABEL_TASK` and `RELAY_DOCKER_LABEL_RUN`; any container/volume it
 starts must carry all three so `relay run cleanup` can attribute it to this
