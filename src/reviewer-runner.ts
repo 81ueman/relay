@@ -11,6 +11,7 @@ import type { Task } from "./schema";
 import { gitHead } from "./verify";
 import { hostGit } from "./review-workspace";
 import { ensureScratchRoot, scratchEnv } from "./scratch";
+import { controlPlaneNamespace } from "./run-resources";
 import { recordReview, taskChecks } from "./workflow";
 import { ensureHeadlessWorker, getWorker, HEADLESS_AGENT_KIND } from "./workers";
 import {
@@ -507,8 +508,9 @@ export function buildReviewBrief(
     "",
     "Use `$TMPDIR` for scratch and `$CARGO_TARGET_DIR` for build output: they are",
     "Relay-owned per-review paths, never `/tmp/<name>`. Any container or volume you",
-    "start MUST carry `--label \"$RELAY_DOCKER_LABEL_TASK\"` and",
-    "`--label \"$RELAY_DOCKER_LABEL_RUN\"` so Relay can reclaim it."
+    "start MUST carry `--label \"$RELAY_DOCKER_LABEL_PLANE\"`,",
+    "`--label \"$RELAY_DOCKER_LABEL_TASK\"` and `--label \"$RELAY_DOCKER_LABEL_RUN\"`",
+    "so Relay can reclaim it; a missing plane label makes the resource untraceable."
   );
   if (findings.length > 0) {
     lines.push("", `## Prior findings @ attempt ${token(task)} (context — verify they are actually fixed)`);
@@ -1054,7 +1056,9 @@ export async function runHeadlessReview(
     brief,
     env: {
       ...(deps.env ?? {}),
-      ...(scratchRoot ? scratchEnv(scratchRoot, { taskId: task.id, runId: reviewRunId }) : {}),
+      ...(scratchRoot
+        ? scratchEnv(scratchRoot, { plane: controlPlaneNamespace(db), taskId: task.id, runId: reviewRunId })
+        : {}),
       ...(native?.spawnEnv ?? {}),
     },
     timeoutMs: deps.timeoutMs ?? reviewTimeoutMs(),

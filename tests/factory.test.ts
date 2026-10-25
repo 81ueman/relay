@@ -21,6 +21,7 @@ import { getTaskResult, insertTaskResult, RESULT_WRITE_ERROR } from "../src/resu
 import { acceptRunSubmission, DUPLICATE_WRITER, getRun, listRuns } from "../src/dsh-runner";
 import { PINNED_DSH_VERSION } from "../src/dsh-version";
 import { applyWorkspaceCleanup, inheritFindings, launchTaskRun } from "../src/run-lifecycle";
+import { disabledRunResourceDocker } from "../src/run-resources";
 import { buildDashboardView } from "../src/dashboard/model";
 import { defaultRunner, gitHead, type CommandRunner } from "../src/verify";
 import { processPgid, spawnIdentityToken } from "../src/proc-identity";
@@ -791,6 +792,8 @@ describe("Factory E2E: real worktree, fake headless dsh + independent reviewer",
       repo,
       worktreesRoot: join(dir, "worktrees"),
       outputRoot: join(dir, "runs"),
+      // ISH-1221: never reach host Docker from the test suite.
+      docker: disabledRunResourceDocker(),
     });
     expect(plan.removed).toBe(true);
     expect(existsSync(scratch)).toBe(false);

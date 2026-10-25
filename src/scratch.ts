@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readdirSync, lstatSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { defaultDbPath } from "./db";
+import { RELAY_PLANE_LABEL } from "./run-resources";
 
 /**
  * ISH-1221 — Relay-owned, per-Run scratch.
@@ -69,8 +70,15 @@ export function ensureScratchRoot(root: string): string {
  * inherited host TMPDIR, so a focused check cannot silently fall back to the
  * shared `/tmp`. `RELAY_DOCKER_LABEL_*` makes it easy for the process to label
  * any container/volume it starts; cleanup removes exactly those labels.
+ *
+ * `plane` namespaces the labels to THIS control plane. `relay.task=T1` alone is
+ * ambiguous on a shared host (every checkout numbers its own Tasks from T1), so
+ * a resource missing the plane label is only matched through its Run id.
  */
-export function scratchEnv(root: string, ids: { taskId: string; runId: string }): Record<string, string> {
+export function scratchEnv(
+  root: string,
+  ids: { plane: string; taskId: string; runId: string }
+): Record<string, string> {
   const tmp = join(root, SCRATCH_TMP_DIR);
   const cargo = join(root, SCRATCH_CARGO_DIR);
   return {
@@ -83,6 +91,7 @@ export function scratchEnv(root: string, ids: { taskId: string; runId: string })
     RELAY_CARGO_TARGET_DIR: cargo,
     RELAY_TASK_ID: ids.taskId,
     RELAY_RUN_ID: ids.runId,
+    RELAY_DOCKER_LABEL_PLANE: `${RELAY_PLANE_LABEL}=${ids.plane}`,
     RELAY_DOCKER_LABEL_TASK: `relay.task=${ids.taskId}`,
     RELAY_DOCKER_LABEL_RUN: `relay.run=${ids.runId}`,
   };

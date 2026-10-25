@@ -1,22 +1,51 @@
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { resolve } from "node:path";
+import { defaultDbPath } from "./db";
 
 /**
  * ISH-1221 — Relay-labelled container/volume inventory and reclamation.
  *
  * Relay itself does not start containers; the worker/reviewer processes it
  * launches do. Relay therefore hands them the label values
- * (`RELAY_DOCKER_LABEL_TASK` / `RELAY_DOCKER_LABEL_RUN`) and reclaims exactly
- * those labels. It NEVER lists, stops or deletes an unlabelled container or
- * volume (other projects share the host) and NEVER has an image-removal path
- * (the cEOS/NOS images are hand-imported and cannot be re-pulled).
+ * (`RELAY_DOCKER_LABEL_PLANE` / `RELAY_DOCKER_LABEL_TASK` /
+ * `RELAY_DOCKER_LABEL_RUN`) and reclaims exactly those labels. It NEVER lists,
+ * stops or deletes an unlabelled container or volume (other projects share the
+ * host) and NEVER has an image-removal path (the cEOS/NOS images are
+ * hand-imported and cannot be re-pulled).
+ *
+ * `relay.task=T1` is NOT globally unique: every control plane numbers its own
+ * Tasks from T1 (`src/tasks.ts`). The `relay.plane=<hash>` label namespaces the
+ * resource to the control plane whose DB created it, so the relay and ishiul
+ * control planes on one host never reclaim each other's T1. A resource without
+ * the plane label is only attributable through a globally unique Run id.
  */
 
+export const RELAY_PLANE_LABEL = "relay.plane";
 export const RELAY_TASK_LABEL = "relay.task";
 export const RELAY_RUN_LABEL = "relay.run";
+
+/**
+ * Stable control-plane namespace from the DB path (12 hex chars of SHA-256).
+ * `resolve` (not realpath) keeps the id stable for the same configured path.
+ */
+export function controlPlaneId(dbPath: string = defaultDbPath()): string {
+  return createHash("sha256").update(resolve(dbPath)).digest("hex").slice(0, 12);
+}
+
+/**
+ * The namespace of the OPEN DB. `Database.filename` is the actual control-plane
+ * path, so two checkouts (or an explicit `RELAY_DB`) cannot collide even when
+ * both are reached through the same cwd/default.
+ */
+export function controlPlaneNamespace(db: { filename?: string }): string {
+  return controlPlaneId(db.filename ?? defaultDbPath());
+}
 
 export interface RunContainer {
   id: string;
   name: string;
+  plane: string | null;
   taskId: string | null;
   runId: string | null;
   state: string | null;
@@ -26,6 +55,7 @@ export interface RunContainer {
 
 export interface RunVolume {
   name: string;
+  plane: string | null;
   taskId: string | null;
   runId: string | null;
   /** Docker has no cheap per-volume size; the leak report shows `-`. */
@@ -50,7 +80,7 @@ export interface ExecResult {
 export type DockerExec = (argv: string[], timeoutMs?: number) => ExecResult;
 
 export interface RunResourceDocker {
-  /** Every container/volume carrying a Relay label (`relay.task`). */
+  /** Every container/volume carrying a Relay label (`relay.plane`/`relay.task`/`relay.run`). */
   snapshot(): RunResourceSnapshot;
   removeContainer(id: string): { ok: boolean; error: string };
   removeVolume(name: string): { ok: boolean; error: string };
@@ -68,6 +98,22 @@ export function realDockerExec(): DockerExec {
   };
 }
 
+/**
+ * The DEFAULT when no seam is passed. It contacts no host Docker at all, so the
+ * library (and `bun test`) can never remove a container by accident. The CLI is
+ * the one production caller and explicitly passes `realRunResourceDocker()`;
+ * tests pass a fake. An explicit seam is the opt-in.
+ */
+export function disabledRunResourceDocker(
+  reason = "docker inventory disabled: no RunResourceDocker seam was passed"
+): RunResourceDocker {
+  return {
+    snapshot: () => ({ containers: [], volumes: [], containerError: reason, volumeError: reason }),
+    removeContainer: () => ({ ok: false, error: reason }),
+    removeVolume: () => ({ ok: false, error: reason }),
+  };
+}
+
 /** Parse a `docker --format '{{json .}}'` line stream. Malformed lines are skipped. */
 function parseJsonLines(raw: string): Record<string, unknown>[] {
   const out: Record<string, unknown>[] = [];
@@ -82,9 +128,19 @@ function parseJsonLines(raw: string): Record<string, unknown>[] {
   return out;
 }
 
-/** Docker labels are a comma-separated `k=v` list. */
+/**
+ * Docker labels arrive in TWO shapes: `docker ps --format '{{json .}}'` gives a
+ * comma-separated `k=v` string, while `docker volume inspect` gives a JSON
+ * object. Accept both so a volume's labels are never silently lost.
+ */
 export function parseDockerLabels(raw: unknown): Record<string, string> {
   const out: Record<string, string> = {};
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+      if (typeof value === "string" && key.trim()) out[key.trim()] = value.trim();
+    }
+    return out;
+  }
   if (typeof raw !== "string" || !raw.trim()) return out;
   for (const part of raw.split(",")) {
     const eq = part.indexOf("=");
@@ -107,56 +163,82 @@ export function parseDockerSize(raw: unknown): number | null {
   return Math.round(n * (mult[unit] ?? 1));
 }
 
-function labelMap(raw: unknown): { taskId: string | null; runId: string | null } {
+function labelMap(raw: unknown): { plane: string | null; taskId: string | null; runId: string | null } {
   const labels = parseDockerLabels(raw);
+  const plane = (labels[RELAY_PLANE_LABEL] ?? "").trim() || null;
   const taskId = (labels[RELAY_TASK_LABEL] ?? "").trim() || null;
   const runId = (labels[RELAY_RUN_LABEL] ?? "").trim() || null;
-  return { taskId, runId };
+  return { plane, taskId, runId };
 }
 
+/**
+ * Read containers matching EITHER Relay label family. Two queries are needed
+ * because Docker ANDs multiple `label=` filters; merging by id lists a resource
+ * that carries only `relay.run` (the run-id fallback is a real path, not dead
+ * code). A failed query is reported but does not discard the other's inventory.
+ */
 function readContainers(exec: DockerExec): { containers: RunContainer[]; error: string | null } {
-  const r = exec([
-    "ps",
-    "-a",
-    "--filter",
-    `label=${RELAY_TASK_LABEL}`,
-    "--size",
-    "--no-trunc",
-    "--format",
-    "{{json .}}",
-  ]);
-  if (!r.ok) return { containers: [], error: (r.stderr || r.stdout || "docker ps failed").slice(0, 300) };
-  const containers: RunContainer[] = [];
-  for (const row of parseJsonLines(r.stdout)) {
-    const id = String(row.ID ?? "").trim();
-    if (!id) continue;
-    const labels = labelMap(row.Labels);
-    containers.push({
-      id,
-      name: String(row.Names ?? "").trim(),
-      taskId: labels.taskId,
-      runId: labels.runId,
-      state: typeof row.State === "string" ? row.State : null,
-      sizeBytes: parseDockerSize(row.Size),
-    });
+  const byId = new Map<string, RunContainer>();
+  const errors: string[] = [];
+  for (const label of [RELAY_TASK_LABEL, RELAY_RUN_LABEL]) {
+    const r = exec([
+      "ps",
+      "-a",
+      "--filter",
+      `label=${label}`,
+      "--size",
+      "--no-trunc",
+      "--format",
+      "{{json .}}",
+    ]);
+    if (!r.ok) {
+      errors.push((r.stderr || r.stdout || `docker ps (${label}) failed`).slice(0, 300));
+      continue;
+    }
+    for (const row of parseJsonLines(r.stdout)) {
+      const id = String(row.ID ?? "").trim();
+      if (!id || byId.has(id)) continue;
+      const labels = labelMap(row.Labels);
+      byId.set(id, {
+        id,
+        name: String(row.Names ?? "").trim(),
+        plane: labels.plane,
+        taskId: labels.taskId,
+        runId: labels.runId,
+        state: typeof row.State === "string" ? row.State : null,
+        sizeBytes: parseDockerSize(row.Size),
+      });
+    }
   }
-  return { containers, error: null };
+  return { containers: [...byId.values()], error: errors.length > 0 ? errors.join("; ") : null };
 }
 
 function readVolumes(exec: DockerExec): { volumes: RunVolume[]; error: string | null } {
-  const listed = exec(["volume", "ls", "--filter", `label=${RELAY_TASK_LABEL}`, "--format", "{{.Name}}"]);
-  if (!listed.ok) return { volumes: [], error: (listed.stderr || listed.stdout || "docker volume ls failed").slice(0, 300) };
+  const names = new Set<string>();
+  const errors: string[] = [];
+  for (const label of [RELAY_TASK_LABEL, RELAY_RUN_LABEL]) {
+    const listed = exec(["volume", "ls", "--filter", `label=${label}`, "--format", "{{.Name}}"]);
+    if (!listed.ok) {
+      errors.push((listed.stderr || listed.stdout || `docker volume ls (${label}) failed`).slice(0, 300));
+      continue;
+    }
+    for (const name of listed.stdout.split("\n").map((s) => s.trim()).filter(Boolean)) names.add(name);
+  }
   const volumes: RunVolume[] = [];
-  for (const name of listed.stdout.split("\n").map((s) => s.trim()).filter(Boolean)) {
+  for (const name of names) {
     const inspected = exec(["volume", "inspect", "--format", "{{json .}}", name]);
-    let labels: { taskId: string | null; runId: string | null } = { taskId: null, runId: null };
+    let labels: { plane: string | null; taskId: string | null; runId: string | null } = {
+      plane: null,
+      taskId: null,
+      runId: null,
+    };
     if (inspected.ok) {
       const rows = parseJsonLines(inspected.stdout);
       if (rows[0]) labels = labelMap((rows[0] as { Labels?: unknown }).Labels);
     }
-    volumes.push({ name, taskId: labels.taskId, runId: labels.runId, sizeBytes: null });
+    volumes.push({ name, plane: labels.plane, taskId: labels.taskId, runId: labels.runId, sizeBytes: null });
   }
-  return { volumes, error: null };
+  return { volumes, error: errors.length > 0 ? errors.join("; ") : null };
 }
 
 /** The production Docker inventory/removal implementation. */
@@ -173,7 +255,10 @@ export function realRunResourceDocker(exec: DockerExec = realDockerExec()): RunR
       };
     },
     removeContainer(id) {
-      const r = exec(["rm", "-f", id]);
+      // `-v` also removes the ANONYMOUS volumes of this container (the 2–5 GB
+      // `dind-var-lib-docker-*` ones named in ISH-1221). It cannot touch a
+      // named/unlabelled volume owned by another container.
+      const r = exec(["rm", "-f", "-v", id]);
       return { ok: r.ok, error: r.ok ? "" : (r.stderr || r.stdout || "docker rm failed").slice(0, 300) };
     },
     removeVolume(name) {
@@ -182,9 +267,4 @@ export function realRunResourceDocker(exec: DockerExec = realDockerExec()): RunR
       return { ok: r.ok, error: r.ok ? "" : (r.stderr || r.stdout || "docker volume rm failed").slice(0, 300) };
     },
   };
-}
-
-/** True when a container/volume is attributable to a Relay label. */
-export function isRelayAttributed(r: { taskId: string | null; runId: string | null }): boolean {
-  return !!(r.taskId || r.runId);
 }

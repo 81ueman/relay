@@ -27,6 +27,10 @@ Each Run owns `<control-plane>/runs/<run-id>/scratch/` and receives
 inherited host `TMPDIR`, so a focused check writes into the Run's root instead
 of shared `/tmp/<name>`. The Run logs stay in `<control-plane>/runs/<run-id>/`
 as retained evidence; cleanup removes only the `scratch` subtree.
+The process also receives `RELAY_DOCKER_LABEL_PLANE`,
+`RELAY_DOCKER_LABEL_TASK` and `RELAY_DOCKER_LABEL_RUN`; any container/volume it
+starts must carry all three so `relay run cleanup` can attribute it to this
+Task in this control plane.
 `relay run list --leaks` reports orphaned scratch roots, worktrees and
 Relay-labelled containers/volumes with sizes.
 

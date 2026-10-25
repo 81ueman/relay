@@ -16,6 +16,7 @@ import {
 } from "./run-launcher";
 import { childEnv } from "./child-env";
 import { ensureScratchRoot, runScratchRoot, scratchEnv } from "./scratch";
+import { controlPlaneNamespace } from "./run-resources";
 import { isPinnedDsh, PINNED_DSH_VERSION, readDshVersion } from "./dsh-version";
 import { assertLaunchDiskSpace, type DiskGuardOptions } from "./disk-guard";
 import { gitHead } from "./verify";
@@ -459,8 +460,12 @@ export function buildTaskPrompt(task: Task): string {
     "reclaim it when the Task ends (Relay never touches unlabelled resources):",
     "",
     "```",
-    'docker run --label "$RELAY_DOCKER_LABEL_TASK" --label "$RELAY_DOCKER_LABEL_RUN" ...',
-    'docker volume create --label "$RELAY_DOCKER_LABEL_TASK" --label "$RELAY_DOCKER_LABEL_RUN" ...',
+    'docker run --label "$RELAY_DOCKER_LABEL_PLANE" --label "$RELAY_DOCKER_LABEL_TASK" --label "$RELAY_DOCKER_LABEL_RUN" ...',
+    'docker volume create --label "$RELAY_DOCKER_LABEL_PLANE" --label "$RELAY_DOCKER_LABEL_TASK" --label "$RELAY_DOCKER_LABEL_RUN" ...',
+    "",
+    "All THREE labels are required: the plane label namespaces this control plane",
+    "(Task ids repeat across checkouts) and an unlabelled or partially labelled",
+    "resource is never reclaimed.",
     "```"
   );
   return lines.join("\n");
@@ -677,7 +682,7 @@ export async function startDshRun(db: Database, opts: StartRunOptions): Promise<
     // ISH-1221: the Relay-owned scratch values WIN over inherited host values,
     // so a focused check cannot silently write to shared /tmp.
     ...childEnv(process.env, opts.env),
-    ...scratchEnv(scratchRoot, { taskId: task.id, runId }),
+    ...scratchEnv(scratchRoot, { plane: controlPlaneNamespace(db), taskId: task.id, runId }),
     DSH_PERMISSION_MODE: permissionMode,
   };
 

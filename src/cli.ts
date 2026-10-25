@@ -34,6 +34,11 @@ import { parseRunFailureClass } from "./run-failure";
 import { signalRunProcess } from "./run-signal";
 import { scanRunLeaks } from "./run-leaks";
 import {
+  disabledRunResourceDocker,
+  realRunResourceDocker,
+  type RunResourceDocker,
+} from "./run-resources";
+import {
   applyWorkspaceCleanup,
   ensureTaskWorktree,
   launchTaskRun,
@@ -61,6 +66,20 @@ import { runDashboard } from "./dashboard/command";
 import { runWeb } from "./web";
 import { runGc } from "./gc";
 import { addReminder, disableReminder, listReminders } from "./reminders";
+
+/**
+ * ISH-1221: the CLI is the ONE production caller that opts into real Docker
+ * inventory. Library defaults are disabled, and `RELAY_DOCKER_RESOURCES=off`
+ * (or `0`) is an explicit kill switch for tests / hosts that manage Docker
+ * separately. No path here ever touches an image or an unlabelled resource.
+ */
+function runResourceDocker(): RunResourceDocker {
+  const setting = (process.env.RELAY_DOCKER_RESOURCES ?? "").trim().toLowerCase();
+  if (setting === "off" || setting === "0" || setting === "false") {
+    return disabledRunResourceDocker("docker inventory disabled by RELAY_DOCKER_RESOURCES");
+  }
+  return realRunResourceDocker();
+}
 
 // A role is "known" if it matches a registered worker or a built-in special role.
 // Used for a non-fatal warning on `task add --role`, never a rejection.
@@ -1640,6 +1659,7 @@ async function main(): Promise<void> {
               outputRoot,
               worktreesRoot: flag(rest, "--worktrees") ?? undefined,
               reviewWorktreesRoot: flag(rest, "--review-worktrees") ?? undefined,
+              docker: runResourceDocker(),
             });
             if (hasFlag(rest, "--json")) {
               console.log(JSON.stringify(report, null, 2));
@@ -1980,6 +2000,7 @@ async function main(): Promise<void> {
             reviewWorktreesRoot: repoFlag
               ? join(repoFlag, STATE_DIR, "review-worktrees")
               : join(projectRoot(), STATE_DIR, "review-worktrees"),
+            docker: runResourceDocker(),
             ...(github ? { github } : {}),
           });
           if (hasFlag(rest, "--json")) {

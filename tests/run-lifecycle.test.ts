@@ -25,6 +25,7 @@ import {
   runSubmitterError,
   taskBranchName,
 } from "../src/run-lifecycle";
+import { disabledRunResourceDocker } from "../src/run-resources";
 
 // ISH-760: the Task worktree + disposable dsh Run lifecycle, single-writer.
 // A REAL temp git repo + a FAKE dsh process keep the whole lifecycle
@@ -1035,23 +1036,27 @@ describe("submitter binding: a stale/late/failed Run never advances the Task", (
   });
 });
 
+// ISH-1221: cleanup tests NEVER reach the host Docker daemon. The disabled
+// seam is explicit here (the library default is also disabled).
+const noDocker = disabledRunResourceDocker();
+
 describe("safe cleanup: permissions, evidence, PR lifecycle", () => {
   test("a live Run blocks cleanup; an open PR blocks cleanup", async () => {
     const id = newTask({ prUrl: "https://example.test/pr/1" });
     const launched = await launchTaskRun(db, id, { repo, spawner: new FakeSpawner(), outputRoot: outputRoot() });
-    const plan = await planWorkspaceCleanup(db, id, { repo, worktreesRoot: join(dir, "worktrees") });
+    const plan = await planWorkspaceCleanup(db, id, { repo, worktreesRoot: join(dir, "worktrees"), docker: noDocker });
     expect(plan.remove).toBe(false);
     expect(plan.reasons.join(" ")).toMatch(/active run/);
     launched.handle.cancel();
     await launched.handle.wait();
-    const plan2 = await planWorkspaceCleanup(db, id, { repo, worktreesRoot: join(dir, "worktrees") });
+    const plan2 = await planWorkspaceCleanup(db, id, { repo, worktreesRoot: join(dir, "worktrees"), docker: noDocker });
     expect(plan2.reasons.join(" ")).toMatch(/open PR/);
   });
 
   test("an explicit abort allows reclaiming the worktree", async () => {
     const id = newTask();
     const b = ensureTaskWorktree(db, id, { repo });
-    const plan = await applyWorkspaceCleanup(db, id, { apply: true, abort: "Gateway abandoned the lane", repo, worktreesRoot: join(dir, "worktrees") });
+    const plan = await applyWorkspaceCleanup(db, id, { apply: true, abort: "Gateway abandoned the lane", repo, worktreesRoot: join(dir, "worktrees"), docker: noDocker });
     expect(plan.removed).toBe(true);
     expect(existsSync(b.worktree)).toBe(false);
     expect(getTask(db, id)!.worktree).toBeNull();
@@ -1061,7 +1066,7 @@ describe("safe cleanup: permissions, evidence, PR lifecycle", () => {
     const id = newTask();
     const b = ensureTaskWorktree(db, id, { repo });
     const sourceHead = git(repo, "rev-parse", "HEAD");
-    const opts = { apply: true, abort: "abort", repo, worktreesRoot: join(dir, "worktrees") };
+    const opts = { apply: true, abort: "abort", repo, worktreesRoot: join(dir, "worktrees"), docker: noDocker };
     expect((await applyWorkspaceCleanup(db, id, opts)).removed).toBe(true);
     expect(existsSync(b.worktree)).toBe(false);
     // Second apply: the ledger binding is gone -> a plain no-op, never a throw.
@@ -1086,7 +1091,7 @@ describe("safe cleanup: permissions, evidence, PR lifecycle", () => {
     const unpushed = git(b.worktree, "rev-parse", "HEAD");
     expect(hasCommit(repo, unpushed)).toBe(false); // not in the source yet
 
-    const opts = { apply: true, abort: "abandoned", repo, worktreesRoot: join(dir, "worktrees") };
+    const opts = { apply: true, abort: "abandoned", repo, worktreesRoot: join(dir, "worktrees"), docker: noDocker };
     const plan = await applyWorkspaceCleanup(db, id, opts);
     expect(plan.removed).toBe(true);
     expect(existsSync(b.worktree)).toBe(false);
@@ -1105,7 +1110,7 @@ describe("safe cleanup: permissions, evidence, PR lifecycle", () => {
     git(b.worktree, "add", "pushed.txt");
     git(b.worktree, "-c", "user.email=relay@test", "-c", "user.name=relay-test", "commit", "-q", "-m", "pushed work");
     git(b.worktree, "push", "-q", "origin", `HEAD:refs/heads/${b.branch}`);
-    const plan = await applyWorkspaceCleanup(db, id, { apply: true, abort: "aborted", repo, worktreesRoot: join(dir, "worktrees") });
+    const plan = await applyWorkspaceCleanup(db, id, { apply: true, abort: "aborted", repo, worktreesRoot: join(dir, "worktrees"), docker: noDocker });
     expect(plan.removed).toBe(true);
   });
 
@@ -1116,7 +1121,7 @@ describe("safe cleanup: permissions, evidence, PR lifecycle", () => {
     writeFileSync(join(b.worktree, "wip.txt"), "wip\n");
     git(b.worktree, "add", "wip.txt");
     git(b.worktree, "-c", "user.email=relay@test", "-c", "user.name=relay-test", "commit", "-q", "-m", "discarded");
-    const plan = await applyWorkspaceCleanup(db, id, { apply: true, force: true, abort: "discard", repo, worktreesRoot: join(dir, "worktrees") });
+    const plan = await applyWorkspaceCleanup(db, id, { apply: true, force: true, abort: "discard", repo, worktreesRoot: join(dir, "worktrees"), docker: noDocker });
     expect(plan.removed).toBe(true);
     expect(git(repo, "for-each-ref", "--format=%(refname)", "refs/relay-kept/")).toBe("");
   });
@@ -1130,7 +1135,7 @@ describe("safe cleanup: permissions, evidence, PR lifecycle", () => {
     // Simulate a real merge observed on the provider.
     db.query(`UPDATE tasks SET state='done', accepted_at=?, merged_at=? WHERE id=?`).run(Date.now(), Date.now(), id);
 
-    const plan = await applyWorkspaceCleanup(db, id, { apply: true, repo, worktreesRoot: join(dir, "worktrees") });
+    const plan = await applyWorkspaceCleanup(db, id, { apply: true, repo, worktreesRoot: join(dir, "worktrees"), docker: noDocker });
     expect(plan.removed).toBe(true);
     expect(plan.retainedRuns).toBeGreaterThanOrEqual(1);
     // Evidence survives: the run row + its output dir are untouched.
@@ -1142,10 +1147,10 @@ describe("safe cleanup: permissions, evidence, PR lifecycle", () => {
     const id = newTask();
     const b = ensureTaskWorktree(db, id, { repo });
     writeFileSync(join(b.worktree, "wip.txt"), "uncommitted\n");
-    const blocked = await applyWorkspaceCleanup(db, id, { apply: true, abort: "abort", repo, worktreesRoot: join(dir, "worktrees") });
+    const blocked = await applyWorkspaceCleanup(db, id, { apply: true, abort: "abort", repo, worktreesRoot: join(dir, "worktrees"), docker: noDocker });
     expect(blocked.removed).toBe(false);
     expect(blocked.reasons.join(" ")).toMatch(/uncommitted/);
-    const forced = await applyWorkspaceCleanup(db, id, { apply: true, force: true, abort: "abort", repo, worktreesRoot: join(dir, "worktrees") });
+    const forced = await applyWorkspaceCleanup(db, id, { apply: true, force: true, abort: "abort", repo, worktreesRoot: join(dir, "worktrees"), docker: noDocker });
     expect(forced.removed).toBe(true);
   });
 
@@ -1159,7 +1164,7 @@ describe("safe cleanup: permissions, evidence, PR lifecycle", () => {
       Date.now(),
       id
     );
-    const plan = await applyWorkspaceCleanup(db, id, { apply: true, repo, worktreesRoot: join(dir, "worktrees") });
+    const plan = await applyWorkspaceCleanup(db, id, { apply: true, repo, worktreesRoot: join(dir, "worktrees"), docker: noDocker });
     expect(plan.removed).toBe(false);
     expect(plan.reasons.join(" ")).toMatch(/not relay-owned/);
     expect(existsSync(human)).toBe(true);

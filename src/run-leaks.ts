@@ -5,7 +5,11 @@ import { defaultDbPath, now, projectRoot, STATE_DIR } from "./db";
 import { isTerminalTaskState, type TaskState } from "./schema";
 import { findActiveWriter } from "./dsh-runner";
 import { defaultRunsRoot, pathSizeBytes, scratchPathSegment } from "./scratch";
-import { realRunResourceDocker, type RunResourceDocker } from "./run-resources";
+import {
+  controlPlaneNamespace,
+  disabledRunResourceDocker,
+  type RunResourceDocker,
+} from "./run-resources";
 
 /**
  * ISH-1221 — orphan report for run-scoped resources.
@@ -18,8 +22,10 @@ import { realRunResourceDocker, type RunResourceDocker } from "./run-resources";
  *   - Relay-labelled containers/volumes (with the size Docker reports).
  *
  * It never lists an unlabelled container/volume (other projects share the host)
- * and has no image path at all. `relay run list --leaks` renders this for the
- * gateway patrol.
+ * and has no image path at all. The `relay.plane` namespace is authoritative:
+ * another control plane's `relay.task=T1` is NOT reported as this plane's
+ * orphan (Task ids repeat across checkouts). `relay run list --leaks` renders
+ * this for the gateway patrol.
  */
 
 export type LeakKind = "scratch" | "review-scratch" | "worktree" | "review-worktree" | "container" | "volume";
@@ -74,6 +80,7 @@ function addEntry(report: LeakReport, entry: LeakEntry): void {
 
 export function scanRunLeaks(db: Database, opts: LeakScanOptions = {}): LeakReport {
   const report: LeakReport = { checkedAt: now(), entries: [], totalBytes: 0, dockerErrors: [] };
+  const plane = controlPlaneNamespace(db);
   const repo = opts.repo ?? projectRoot();
   const outputRoot = opts.outputRoot ?? defaultRunsRoot();
   const worktreesRoot = opts.worktreesRoot ?? join(dirname(defaultDbPath()), "worktrees");
@@ -193,7 +200,7 @@ export function scanRunLeaks(db: Database, opts: LeakScanOptions = {}): LeakRepo
   // unlabelled resource is not Relay's and is never listed or touched.
   let snapshot;
   try {
-    snapshot = (opts.docker ?? realRunResourceDocker()).snapshot();
+    snapshot = (opts.docker ?? disabledRunResourceDocker()).snapshot();
   } catch (e) {
     report.dockerErrors.push(e instanceof Error ? e.message : String(e));
     return report;
@@ -203,6 +210,9 @@ export function scanRunLeaks(db: Database, opts: LeakScanOptions = {}): LeakRepo
   for (const c of snapshot.containers) {
     // No Relay label at all -> not Relay's resource: never list or touch it.
     if (!c.taskId && !c.runId) continue;
+    // Another control plane's resource, or a bare task id with no plane and no
+    // Run id this DB knows: not provably ours, so not reported.
+    if (!belongsToThisPlane(c, plane, runById)) continue;
     const run = c.runId ? runById.get(c.runId) ?? null : null;
     const task = c.taskId ? taskById.get(c.taskId) ?? null : run ? taskById.get(run.task_id) ?? null : null;
     const taskId = c.taskId ?? run?.task_id ?? null;
@@ -222,6 +232,7 @@ export function scanRunLeaks(db: Database, opts: LeakScanOptions = {}): LeakRepo
   for (const v of snapshot.volumes) {
     // No Relay label at all -> not Relay's resource: never list or touch it.
     if (!v.taskId && !v.runId) continue;
+    if (!belongsToThisPlane(v, plane, runById)) continue;
     const run = v.runId ? runById.get(v.runId) ?? null : null;
     const task = v.taskId ? taskById.get(v.taskId) ?? null : run ? taskById.get(run.task_id) ?? null : null;
     const taskId = v.taskId ?? run?.task_id ?? null;
@@ -239,6 +250,20 @@ export function scanRunLeaks(db: Database, opts: LeakScanOptions = {}): LeakRepo
     });
   }
   return report;
+}
+
+/**
+ * Plane-scoped attribution. A plane label must match this control plane. With
+ * no plane label only a Run id present in THIS DB is unique enough to attribute
+ * (`relay.task=T1` is reused by every checkout).
+ */
+function belongsToThisPlane(
+  resource: { plane: string | null; runId: string | null },
+  plane: string,
+  runById: Map<string, RunRow>
+): boolean {
+  if (resource.plane !== null) return resource.plane === plane;
+  return !!(resource.runId && runById.has(resource.runId));
 }
 
 function safeReaddir(root: string): string[] {

@@ -26,7 +26,11 @@ import { issueKeyForTask, resolveTaskPrTarget } from "./pr-target";
 import { resolveTaskPrRef } from "./pr-binding";
 import { removeReviewWorktree } from "./review-workspace";
 import { defaultRunsRoot, reviewScratchTaskRoot, removeScratchRoot } from "./scratch";
-import { realRunResourceDocker, type RunResourceDocker } from "./run-resources";
+import {
+  controlPlaneNamespace,
+  disabledRunResourceDocker,
+  type RunResourceDocker,
+} from "./run-resources";
 import { taskHeadOvertakenByOtherWriter } from "./run-owner";
 
 /**
@@ -1337,7 +1341,12 @@ export interface CleanupOptions {
    * cleanup itself never trusts the stale `task.pr_url` as a state.
    */
   prState?: PrState | "none";
-  /** Docker inventory/removal seam (default: the real docker CLI). */
+  /**
+   * Docker inventory/removal seam. There is NO implicit real-docker default:
+   * the library uses a disabled seam unless the caller passes one, so a test or
+   * an embedding process can never `docker rm` a host container by accident.
+   * The CLI passes `realRunResourceDocker()` explicitly.
+   */
   docker?: RunResourceDocker;
 }
 
@@ -1443,13 +1452,24 @@ function reviewWorktreesForTask(root: string, taskId: string): string[] {
   }
 }
 
+/**
+ * Attribution for reclamation. The control-plane namespace is authoritative:
+ * `relay.task=T1` exists in every checkout, so a task-id match from ANOTHER
+ * plane is never ours. A globally unique Run id can still identify a resource
+ * that predates (or omitted) the plane label.
+ */
 function resourceBelongsToTask(
-  resource: { taskId: string | null; runId: string | null },
+  resource: { plane: string | null; taskId: string | null; runId: string | null },
+  plane: string,
   taskId: string,
   runIds: Set<string>
 ): boolean {
-  if (resource.taskId !== null) return resource.taskId === taskId;
-  return !!(resource.runId && runIds.has(resource.runId));
+  if (resource.plane !== null && resource.plane !== plane) return false;
+  if (resource.runId !== null && runIds.has(resource.runId)) return true;
+  // No plane label and no known Run id: a bare task id is ambiguous across
+  // control planes, so it is NOT proof of ownership.
+  if (resource.plane === null) return false;
+  return resource.taskId === taskId;
 }
 
 /** Save tracked changes + a status note so a dirty worktree is never silently lost. */
@@ -1499,6 +1519,7 @@ export async function planWorkspaceCleanup(
   const branch = task.branch;
   const runs = runRowsForTask(db, taskId);
   const runIds = new Set(runs.map((r) => r.id));
+  const plane = controlPlaneNamespace(db);
   const outputRoot = opts.outputRoot ?? defaultRunsRoot();
   const reviewRoot =
     opts.reviewWorktreesRoot ?? join(opts.repo ?? projectRoot(), STATE_DIR, "review-worktrees");
@@ -1530,17 +1551,17 @@ export async function planWorkspaceCleanup(
     volumeError: null,
   };
   try {
-    snapshot = (opts.docker ?? realRunResourceDocker()).snapshot();
+    snapshot = (opts.docker ?? disabledRunResourceDocker()).snapshot();
   } catch (e) {
     warnings.push(`docker inventory failed: ${e instanceof Error ? e.message : String(e)}`);
   }
   if (snapshot.containerError) warnings.push(`container inventory unavailable: ${snapshot.containerError}`);
   if (snapshot.volumeError) warnings.push(`volume inventory unavailable: ${snapshot.volumeError}`);
   plan.containers = snapshot.containers
-    .filter((c) => resourceBelongsToTask(c, taskId, runIds))
+    .filter((c) => resourceBelongsToTask(c, plane, taskId, runIds))
     .map((c) => ({ id: c.id, name: c.name }));
   plan.volumes = snapshot.volumes
-    .filter((v) => resourceBelongsToTask(v, taskId, runIds))
+    .filter((v) => resourceBelongsToTask(v, plane, taskId, runIds))
     .map((v) => ({ name: v.name }));
 
   const merged = task.merged_at !== null;
@@ -1555,21 +1576,39 @@ export async function planWorkspaceCleanup(
     }
   }
 
-  // The stale binding is NOT evidence. Re-read the live state; only an actually
-  // OPEN PR (or an unverifiable bound PR) refuses.
-  if (!merged && !accepted && !aborted) {
+  // The stale binding is NOT evidence. Re-read the live state for EVERY
+  // non-merged reclaim (cancelled, accepted, `--abort` included); only an
+  // actually OPEN PR (or an unverifiable bound PR) refuses. A CLOSED PR is the
+  // signal that the branch is safe to reclaim.
+  if (!merged) {
     const pr = await observeTaskPr(task, opts);
     if (pr.state === "open") {
       reasons.push(`open PR ${pr.url ?? task.pr_url ?? "(bound PR)"}`);
     } else if (pr.state === "unknown") {
       reasons.push(
-        `open PR ${pr.url ?? task.pr_url ?? "(bound PR)"} (live state could not be re-read; pass --abort to reclaim)`
+        `open PR ${pr.url ?? task.pr_url ?? "(bound PR)"} (live state could not be re-read; refusing until the PR can be checked)`
       );
     }
   }
 
-  const active = findActiveWriter(db, { cwd: worktree ?? projectRoot(), branch });
-  if (active) reasons.push(`active run ${active.id} (${active.state}) still holds this worktree`);
+  // A Run row can outlive the recorded worktree (or the Task never recorded
+  // one). Checking `projectRoot()` in that case would mistake an unrelated live
+  // Run in the main checkout for a writer on this Task.
+  const active = worktree
+    ? findActiveWriter(db, { cwd: worktree, branch })
+    : db
+        .query(
+          `SELECT id, state FROM runs WHERE task_id = ? AND state IN ('starting','running')
+           ORDER BY created_at DESC, rowid DESC LIMIT 1`
+        )
+        .get(taskId) as { id: string; state: string } | null;
+  if (active) {
+    reasons.push(
+      worktree
+        ? `active run ${active.id} (${active.state}) still holds this worktree`
+        : `active run ${active.id} (${active.state}) still holds this task`
+    );
+  }
 
   if (worktree && existsSync(worktree)) {
     const wtRoot = taskWorktreesRoot(opts.worktreesRoot);
@@ -1773,7 +1812,7 @@ export async function applyWorkspaceCleanup(
     return plan;
   }
 
-  const docker = opts.docker ?? realRunResourceDocker();
+  const docker = opts.docker ?? disabledRunResourceDocker();
   for (const c of plan.containers) {
     const r = docker.removeContainer(c.id);
     if (r.ok) plan.removedResources.push(`container ${c.id}${c.name ? ` (${c.name})` : ""}`);

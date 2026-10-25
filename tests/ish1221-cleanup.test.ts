@@ -13,7 +13,7 @@ import { PINNED_DSH_VERSION } from "../src/dsh-version";
 import { applyWorkspaceCleanup, planWorkspaceCleanup } from "../src/run-lifecycle";
 import type { GitHubReadOnly, PrView } from "../src/providers";
 import type { RunContainer, RunResourceDocker, RunVolume } from "../src/run-resources";
-import { realRunResourceDocker } from "../src/run-resources";
+import { controlPlaneId, realRunResourceDocker } from "../src/run-resources";
 import { scanRunLeaks } from "../src/run-leaks";
 import { reviewScratchTaskRoot } from "../src/scratch";
 
@@ -195,17 +195,26 @@ function githubWith(state: PrView["state"]): GitHubReadOnly {
   };
 }
 
+function thisPlane(): string {
+  return controlPlaneId(process.env.RELAY_DB!);
+}
+
 function labelledDocker(taskId: string, runId: string, otherTask = "T999"): FakeDocker {
+  const plane = thisPlane();
   const docker = new FakeDocker();
   docker.containers = [
-    { id: "c-task", name: "relay-task", taskId, runId, state: "exited", sizeBytes: 1024 },
-    { id: "c-other", name: "relay-other", taskId: otherTask, runId: "run-other", state: "exited", sizeBytes: 2048 },
-    { id: "c-unlabelled", name: "human", taskId: null, runId: null, state: "running", sizeBytes: 4096 },
+    { id: "c-task", name: "relay-task", plane, taskId, runId, state: "exited", sizeBytes: 1024 },
+    { id: "c-other", name: "relay-other", plane, taskId: otherTask, runId: "run-other", state: "exited", sizeBytes: 2048 },
+    // Same Task id as THIS plane, but a different control plane: T55 exists in
+    // every checkout, so this must never be removed or reported as ours.
+    { id: "c-cross-plane", name: "relay-foreign", plane: "0123456789ab", taskId, runId: "run-foreign", state: "exited", sizeBytes: 3072 },
+    { id: "c-unlabelled", name: "human", plane: null, taskId: null, runId: null, state: "running", sizeBytes: 4096 },
   ];
   docker.volumes = [
-    { name: "v-task", taskId, runId, sizeBytes: null },
-    { name: "v-other", taskId: otherTask, runId: "run-other", sizeBytes: null },
-    { name: "v-unlabelled", taskId: null, runId: null, sizeBytes: null },
+    { name: "v-task", plane, taskId, runId, sizeBytes: null },
+    { name: "v-other", plane, taskId: otherTask, runId: "run-other", sizeBytes: null },
+    { name: "v-cross-plane", plane: "0123456789ab", taskId, runId: "run-foreign", sizeBytes: null },
+    { name: "v-unlabelled", plane: null, taskId: null, runId: null, sizeBytes: null },
   ];
   return docker;
 }
@@ -233,6 +242,7 @@ describe("ISH-1221: run scratch + labelled resource reclamation", () => {
     expect(env.TEMP).toBe(env.TMPDIR);
     expect(env.CARGO_TARGET_DIR).toBe(join(run.output_dir, "scratch", "cargo-target"));
     expect(env.RELAY_SCRATCH_DIR).toBe(join(run.output_dir, "scratch"));
+    expect(env.RELAY_DOCKER_LABEL_PLANE).toBe(`relay.plane=${thisPlane()}`);
     expect(env.RELAY_DOCKER_LABEL_TASK).toBe(`relay.task=${other}`);
     expect(env.RELAY_DOCKER_LABEL_RUN).toBe(`relay.run=${run.id}`);
     expect(env.TMPDIR).not.toBe(scratch);
@@ -241,6 +251,8 @@ describe("ISH-1221: run scratch + labelled resource reclamation", () => {
   test("merged cleanup removes the worktree, scratch and only this Task's labelled resources", async () => {
     const id = newTask();
     const { runId, outputDir, scratch } = await launchedRun(id);
+    const worktree = getTask(db, id)!.worktree!;
+    expect(existsSync(worktree)).toBe(true);
     db.query(`UPDATE tasks SET state='done', accepted_at=?, merged_at=? WHERE id=?`).run(Date.now(), Date.now(), id);
     const docker = labelledDocker(id, runId);
 
@@ -254,6 +266,7 @@ describe("ISH-1221: run scratch + labelled resource reclamation", () => {
     expect(plan.remove).toBe(true);
     expect(plan.removed).toBe(true);
     expect(getTask(db, id)!.worktree).toBeNull();
+    expect(existsSync(worktree)).toBe(false);
     expect(existsSync(scratch)).toBe(false);
     // Run logs are retained as evidence.
     expect(getRun(db, runId)).not.toBeNull();
@@ -262,8 +275,8 @@ describe("ISH-1221: run scratch + labelled resource reclamation", () => {
     // Only the matching labels were removed.
     expect(docker.removedContainers).toEqual(["c-task"]);
     expect(docker.removedVolumes).toEqual(["v-task"]);
-    expect(docker.containers.map((c) => c.id)).toEqual(["c-other", "c-unlabelled"]);
-    expect(docker.volumes.map((v) => v.name)).toEqual(["v-other", "v-unlabelled"]);
+    expect(docker.containers.map((c) => c.id)).toEqual(["c-other", "c-cross-plane", "c-unlabelled"]);
+    expect(docker.volumes.map((v) => v.name)).toEqual(["v-other", "v-cross-plane", "v-unlabelled"]);
     // Images are untouched: the seam has no image path at all.
     expect(docker.images).toEqual(["ceos:4.31.2f", "frr:9.1"]);
   });
@@ -271,6 +284,7 @@ describe("ISH-1221: run scratch + labelled resource reclamation", () => {
   test("a CANCELLED Task whose PR is CLOSED is reclaimed, not refused as open PR", async () => {
     const id = newTask({ prUrl: "https://github.com/o/r/pull/1" });
     const { runId, scratch } = await launchedRun(id);
+    const worktree = getTask(db, id)!.worktree!;
     db.query(`UPDATE tasks SET state='cancelled', pr_repo='o/r' WHERE id=?`).run(id);
     const docker = labelledDocker(id, runId);
 
@@ -286,6 +300,7 @@ describe("ISH-1221: run scratch + labelled resource reclamation", () => {
     expect(plan.remove).toBe(true);
     expect(plan.removed).toBe(true);
     expect(getTask(db, id)!.worktree).toBeNull();
+    expect(existsSync(worktree)).toBe(false);
     expect(existsSync(scratch)).toBe(false);
     expect(docker.removedContainers).toEqual(["c-task"]);
     expect(docker.removedVolumes).toEqual(["v-task"]);
@@ -366,7 +381,16 @@ describe("ISH-1221: run scratch + labelled resource reclamation", () => {
     }
     expect(report.entries.map((e) => e.id)).not.toContain("c-unlabelled");
     expect(report.entries.map((e) => e.id)).not.toContain("v-unlabelled");
+    // Another control plane's relay.task=<same T> is not this plane's orphan.
+    expect(report.entries.map((e) => e.id)).not.toContain("c-cross-plane");
+    expect(report.entries.map((e) => e.id)).not.toContain("v-cross-plane");
     expect(report.dockerErrors).toEqual([]);
+  });
+
+  test("a leak scan with no docker seam reports the disabled inventory instead of reading host Docker", () => {
+    const report = scanRunLeaks(db, { repo, outputRoot: outputRoot(), worktreesRoot: worktreesRoot() });
+    expect(report.dockerErrors.join(" ")).toMatch(/docker inventory disabled/);
+    expect(report.entries.filter((e) => e.kind === "container" || e.kind === "volume")).toEqual([]);
   });
 
   test("the CLI `relay run cleanup <task> --apply` removes the worktree and scratch", async () => {
@@ -376,7 +400,13 @@ describe("ISH-1221: run scratch + labelled resource reclamation", () => {
     const cli = join(import.meta.dir, "..", "src", "cli.ts");
     const out = execFileSync(process.execPath, [cli, "run", "cleanup", id, "--apply", "--repo", repo, "--json"], {
       encoding: "utf8",
-      env: { ...process.env, RELAY_DB: process.env.RELAY_DB!, RELAY_MIN_FREE_DISK_BYTES: "0" },
+      env: {
+        ...process.env,
+        RELAY_DB: process.env.RELAY_DB!,
+        RELAY_MIN_FREE_DISK_BYTES: "0",
+        // Never let the CLI subprocess read/remove real host Docker resources.
+        RELAY_DOCKER_RESOURCES: "off",
+      },
     });
     const plan = JSON.parse(out);
     expect(plan.removed).toBe(true);
@@ -398,5 +428,68 @@ describe("ISH-1221: run scratch + labelled resource reclamation", () => {
     const flat = argv.map((a) => a.join(" ")).join("\n");
     expect(flat).not.toMatch(/\brmi\b|image\s+prune|system\s+prune/);
     expect(flat).toContain("label=relay.task");
+    expect(flat).toContain("label=relay.run");
+    // `-v` reclaims the labelled container's anonymous dind volumes too.
+    expect(flat).toContain("rm -f -v abc");
+  });
+
+  test("the control-plane namespace differs per DB path", () => {
+    expect(controlPlaneId("/a/.relay/state.db")).not.toBe(controlPlaneId("/b/.relay/state.db"));
+    expect(controlPlaneId("/a/.relay/state.db")).toBe(controlPlaneId("/a/.relay/state.db"));
+  });
+
+  test("the inventory includes run-only labels and the plane label", () => {
+    const plane = thisPlane();
+    const docker = realRunResourceDocker((args) => {
+      if (args[0] === "ps") {
+        const filter = args[args.indexOf("--filter") + 1];
+        const row =
+          filter === "label=relay.run"
+            ? { ID: "run-only", Names: "r", Labels: `relay.plane=${plane},relay.run=run-1`, State: "exited", Size: "1MB" }
+            : { ID: "task-only", Names: "t", Labels: `relay.plane=${plane},relay.task=T1`, State: "exited", Size: "2MB" };
+        return { ok: true, stdout: JSON.stringify(row), stderr: "" };
+      }
+      if (args[0] === "volume" && args[1] === "ls") {
+        const filter = args[args.indexOf("--filter") + 1];
+        return { ok: true, stdout: filter === "label=relay.run" ? "v-run\n" : "v-task\n", stderr: "" };
+      }
+      if (args[0] === "volume" && args[1] === "inspect") {
+        const name = args[args.length - 1];
+        return {
+          ok: true,
+          stdout: JSON.stringify({
+            Labels: { "relay.plane": plane, "relay.task": "T1", "relay.run": name === "v-run" ? "run-1" : "run-2" },
+          }),
+          stderr: "",
+        };
+      }
+      return { ok: true, stdout: "", stderr: "" };
+    });
+    const snapshot = docker.snapshot();
+    expect(snapshot.containers.map((c) => c.id).sort()).toEqual(["run-only", "task-only"]);
+    expect(snapshot.containers.every((c) => c.plane === plane)).toBe(true);
+    expect(snapshot.volumes.map((v) => v.name).sort()).toEqual(["v-run", "v-task"]);
+    expect(snapshot.volumes.every((v) => v.plane === plane)).toBe(true);
+  });
+
+  test("--abort still refuses a live-OPEN PR, and the default seam never touches Docker", async () => {
+    const id = newTask({ prUrl: "https://github.com/o/r/pull/1" });
+    const { scratch } = await launchedRun(id);
+    db.query(`UPDATE tasks SET state='cancelled', pr_repo='o/r' WHERE id=?`).run(id);
+    const plan = await applyWorkspaceCleanup(db, id, {
+      apply: true,
+      abort: "superseded",
+      repo,
+      worktreesRoot: worktreesRoot(),
+      outputRoot: outputRoot(),
+      github: githubWith("open"),
+    });
+    expect(plan.remove).toBe(false);
+    expect(plan.reasons.join(" ")).toMatch(/open PR/);
+    expect(existsSync(scratch)).toBe(true);
+    // No docker seam was passed: the disabled default is what ran, and it says so.
+    expect(plan.containers).toEqual([]);
+    expect(plan.volumes).toEqual([]);
+    expect(plan.warnings.join(" ")).toMatch(/docker inventory disabled/);
   });
 });
