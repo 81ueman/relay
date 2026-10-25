@@ -49,6 +49,7 @@ import {
 } from "./reviewer-runner";
 import { checkMergeGate, type MergeGateDecision, type MergeGateDeps } from "./merge-gate";
 import { importHeadIntoSource, prepareReadOnlyReviewWorktree, removeReviewWorktree } from "./review-workspace";
+import { reviewScratchRoot } from "./scratch";
 import type { ChecksReadOnly, NativeReviewDeps } from "./providers";
 import { bindTaskPr, type PrBindingDeps } from "./pr-binding";
 import { resolveTaskPrTarget } from "./pr-target";
@@ -1538,6 +1539,9 @@ async function runFactoryTaskInner(
               model: deps.reviewerModel,
               reviewerWorker,
               reviewWorktree,
+              // ISH-1221: a Relay-owned per-review scratch root (TMPDIR etc.),
+              // reclaimed with the Task's other run-scoped resources.
+              scratchRoot: reviewScratchRoot(deps.outputRoot, taskId, task.attempt, reviewHead),
               ...(deps.reviewRubric ? { reviewRubric: deps.reviewRubric } : {}),
               nativeReview: deps.nativeReview,
               // ISH-830e: give the host reviewer the VERIFY evidence so it need

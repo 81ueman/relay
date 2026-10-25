@@ -2,10 +2,11 @@ import type { Database } from "bun:sqlite";
 import { execFileSync } from "node:child_process";
 import { copyFileSync, existsSync, linkSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve, sep } from "node:path";
-import { defaultDbPath, now, projectRoot } from "./db";
+import { defaultDbPath, now, projectRoot, STATE_DIR } from "./db";
 import { assertLaunchDiskSpace, defaultDiskPaths, type DiskGuardOptions } from "./disk-guard";
 import { logEvent } from "./events";
 import type { Run, Task, TaskResult } from "./schema";
+import type { GitHubReadOnly, PrState } from "./providers";
 import { isTerminalTaskState } from "./schema";
 import { getTask } from "./tasks";
 import {
@@ -22,6 +23,14 @@ import type { CheckSpec } from "./verify";
 import { redactSecrets } from "./redact";
 import { readEvidenceTail, terminalImplementRunSignature } from "./implement-recovery";
 import { issueKeyForTask, resolveTaskPrTarget } from "./pr-target";
+import { resolveTaskPrRef } from "./pr-binding";
+import { removeReviewWorktree } from "./review-workspace";
+import { defaultRunsRoot, reviewScratchTaskRoot, removeScratchRoot } from "./scratch";
+import {
+  controlPlaneNamespace,
+  disabledRunResourceDocker,
+  type RunResourceDocker,
+} from "./run-resources";
 import { taskHeadOvertakenByOtherWriter } from "./run-owner";
 
 /**
@@ -1315,6 +1324,35 @@ export interface CleanupOptions {
   worktreesRoot?: string;
   /** The MAIN checkout the worktree belongs to (default: the project root). */
   repo?: string;
+  /** Root for Relay-owned Run/review output (default `<control-plane>/runs`). */
+  outputRoot?: string;
+  /** Root for disposable review worktrees (default `<repo>/.relay/review-worktrees`). */
+  reviewWorktreesRoot?: string;
+  /** Where a dirty-worktree patch is saved on `--apply`. */
+  patchesRoot?: string;
+  /**
+   * Read-only GitHub reader used to RE-CHECK the live PR state. Without it, a
+   * recorded `pr_url` is treated conservatively as an unverified open PR.
+   */
+  github?: GitHubReadOnly;
+  /**
+   * A previously observed live PR state (`none` = no PR). This seam is for
+   * callers that already re-read the PR (and for deterministic tests); the
+   * cleanup itself never trusts the stale `task.pr_url` as a state.
+   */
+  prState?: PrState | "none";
+  /**
+   * Docker inventory/removal seam. There is NO implicit real-docker default:
+   * the library uses a disabled seam unless the caller passes one, so a test or
+   * an embedding process can never `docker rm` a host container by accident.
+   * The CLI passes `realRunResourceDocker()` explicitly.
+   */
+  docker?: RunResourceDocker;
+}
+
+export interface CleanupContainer {
+  id: string;
+  name: string;
 }
 
 export interface CleanupPlan {
@@ -1329,24 +1367,163 @@ export interface CleanupPlan {
   removed: boolean;
   /** Run output dirs are NEVER touched (evidence retention). */
   retainedRuns: number;
+  /** Per-Run scratch roots that cleanup owns (not the retained Run logs). */
+  scratchDirs: string[];
+  /** Disposable review worktrees at the Task's reviewed heads. */
+  reviewWorktrees: string[];
+  /** Relay-labelled containers attributable to this Task. */
+  containers: CleanupContainer[];
+  /** Relay-labelled volumes attributable to this Task. */
+  volumes: { name: string }[];
+  /** A saved patch when a dirty worktree blocks removal (never silent loss). */
+  savedPatch: string | null;
+  /** Non-fatal inventory/removal problems (docker absent, volume busy, ...). */
+  warnings: string[];
+  /** What `--apply` actually removed (empty on a dry-run/refusal). */
+  removedResources: string[];
+}
+
+interface ObservedPr {
+  state: PrState | "none";
+  url: string | null;
+  source: "option" | "live" | "none" | "unverified";
 }
 
 /**
- * Plan (and, with `apply`, perform) a SAFE workspace cleanup. Removal is allowed
- * only when: the Task is really merged OR explicitly aborted; there is no open
- * PR; no Run still holds the worktree/branch; the worktree is relay-owned (under
- * the Relay worktrees root); it has no uncommitted changes; and every commit on
- * it is on a remote (or has been copied back into the source repo). The `runs`
- * rows
- * and their output dirs are RETAINED as evidence.
+ * Re-read the Task's PR state. A stale `task.pr_url` is never treated as OPEN:
+ * only a LIVE read (or an explicit `prState` seam) decides. When a PR is bound
+ * but cannot be read, the cleanup fails CLOSED (an unverifiable PR is not proof
+ * it is closed).
  */
-export function planWorkspaceCleanup(db: Database, taskId: string, opts: CleanupOptions = {}): CleanupPlan {
+async function observeTaskPr(task: Task, opts: CleanupOptions): Promise<ObservedPr> {
+  if (opts.prState !== undefined) return { state: opts.prState, url: task.pr_url, source: "option" };
+  if (!task.pr_url) {
+    // A branch-only Task has no recorded PR identity. If a reader is available,
+    // still look for a live PR on the branch; a missing/unreadable lookup is NOT
+    // a hazard by itself (a PR that was never bound cannot be "stale open").
+    if (opts.github && task.branch) {
+      const repo = task.pr_repo ?? resolveTaskPrTarget(task, { repo: opts.repo })?.repo ?? null;
+      if (repo) {
+        try {
+          const view = await opts.github.findPullRequestForBranch(repo, task.branch);
+          if (view) return { state: view.state, url: view.url, source: "live" };
+        } catch {
+          /* a failed read is not proof of an open PR */
+        }
+      }
+    }
+    return { state: "none", url: null, source: "none" };
+  }
+  if (!opts.github) return { state: "unknown", url: task.pr_url, source: "unverified" };
+  const ref = resolveTaskPrRef(task);
+  try {
+    if (ref) {
+      const view = await opts.github.getPullRequest(ref);
+      if (view) return { state: view.state, url: view.url, source: "live" };
+    } else {
+      const repo = task.pr_repo ?? resolveTaskPrTarget(task, { repo: opts.repo })?.repo ?? null;
+      if (repo && task.branch) {
+        const view = await opts.github.findPullRequestForBranch(repo, task.branch);
+        if (view) return { state: view.state, url: view.url, source: "live" };
+      }
+    }
+  } catch {
+    /* fall through to fail-closed */
+  }
+  return { state: "unknown", url: task.pr_url, source: "unverified" };
+}
+
+function runRowsForTask(db: Database, taskId: string): { id: string; output_dir: string }[] {
+  return db.query(`SELECT id, output_dir FROM runs WHERE task_id = ? ORDER BY created_at ASC`).all(taskId) as {
+    id: string;
+    output_dir: string;
+  }[];
+}
+
+function reviewWorktreesForTask(root: string, taskId: string): string[] {
+  if (!existsSync(root)) return [];
+  try {
+    return readdirSync(root)
+      .filter((name) => name === taskId || name.startsWith(`${taskId}-`))
+      .map((name) => join(root, name))
+      .filter((path) => existsSync(path));
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Attribution for reclamation. The control-plane namespace is authoritative:
+ * `relay.task=T1` exists in every checkout, so a task-id match from ANOTHER
+ * plane is never ours. A globally unique Run id can still identify a resource
+ * that predates (or omitted) the plane label.
+ */
+function resourceBelongsToTask(
+  resource: { plane: string | null; taskId: string | null; runId: string | null },
+  plane: string,
+  taskId: string,
+  runIds: Set<string>
+): boolean {
+  if (resource.plane !== null && resource.plane !== plane) return false;
+  if (resource.runId !== null && runIds.has(resource.runId)) return true;
+  // No plane label and no known Run id: a bare task id is ambiguous across
+  // control planes, so it is NOT proof of ownership.
+  if (resource.plane === null) return false;
+  return resource.taskId === taskId;
+}
+
+/** Save tracked changes + a status note so a dirty worktree is never silently lost. */
+function saveCleanupPatch(taskId: string, worktree: string, patchesRoot: string | undefined): { path: string; error: string } {
+  const root = patchesRoot ?? join(dirname(defaultDbPath()), "patches");
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const path = join(root, `${sanitizeId(taskId)}-${stamp}.patch`);
+  const diff = gitRun(worktree, ["diff", "HEAD"]);
+  const status = gitRun(worktree, ["status", "--porcelain"]);
+  try {
+    mkdirSync(root, { recursive: true });
+    writeFileSync(
+      path,
+      `# Relay cleanup patch for ${taskId} from ${worktree}\n# ${new Date().toISOString()}\n` +
+        `${diff.ok ? diff.out : `# git diff failed: ${diff.err || diff.out}`}\n\n` +
+        `# git status --porcelain\n${status.ok ? status.out : `# git status failed: ${status.err || status.out}`}\n`
+    );
+    return { path, error: "" };
+  } catch (e) {
+    return { path, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+/**
+ * Plan (and, with `apply`, perform) a SAFE workspace cleanup.
+ *
+ * Removal is allowed only when the Task is really merged/accepted, CANCELLED,
+ * or explicitly aborted; its PR is not live-OPEN (re-read, never inferred from
+ * the stale binding); no Run still holds the worktree/branch; the worktree is
+ * relay-owned and has no uncommitted changes (a saved patch is offered); and
+ * every commit on it is on a remote or copied back into the source repo.
+ *
+ * The `runs` rows and their output directories are RETAINED as evidence. Only
+ * the per-Run `scratch` subtrees, disposable review worktrees and Relay-labelled
+ * containers/volumes are reclaimed.
+ */
+export async function planWorkspaceCleanup(
+  db: Database,
+  taskId: string,
+  opts: CleanupOptions = {}
+): Promise<CleanupPlan> {
   const task = getTask(db, taskId);
   if (!task) throw new Error(`unknown task: ${taskId}`);
   const reasons: string[] = [];
+  const warnings: string[] = [];
   const worktree = task.worktree;
   const branch = task.branch;
-  const retainedRuns = (db.query(`SELECT COUNT(*) AS n FROM runs WHERE task_id = ?`).get(taskId) as { n: number }).n;
+  const runs = runRowsForTask(db, taskId);
+  const runIds = new Set(runs.map((r) => r.id));
+  const plane = controlPlaneNamespace(db);
+  const outputRoot = opts.outputRoot ?? defaultRunsRoot();
+  const reviewRoot =
+    opts.reviewWorktreesRoot ?? join(opts.repo ?? projectRoot(), STATE_DIR, "review-worktrees");
+  const reviewScratch = reviewScratchTaskRoot(outputRoot, taskId);
   const plan: CleanupPlan = {
     taskId,
     worktree,
@@ -1355,60 +1532,134 @@ export function planWorkspaceCleanup(db: Database, taskId: string, opts: Cleanup
     apply: opts.apply === true,
     reasons,
     removed: false,
-    retainedRuns,
+    retainedRuns: runs.length,
+    scratchDirs: runs.map((r) => join(r.output_dir, "scratch")).filter((p) => existsSync(p)),
+    reviewWorktrees: reviewWorktreesForTask(reviewRoot, taskId),
+    containers: [],
+    volumes: [],
+    savedPatch: null,
+    warnings,
+    removedResources: [],
   };
+  if (existsSync(reviewScratch)) plan.scratchDirs.push(reviewScratch);
 
-  if (!worktree) {
-    reasons.push("no recorded worktree");
-    return plan;
+  // Docker inventory: only resources carrying a Relay label are ever considered.
+  let snapshot: ReturnType<RunResourceDocker["snapshot"]> = {
+    containers: [],
+    volumes: [],
+    containerError: null,
+    volumeError: null,
+  };
+  try {
+    snapshot = (opts.docker ?? disabledRunResourceDocker()).snapshot();
+  } catch (e) {
+    warnings.push(`docker inventory failed: ${e instanceof Error ? e.message : String(e)}`);
   }
+  if (snapshot.containerError) warnings.push(`container inventory unavailable: ${snapshot.containerError}`);
+  if (snapshot.volumeError) warnings.push(`volume inventory unavailable: ${snapshot.volumeError}`);
+  plan.containers = snapshot.containers
+    .filter((c) => resourceBelongsToTask(c, plane, taskId, runIds))
+    .map((c) => ({ id: c.id, name: c.name }));
+  plan.volumes = snapshot.volumes
+    .filter((v) => resourceBelongsToTask(v, plane, taskId, runIds))
+    .map((v) => ({ name: v.name }));
 
   const merged = task.merged_at !== null;
+  const accepted = task.accepted_at !== null;
+  const cancelled = task.state === "cancelled";
   const aborted = !!opts.abort;
-  if (!merged && !aborted) {
+  if (!merged && !accepted && !cancelled && !aborted) {
     if (!isTerminalTaskState(task.state)) {
       reasons.push(`task is not terminal (state=${task.state})`);
     } else {
-      reasons.push("task is terminal but not merged; pass --abort <reason> to reclaim it");
+      reasons.push("task is terminal but not merged/accepted; pass --abort <reason> to reclaim it");
     }
   }
-  if (task.pr_url && !merged && !aborted) reasons.push(`open PR ${task.pr_url}`);
 
-  const active = findActiveWriter(db, { cwd: worktree, branch });
-  if (active) reasons.push(`active run ${active.id} (${active.state}) still holds this worktree`);
-
-  if (!existsSync(worktree)) {
-    // Already gone: nothing to remove, but still clear the ledger binding.
-    plan.remove = reasons.length === 0;
-    if (!plan.remove) reasons.push("worktree path is missing but another guard failed");
-    return plan;
+  // The stale binding is NOT evidence. Re-read the live state for EVERY
+  // non-merged reclaim (cancelled, accepted, `--abort` included); only an
+  // actually OPEN PR (or an unverifiable bound PR) refuses. A CLOSED PR is the
+  // signal that the branch is safe to reclaim.
+  if (!merged) {
+    const pr = await observeTaskPr(task, opts);
+    if (pr.state === "open") {
+      reasons.push(`open PR ${pr.url ?? task.pr_url ?? "(bound PR)"}`);
+    } else if (pr.state === "unknown") {
+      reasons.push(
+        `open PR ${pr.url ?? task.pr_url ?? "(bound PR)"} (live state could not be re-read; refusing until the PR can be checked)`
+      );
+    }
   }
 
-  const wtRoot = taskWorktreesRoot(opts.worktreesRoot);
-  const owned = isUnder(worktree, wtRoot) && resolve(worktree) !== resolve(projectRoot());
-  if (!owned && !opts.force) reasons.push(`worktree is not relay-owned (not under ${wtRoot})`);
+  // A Run row can outlive the recorded worktree (or the Task never recorded
+  // one). Checking `projectRoot()` in that case would mistake an unrelated live
+  // Run in the main checkout for a writer on this Task.
+  const active = worktree
+    ? findActiveWriter(db, { cwd: worktree, branch })
+    : db
+        .query(
+          `SELECT id, state FROM runs WHERE task_id = ? AND state IN ('starting','running')
+           ORDER BY created_at DESC, rowid DESC LIMIT 1`
+        )
+        .get(taskId) as { id: string; state: string } | null;
+  if (active) {
+    reasons.push(
+      worktree
+        ? `active run ${active.id} (${active.state}) still holds this worktree`
+        : `active run ${active.id} (${active.state}) still holds this task`
+    );
+  }
 
-  const dirty = gitRun(worktree, ["status", "--porcelain"]);
-  if (dirty.ok && dirty.out && !opts.force) reasons.push("worktree has uncommitted changes");
-  if (!dirty.ok) reasons.push("worktree is not a readable git checkout");
-  if (dirty.ok) {
-    // ISH-904: reclaiming a self-contained clone DELETES the branch and every
-    // commit on it, so a commit that no remote has would be LOST (with a legacy
-    // linked worktree it used to survive in the source repo). Copy those commits
-    // back into the source repo first (a local path fetch, no network) — the same
-    // custody the linked worktree had. `--force` skips this and really discards.
-    if (!opts.force) {
+  if (worktree && existsSync(worktree)) {
+    const wtRoot = taskWorktreesRoot(opts.worktreesRoot);
+    const owned = isUnder(worktree, wtRoot) && resolve(worktree) !== resolve(projectRoot());
+    if (!owned && !opts.force) reasons.push(`worktree is not relay-owned (not under ${wtRoot})`);
+
+    const dirty = gitRun(worktree, ["status", "--porcelain"]);
+    if (!dirty.ok) {
+      reasons.push("worktree is not a readable git checkout");
+    } else if (dirty.out) {
+      if (!opts.force) {
+        if (opts.apply) {
+          const saved = saveCleanupPatch(taskId, worktree, opts.patchesRoot);
+          if (saved.error) {
+            reasons.push(`worktree has uncommitted changes and the patch could not be saved: ${saved.error}`);
+          } else {
+            plan.savedPatch = saved.path;
+            reasons.push(`worktree has uncommitted changes (saved patch: ${saved.path}; re-run with --force to discard)`);
+          }
+        } else {
+          reasons.push("worktree has uncommitted changes (pass --apply to save a patch, or --force to discard)");
+        }
+      }
+    } else if (!opts.force) {
+      // ISH-904: a self-contained clone deletes the branch and every commit on
+      // it, so commits no remote has are copied back into the source repo first.
       const lost = unprotectedCommits(worktree, opts.repo);
       if (lost.length > 0) {
         const kept = preserveCommitsInSource(db, taskId, opts.repo, worktree, branch);
-        if (!kept.ok) reasons.push(`workspace has ${lost.length} commit(s) not on any remote and they could not be kept: ${kept.error}`);
+        if (!kept.ok) {
+          reasons.push(`workspace has ${lost.length} commit(s) not on any remote and they could not be kept: ${kept.error}`);
+        }
       }
     }
   }
 
+  const hasWorktree = !!worktree;
+  const hasResources =
+    hasWorktree ||
+    plan.scratchDirs.length > 0 ||
+    plan.reviewWorktrees.length > 0 ||
+    plan.containers.length > 0 ||
+    plan.volumes.length > 0;
+
+  if (!hasResources) {
+    reasons.push("nothing to reclaim");
+  }
   plan.remove = reasons.length === 0;
   return plan;
 }
+
 
 /**
  * Commits reachable from the workspace HEAD (or its Task branch) that NO remote
@@ -1515,28 +1766,96 @@ function reclaimWorkspace(path: string, force: boolean): { ok: boolean; error: s
   return existsSync(path) ? { ok: false, error: `${path} still exists after removal` } : { ok: true, error: "" };
 }
 
-export function applyWorkspaceCleanup(db: Database, taskId: string, opts: CleanupOptions = {}): CleanupPlan {
-  const plan = planWorkspaceCleanup(db, taskId, opts);
-  if (!plan.apply || !plan.worktree) return plan;
+interface RemoveResult {
+  ok: boolean;
+  error: string;
+}
+
+function reclaimReviewWorktree(repo: string, path: string): RemoveResult {
+  try {
+    removeReviewWorktree(repo, path);
+  } catch {
+    /* fall through to the directory removal below */
+  }
+  if (!existsSync(path)) return { ok: true, error: "" };
+  try {
+    rmSync(path, { recursive: true, force: true });
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+  return existsSync(path) ? { ok: false, error: `${path} still exists after removal` } : { ok: true, error: "" };
+}
+
+/**
+ * Apply a cleanup plan. Only a plan whose guards passed removes anything, and
+ * only the resources attributed to THIS Task are removed.
+ */
+export async function applyWorkspaceCleanup(
+  db: Database,
+  taskId: string,
+  opts: CleanupOptions = {}
+): Promise<CleanupPlan> {
+  const plan = await planWorkspaceCleanup(db, taskId, opts);
+  if (!plan.apply) return plan;
   if (!plan.remove) {
     logEvent(db, {
       source: "run-lifecycle",
       taskId,
       type: "worktree.cleanup_skipped",
-      payload: { worktree: plan.worktree, branch: plan.branch, reasons: plan.reasons },
+      payload: {
+        worktree: plan.worktree,
+        branch: plan.branch,
+        reasons: plan.reasons,
+        savedPatch: plan.savedPatch,
+      },
     });
     return plan;
   }
-  if (existsSync(plan.worktree)) {
-    const r = reclaimWorkspace(plan.worktree, opts.force === true);
-    if (!r.ok) {
-      plan.reasons.push(`workspace removal failed: ${r.error.slice(0, 200)}`);
-      plan.remove = false;
-      return plan;
-    }
+
+  const docker = opts.docker ?? disabledRunResourceDocker();
+  for (const c of plan.containers) {
+    const r = docker.removeContainer(c.id);
+    if (r.ok) plan.removedResources.push(`container ${c.id}${c.name ? ` (${c.name})` : ""}`);
+    else plan.warnings.push(`container ${c.id} not removed: ${r.error}`);
   }
-  db.query(`UPDATE tasks SET worktree = NULL, updated_at = ? WHERE id = ?`).run(now(), taskId);
-  plan.removed = true;
+  for (const v of plan.volumes) {
+    const r = docker.removeVolume(v.name);
+    if (r.ok) plan.removedResources.push(`volume ${v.name}`);
+    else plan.warnings.push(`volume ${v.name} not removed: ${r.error}`);
+  }
+  for (const path of plan.scratchDirs) {
+    if (removeScratchRoot(path)) plan.removedResources.push(`scratch ${path}`);
+  }
+  for (const path of plan.reviewWorktrees) {
+    const r = reclaimReviewWorktree(opts.repo ?? projectRoot(), path);
+    if (r.ok) plan.removedResources.push(`review worktree ${path}`);
+    else plan.warnings.push(`review worktree ${path} not removed: ${r.error}`);
+  }
+
+  if (plan.worktree) {
+    if (existsSync(plan.worktree)) {
+      const r = reclaimWorkspace(plan.worktree, opts.force === true);
+      if (!r.ok) {
+        plan.warnings.push(`workspace removal failed: ${r.error}`);
+        plan.reasons.push(`workspace removal failed: ${r.error}`);
+        plan.remove = false;
+        plan.removed = plan.removedResources.length > 0;
+        logEvent(db, {
+          source: "run-lifecycle",
+          taskId,
+          type: "worktree.cleanup_failed",
+          payload: { worktree: plan.worktree, error: r.error, removedResources: plan.removedResources },
+        });
+        return plan;
+      }
+      plan.removedResources.push(`worktree ${plan.worktree}`);
+    } else {
+      plan.removedResources.push(`worktree ledger ${plan.worktree} (path already gone)`);
+    }
+    db.query(`UPDATE tasks SET worktree = NULL, updated_at = ? WHERE id = ?`).run(now(), taskId);
+  }
+
+  plan.removed = plan.removedResources.length > 0;
   logEvent(db, {
     source: "run-lifecycle",
     taskId,
@@ -1547,6 +1866,12 @@ export function applyWorkspaceCleanup(db: Database, taskId: string, opts: Cleanu
       abort: opts.abort ?? null,
       merged: getTask(db, taskId)?.merged_at !== null,
       retainedRuns: plan.retainedRuns,
+      scratchDirs: plan.scratchDirs,
+      reviewWorktrees: plan.reviewWorktrees,
+      containers: plan.containers.map((c) => c.id),
+      volumes: plan.volumes.map((v) => v.name),
+      removedResources: plan.removedResources,
+      warnings: plan.warnings,
     },
   });
   return plan;

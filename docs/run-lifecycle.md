@@ -12,7 +12,8 @@ This is implemented in `src/run-lifecycle.ts` on top of the ISH-758 phase machin
 ```sh
 relay run worktree <task-id> [--branch B] [--base REF] [--path DIR] [--json]
 relay run launch   <task-id> [--timeout 30m] [--permission MODE] [--json]
-relay run cleanup  <task-id> [--abort REASON] [--apply] [--force] [--json]
+relay run cleanup  <task-id> [--abort REASON] [--apply] [--force] [--repo DIR] [--json]
+relay run list     [--task <id>] [--leaks] [--json]          # --leaks = read-only orphan patrol
 relay run submit   <run-id> [--evidence E] [--summary S]     # the only thing that advances a Task
 ```
 
@@ -323,22 +324,93 @@ phase guards still apply: this works only for an `implement` Task whose current
 attempt has no `TaskSubmitted` yet (the stale Run never recorded one). A Task
 parked for any other reason keeps its ordinary `relay unblock` path.
 
+## Per-Run scratch (ISH-1221)
+
+Every headless Run and every headless review gets a **Relay-owned scratch root**
+under the control plane, and the process receives it as environment:
+
+```
+<control-plane>/runs/<run-id>/scratch/        # a coding Run
+  tmp/                 $TMPDIR, $TMP, $TEMP
+  cargo-target/        $CARGO_TARGET_DIR
+<control-plane>/runs/reviews/<task>/<attempt>-<head>/scratch/
+```
+
+The Relay values **win** over an inherited host `TMPDIR` (`src/scratch.ts`), so
+an ad-hoc `/tmp/<name>` directory is no longer needed. The prompts also tell the
+Run/reviewer to label any container or volume it starts with
+`$RELAY_DOCKER_LABEL_PLANE` / `$RELAY_DOCKER_LABEL_TASK` /
+`$RELAY_DOCKER_LABEL_RUN` (`relay.plane=<control-plane>`, `relay.task=<T>`,
+`relay.run=<run-id>`), which is what makes it attributable to the Task. The
+plane label is required because Task ids repeat across checkouts: `T55` exists
+in every control plane's own DB, so `relay.task=T55` alone cannot distinguish
+the relay host from the ishiul host. A resource with no plane label is matched
+only through its globally unique Run id. Relay never starts containers itself
+and never removes an unlabelled (or other-control-plane) resource or any image.
+
+The Run's `stdout.log`, `stderr.log`, `dsh.jsonl` and `events.jsonl` live next to
+`scratch/` and are **retained**; cleanup removes only the scratch subtree.
+
 ## Safe workspace cleanup (evidence-retaining)
 
 `relay run cleanup` is **dry-run** by default. Removal happens only when every
 guard passes:
 
-- the Task is **really merged** (`TaskMerged`) or explicitly **aborted**
-  (`--abort <reason>`);
-- there is no **open PR** (`pr_url` bound and not merged, without `--abort`);
+- the Task is **really merged/accepted**, **cancelled**, or explicitly **aborted**
+  (`--abort <reason>`); a terminal-but-unmerged `failed` Task still needs the
+  explicit abort;
+- its PR is not **live-OPEN**: a recorded `pr_url` is re-read through the
+  read-only GitHub reader for every non-merged reclaim (cancelled, accepted and
+  `--abort` included), never inferred from the stale binding. A CLOSED PR (and a
+  branch-only Task with no recorded PR identity) does not refuse cleanup; an
+  unverifiable bound PR fails closed and says so. `--abort` overrides the
+  merge-authorization, NOT the live-PR hazard;
 - no Run still holds the worktree/branch;
 - the worktree is **relay-owned** (under the Relay worktrees root, never the main
   checkout or a human workspace);
-- it has **no uncommitted changes** (`--force` overrides only the last two);
+- it has **no uncommitted changes** (`--force` overrides the dirty/ownership
+  guards). On `--apply` a dirty worktree's tracked diff and `git status` are
+  saved to `<control-plane>/patches/<task>-<timestamp>.patch`, and the refusal
+  names that path;
 - its commits are on a remote, or were copied back into the source repo (above).
+
+For a merged/accepted/cancelled Task, cleanup also removes:
+
+- every per-Run `scratch/` subtree for that Task's Runs;
+- the Task's review scratch root and disposable review worktrees;
+- containers/volumes that carry this Task's Relay label **and this control
+  plane's `relay.plane` label** (or a Relay Run id belonging to this Task, which
+  is globally unique). Another control plane's identically numbered Task is
+  never touched.
+
+The library default is a DISABLED Docker seam: `planWorkspaceCleanup` /
+`applyWorkspaceCleanup` / `scanRunLeaks` reach host Docker only when the caller
+passes `realRunResourceDocker()`. The CLI is that caller; set
+`RELAY_DOCKER_RESOURCES=off` (or `0`) to skip Docker entirely on a host where it
+is unavailable or managed separately. This is why the test suite cannot remove a
+host container by accident. `docker rm -f -v` reclaims a removed container's
+anonymous volumes (the dind `dind-var-lib-docker-*` case) — named or unlabelled
+volumes of other containers are not affected.
 
 The `runs` rows and their output directories are **never** deleted by cleanup —
 they are the evidence. The Task row and its structured results survive too.
+
+## Leak patrol (ISH-1221)
+
+`relay run list --leaks` is the read-only patrol the gateway can call. It lists
+resources attributable to Relay whose Run/Task is over (or whose Task row is
+gone), with sizes:
+
+- per-Run and per-review scratch roots;
+- Task worktrees and disposable review worktrees;
+- Relay-labelled containers (Docker's reported size) and volumes.
+
+It never lists an unlabelled container/volume, another control plane's
+`relay.plane` resources, or any image. Docker being absent/down is reported as
+`docker unchecked: ...`, not hidden; with no seam (or
+`RELAY_DOCKER_RESOURCES=off`) the container/volume section says the inventory is
+disabled rather than silently claiming zero. `--json` returns the same report as
+structured data.
 
 A self-contained clone workspace is removed as a directory (`rm -rf`), so the
 SOURCE repo's `.git` is never touched (a linked `git worktree remove` would have
@@ -364,6 +436,13 @@ no Herdr): worktree create/select → launch (pin brief) → duplicate writer re
 → submit → verify PASS → review FIX → a new Run on the same worktree that inherits
 the findings → submit → review PASS → observed merge → safe cleanup with retained
 evidence, and asserts every rejection case.
+
+`tests/ish1221-cleanup.test.ts` covers the run-scoped resource reclamation: the
+per-Run `TMPDIR`/`CARGO_TARGET_DIR`, merged and cancelled cleanup, a CLOSED-PR
+cancelled Task vs a live-OPEN PR refusal, the dirty-worktree saved patch,
+labelled container/volume removal vs unlabelled resources/images, and the leak
+report. `tests/factory.test.ts` proves a reviewer's focused check writes into the
+Relay review scratch root, not `/tmp`.
 
 ## Verified / not verified
 

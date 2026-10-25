@@ -15,6 +15,8 @@ import {
   releaseRunLauncher,
 } from "./run-launcher";
 import { childEnv } from "./child-env";
+import { ensureScratchRoot, runScratchRoot, scratchEnv } from "./scratch";
+import { controlPlaneNamespace } from "./run-resources";
 import { isPinnedDsh, PINNED_DSH_VERSION, readDshVersion } from "./dsh-version";
 import { assertLaunchDiskSpace, type DiskGuardOptions } from "./disk-guard";
 import { gitHead } from "./verify";
@@ -446,6 +448,26 @@ export function buildTaskPrompt(task: Task): string {
       " commit on the current branch. Do not merge. Report what you changed and any" +
       " check you ran."
   );
+  lines.push(
+    "",
+    "## Scratch and labelled resources (Relay-owned)",
+    "",
+    "Use `$TMPDIR` for temporary files and `$CARGO_TARGET_DIR` for build output.",
+    "They point inside this Run's Relay-owned scratch root. Never create a",
+    "`/tmp/<name>` directory or build outside them.",
+    "",
+    "Any container or volume you start MUST carry the Relay labels, so Relay can",
+    "reclaim it when the Task ends (Relay never touches unlabelled resources):",
+    "",
+    "```",
+    'docker run --label "$RELAY_DOCKER_LABEL_PLANE" --label "$RELAY_DOCKER_LABEL_TASK" --label "$RELAY_DOCKER_LABEL_RUN" ...',
+    'docker volume create --label "$RELAY_DOCKER_LABEL_PLANE" --label "$RELAY_DOCKER_LABEL_TASK" --label "$RELAY_DOCKER_LABEL_RUN" ...',
+    "",
+    "All THREE labels are required: the plane label namespaces this control plane",
+    "(Task ids repeat across checkouts) and an unlabelled or partially labelled",
+    "resource is never reclaimed.",
+    "```"
+  );
   return lines.join("\n");
 }
 
@@ -564,7 +586,6 @@ export async function startDshRun(db: Database, opts: StartRunOptions): Promise<
   writeFileSync(stdoutPath, "");
   writeFileSync(stderrPath, "");
   writeFileSync(dshEventsPath, "");
-
   const events = (e: RunEvent): void => {
     appendFileSync(eventsPath, `${JSON.stringify({ ts: now(), ...e })}\n`);
   };
@@ -590,6 +611,11 @@ export async function startDshRun(db: Database, opts: StartRunOptions): Promise<
     resumeSessionId: opts.resumeSessionId ?? null,
   });
 
+  // ISH-1221: create the Relay-owned per-Run scratch root only AFTER the Run row
+  // was admitted, so a refused duplicate writer never leaves an orphan scratch
+  // directory that no Run attributes. The logs stay here as retained evidence;
+  // only `scratch/` is reclaimed when the Task is terminal.
+  const scratchRoot = ensureScratchRoot(runScratchRoot(runDir));
   const resumeSessionId = opts.resumeSessionId ?? null;
   events({
     t: "run.started",
@@ -603,6 +629,7 @@ export async function startDshRun(db: Database, opts: StartRunOptions): Promise<
     permissionMode,
     dshBin,
     dshBinSource: dshChoice.source,
+    scratchRoot,
     ...(opts.resumedFromRunId
       ? {
           resumedFromRunId: opts.resumedFromRunId,
@@ -627,6 +654,7 @@ export async function startDshRun(db: Database, opts: StartRunOptions): Promise<
       permissionMode,
       dshBin,
       dshBinSource: dshChoice.source,
+      scratchRoot,
       ...(opts.resumedFromRunId
         ? {
             resumedFromRunId: opts.resumedFromRunId,
@@ -651,10 +679,11 @@ export async function startDshRun(db: Database, opts: StartRunOptions): Promise<
     prompt,
   ];
   const env: Record<string, string> = {
+    // ISH-1221: the Relay-owned scratch values WIN over inherited host values,
+    // so a focused check cannot silently write to shared /tmp.
     ...childEnv(process.env, opts.env),
+    ...scratchEnv(scratchRoot, { plane: controlPlaneNamespace(db), taskId: task.id, runId }),
     DSH_PERMISSION_MODE: permissionMode,
-    RELAY_RUN_ID: runId,
-    RELAY_TASK_ID: task.id,
   };
 
   let proc: DshProcess;

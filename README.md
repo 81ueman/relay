@@ -619,9 +619,13 @@ touches the live writer's worktree. **Different** worktrees/branches may run in
 parallel, even on the same files. A Run is **not** a submission: `relay run
 submit` is the only thing that advances the Task, and it refuses a stale/late/
 superseded Run (by Task/phase/attempt/**generation**/branch/HEAD). `relay run
-cleanup` reclaims a worktree only when it is **safe** (a real merge or `--abort`,
-no open PR, no active writer, no uncommitted changes, relay-owned) and always
-**retains the run logs** as evidence. See
+cleanup` reclaims a worktree only when it is **safe** (a real merge, a cancelled
+Task, or `--abort`; no live-OPEN PR — the PR is re-read, never inferred from the
+stale binding — no active writer, no uncommitted changes, relay-owned). It also
+removes the per-Run scratch root and the containers/volumes carrying this control
+plane's `relay.plane`/`relay.task`/`relay.run` labels, and always **retains the
+run logs** as evidence. `relay run list --leaks` is the read-only orphan patrol
+(scratch, worktrees, labelled containers/volumes with sizes). See
 [`docs/run-lifecycle.md`](docs/run-lifecycle.md).
 
 **Pre-launch disk guard (ISH-1009).** Before a Run row is created, and before a

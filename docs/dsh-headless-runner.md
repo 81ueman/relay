@@ -9,7 +9,7 @@ This is implemented in `src/dsh-runner.ts` (process lifecycle) and
 
 ```sh
 relay run start <task-id> [--cwd DIR] [--prompt TEXT] [--permission MODE] [--timeout 30m] [--json]
-relay run list [--task <id>] [--json]
+relay run list [--task <id>] [--leaks] [--json]
 relay run show <run-id> [--json]
 relay run logs <run-id> [--tail N]     # stdout + stderr + the dsh event chronology
 relay run cancel <run-id>
@@ -18,6 +18,21 @@ relay run submit <run-id> [--evidence E] [--summary S]
 
 A one-shot headless attempt is launched directly by `src/dsh-runner.ts`; there
 is no long-lived `dsh web` bridge.
+
+## Per-Run scratch (ISH-1221)
+
+Each Run owns `<control-plane>/runs/<run-id>/scratch/` and receives
+`TMPDIR`/`TMP`/`TEMP` = `scratch/tmp` and `CARGO_TARGET_DIR` =
+`scratch/cargo-target` (see `src/scratch.ts`). The Relay values override an
+inherited host `TMPDIR`, so a focused check writes into the Run's root instead
+of shared `/tmp/<name>`. The Run logs stay in `<control-plane>/runs/<run-id>/`
+as retained evidence; cleanup removes only the `scratch` subtree.
+The process also receives `RELAY_DOCKER_LABEL_PLANE`,
+`RELAY_DOCKER_LABEL_TASK` and `RELAY_DOCKER_LABEL_RUN`; any container/volume it
+starts must carry all three so `relay run cleanup` can attribute it to this
+Task in this control plane.
+`relay run list --leaks` reports orphaned scratch roots, worktrees and
+Relay-labelled containers/volumes with sizes.
 
 ## Coding binary (ISH-1133)
 

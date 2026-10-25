@@ -20,7 +20,8 @@ import {
 import { getTaskResult, insertTaskResult, RESULT_WRITE_ERROR } from "../src/results";
 import { acceptRunSubmission, DUPLICATE_WRITER, getRun, listRuns } from "../src/dsh-runner";
 import { PINNED_DSH_VERSION } from "../src/dsh-version";
-import { inheritFindings, launchTaskRun } from "../src/run-lifecycle";
+import { applyWorkspaceCleanup, inheritFindings, launchTaskRun } from "../src/run-lifecycle";
+import { disabledRunResourceDocker } from "../src/run-resources";
 import { buildDashboardView } from "../src/dashboard/model";
 import { defaultRunner, gitHead, type CommandRunner } from "../src/verify";
 import { processPgid, spawnIdentityToken } from "../src/proc-identity";
@@ -746,6 +747,56 @@ describe("Factory E2E: real worktree, fake headless dsh + independent reviewer",
     expect(row?.evidence_ref).toBeTruthy();
     expect(existsSync(row!.evidence_ref!)).toBe(true);
     expect(row!.evidence_ref!.startsWith(cwd)).toBe(false);
+  });
+
+  test("ISH-1221: a reviewer focused check writes into the Relay per-review scratch root", async () => {
+    const dsh = fakeDsh("dsh-scratch", COMMITTING_DSH);
+    const id = newTask();
+    const marker = `ish1221-focused-${process.pid}.txt`;
+    const scratchSeen: string[] = [];
+    const reviewer: ReviewerSpawner = {
+      async run(ctx: ReviewerSpawnContext): Promise<ReviewerProcess> {
+        const head = gitHead(ctx.cwd);
+        const tmp = ctx.env.TMPDIR ?? "";
+        scratchSeen.push(tmp);
+        // The real reviewer's "focused check": write a build/test artifact where
+        // Relay told it to, never to shared /tmp/<name>.
+        execFileSync("sh", ["-c", `mkdir -p "$TMPDIR/focused" && echo ok > "$TMPDIR/focused/${marker}"`], {
+          env: { ...process.env, ...ctx.env },
+        });
+        return {
+          exitCode: 0,
+          signal: null,
+          stdout: JSON.stringify({ verdict: "pass", head, summary: "focused check wrote to Relay scratch" }),
+          stderr: "",
+        };
+      },
+    };
+    const res = await runFactoryTask(db, id, factoryDeps(dsh, reviewer));
+    expect(res.outcome).toBe("merge_ready");
+    expect(scratchSeen).toHaveLength(1);
+    const scratch = scratchSeen[0];
+    expect(scratch).toContain(join("runs", "reviews", id));
+    expect(existsSync(join(scratch, "focused", marker))).toBe(true);
+    expect(existsSync(join(tmpdir(), "focused", marker))).toBe(false);
+
+    // The same Task's cleanup removes the review scratch root (evidence in the
+    // Task worktree is separate; the Run logs live under runs/<run>/).
+    db.query(`UPDATE tasks SET state='done', accepted_at=?, merged_at=? WHERE id=?`).run(
+      Date.now(),
+      Date.now(),
+      id
+    );
+    const plan = await applyWorkspaceCleanup(db, id, {
+      apply: true,
+      repo,
+      worktreesRoot: join(dir, "worktrees"),
+      outputRoot: join(dir, "runs"),
+      // ISH-1221: never reach host Docker from the test suite.
+      docker: disabledRunResourceDocker(),
+    });
+    expect(plan.removed).toBe(true);
+    expect(existsSync(scratch)).toBe(false);
   });
 
   test("a coding Run that exits nonzero canNOT advance and is not auto-retried on re-entry", async () => {
