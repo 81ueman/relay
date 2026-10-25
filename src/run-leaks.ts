@@ -4,7 +4,7 @@ import { dirname, join, resolve, sep } from "node:path";
 import { defaultDbPath, now, projectRoot, STATE_DIR } from "./db";
 import { isTerminalTaskState, type TaskState } from "./schema";
 import { findActiveWriter } from "./dsh-runner";
-import { defaultRunsRoot, pathSizeBytes, scratchPathSegment } from "./scratch";
+import { defaultRunsRoot, pathSizeBytes, scratchPathSegment, taskCargoTarget } from "./scratch";
 import { dindVolumeNamesForWorkspace, dindVolumeNamesFromContainerLabels, workspacePathVariants } from "./devcontainer-id";
 import {
   controlPlaneNamespace,
@@ -21,7 +21,8 @@ import {
  * whose Run/Task is over (or whose Task no longer exists):
  *
  *   - per-Run / per-review scratch roots (with a recursive size);
- *   - Task and disposable review worktrees (with a size);
+ *   - the Task-scoped Cargo build directory (`<worktree>/target`, ISH-1225) and
+ *     Task/disposable review worktrees (with a size);
  *   - Relay-labelled containers;
  *   - devcontainer containers attributed by their exact `devcontainer.local_folder`
  *     label on a Relay-owned worktree path (ISH-1224);
@@ -40,6 +41,7 @@ import {
 export type LeakKind =
   | "scratch"
   | "review-scratch"
+  | "build"
   | "worktree"
   | "review-worktree"
   | "container"
@@ -240,19 +242,36 @@ export function scanRunLeaks(db: Database, opts: LeakScanOptions = {}): LeakRepo
   // 3. Task worktrees: terminal Task + no writer. A directory under the Relay
   // root with no Task row is orphaned too.
   const reportedWorktrees = new Set<string>();
+  /** ISH-1225: report the Task build cache only when its Task is reclaimable. */
+  const addBuildEntry = (worktree: string, task: TaskRow | null): void => {
+    const build = taskCargoTarget(worktree);
+    if (!existsSync(build)) return;
+    addEntry(report, {
+      kind: "build",
+      id: build,
+      taskId: task?.id ?? null,
+      runId: null,
+      path: build,
+      sizeBytes: pathSizeBytes(build),
+      detail: task ? `task ${task.state}` : "task not found",
+    });
+  };
   for (const task of tasks) {
     if (!task.worktree || !existsSync(task.worktree)) continue;
     if (!isTerminalTaskState(task.state) || hasLiveWriter(task)) continue;
     reportedWorktrees.add(task.worktree);
+    // The build dir is a separate entry, so do not count its bytes twice.
+    const build = taskCargoTarget(task.worktree);
     addEntry(report, {
       kind: "worktree",
       id: task.worktree,
       taskId: task.id,
       runId: null,
       path: task.worktree,
-      sizeBytes: pathSizeBytes(task.worktree),
+      sizeBytes: pathSizeBytes(task.worktree, existsSync(build) ? [build] : []),
       detail: `task ${task.state}`,
     });
+    addBuildEntry(task.worktree, task);
   }
   for (const name of safeReaddir(worktreesRoot)) {
     const path = join(worktreesRoot, name);
@@ -260,15 +279,17 @@ export function scanRunLeaks(db: Database, opts: LeakScanOptions = {}): LeakRepo
     const task = tasks.find((t) => t.worktree === path || t.id === name) ?? null;
     if (task && !isTerminalTaskState(task.state)) continue;
     if (task && hasLiveWriter(task)) continue;
+    const build = taskCargoTarget(path);
     addEntry(report, {
       kind: "worktree",
       id: path,
       taskId: task?.id ?? null,
       runId: null,
       path,
-      sizeBytes: pathSizeBytes(path),
+      sizeBytes: pathSizeBytes(path, existsSync(build) ? [build] : []),
       detail: task ? `task ${task.state}` : "task not found",
     });
+    addBuildEntry(path, task);
   }
 
   // 4. Disposable review worktrees. Infer the Task from its `<task>-<attempt>-<head>`

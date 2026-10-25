@@ -197,7 +197,7 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
   run: {
     about:
       "ISH-803/ISH-810 one-shot headless dsh Runs: 1 Run = 1 `dsh --profile headless --json` process = 1 coding attempt, in the Task's worktree, with NO Herdr pane/TUI/`dsh web`/wake/attach. Under <control-plane>/runs/<run-id>/: stdout.log (raw dsh JSONL), stderr.log (reasoning/errors), dsh.jsonl (the ORIGINAL dsh session/status/text/tool_call/tool_result/final events, per-Run evidence) and events.jsonl (Relay's own lifecycle log, kept distinct). A process `exit 0` or a terminal `final` does NOT complete anything — only `relay run submit` (a structured submission bound to the Run/Task/phase/attempt/branch/HEAD) advances the Task. `start` waits for the Run to reach a terminal state (there is no detached mode yet). Permissions are the worktree: $DSH_PERMISSION_MODE=workspace-write by default. " +
-      "ISH-760 adds the Task lifecycle: `launch` owns ONE branch+worktree per Task, pins the task spec + verification steps + prior findings into the worktree BEFORE launch, and runs ONE disposable dsh Run per phase/attempt (a FIX is the SAME worktree + findings + a NEW Run). A second writer on the same worktree/branch is refused until the previous Run ends; different worktrees/branches may run in parallel. `worktree` creates/selects the worktree; `cleanup` reclaims it only when safe (merged/accepted/cancelled or --abort, live PR not OPEN, no active writer, no uncommitted changes, relay-owned) and retains the run logs; it also removes the per-Run scratch root, Relay-labelled containers/volumes, a stopped devcontainer attributed by its exact `devcontainer.local_folder` label on the Task's worktree (ISH-1224), and the Run's devcontainer `dind-var-lib-docker-*` named volume (derived from the Run's recorded workspace id or the holder's labels; `docker rm -v` alone does NOT remove a named volume). `relay run list --leaks` reports orphaned scratch dirs, worktrees, Relay-labelled containers/volumes, attributed stopped devcontainers, and derived dind volumes (with the holding container) with sizes (read-only patrol). `relay run logs <run-id>` renders the read-only dsh session/status/text/tool_call/tool_result/final chronology from the per-Run dsh.jsonl (no TUI/Web UI needed). " +
+      "ISH-760 adds the Task lifecycle: `launch` owns ONE branch+worktree per Task, pins the task spec + verification steps + prior findings into the worktree BEFORE launch, and runs ONE disposable dsh Run per phase/attempt (a FIX is the SAME worktree + findings + a NEW Run). A second writer on the same worktree/branch is refused until the previous Run ends; different worktrees/branches may run in parallel. `worktree` creates/selects the worktree; `cleanup` reclaims it only when safe (merged/accepted/cancelled or --abort, live PR not OPEN, no active writer, no uncommitted changes, relay-owned) and retains the run logs; it also removes the per-Run scratch root, the Task-scoped Cargo build cache (`<worktree>/target`, ISH-1225), Relay-labelled containers/volumes, a stopped devcontainer attributed by its exact `devcontainer.local_folder` label on the Task's worktree (ISH-1224), and the Run's devcontainer `dind-var-lib-docker-*` named volume (derived from the Run's recorded workspace id or the holder's labels; `docker rm -v` alone does NOT remove a named volume). `relay run list --leaks` reports orphaned scratch dirs, the Task build dir, worktrees, Relay-labelled containers/volumes, attributed stopped devcontainers, and derived dind volumes (with the holding container) with sizes (read-only patrol). `relay run logs <run-id>` renders the read-only dsh session/status/text/tool_call/tool_result/final chronology from the per-Run dsh.jsonl (no TUI/Web UI needed). " +
       "ISH-762 adds `relay run factory <task-id>`: the whole factory for ONE Task with no hand-driven pane for the coding — a real headless dsh Run implements, Relay mechanically VERIFYs the recorded HEAD, an INDEPENDENT headless Claude reviewer (`claude -p --output-format json`) returns a structured FIX/PASS (FIX = the SAME worktree + findings + a FRESH Run), and a PASS reaches read-only MergeReady. It never pushes, merges, accepts or writes a provider." +
       " ISH-1013: a non-ready Factory outcome is classified from the EXISTING rows (code rework exhausted / infra blocked / permission-or-human decision / missing-or-inconclusive evidence / stale head / unknown) with the last Run/attempt/HEAD, failing check/review/log references and a concrete next action. The same projection is stored as a durable `factory.outcome` event and shown by `relay run show` / `relay run logs` and `relay task show`; `relay run factory --json` carries it as `failure`.",
     usage: [
@@ -1665,9 +1665,10 @@ async function main(): Promise<void> {
         const rest = argv.slice(2);
         const outputRoot = join(dirname(defaultDbPath()), "runs");
         if (!sub || sub === "list") {
-          // ISH-1221: the READ-ONLY orphan patrol for the gateway. It reports
-          // scratch dirs, worktrees and Relay-labelled containers/volumes whose
-          // Run/Task is over, with sizes; it never removes anything.
+          // ISH-1221/1225: the READ-ONLY orphan patrol for the gateway. It
+          // reports scratch dirs, Task build dirs, worktrees and Relay-labelled
+          // containers/volumes whose Run/Task is over, with sizes; it never
+          // removes anything.
           if (hasFlag(rest, "--leaks")) {
             const report = scanRunLeaks(db, {
               repo: flag(rest, "--repo") ?? projectRoot(),
@@ -1988,7 +1989,8 @@ async function main(): Promise<void> {
           // ISH-760/1221 safe cleanup: merged/accepted/cancelled (or explicit
           // abort), live PR re-checked (a stale binding is never "open"), no
           // active writer, no uncommitted changes, relay-owned. Run logs are
-          // retained; only the per-Run scratch/containers/volumes/worktrees go.
+          // retained; only the per-Run scratch, the Task build cache,
+          // containers/volumes and worktrees go (ISH-1225).
           const id = positionals(rest)[0];
           if (!id) throw new Error("usage: relay run cleanup <task-id> [--abort REASON] [--apply] [--force] [--repo DIR] [--json]");
           const task = getTask(db, id);
@@ -2025,6 +2027,7 @@ async function main(): Promise<void> {
           const verdict = plan.apply ? (plan.removed ? "REMOVED" : plan.remove ? "would remove" : "skipped") : "dry-run (pass --apply)";
           console.log(`relay run cleanup ${id} — ${verdict}`);
           console.log(`  worktree: ${plan.worktree ?? "-"}  branch: ${plan.branch ?? "-"}`);
+          if (plan.buildDir) console.log(`  build: ${plan.buildDir}`);
           console.log(`  retained runs (evidence): ${plan.retainedRuns}`);
           if (plan.scratchDirs.length) console.log(`  scratch: ${plan.scratchDirs.join(", ")}`);
           if (plan.reviewWorktrees.length) console.log(`  review worktrees: ${plan.reviewWorktrees.join(", ")}`);

@@ -1539,8 +1539,9 @@ async function runFactoryTaskInner(
               model: deps.reviewerModel,
               reviewerWorker,
               reviewWorktree,
-              // ISH-1221: a Relay-owned per-review scratch root (TMPDIR etc.),
-              // reclaimed with the Task's other run-scoped resources.
+              // ISH-1221/1225: a Relay-owned per-review TMPDIR root; the Cargo
+              // target is the Task worktree's shared `target/` (set inside
+              // runHeadlessReview after the no-live-writer fence).
               scratchRoot: reviewScratchRoot(deps.outputRoot, taskId, task.attempt, reviewHead),
               ...(deps.reviewRubric ? { reviewRubric: deps.reviewRubric } : {}),
               nativeReview: deps.nativeReview,

@@ -15,7 +15,7 @@ import {
   releaseRunLauncher,
 } from "./run-launcher";
 import { childEnv } from "./child-env";
-import { ensureScratchRoot, runScratchRoot, scratchEnv } from "./scratch";
+import { ensureScratchRoot, runScratchRoot, scratchEnv, taskCargoTarget } from "./scratch";
 import { controlPlaneNamespace } from "./run-resources";
 import { dindVolumeNamesForWorkspace } from "./devcontainer-id";
 import { isPinnedDsh, PINNED_DSH_VERSION, readDshVersion } from "./dsh-version";
@@ -456,8 +456,10 @@ export function buildTaskPrompt(task: Task): string {
     "",
     "## Scratch and labelled resources (Relay-owned)",
     "",
-    "Use `$TMPDIR` for temporary files and `$CARGO_TARGET_DIR` for build output.",
-    "They point inside this Run's Relay-owned scratch root. Never create a",
+    "Use `$TMPDIR` for temporary files; it points inside this Run's Relay-owned",
+    "scratch root. Use `$CARGO_TARGET_DIR` for build output: it is the Task's",
+    "shared build cache inside the Task worktree, so a FIX attempt and Relay's",
+    "VERIFY reuse it instead of cold-building another copy. Never create a",
     "`/tmp/<name>` directory or build outside them.",
     "",
     "Any container or volume you start MUST carry the Relay labels, so Relay can",
@@ -631,7 +633,10 @@ export async function startDshRun(db: Database, opts: StartRunOptions): Promise<
   // was admitted, so a refused duplicate writer never leaves an orphan scratch
   // directory that no Run attributes. The logs stay here as retained evidence;
   // only `scratch/` is reclaimed when the Task is terminal.
+  // ISH-1225: the build cache is NOT per-Run. Every implement/FIX Run, VERIFY and
+  // the reviewer share the Task worktree's `target/` (removed with the worktree).
   const scratchRoot = ensureScratchRoot(runScratchRoot(runDir));
+  const cargoTargetDir = taskCargoTarget(cwd);
   const resumeSessionId = opts.resumeSessionId ?? null;
   events({
     t: "run.started",
@@ -646,6 +651,7 @@ export async function startDshRun(db: Database, opts: StartRunOptions): Promise<
     dshBin,
     dshBinSource: dshChoice.source,
     scratchRoot,
+    cargoTargetDir,
     devcontainerVolumes,
     ...(opts.resumedFromRunId
       ? {
@@ -672,6 +678,7 @@ export async function startDshRun(db: Database, opts: StartRunOptions): Promise<
       dshBin,
       dshBinSource: dshChoice.source,
       scratchRoot,
+      cargoTargetDir,
       devcontainerVolumes,
       ...(opts.resumedFromRunId
         ? {
@@ -697,10 +704,14 @@ export async function startDshRun(db: Database, opts: StartRunOptions): Promise<
     prompt,
   ];
   const env: Record<string, string> = {
-    // ISH-1221: the Relay-owned scratch values WIN over inherited host values,
-    // so a focused check cannot silently write to shared /tmp.
+    // ISH-1221/1225: the Relay-owned values WIN over inherited host values, so a
+    // focused check cannot silently write to shared /tmp or a host target dir.
     ...childEnv(process.env, opts.env),
-    ...scratchEnv(scratchRoot, { plane: controlPlaneNamespace(db), taskId: task.id, runId }),
+    ...scratchEnv(
+      scratchRoot,
+      { plane: controlPlaneNamespace(db), taskId: task.id, runId },
+      { cargoTargetDir }
+    ),
     DSH_PERMISSION_MODE: permissionMode,
   };
 

@@ -576,7 +576,11 @@ and both the pre-run `base_head_sha` and the PRODUCED HEAD re-read in the worktr
 at Run end (dsh is asked to commit). The coding binary defaults to
 `$HOME/.dsh/bin/dsh-model` when it is executable, else `dsh` (`--dsh` /
 `RELAY_DSH_BIN` override); `run.started` and `dsh.run.started` record the chosen
-binary and its source. `relay run start` waits for a terminal state.
+binary and its source. `relay run start` waits for a terminal state. `TMPDIR` is
+per-Run scratch under `<control-plane>/runs/<run-id>/scratch/tmp`, but
+`CARGO_TARGET_DIR` is the **Task** worktree's `target/`, shared by every
+implement/FIX Run, VERIFY and the reviewer (ISH-1225) so a FIX never cold-builds
+another copy; it is removed with the worktree by `relay run cleanup`.
 Cancel/timeout kill the whole process group. Permissions stay in the worktree
 (`DSH_PERMISSION_MODE=workspace-write`). A process `exit 0` or a terminal `final`
 event is **not** a submission — only a structured `relay run submit` bound to the
@@ -622,15 +626,16 @@ superseded Run (by Task/phase/attempt/**generation**/branch/HEAD). `relay run
 cleanup` reclaims a worktree only when it is **safe** (a real merge, a cancelled
 Task, or `--abort`; no live-OPEN PR — the PR is re-read, never inferred from the
 stale binding — no active writer, no uncommitted changes, relay-owned). It also
-removes the per-Run scratch root and the containers/volumes carrying this control
-plane's `relay.plane`/`relay.task`/`relay.run` labels, a stopped devcontainer
-attributed by its exact `devcontainer.local_folder` label on the Task worktree,
-plus the Run's devcontainer `dind-var-lib-docker-*` **named** volume (derived
-from the Run's recorded workspace or the holder's labels; `docker rm -v` alone
-does not remove a named volume), and always **retains the run logs** as evidence.
-`relay run list --leaks` is the read-only orphan patrol (scratch, worktrees,
-labelled containers/volumes, attributed stopped devcontainers and derived dind
-volumes with the holder and Docker's size). An unreadable live PR still fails
+removes the per-Run scratch root, the Task build cache (`<worktree>/target`,
+ISH-1225) and the containers/volumes carrying this control plane's
+`relay.plane`/`relay.task`/`relay.run` labels, a stopped devcontainer attributed
+by its exact `devcontainer.local_folder` label on the Task worktree, plus the
+Run's devcontainer `dind-var-lib-docker-*` **named** volume (derived from the
+Run's recorded workspace or the holder's labels; `docker rm -v` alone does not
+remove a named volume), and always **retains the run logs** as evidence.
+`relay run list --leaks` is the read-only orphan patrol (scratch, Task build
+dirs, worktrees, labelled containers/volumes, attributed stopped devcontainers
+and derived dind volumes with the holder and Docker's size). An unreadable live PR still fails
 closed; the refusal names the next step (`gh auth status` or `relay pr unbind
 <task> --reason ...`). See [`docs/run-lifecycle.md`](docs/run-lifecycle.md).
 
