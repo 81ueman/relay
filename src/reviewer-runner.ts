@@ -10,6 +10,7 @@ import { REVIEWER_ROLE } from "./schema";
 import type { Task } from "./schema";
 import { gitHead } from "./verify";
 import { hostGit } from "./review-workspace";
+import { ensureScratchRoot, scratchEnv } from "./scratch";
 import { recordReview, taskChecks } from "./workflow";
 import { ensureHeadlessWorker, getWorker, HEADLESS_AGENT_KIND } from "./workers";
 import {
@@ -298,6 +299,12 @@ export interface HeadlessReviewDeps {
    */
   reviewRubric?: ReviewRubric;
   /**
+   * ISH-1221: a Relay-owned per-review scratch root. When set, the reviewer
+   * process gets TMPDIR/TMP/TEMP/CARGO_TARGET_DIR under it, so a focused check
+   * writes there instead of shared `/tmp/<name>`. The root is created here.
+   */
+  scratchRoot?: string;
+  /**
    * ISH-883: post a NATIVE GitHub Pull Request Review and read it back. When
    * omitted (the default), the reviewer keeps the local structured-verdict path
    * and Relay performs no external write. When present, a valid verdict is only
@@ -496,7 +503,12 @@ export function buildReviewBrief(
     "",
     "In the structured `summary`, name the focused commands you ran (or write an",
     "explicit `no execution needed because <concrete reason>`) — silence is not enough.",
-    "A blocking claim should carry the repro command/output, or an unambiguous code trace."
+    "A blocking claim should carry the repro command/output, or an unambiguous code trace.",
+    "",
+    "Use `$TMPDIR` for scratch and `$CARGO_TARGET_DIR` for build output: they are",
+    "Relay-owned per-review paths, never `/tmp/<name>`. Any container or volume you",
+    "start MUST carry `--label \"$RELAY_DOCKER_LABEL_TASK\"` and",
+    "`--label \"$RELAY_DOCKER_LABEL_RUN\"` so Relay can reclaim it."
   );
   if (findings.length > 0) {
     lines.push("", `## Prior findings @ attempt ${token(task)} (context — verify they are actually fixed)`);
@@ -1033,10 +1045,18 @@ export async function runHeadlessReview(
   });
 
   const spawner = deps.spawner ?? bunReviewerSpawner(deps.command ?? DEFAULT_REVIEW_COMMAND);
+  // ISH-1221: the reviewer gets its OWN Relay-owned scratch root, overriding an
+  // inherited host TMPDIR. The root is removed when the Task is reclaimed.
+  const scratchRoot = deps.scratchRoot ? ensureScratchRoot(deps.scratchRoot) : null;
+  const reviewRunId = `review-${task.id}-${task.attempt}-${head.slice(0, 10)}`;
   const proc = await spawner.run({
     cwd: worktree,
     brief,
-    env: { ...(deps.env ?? {}), ...(native?.spawnEnv ?? {}) },
+    env: {
+      ...(deps.env ?? {}),
+      ...(scratchRoot ? scratchEnv(scratchRoot, { taskId: task.id, runId: reviewRunId }) : {}),
+      ...(native?.spawnEnv ?? {}),
+    },
     timeoutMs: deps.timeoutMs ?? reviewTimeoutMs(),
     model: deps.model,
     ...(native?.allowedTools ? { allowedTools: native.allowedTools } : {}),

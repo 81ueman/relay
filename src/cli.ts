@@ -32,6 +32,7 @@ import { acceptRunSubmission, getRun, listRuns, startDshRun } from "./dsh-runner
 import { formatDshEvent, readDshEvents } from "./dsh-events";
 import { parseRunFailureClass } from "./run-failure";
 import { signalRunProcess } from "./run-signal";
+import { scanRunLeaks } from "./run-leaks";
 import {
   applyWorkspaceCleanup,
   ensureTaskWorktree,
@@ -122,8 +123,8 @@ Usage:
   relay run launch <task-id> [--timeout 30m] [--permission MODE] [--json]   # ensure worktree + pin brief + ONE dsh Run
   relay run factory <task-id> [--max-attempts N] [--max-resumes N] [--transient-wait 60m] [--transient-backoff 30s] [--dsh BIN] [--reviewer CMD] [--model M] [--permission MODE] [--timeout 30m] [--review-rubric PATH] [--json]  # code-change tasks only; dsh -> VERIFY -> Claude review -> MergeReady
   relay run worktree <task-id> [--branch B] [--base REF] [--path DIR] [--json]
-  relay run cleanup <task-id> [--abort REASON] [--apply] [--force] [--json]
-  relay run list [--task <id>] [--json]
+  relay run cleanup <task-id> [--abort REASON] [--apply] [--force] [--repo DIR] [--json]
+  relay run list [--task <id>] [--leaks] [--json]
   relay run show <run-id> [--json]          # a headless dsh Run (no Herdr)
   relay run logs <run-id> [--tail N]
   relay run cancel <run-id>
@@ -176,7 +177,7 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
   run: {
     about:
       "ISH-803/ISH-810 one-shot headless dsh Runs: 1 Run = 1 `dsh --profile headless --json` process = 1 coding attempt, in the Task's worktree, with NO Herdr pane/TUI/`dsh web`/wake/attach. Under <control-plane>/runs/<run-id>/: stdout.log (raw dsh JSONL), stderr.log (reasoning/errors), dsh.jsonl (the ORIGINAL dsh session/status/text/tool_call/tool_result/final events, per-Run evidence) and events.jsonl (Relay's own lifecycle log, kept distinct). A process `exit 0` or a terminal `final` does NOT complete anything — only `relay run submit` (a structured submission bound to the Run/Task/phase/attempt/branch/HEAD) advances the Task. `start` waits for the Run to reach a terminal state (there is no detached mode yet). Permissions are the worktree: $DSH_PERMISSION_MODE=workspace-write by default. " +
-      "ISH-760 adds the Task lifecycle: `launch` owns ONE branch+worktree per Task, pins the task spec + verification steps + prior findings into the worktree BEFORE launch, and runs ONE disposable dsh Run per phase/attempt (a FIX is the SAME worktree + findings + a NEW Run). A second writer on the same worktree/branch is refused until the previous Run ends; different worktrees/branches may run in parallel. `worktree` creates/selects the worktree; `cleanup` reclaims it only when safe (real merge or --abort, no open PR, no active writer, no uncommitted changes, relay-owned) and retains the run logs. `relay run logs <run-id>` renders the read-only dsh session/status/text/tool_call/tool_result/final chronology from the per-Run dsh.jsonl (no TUI/Web UI needed). " +
+      "ISH-760 adds the Task lifecycle: `launch` owns ONE branch+worktree per Task, pins the task spec + verification steps + prior findings into the worktree BEFORE launch, and runs ONE disposable dsh Run per phase/attempt (a FIX is the SAME worktree + findings + a NEW Run). A second writer on the same worktree/branch is refused until the previous Run ends; different worktrees/branches may run in parallel. `worktree` creates/selects the worktree; `cleanup` reclaims it only when safe (merged/accepted/cancelled or --abort, live PR not OPEN, no active writer, no uncommitted changes, relay-owned) and retains the run logs; it also removes the per-Run scratch root and Relay-labelled containers/volumes. `relay run list --leaks` reports orphaned scratch dirs, worktrees and Relay-labelled containers/volumes with sizes (read-only patrol). `relay run logs <run-id>` renders the read-only dsh session/status/text/tool_call/tool_result/final chronology from the per-Run dsh.jsonl (no TUI/Web UI needed). " +
       "ISH-762 adds `relay run factory <task-id>`: the whole factory for ONE Task with no hand-driven pane for the coding — a real headless dsh Run implements, Relay mechanically VERIFYs the recorded HEAD, an INDEPENDENT headless Claude reviewer (`claude -p --output-format json`) returns a structured FIX/PASS (FIX = the SAME worktree + findings + a FRESH Run), and a PASS reaches read-only MergeReady. It never pushes, merges, accepts or writes a provider." +
       " ISH-1013: a non-ready Factory outcome is classified from the EXISTING rows (code rework exhausted / infra blocked / permission-or-human decision / missing-or-inconclusive evidence / stale head / unknown) with the last Run/attempt/HEAD, failing check/review/log references and a concrete next action. The same projection is stored as a durable `factory.outcome` event and shown by `relay run show` / `relay run logs` and `relay task show`; `relay run factory --json` carries it as `failure`.",
     usage: [
@@ -184,8 +185,8 @@ const COMMAND_HELP: Record<string, { about: string; usage: string[] }> = {
       "relay run launch <task-id> [--timeout 30m] [--permission MODE] [--json]",
       "relay run factory <task-id> [--max-attempts N] [--max-resumes N] [--transient-wait 60m] [--transient-backoff 30s] [--dsh BIN] [--reviewer CMD] [--model M] [--permission MODE] [--timeout 30m] [--review-rubric PATH] [--review-output-contract PATH] [--json]",
       "relay run worktree <task-id> [--branch B] [--base REF] [--path DIR] [--json]",
-      "relay run cleanup <task-id> [--abort REASON] [--apply] [--force] [--json]",
-      "relay run list [--task <id>] [--limit N] [--json]",
+      "relay run cleanup <task-id> [--abort REASON] [--apply] [--force] [--repo DIR] [--json]",
+      "relay run list [--task <id>] [--limit N] [--leaks] [--json]",
       "relay run show <run-id> [--json]",
       "relay run logs <run-id> [--tail N]",
       "relay run cancel <run-id>",
@@ -642,7 +643,7 @@ const VALUE_FLAGS = new Set([
   "--head", "--phase", "--attempt", "--branch", "--summary", "--permission",
   "--timeout", "--prompt", "--tail",
   // ISH-760 worktree/cleanup flags.
-  "--abort", "--path",
+  "--abort", "--path", "--worktrees",
   // ISH-1174 transient-recovery caps.
   "--max-resumes", "--transient-wait", "--transient-backoff",
   // Factory tuning value flags (so a value after one is never read as the id).
@@ -1630,6 +1631,32 @@ async function main(): Promise<void> {
         const rest = argv.slice(2);
         const outputRoot = join(dirname(defaultDbPath()), "runs");
         if (!sub || sub === "list") {
+          // ISH-1221: the READ-ONLY orphan patrol for the gateway. It reports
+          // scratch dirs, worktrees and Relay-labelled containers/volumes whose
+          // Run/Task is over, with sizes; it never removes anything.
+          if (hasFlag(rest, "--leaks")) {
+            const report = scanRunLeaks(db, {
+              repo: flag(rest, "--repo") ?? projectRoot(),
+              outputRoot,
+              worktreesRoot: flag(rest, "--worktrees") ?? undefined,
+              reviewWorktreesRoot: flag(rest, "--review-worktrees") ?? undefined,
+            });
+            if (hasFlag(rest, "--json")) {
+              console.log(JSON.stringify(report, null, 2));
+              break;
+            }
+            const label = (kind: string) => kind.padEnd(15);
+            console.log(
+              `relay run leaks — ${report.entries.length} orphaned resource(s), ` +
+                `${formatBytes(report.totalBytes)} known size`
+            );
+            for (const e of report.entries) {
+              const who = `${e.taskId ?? "-"}/${e.runId ?? "-"}`;
+              console.log(`${label(e.kind)} ${formatBytes(e.sizeBytes).padStart(9)}  ${who}  ${e.id}${e.detail ? `  (${e.detail})` : ""}`);
+            }
+            for (const err of report.dockerErrors) console.log(`docker unchecked: ${err}`);
+            break;
+          }
           const limitRaw = flag(rest, "--limit");
           const runs = listRuns(db, {
             taskId: flag(rest, "--task") ?? undefined,
@@ -1923,16 +1950,37 @@ async function main(): Promise<void> {
           break;
         }
         if (sub === "cleanup") {
-          // ISH-760 safe cleanup: merged or explicit abort, no open PR, no active
-          // writer, no uncommitted changes, relay-owned. Run logs are retained.
+          // ISH-760/1221 safe cleanup: merged/accepted/cancelled (or explicit
+          // abort), live PR re-checked (a stale binding is never "open"), no
+          // active writer, no uncommitted changes, relay-owned. Run logs are
+          // retained; only the per-Run scratch/containers/volumes/worktrees go.
           const id = positionals(rest)[0];
-          if (!id) throw new Error("usage: relay run cleanup <task-id> [--abort REASON] [--apply] [--force] [--json]");
+          if (!id) throw new Error("usage: relay run cleanup <task-id> [--abort REASON] [--apply] [--force] [--repo DIR] [--json]");
+          const task = getTask(db, id);
+          if (!task) throw new Error(`unknown task: ${id}`);
           const abort = flag(rest, "--abort") ?? undefined;
           const apply = hasFlag(rest, "--apply");
-          const plan = applyWorkspaceCleanup(db, id, {
+          // ISH-1221: re-read the PR live before deciding it is OPEN. Auto-detect
+          // the read-only gh reader only when a PR identity is recorded.
+          let github: Awaited<ReturnType<typeof operatorProviderDepsFromEnv>>["github"];
+          if (task.pr_url || task.pr_repo) {
+            try {
+              github = (await operatorProviderDepsFromEnv()).github;
+            } catch {
+              /* no reader -> the plan fails closed on a recorded PR and says why */
+            }
+          }
+          const repoFlag = flag(rest, "--repo");
+          const plan = await applyWorkspaceCleanup(db, id, {
             apply,
             force: hasFlag(rest, "--force"),
             abort,
+            repo: repoFlag ?? undefined,
+            outputRoot,
+            reviewWorktreesRoot: repoFlag
+              ? join(repoFlag, STATE_DIR, "review-worktrees")
+              : join(projectRoot(), STATE_DIR, "review-worktrees"),
+            ...(github ? { github } : {}),
           });
           if (hasFlag(rest, "--json")) {
             console.log(JSON.stringify(plan, null, 2));
@@ -1942,6 +1990,12 @@ async function main(): Promise<void> {
           console.log(`relay run cleanup ${id} — ${verdict}`);
           console.log(`  worktree: ${plan.worktree ?? "-"}  branch: ${plan.branch ?? "-"}`);
           console.log(`  retained runs (evidence): ${plan.retainedRuns}`);
+          if (plan.scratchDirs.length) console.log(`  scratch: ${plan.scratchDirs.join(", ")}`);
+          if (plan.reviewWorktrees.length) console.log(`  review worktrees: ${plan.reviewWorktrees.join(", ")}`);
+          if (plan.containers.length) console.log(`  containers: ${plan.containers.map((c) => c.id).join(", ")}`);
+          if (plan.volumes.length) console.log(`  volumes: ${plan.volumes.map((v) => v.name).join(", ")}`);
+          if (plan.savedPatch) console.log(`  saved patch: ${plan.savedPatch}`);
+          for (const warning of plan.warnings) console.log(`  warning: ${warning}`);
           for (const reason of plan.reasons) console.log(`  skip: ${reason}`);
           break;
         }
