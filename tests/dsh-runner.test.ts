@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Database } from "bun:sqlite";
 import { openDb } from "../src/db";
+import { listEvents } from "../src/events";
 import {
   blockImplementFailure,
   findTaskResult,
@@ -178,7 +179,7 @@ function git(cwd: string, ...args: string[]): string {
  * and NO linked branch/HEAD — the normal implement-phase state the non-git
  * `newTask()` could not exercise (both sides were NULL there).
  */
-function newGitTask(): { id: string; cwd: string; outputRoot: string; baseHead: string; branch: string } {
+function newGitTask(branchName?: string): { id: string; cwd: string; outputRoot: string; baseHead: string; branch: string } {
   const cwd = mkdtempSync(join(tmpdir(), "relay-dsh-git-"));
   git(cwd, "init", "-q");
   git(cwd, "config", "user.email", "relay@test");
@@ -186,6 +187,10 @@ function newGitTask(): { id: string; cwd: string; outputRoot: string; baseHead: 
   writeFileSync(join(cwd, "README.md"), "base\n");
   git(cwd, "add", "README.md");
   git(cwd, "commit", "-q", "-m", "base");
+  // A distinct branch name makes two REAL worktrees independent writers even
+  // when os.tmpdir() itself lives inside a checkout (the writer fence is keyed
+  // by branch as well as cwd, by design).
+  if (branchName) git(cwd, "checkout", "-q", "-b", branchName);
   const baseHead = git(cwd, "rev-parse", "HEAD");
   const branch = git(cwd, "rev-parse", "--abbrev-ref", "HEAD");
   const t = intakeTask(db, {
@@ -556,8 +561,12 @@ describe("one-shot headless dsh Run lifecycle", () => {
   });
 
   test("two Runs in different cwds run concurrently", async () => {
-    const a = newTask();
-    const b = newTask();
+    // Two REAL, independent worktrees. Distinct branches are required because
+    // the single-writer fence is keyed by branch as well as cwd; a plain temp dir
+    // can resolve to the checkout's branch when the harness puts os.tmpdir()
+    // inside a repo.
+    const a = newGitTask("relay-concurrent-a");
+    const b = newGitTask("relay-concurrent-b");
     const spawner = new FakeSpawner();
     const h1 = await startDshRun(db, { taskId: a.id, spawner, outputRoot: a.outputRoot, cwd: a.cwd });
     const h2 = await startDshRun(db, { taskId: b.id, spawner, outputRoot: b.outputRoot, cwd: b.cwd });
@@ -1270,7 +1279,18 @@ describe("ISH-808: a cancelled task is terminal on the Run path", () => {
     expect(() => acceptRunSubmission(db, { runId: h.id })).toThrow(/terminal/);
     // The task stays cancelled — never queued/verify again.
     expect(getTask(db, id)!.state).toBe("cancelled");
-    expect(findTaskResult(db, id, "implement", 0, "TaskSubmitted")).toBeNull();
+    // ISH-1245: the late submission is still stored as EVIDENCE, never applied.
+    const late = findTaskResult(db, id, "implement", 0, "TaskSubmitted");
+    expect(late?.head_sha).toBe(getRun(db, h.id)!.head_sha);
+    expect(late?.evidence_ref).toBe(`run:${h.id}`);
+    expect(
+      listEvents(db).some(
+        (e) =>
+          e.task_id === id &&
+          e.type === "task.late_result_ignored" &&
+          JSON.parse(e.payload_json).resultId === late!.id
+      )
+    ).toBe(true);
   });
 
   test("cancelTask keeps a live Run visible to the single-writer fence and stops its process", async () => {

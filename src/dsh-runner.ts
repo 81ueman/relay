@@ -21,7 +21,7 @@ import { dindVolumeNamesForWorkspace } from "./devcontainer-id";
 import { isPinnedDsh, PINNED_DSH_VERSION, readDshVersion } from "./dsh-version";
 import { assertLaunchDiskSpace, type DiskGuardOptions } from "./disk-guard";
 import { gitHead } from "./verify";
-import { submitImplementationFromRun, type RunImplementation } from "./workflow";
+import { recordLateRunSubmission, submitImplementationFromRun, type RunImplementation } from "./workflow";
 import {
   findActiveWriterRow,
   runHeadFenceRepos,
@@ -1007,7 +1007,10 @@ export function acceptRunSubmission(db: Database, sub: RunSubmission): Run {
   if (!task) rejectSubmission(`run ${run.id} references missing task ${run.task_id}`);
   // ISH-808: a terminal task is CLOSED. An in-flight Run's `exit 0` (or a Run
   // started before the cancel) must never resurrect it into queued/review.
+  // ISH-1245: the structured submission is still recorded as EVIDENCE before the
+  // ordinary refusal, so a late Run is auditable (`task.late_result_ignored`).
   if (isTerminalTaskState(task.state)) {
+    recordLateRunSubmission(db, task, run);
     rejectSubmission(`run ${run.id} cannot advance task ${task.id}: it is terminal (state=${task.state})`);
   }
   if (task.phase !== run.phase || task.attempt !== run.attempt) {

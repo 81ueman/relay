@@ -12,7 +12,7 @@ import {
   touchProgress,
 } from "./workers";
 import type { Task, TaskState, WorkerState } from "./schema";
-import { TERMINAL_TASK_STATES } from "./schema";
+import { TERMINAL_TASK_STATES, isTerminalTaskState } from "./schema";
 import { RELAY_TAG, sendMessage } from "./messages";
 import { requestReconcile } from "./control";
 import { signalRunProcess } from "./run-signal";
@@ -1326,19 +1326,35 @@ export function rejectTask(db: Database, taskId: string, workerId: string, reaso
 export function blockTask(db: Database, taskId: string, workerId: string, reason: string, human: boolean): Task {
   const task = getTask(db, taskId);
   if (!task) throw new Error(`unknown task: ${taskId}`);
+  // ISH-1245: a closed Task must never be parked into a reversible block.
+  if (isTerminalTaskState(task.state)) {
+    throw new Error(`cannot block task in terminal state ${task.state}`);
+  }
   const t = now();
   const state: TaskState = human ? "blocked_human" : "blocked_internal";
   // Durable first, in ONE transaction: the block, its parent notification (note +
   // message) and the worker release either all commit or none do.
-  db.transaction(() => {
+  const blocked = db.transaction(() => {
+    // ISH-1245: take the write lock and re-read before parking. A close that
+    // committed after the entry check is never overwritten by a late block.
+    const guard = db.query(
+      `UPDATE tasks SET state = ?, assignee = NULL, lease_until = NULL, lease_token = lease_token + 1, updated_at = ?
+        WHERE id = ? AND state NOT IN (${TERMINAL_STATE_SQL})`
+    ).run(state, t, taskId);
+    if (guard.changes !== 1) {
+      const live = getTask(db, taskId)!;
+      logEvent(db, {
+        source: "worker",
+        workerId,
+        taskId,
+        type: "task.late_result_ignored",
+        payload: { kind: "Block", taskState: live.state, human, reason },
+      });
+      return live;
+    }
     db.query(`INSERT INTO task_notes (task_id, worker_id, kind, body, created_at) VALUES (?, ?, ?, ?, ?)`).run(
       taskId, workerId, human ? "blocked_human" : "blocked_internal", reason, t
     );
-    // Blocking releases ownership completely: no stale assignee/lease survives, so
-    // the task cannot be "submitted" later by a worker that no longer owns it.
-    db.query(
-      `UPDATE tasks SET state = ?, assignee = NULL, lease_until = NULL, lease_token = lease_token + 1, updated_at = ? WHERE id = ?`
-    ).run(state, t, taskId);
     // A blocked task never parks the worker: it must immediately take the next runnable task
     // (or resume the running parent it still owns — see clearCurrentTaskOrRestoreParent).
     if (task.assignee) {
@@ -1370,7 +1386,9 @@ export function blockTask(db: Database, taskId: string, workerId: string, reason
       // resolves). blocked_internal never pings the human.
       notifyHumanBlocked(db, child, workerId, reason, t);
     }
+    return null;
   })();
+  if (blocked) return blocked;
   requestReconcile(db, `block:${taskId}`);
   return getTask(db, taskId)!;
 }

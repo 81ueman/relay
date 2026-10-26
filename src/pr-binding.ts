@@ -1,6 +1,7 @@
 import type { Database } from "bun:sqlite";
 import { logEvent } from "./events";
 import type { Task } from "./schema";
+import { isTerminalTaskState } from "./schema";
 import { getTask } from "./tasks";
 import { parsePrUrl, type GitHubReadOnly, type PrRef, type PrView } from "./providers";
 import { normalizeRepoSlug, resolveTaskPrTarget } from "./pr-target";
@@ -214,9 +215,36 @@ export async function bindTaskPr(
 
   const bound = (status: "bound" | "adopted", view: PrView, event: string): PrBindingResult => {
     const linked = linkTask(db, taskId, viewLink(view));
-    // linkTask is a no-op on a terminal task / a settled head: a binding that
-    // did not actually land on the produced commit is not a binding. EXACT full
-    // SHA (case-insensitive), never a prefix.
+    // ISH-1245: the PR read is asynchronous, so the Task can be closed while it
+    // is in flight. linkTask keeps the terminal state; a binding that did not
+    // land is refused and audited (never reported as "bound" just because the
+    // unchanged head happens to match).
+    if (isTerminalTaskState(linked.state)) {
+      logEvent(db, {
+        source: "pr-binding",
+        taskId,
+        type: "task.late_result_ignored",
+        payload: {
+          kind: "PrBinding",
+          taskState: linked.state,
+          status,
+          repo: view.ref.repo,
+          number: view.ref.number,
+          head: view.headSha,
+          expectedHead,
+          reason: "PR binding finished after the Task was closed",
+        },
+      });
+      return blocked(
+        "STALE",
+        `task ${taskId} is ${linked.state}; a PR binding cannot re-open a closed Task`,
+        view.ref,
+        view.headSha
+      );
+    }
+    // linkTask is a no-op on a settled head: a binding that did not actually land
+    // on the produced commit is not a binding. EXACT full SHA (case-insensitive),
+    // never a prefix.
     if (!sameCommitSha(linked.head_sha, expectedHead)) {
       return blocked("STALE", `linked head ${short(linked.head_sha)} != produced commit ${short(expectedHead)}`, view.ref, view.headSha);
     }
