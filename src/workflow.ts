@@ -12,6 +12,7 @@ import {
   getTaskResult,
   insertTaskResult,
   notifyGatewayTo,
+  type TaskResultInput,
 } from "./results";
 import type { CodePhase, ResultKind, Run, Task, TaskResult, TaskState, VerifyOutcome } from "./schema";
 import { INTEGRATOR_ROLE, REVIEWER_ROLE, TERMINAL_TASK_STATES, isTerminalTaskState } from "./schema";
@@ -327,6 +328,34 @@ function applyResultPhase(
   if (!live) throw new Error(`unknown task: ${task.id}`);
   if (!isTerminalTaskState(live.state)) return applyPhase(db, task, phase, update);
   return lateResultIgnored(db, task.id, result, actor);
+}
+
+/**
+ * ISH-1246: the ENTRY-CHECK counterpart of `applyResultPhase`.
+ *
+ * The ISH-1245 write-time fence catches a close that lands between a caller's
+ * entry check and its write. When the close ALREADY committed before the call,
+ * the entry check refuses the result and the write-time guard is never reached;
+ * without this helper the late verdict vanished behind the refusal. Record it
+ * with the SAME evidence shape as the write-time path — the durable result row
+ * plus `task.late_result_ignored` — and leave the Task terminal. The caller then
+ * refuses exactly as before (the Task is never re-opened).
+ *
+ * Callers must only invoke this after observing a terminal Task; `lateResultIgnored`
+ * re-reads so the event always names the live terminal state.
+ */
+export function recordLateResultEvidence(
+  db: Database,
+  task: Pick<Task, "id" | "state">,
+  input: Omit<TaskResultInput, "taskId">,
+  actor: string | null,
+  detail: Record<string, unknown> = {}
+): TaskResult {
+  return db.transaction(() => {
+    const result = insertTaskResult(db, { taskId: task.id, ...input });
+    lateResultIgnored(db, task.id, result, actor, { source: "entry-check", ...detail });
+    return result;
+  })();
 }
 
 /**
@@ -751,7 +780,24 @@ export function submitPhase(db: Database, taskId: string, workerId: string, opts
     throw new Error(`${WORKFLOW_ERROR}: ${taskId} is not a code-change task; use \`relay submit\``);
   }
   // ISH-808: terminal (e.g. cancelled) tasks are CLOSED and must not be advanced.
+  // ISH-1246: the late submission is still EVIDENCE (row + event), exactly like
+  // the write-time fence below; the Task stays terminal.
   if (isTerminalTaskState(task.state)) {
+    recordLateResultEvidence(
+      db,
+      task,
+      {
+        phase: derivePhase(task) ?? "",
+        attempt: task.attempt,
+        kind: "TaskSubmitted",
+        workerId,
+        headSha: opts.headSha ?? task.head_sha,
+        evidenceRef: opts.evidence ?? null,
+        reason: `late submit for ${task.state} task ${taskId}`,
+        payload: { source: "submitPhase", late: true, taskState: task.state },
+      },
+      workerId
+    );
     throw new Error(`${WORKFLOW_ERROR}: cannot submit terminal task ${taskId} (state=${task.state})`);
   }
   const phase = phaseOf(task);
@@ -1083,6 +1129,23 @@ export function recordVerification(
   if (!task) throw new Error(`unknown task: ${taskId}`);
   if (!isCodeTask(task)) throw new Error(`${WORKFLOW_ERROR}: ${taskId} is not a code-change task`);
   if (isTerminalTaskState(task.state)) {
+    // ISH-1246: keep the late verdict as evidence; the Task stays terminal.
+    recordLateResultEvidence(
+      db,
+      task,
+      {
+        phase: derivePhase(task) ?? "",
+        attempt: task.attempt,
+        kind: "VerificationResult",
+        workerId,
+        passed: opts.passed,
+        headSha: opts.headSha ?? task.head_sha,
+        evidenceRef: opts.evidence ?? null,
+        reason: `late verification for ${task.state} task ${taskId}`,
+        payload: { source: "recordVerification", late: true, taskState: task.state },
+      },
+      workerId
+    );
     throw new Error(`${WORKFLOW_ERROR}: cannot record a verification for terminal task ${taskId} (state=${task.state})`);
   }
   const phase = phaseOf(task);
@@ -1651,6 +1714,36 @@ export function recordReview(db: Database, taskId: string, reviewerId: string, o
   if (!task) throw new Error(`unknown task: ${taskId}`);
   if (!isCodeTask(task)) throw new Error(`${WORKFLOW_ERROR}: ${taskId} is not a code-change task`);
   const phase = phaseOf(task);
+  // ISH-1246: a verdict that arrived after the Task closed is refused by the
+  // state/phase entry check below. Keep it as evidence with the write-time
+  // shape (ReviewResult row + `task.late_result_ignored`); never re-open.
+  if (isTerminalTaskState(task.state)) {
+    const lateIdentity = opts.externalReviewer?.trim() || reviewerId;
+    recordLateResultEvidence(
+      db,
+      task,
+      {
+        phase,
+        attempt: task.attempt,
+        kind: "ReviewResult",
+        workerId: lateIdentity,
+        passed: opts.verdict === "pass",
+        headSha: opts.headSha ?? task.head_sha,
+        profile: (opts.profile ?? task.review_profile ?? DEFAULT_REVIEW_PROFILE).trim() || DEFAULT_REVIEW_PROFILE,
+        reason: opts.reason ?? `late ${opts.verdict} review for ${task.state} task ${taskId}`,
+        evidenceRef: opts.evidence ?? null,
+        payload: {
+          source: opts.source ?? (opts.externalReviewer?.trim() ? "external" : "worker"),
+          reviewer: lateIdentity,
+          base: task.pr_base ?? null,
+          late: true,
+          taskState: task.state,
+        },
+      },
+      lateIdentity
+    );
+    throw new Error(`${WORKFLOW_ERROR}: cannot record a review for ${taskId} (state ${task.state}, phase ${phase})`);
+  }
   const suppliedSupersede =
     opts.supersedesResultId !== undefined ? getTaskResult(db, opts.supersedesResultId) : null;
   if (opts.supersedesResultId !== undefined) {
@@ -2121,7 +2214,21 @@ export function acceptTask(db: Database, taskId: string, actor: string): Task {
   if (!task) throw new Error(`unknown task: ${taskId}`);
   if (!isCodeTask(task)) throw new Error(`${WORKFLOW_ERROR}: ${taskId} is not a code-change task`);
   // ISH-808: a cancelled task at merge_ready must not be accepted into `done`.
+  // ISH-1246: the late acceptance is still EVIDENCE; the Task stays terminal.
   if (isTerminalTaskState(task.state)) {
+    recordLateResultEvidence(
+      db,
+      task,
+      {
+        phase: derivePhase(task) ?? "",
+        attempt: task.attempt,
+        kind: "TaskAccepted",
+        workerId: actor,
+        reason: `late accept for ${task.state} task ${taskId}`,
+        payload: { source: "acceptTask", late: true, taskState: task.state },
+      },
+      actor
+    );
     throw new Error(`${GATE_ERROR}: cannot accept terminal task ${taskId} (state=${task.state})`);
   }
   const phase = phaseOf(task);
