@@ -6,7 +6,7 @@ import { logEvent } from "./events";
 import { getTask, reviewHeldByLiveReviewer } from "./tasks";
 import { inheritFindings } from "./run-lifecycle";
 import { findSubmissionForAttempt, isResultWriteError } from "./results";
-import { REVIEWER_ROLE } from "./schema";
+import { REVIEWER_ROLE, isTerminalTaskState } from "./schema";
 import type { Task } from "./schema";
 import { gitHead } from "./verify";
 import { hostGit } from "./review-workspace";
@@ -1258,6 +1258,24 @@ export async function runHeadlessReview(
   // credited, even though `recordReview` only compares the DB `head_sha`.
   const postHead = gitHead(worktree);
   const liveReview = getTask(db, taskId);
+  // ISH-1245: the reviewer process can outlive the Task. A verdict that came
+  // back after a close is evidence only; record it (head/verdict/raw-output ref)
+  // and never call recordReview for the terminal Task.
+  if (liveReview && isTerminalTaskState(liveReview.state)) {
+    logEvent(db, {
+      source: "factory",
+      taskId,
+      type: "task.late_result_ignored",
+      payload: {
+        kind: "ReviewResult",
+        taskState: liveReview.state,
+        head,
+        verdict: verdict.verdict,
+        evidence: evidencePath,
+        source: "claude-headless",
+      },
+    });
+  }
   if (
     postHead !== head ||
     !liveReview ||

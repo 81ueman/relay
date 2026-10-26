@@ -13,8 +13,8 @@ import {
   insertTaskResult,
   notifyGatewayTo,
 } from "./results";
-import type { CodePhase, ResultKind, Run, Task, TaskState, VerifyOutcome } from "./schema";
-import { INTEGRATOR_ROLE, REVIEWER_ROLE, isTerminalTaskState } from "./schema";
+import type { CodePhase, ResultKind, Run, Task, TaskResult, TaskState, VerifyOutcome } from "./schema";
+import { INTEGRATOR_ROLE, REVIEWER_ROLE, TERMINAL_TASK_STATES, isTerminalTaskState } from "./schema";
 import {
   clearCurrentTaskOrRestoreParent,
   getTask,
@@ -73,6 +73,15 @@ export const STALE_RESULT = "STALE_RESULT";
  * NG/HOLD is present, or the observed conflict does not match the bound HEAD).
  */
 export const REBASE_REFUSED = "REBASE_REFUSED";
+/**
+ * ISH-1245: a result produced by work that started BEFORE the Task was closed
+ * (cancelled / failed / done) was refused as a transition. The result row is
+ * kept as evidence and `task.late_result_ignored` records why it did not move.
+ */
+export const LATE_RESULT_IGNORED = "LATE_RESULT_IGNORED";
+
+/** Terminal task states as an SQL list; shares the definition with isTerminalTaskState. */
+const TERMINAL_STATE_SQL = TERMINAL_TASK_STATES.map((s) => `'${s}'`).join(",");
 
 /**
  * ISH-759: the pseudo-role Relay itself takes while it MECHANICALLY verifies a
@@ -197,6 +206,12 @@ interface PhaseUpdate {
  * With `expectPhase`/`expectAttempt` the UPDATE is conditional and a mismatch
  * throws `STALE_ATTEMPT` — a concurrent/replayed recovery can never advance the
  * Task twice.
+ *
+ * ISH-1245: the UPDATE is ALSO conditional on the Task still being non-terminal.
+ * `cancelTask` leaves phase/attempt untouched, so this is the write-time fence
+ * that catches a close committed after the caller's entry check. It is a
+ * backstop: the result paths call `applyResultPhase`, which records the late
+ * result as evidence instead of rolling it back.
  */
 function applyPhase(db: Database, task: Task, phase: CodePhase, u: PhaseUpdate): Task {
   const t = now();
@@ -217,7 +232,7 @@ function applyPhase(db: Database, task: Task, phase: CodePhase, u: PhaseUpdate):
             head_sha = CASE WHEN ? = 1 THEN NULL WHEN ? = 1 THEN ? ELSE head_sha END,
             result_ref = ?, accepted_at = ?,
             lease_token = lease_token + 1, lease_until = NULL, updated_at = ?
-      WHERE id = ? ${guards.join(" ")}`
+      WHERE id = ? AND state NOT IN (${TERMINAL_STATE_SQL}) ${guards.join(" ")}`
   ).run(
     phase,
     u.state,
@@ -233,12 +248,85 @@ function applyPhase(db: Database, task: Task, phase: CodePhase, u: PhaseUpdate):
     task.id,
     ...guardArgs
   );
-  if (guards.length > 0 && r.changes !== 1) {
+  if (r.changes !== 1) {
+    const live = getTask(db, task.id);
+    if (live && isTerminalTaskState(live.state)) {
+      throw new Error(
+        `${LATE_RESULT_IGNORED}: task ${task.id} was closed as '${live.state}' while the transition was in flight`
+      );
+    }
     throw new Error(
       `${STALE_ATTEMPT}: task ${task.id} is no longer phase '${u.expectPhase ?? task.phase}' attempt ${u.expectAttempt ?? task.attempt}; the transition is stale`
     );
   }
   return getTask(db, task.id)!;
+}
+
+/**
+ * ISH-1245: record a result that arrived for an already-CLOSED Task as EVIDENCE
+ * only. The Task's state/phase/head/attempt are untouched, and
+ * `task.late_result_ignored` carries the verdict plus the result row id.
+ *
+ * MUST be called inside the transaction that wrote `result`, after that write:
+ * the transaction then holds SQLite's write lock, so this re-read observes a
+ * `cancel`/`fail`/`accept` committed while the work was in flight. (A pre-check
+ * alone is not enough: another process can commit the close between the read
+ * and the write, and `cancelTask` deliberately leaves phase/attempt unchanged.)
+ *
+ * Returns the live Task when it is terminal, or null when it is still live.
+ */
+function lateResultIgnored(
+  db: Database,
+  taskId: string,
+  result: TaskResult,
+  actor: string | null,
+  detail: Record<string, unknown> = {}
+): Task | null {
+  const live = getTask(db, taskId);
+  if (!live || !isTerminalTaskState(live.state)) return null;
+  logEvent(db, {
+    source: "workflow",
+    workerId: actor ?? result.worker_id ?? null,
+    taskId,
+    type: "task.late_result_ignored",
+    payload: {
+      resultId: result.id,
+      kind: result.kind,
+      phase: result.phase,
+      attempt: result.attempt,
+      passed: result.passed === null ? null : result.passed === 1,
+      head: result.head_sha,
+      evidence: result.evidence_ref,
+      reason: result.reason,
+      taskState: live.state,
+      ...detail,
+    },
+  });
+  return live;
+}
+
+/**
+ * ISH-1245: apply a phase transition backed by `result`, but ONLY while the Task
+ * is still non-terminal at write time. MUST be called inside the same
+ * transaction that wrote `result`.
+ *
+ * When the Task was closed while the result was in flight, the result row stays
+ * committed as evidence and `task.late_result_ignored` records the refusal; this
+ * returns null so the caller can skip the worker release / notification. A live
+ * Task takes the ordinary `applyPhase` transition exactly as before.
+ */
+function applyResultPhase(
+  db: Database,
+  task: Task,
+  phase: CodePhase,
+  update: PhaseUpdate,
+  result: TaskResult,
+  actor: string | null
+): Task | null {
+  const live = getTask(db, task.id);
+  if (!live) throw new Error(`unknown task: ${task.id}`);
+  if (!isTerminalTaskState(live.state)) return applyPhase(db, task, phase, update);
+  return lateResultIgnored(db, task.id, result, actor);
 }
 
 /**
@@ -256,6 +344,26 @@ function applyPhase(db: Database, task: Task, phase: CodePhase, u: PhaseUpdate):
  */
 function invalidateReview(db: Database, task: Task, newHead: string | null, reason: string, workerId?: string): Task {
   const t = now();
+  // ISH-1245: a late HEAD/base observation must not reopen a CLOSED Task. The
+  // callers take the write lock before this (a link/submit write), so this
+  // re-read sees a close committed while the observation was in flight.
+  const live = getTask(db, task.id);
+  if (live && isTerminalTaskState(live.state)) {
+    logEvent(db, {
+      source: "workflow",
+      taskId: task.id,
+      type: "task.late_result_ignored",
+      payload: {
+        kind: "ReviewInvalidated",
+        taskState: live.state,
+        reason,
+        fromHead: task.head_sha,
+        toHead: newHead,
+        fromPhase: task.phase,
+      },
+    });
+    return live;
+  }
   const headChanged = (newHead ?? null) !== (task.head_sha ?? null);
   const phase: CodePhase = headChanged ? "verify" : "review";
   const claimRole =
@@ -554,11 +662,35 @@ export function linkTask(
     prDiff !== task.pr_diff;
   if (!linkChanged) return task;
   const updated = db.transaction(() => {
-    db.query(
+    // ISH-1245: the link observation may have raced a close (e.g. a PR read
+    // completed after `relay task cancel`). Take the write lock and re-read;
+    // a closed Task records the binding as evidence and is never re-opened.
+    const linked = db.query(
       `UPDATE tasks
           SET pr_url = ?, branch = ?, head_sha = ?, pr_repo = ?, pr_base = ?, pr_base_sha = ?, pr_diff = ?, updated_at = ?
-        WHERE id = ?`
+        WHERE id = ? AND state NOT IN (${TERMINAL_STATE_SQL})`
     ).run(prUrl, branch, headSha, prRepo, prBase, prBaseSha, prDiff, now(), taskId);
+    if (linked.changes !== 1) {
+      const live = getTask(db, taskId)!;
+      logEvent(db, {
+        source: "workflow",
+        taskId,
+        type: "task.late_result_ignored",
+        payload: {
+          kind: "PrBinding",
+          taskState: live.state,
+          prUrl,
+          branch,
+          head: headSha,
+          prRepo,
+          prBase,
+          prBaseSha,
+          prDiff,
+          reason: "late link ignored: task closed in flight",
+        },
+      });
+      return live;
+    }
     let next = getTask(db, taskId)!;
     const phase = derivePhase(task);
     if ((headChanged || baseBranchChanged) && isCodeTask(task) && phase && REVIEW_PINNED_PHASES.includes(phase)) {
@@ -569,7 +701,9 @@ export function linkTask(
     }
     return next;
   })();
-  if (headChanged || baseBranchChanged) requestReconcile(db, `link-changed:${taskId}`);
+  if (!isTerminalTaskState(updated.state) && (headChanged || baseBranchChanged)) {
+    requestReconcile(db, `link-changed:${taskId}`);
+  }
   return updated;
 }
 
@@ -635,10 +769,29 @@ export function submitPhase(db: Database, taskId: string, workerId: string, opts
 
   // Integration names a moved HEAD: the reviewed head no longer applies.
   if (phase === "integration" && opts.headSha !== undefined && opts.headSha !== task.head_sha) {
-    const invalidated = db.transaction(() =>
-      invalidateReview(db, task, opts.headSha!, "integration-head-changed", workerId)
-    )();
-    requestReconcile(db, `head-changed:${taskId}`);
+    const invalidated = db.transaction(() => {
+      // ISH-1245: this submit may have lost a race with a close. Take the write
+      // lock and re-read BEFORE invalidating; a late submit is evidence only.
+      const guard = db
+        .query(`UPDATE tasks SET updated_at = updated_at WHERE id = ? AND state NOT IN (${TERMINAL_STATE_SQL})`)
+        .run(taskId);
+      if (guard.changes !== 1) {
+        const result = insertTaskResult(db, {
+          taskId,
+          phase,
+          attempt: task.attempt,
+          kind: "TaskSubmitted",
+          workerId,
+          headSha: opts.headSha ?? task.head_sha,
+          evidenceRef: opts.evidence ?? null,
+          reason: "late integration submit (task closed in flight)",
+          payload: { source: "submitPhase", late: true, headChanged: opts.headSha },
+        });
+        return lateResultIgnored(db, taskId, result, workerId, { source: "submitPhase" }) ?? getTask(db, taskId)!;
+      }
+      return invalidateReview(db, task, opts.headSha!, "integration-head-changed", workerId);
+    })();
+    if (!isTerminalTaskState(invalidated.state)) requestReconcile(db, `head-changed:${taskId}`);
     return invalidated;
   }
 
@@ -658,17 +811,25 @@ export function submitPhase(db: Database, taskId: string, workerId: string, opts
       headSha: opts.headSha ?? task.head_sha,
       evidenceRef: opts.evidence ?? null,
     });
-    const u = applyPhase(db, task, next, {
-      state: next === "review" ? "review" : "queued",
-      attempt: task.attempt,
-      claimRole: nextClaimRole,
-      headSha: opts.headSha !== undefined ? opts.headSha : undefined,
-      resultRef: `result:${result.id}`,
-    });
+    const u = applyResultPhase(
+      db,
+      task,
+      next,
+      {
+        state: next === "review" ? "review" : "queued",
+        attempt: task.attempt,
+        claimRole: nextClaimRole,
+        headSha: opts.headSha !== undefined ? opts.headSha : undefined,
+        resultRef: `result:${result.id}`,
+      },
+      result,
+      workerId
+    );
+    if (!u) return getTask(db, taskId)!;
     releaseWorker(db, workerId, taskId);
     return u;
   })();
-  requestReconcile(db, `submit:${taskId}:${next}`);
+  if (!isTerminalTaskState(updated.state)) requestReconcile(db, `submit:${taskId}:${next}`);
   return updated;
 }
 
@@ -791,12 +952,39 @@ export function submitImplementationFromRun(db: Database, taskId: string, impl: 
   // dead-ends (the gate refuses to accept it and nothing re-routes it).
   if (phase === "integration" && (producedHead ?? null) !== (task.head_sha ?? null)) {
     const invalidated = db.transaction(() => {
+      // ISH-1245: the Run may have finished after a close. Take the write lock
+      // and re-read before invalidating; the late submission is evidence only.
+      const guard = db
+        .query(`UPDATE tasks SET updated_at = updated_at WHERE id = ? AND state NOT IN (${TERMINAL_STATE_SQL})`)
+        .run(taskId);
+      if (guard.changes !== 1) {
+        const result = insertTaskResult(db, {
+          taskId,
+          phase,
+          attempt: task.attempt,
+          kind: "TaskSubmitted",
+          workerId: `dsh-run:${impl.runId}`,
+          headSha: producedHead,
+          evidenceRef: impl.evidence ?? `run:${impl.runId}`,
+          reason: impl.summary ?? null,
+          payload: {
+            runId: impl.runId,
+            source: "dsh-headless",
+            late: true,
+            baseHead: impl.baseHeadSha ?? null,
+            headChanged: producedHead,
+          },
+        });
+        return lateResultIgnored(db, taskId, result, `dsh-run:${impl.runId}`, {
+          source: "submitImplementationFromRun",
+        }) ?? getTask(db, taskId)!;
+      }
       if (adoptBranch) {
         db.query(`UPDATE tasks SET branch = ?, updated_at = ? WHERE id = ?`).run(adoptBranch, now(), taskId);
       }
       return invalidateReview(db, task, producedHead, "integration-head-changed");
     })();
-    requestReconcile(db, `head-changed:${taskId}`);
+    if (!isTerminalTaskState(invalidated.state)) requestReconcile(db, `head-changed:${taskId}`);
     return invalidated;
   }
   assertNoResult(db, taskId, phase, task.attempt, "TaskSubmitted");
@@ -805,9 +993,6 @@ export function submitImplementationFromRun(db: Database, taskId: string, impl: 
   const nextClaimRole =
     next === "verify" && hasMechanicalChecks(task) ? RELAY_ROLE : claimRoleForPhase(next, task.role);
   const updated = db.transaction(() => {
-    if (adoptBranch) {
-      db.query(`UPDATE tasks SET branch = ?, updated_at = ? WHERE id = ?`).run(adoptBranch, now(), taskId);
-    }
     const result = insertTaskResult(db, {
       taskId,
       phase,
@@ -820,6 +1005,15 @@ export function submitImplementationFromRun(db: Database, taskId: string, impl: 
       reason: impl.summary ?? null,
       payload: { runId: impl.runId, source: "dsh-headless", baseHead: impl.baseHeadSha ?? null },
     });
+    // ISH-1245: a Run that cleaned up after the Task was closed keeps its
+    // submission as evidence; it must not adopt a branch or advance the phase.
+    const late = lateResultIgnored(db, taskId, result, `dsh-run:${impl.runId}`, {
+      source: "submitImplementationFromRun",
+    });
+    if (late) return late;
+    if (adoptBranch) {
+      db.query(`UPDATE tasks SET branch = ?, updated_at = ? WHERE id = ?`).run(adoptBranch, now(), taskId);
+    }
     return applyPhase(db, task, next, {
       state: next === "review" ? "review" : "queued",
       attempt: task.attempt,
@@ -830,8 +1024,42 @@ export function submitImplementationFromRun(db: Database, taskId: string, impl: 
       resultRef: `result:${result.id}`,
     });
   })();
-  requestReconcile(db, `run-submit:${taskId}:${next}`);
+  if (!isTerminalTaskState(updated.state)) requestReconcile(db, `run-submit:${taskId}:${next}`);
   return updated;
+}
+
+/**
+ * ISH-1245: a cleanly exited Run that lost a race with a Task close keeps its
+ * structured submission as EVIDENCE. The Task keeps its terminal state; the
+ * caller (`acceptRunSubmission`) still refuses the Run with its ordinary
+ * `RUN_SUBMISSION_REJECTED`, but the run's produced HEAD/summary are durable in
+ * `task_results` and audited by `task.late_result_ignored`.
+ */
+export function recordLateRunSubmission(db: Database, task: Task, run: Run): TaskResult {
+  return db.transaction(() => {
+    const result = insertTaskResult(db, {
+      taskId: task.id,
+      phase: run.phase,
+      attempt: run.attempt,
+      kind: "TaskSubmitted",
+      workerId: `dsh-run:${run.id}`,
+      headSha: run.head_sha,
+      evidenceRef: `run:${run.id}`,
+      reason: `late submission for ${task.state} task ${task.id}`,
+      payload: {
+        runId: run.id,
+        source: "dsh-headless",
+        late: true,
+        taskState: task.state,
+        baseHead: run.base_head_sha,
+      },
+    });
+    lateResultIgnored(db, task.id, result, `dsh-run:${run.id}`, {
+      source: "acceptRunSubmission",
+      baseHead: run.base_head_sha,
+    });
+    return result;
+  })();
 }
 
 export interface VerifyOptions {
@@ -876,17 +1104,25 @@ export function recordVerification(
         headSha: opts.headSha ?? task.head_sha,
         evidenceRef: opts.evidence ?? null,
       });
-      const u = applyPhase(db, task, "review", {
-        state: "review",
-        attempt: task.attempt,
-        claimRole: REVIEWER_ROLE,
-        headSha: opts.headSha !== undefined ? opts.headSha : undefined,
-        resultRef: `result:${result.id}`,
-      });
+      const u = applyResultPhase(
+        db,
+        task,
+        "review",
+        {
+          state: "review",
+          attempt: task.attempt,
+          claimRole: REVIEWER_ROLE,
+          headSha: opts.headSha !== undefined ? opts.headSha : undefined,
+          resultRef: `result:${result.id}`,
+        },
+        result,
+        workerId
+      );
+      if (!u) return getTask(db, taskId)!;
       releaseWorker(db, workerId, taskId);
       return u;
     })();
-    requestReconcile(db, `verified:${taskId}`);
+    if (!isTerminalTaskState(updated.state)) requestReconcile(db, `verified:${taskId}`);
     return updated;
   }
 
@@ -903,17 +1139,25 @@ export function recordVerification(
       headSha: opts.headSha ?? task.head_sha,
       evidenceRef: opts.evidence ?? null,
     });
-    const u = applyPhase(db, task, "implement", {
-      state: "queued",
-      attempt: task.attempt + 1,
-      claimRole: claimRoleForPhase("implement", task.role),
-      clearHead: true,
-      resultRef: `result:${result.id}`,
-    });
+    const u = applyResultPhase(
+      db,
+      task,
+      "implement",
+      {
+        state: "queued",
+        attempt: task.attempt + 1,
+        claimRole: claimRoleForPhase("implement", task.role),
+        clearHead: true,
+        resultRef: `result:${result.id}`,
+      },
+      result,
+      workerId
+    );
+    if (!u) return getTask(db, taskId)!;
     releaseWorker(db, workerId, taskId);
     return u;
   })();
-  requestReconcile(db, `verify-failed:${taskId}`);
+  if (!isTerminalTaskState(updated.state)) requestReconcile(db, `verify-failed:${taskId}`);
   return updated;
 }
 
@@ -962,13 +1206,27 @@ export function quietBlock(
   const t = now();
   const prev = task.assignee;
   const attempt = opts.nextAttempt ?? task.attempt;
-  db.transaction(() => {
-    db.query(
-      `UPDATE tasks
-          SET state = 'blocked_human', assignee = NULL, lease_until = NULL,
-              attempt = ?, lease_token = lease_token + 1, updated_at = ?
-        WHERE id = ?`
-    ).run(attempt, t, task.id);
+  const blocked = db.transaction(() => {
+    // ISH-1245: take the write lock and re-read before parking. A close that
+    // committed after the caller's check must not be overwritten by a late HOLD.
+    const guard = db
+      .query(
+        `UPDATE tasks
+            SET state = 'blocked_human', assignee = NULL, lease_until = NULL,
+                attempt = ?, lease_token = lease_token + 1, updated_at = ?
+          WHERE id = ? AND state NOT IN (${TERMINAL_STATE_SQL})`
+      )
+      .run(attempt, t, task.id);
+    if (guard.changes !== 1) {
+      const live = getTask(db, task.id)!;
+      logEvent(db, {
+        source: "workflow",
+        taskId: task.id,
+        type: "task.late_result_ignored",
+        payload: { kind: "ChildBlocked", taskState: live.state, reason, actor },
+      });
+      return live;
+    }
     db.query(
       `INSERT INTO task_notes (task_id, worker_id, kind, body, created_at) VALUES (?, ?, 'blocked_human', ?, ?)`
     ).run(task.id, actor, reason, t);
@@ -979,7 +1237,9 @@ export function quietBlock(
       clearCurrentTaskOrRestoreParent(db, prev, task.id, t);
       normalizeWorkerAfterTaskRelease(db, prev, t);
     }
+    return null;
   })();
+  if (blocked) return blocked;
   recordChildBlocked(db, task.id, actor, reason, { notifyGateway: true });
   requestReconcile(db, `blocked:${task.id}`);
   return getTask(db, task.id)!;
@@ -1064,6 +1324,28 @@ export function recordImplementRecovery(db: Database, taskId: string, input: Imp
   }
 
   const updated = db.transaction(() => {
+    // ISH-1245: recovery is a state transition too. Take the write lock and
+    // re-read so a close committed after the entry check is never overwritten.
+    const guard = db
+      .query(`UPDATE tasks SET updated_at = updated_at WHERE id = ? AND state NOT IN (${TERMINAL_STATE_SQL})`)
+      .run(taskId);
+    if (guard.changes !== 1) {
+      const live = getTask(db, taskId)!;
+      logEvent(db, {
+        source: "factory",
+        taskId,
+        type: "task.late_result_ignored",
+        payload: {
+          kind: "ImplementRecovery",
+          taskState: live.state,
+          runId: run.id,
+          fromAttempt: task.attempt,
+          signature: input.signature,
+          reason: input.reason,
+        },
+      });
+      return live;
+    }
     logEvent(db, {
       source: "factory",
       taskId,
@@ -1087,7 +1369,7 @@ export function recordImplementRecovery(db: Database, taskId: string, input: Imp
       expectAttempt: task.attempt,
     });
   })();
-  requestReconcile(db, `implement-recovery:${taskId}`);
+  if (!isTerminalTaskState(updated.state)) requestReconcile(db, `implement-recovery:${taskId}`);
   return updated;
 }
 
@@ -1185,7 +1467,33 @@ export async function runMechanicalVerification(
 
   // Re-read: the run may have raced a head move / a rework. Only advance if the
   // task is STILL the verify/attempt/head we started on.
+  const evidence = checks
+    .map((c) => `${c.name}=${c.outcome}${c.exitCode === null ? "" : `(exit ${c.exitCode})`}`)
+    .join(" ");
+  const payload = { outcome, checks: checks.map((c) => ({ ...c })) };
+
+  // ISH-1245: `cancelTask` leaves phase/attempt/head untouched, so the stale
+  // fence below cannot notice a close. A result produced after one is recorded
+  // as EVIDENCE (never applied) with `task.late_result_ignored`.
   const live = getTask(db, taskId)!;
+  if (isTerminalTaskState(live.state)) {
+    db.transaction(() => {
+      const result = insertTaskResult(db, {
+        taskId,
+        phase: "verify",
+        attempt: task.attempt,
+        kind: "VerificationResult",
+        workerId: actor,
+        passed: outcome === "pass",
+        headSha: head,
+        evidenceRef: evidence,
+        reason: outcome === "pass" ? null : bindingError ?? `${outcome}: ${evidence}`,
+        payload,
+      });
+      lateResultIgnored(db, taskId, result, actor, { source: "mechanical-verify", outcome });
+    })();
+    return { task: live, outcome, checks, stale: true };
+  }
   const stale =
     live.phase !== "verify" ||
     live.attempt !== task.attempt ||
@@ -1204,11 +1512,6 @@ export async function runMechanicalVerification(
     throw new Error(`${DUPLICATE_DISPATCH}: VerificationResult already recorded for ${taskId} attempt ${task.attempt}`);
   }
 
-  const evidence = checks
-    .map((c) => `${c.name}=${c.outcome}${c.exitCode === null ? "" : `(exit ${c.exitCode})`}`)
-    .join(" ");
-  const payload = { outcome, checks: checks.map((c) => ({ ...c })) };
-
   if (outcome === "pass") {
     const updated = db.transaction(() => {
       const result = insertTaskResult(db, {
@@ -1222,15 +1525,22 @@ export async function runMechanicalVerification(
         evidenceRef: evidence,
         payload,
       });
-      return applyPhase(db, task, "review", {
-        state: "review",
-        attempt: task.attempt,
-        claimRole: REVIEWER_ROLE,
-        resultRef: `result:${result.id}`,
-      });
+      return applyResultPhase(
+        db,
+        task,
+        "review",
+        {
+          state: "review",
+          attempt: task.attempt,
+          claimRole: REVIEWER_ROLE,
+          resultRef: `result:${result.id}`,
+        },
+        result,
+        actor
+      ) ?? getTask(db, taskId)!;
     })();
-    requestReconcile(db, `verified:${taskId}`);
-    return { task: updated, outcome, checks, stale: false };
+    if (!isTerminalTaskState(updated.state)) requestReconcile(db, `verified:${taskId}`);
+    return { task: updated, outcome, checks, stale: isTerminalTaskState(updated.state) };
   }
 
   if (outcome === "fail") {
@@ -1247,23 +1557,30 @@ export async function runMechanicalVerification(
         reason: evidence,
         payload,
       });
-      return applyPhase(db, task, "implement", {
-        state: "queued",
-        attempt: task.attempt + 1,
-        claimRole: claimRoleForPhase("implement", task.role),
-        clearHead: true,
-        resultRef: `result:${result.id}`,
-      });
+      return applyResultPhase(
+        db,
+        task,
+        "implement",
+        {
+          state: "queued",
+          attempt: task.attempt + 1,
+          claimRole: claimRoleForPhase("implement", task.role),
+          clearHead: true,
+          resultRef: `result:${result.id}`,
+        },
+        result,
+        actor
+      ) ?? getTask(db, taskId)!;
     })();
-    requestReconcile(db, `verify-failed:${taskId}`);
-    return { task: updated, outcome, checks, stale: false };
+    if (!isTerminalTaskState(updated.state)) requestReconcile(db, `verify-failed:${taskId}`);
+    return { task: updated, outcome, checks, stale: isTerminalTaskState(updated.state) };
   }
 
   // not_run / inconclusive for a required check: BLOCK, do not PASS. The
   // VerificationResult records the outcome for evidence, then the task blocks.
   const blockReason = bindingError ?? `${outcome}: ${evidence}`;
-  db.transaction(() => {
-    insertTaskResult(db, {
+  const recorded = db.transaction(() => {
+    const result = insertTaskResult(db, {
       taskId,
       phase: "verify",
       attempt: task.attempt,
@@ -1275,8 +1592,10 @@ export async function runMechanicalVerification(
       reason: bindingError ?? `${outcome}: ${evidence}`,
       payload,
     });
+    return lateResultIgnored(db, taskId, result, actor, { source: "mechanical-verify", outcome }) ?? getTask(db, taskId)!;
   })();
-  const blocked = quietBlock(db, getTask(db, taskId)!, `mechanical verify ${outcome}: ${blockReason}`, actor);
+  if (isTerminalTaskState(recorded.state)) return { task: recorded, outcome, checks, stale: true };
+  const blocked = quietBlock(db, recorded, `mechanical verify ${outcome}: ${blockReason}`, actor);
   return { task: blocked, outcome, checks, stale: false };
 }
 
@@ -1481,16 +1800,24 @@ export function recordReview(db: Database, taskId: string, reviewerId: string, o
         payload: basePayload,
         ...(supersedesId ? { supersedes: supersedesId } : {}),
       });
-      const u = applyPhase(db, task, "integration", {
-        state: "queued",
-        attempt: task.attempt,
-        claimRole: INTEGRATOR_ROLE,
-        resultRef: `result:${result.id}`,
-      });
+      const u = applyResultPhase(
+        db,
+        task,
+        "integration",
+        {
+          state: "queued",
+          attempt: task.attempt,
+          claimRole: INTEGRATOR_ROLE,
+          resultRef: `result:${result.id}`,
+        },
+        result,
+        identity
+      );
+      if (!u) return getTask(db, taskId)!;
       if (!external) releaseWorker(db, reviewerId, taskId);
       return u;
     })();
-    requestReconcile(db, `review-pass:${taskId}`);
+    if (!isTerminalTaskState(updated.state)) requestReconcile(db, `review-pass:${taskId}`);
     return updated;
   }
 
@@ -1510,8 +1837,11 @@ export function recordReview(db: Database, taskId: string, reviewerId: string, o
         payload: { ...basePayload, blocked: true },
         ...(supersedesId ? { supersedes: supersedesId } : {}),
       });
-      return getTask(db, taskId)!;
+      // ISH-1245: a BLOCKED verdict that finished after a close is evidence
+      // only; it must not park the Task into blocked_human.
+      return lateResultIgnored(db, taskId, result, identity) ?? getTask(db, taskId)!;
     })();
+    if (isTerminalTaskState(updated.state)) return updated;
     if (!external) releaseWorker(db, reviewerId, taskId);
     const blocked = quietBlock(
       db,
@@ -1541,17 +1871,25 @@ export function recordReview(db: Database, taskId: string, reviewerId: string, o
       payload: basePayload,
       ...(supersedesId ? { supersedes: supersedesId } : {}),
     });
-    const u = applyPhase(db, task, "implement", {
-      state: "queued",
-      attempt: task.attempt + 1,
-      claimRole: claimRoleForPhase("implement", task.role),
-      clearHead: true,
-      resultRef: `result:${result.id}`,
-    });
+    const u = applyResultPhase(
+      db,
+      task,
+      "implement",
+      {
+        state: "queued",
+        attempt: task.attempt + 1,
+        claimRole: claimRoleForPhase("implement", task.role),
+        clearHead: true,
+        resultRef: `result:${result.id}`,
+      },
+      result,
+      identity
+    );
+    if (!u) return getTask(db, taskId)!;
     if (!external) releaseWorker(db, reviewerId, taskId);
     return u;
   })();
-  if (reopenMergeReady) {
+  if (reopenMergeReady && !isTerminalTaskState(updated.state)) {
     logEvent(db, {
       source: "workflow",
       taskId,
@@ -1564,7 +1902,7 @@ export function recordReview(db: Database, taskId: string, reviewerId: string, o
       },
     });
   }
-  requestReconcile(db, `review-fix:${taskId}`);
+  if (!isTerminalTaskState(updated.state)) requestReconcile(db, `review-fix:${taskId}`);
   return updated;
 }
 
@@ -1705,6 +2043,33 @@ export function requestMergeReadyRebase(
   const toAttempt = fromAttempt + 1;
   const updated = db.transaction(() => {
     const t = now();
+    // ISH-1245: a provider read (conflict/HOLD) is asynchronous, so the Task may
+    // have been closed before this transition starts. Take the write lock and
+    // re-read; a late rebase is evidence only and never re-opens the Task.
+    const guard = db
+      .query(`UPDATE tasks SET updated_at = updated_at WHERE id = ? AND state NOT IN (${TERMINAL_STATE_SQL})`)
+      .run(task.id);
+    if (guard.changes !== 1) {
+      const live = getTask(db, task.id)!;
+      logEvent(db, {
+        source: "workflow",
+        workerId: actor,
+        taskId,
+        type: "task.late_result_ignored",
+        payload: {
+          kind: "RebaseRequested",
+          taskState: live.state,
+          fromPhase: "merge_ready",
+          fromHead: task.head_sha,
+          fromAttempt,
+          reason,
+          prMergeable: opts.prMergeable,
+          prHead: opts.prHeadSha ?? null,
+          supersededPass: pass.id,
+        },
+      });
+      return live;
+    }
     db.query(
       `INSERT INTO task_notes (task_id, worker_id, kind, body, created_at)
        VALUES (?, ?, 'rebase', ?, ?)`
@@ -1739,7 +2104,7 @@ export function requestMergeReadyRebase(
     releaseWorker(db, actor, taskId, t);
     return u;
   })();
-  requestReconcile(db, `rebase:${taskId}`);
+  if (!isTerminalTaskState(updated.state)) requestReconcile(db, `rebase:${taskId}`);
   return updated;
 }
 
@@ -1799,18 +2164,28 @@ export function acceptTask(db: Database, taskId: string, actor: string): Task {
       kind: "TaskAccepted",
       workerId: actor,
     });
-    const u = applyPhase(db, task, phase, {
-      state: "done",
-      attempt: task.attempt,
-      claimRole: null,
-      acceptedAt: t,
-      resultRef: `result:${result.id}`,
-    });
+    // ISH-1245: an accept that lost a race with cancel must not turn a CLOSED
+    // Task into `done` (or bubble a false completion to its parent).
+    const u = applyResultPhase(
+      db,
+      task,
+      phase,
+      {
+        state: "done",
+        attempt: task.attempt,
+        claimRole: null,
+        acceptedAt: t,
+        resultRef: `result:${result.id}`,
+      },
+      result,
+      actor
+    );
+    if (!u) return getTask(db, taskId)!;
     releaseWorker(db, actor, taskId, t);
     notifyParentAccepted(db, u);
     return u;
   })();
-  requestReconcile(db, `accept:${taskId}`);
+  if (!isTerminalTaskState(updated.state) || updated.state === "done") requestReconcile(db, `accept:${taskId}`);
   return updated;
 }
 
@@ -1885,6 +2260,28 @@ export function confirmMerged(db: Database, taskId: string, opts: MergedOptions 
   }
   const t = now();
   const updated = db.transaction(() => {
+    // ISH-1245: a merge observation read from the provider can race a cancel.
+    // `done` is deliberately still allowed (accept-then-merge), but a Task that
+    // closed as cancelled/failed is never credited with a late merge.
+    const guard = db
+      .query(`UPDATE tasks SET updated_at = updated_at WHERE id = ? AND state NOT IN ('cancelled','failed')`)
+      .run(taskId);
+    if (guard.changes !== 1) {
+      const live = getTask(db, taskId)!;
+      logEvent(db, {
+        source: "workflow",
+        taskId,
+        type: "task.late_result_ignored",
+        payload: {
+          kind: "TaskMerged",
+          taskState: live.state,
+          head: mergedHead,
+          repo: opts.repo ?? task.pr_repo,
+          reason: opts.reason ?? null,
+        },
+      });
+      return live;
+    }
     insertTaskResult(db, {
       taskId,
       phase,
@@ -1903,7 +2300,7 @@ export function confirmMerged(db: Database, taskId: string, opts: MergedOptions 
     notifyParentAccepted(db, next);
     return next;
   })();
-  requestReconcile(db, `merged:${taskId}`);
+  if (updated.state !== "cancelled" && updated.state !== "failed") requestReconcile(db, `merged:${taskId}`);
   return updated;
 }
 

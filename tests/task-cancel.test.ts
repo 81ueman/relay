@@ -141,6 +141,13 @@ describe("cancelTask: idempotence and terminal refusal", () => {
     expect(() => cancelTask(db, failed.id, "w1", "nope")).toThrow(/terminal state failed/);
     expect(getTask(db, failed.id)!.state).toBe("failed"); // unchanged
   });
+
+  test("a cancelled task is never re-parked by a late block/dispatch (ISH-1245)", () => {
+    const t = addTask(db, { title: "closed" });
+    cancelTask(db, t.id, "w1", "superseded");
+    expect(() => blockTask(db, t.id, "w1", "late HOLD", true)).toThrow(/terminal state cancelled/);
+    expect(getTask(db, t.id)!.state).toBe("cancelled");
+  });
 });
 
 describe("cancelTask: roll-up and Attention", () => {
