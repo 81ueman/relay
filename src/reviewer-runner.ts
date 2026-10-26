@@ -14,7 +14,7 @@ import { ensureScratchRoot, scratchEnv, taskCargoTarget } from "./scratch";
 import { controlPlaneNamespace } from "./run-resources";
 import { findActiveWriterRow } from "./run-owner";
 import { beginReviewFence, releaseReviewFence, REVIEW_WRITER_ACTIVE, ReviewFenceRefused } from "./review-fence";
-import { recordReview, taskChecks } from "./workflow";
+import { DEFAULT_REVIEW_PROFILE, recordLateResultEvidence, recordReview, taskChecks } from "./workflow";
 import { ensureHeadlessWorker, getWorker, HEADLESS_AGENT_KIND } from "./workers";
 import {
   headsMatch,
@@ -1258,23 +1258,35 @@ export async function runHeadlessReview(
   // credited, even though `recordReview` only compares the DB `head_sha`.
   const postHead = gitHead(worktree);
   const liveReview = getTask(db, taskId);
-  // ISH-1245: the reviewer process can outlive the Task. A verdict that came
-  // back after a close is evidence only; record it (head/verdict/raw-output ref)
-  // and never call recordReview for the terminal Task.
+  const reason = [
+    verdict.summary,
+    ...verdict.findings.map((f) => `[${f.severity}] ${f.file ? `${f.file}${f.line ? `:${f.line}` : ""}: ` : ""}${f.message}`),
+  ]
+    .filter(Boolean)
+    .join("\n");
+  // ISH-1245/ISH-1246: the reviewer process can outlive the Task. A verdict that
+  // came back after a close is evidence only. Use the SAME shape as every other
+  // late result path — a durable ReviewResult row plus `task.late_result_ignored`
+  // — and never call recordReview for the terminal Task.
   if (liveReview && isTerminalTaskState(liveReview.state)) {
-    logEvent(db, {
-      source: "factory",
-      taskId,
-      type: "task.late_result_ignored",
-      payload: {
+    recordLateResultEvidence(
+      db,
+      liveReview,
+      {
+        phase: liveReview.phase ?? "review",
+        attempt: liveReview.attempt,
         kind: "ReviewResult",
-        taskState: liveReview.state,
-        head,
-        verdict: verdict.verdict,
-        evidence: evidencePath,
-        source: "claude-headless",
+        workerId: reviewerWorker,
+        passed: verdict.verdict === "pass",
+        headSha: verdict.head ?? head,
+        profile: (deps.profile ?? liveReview.review_profile ?? DEFAULT_REVIEW_PROFILE).trim() || DEFAULT_REVIEW_PROFILE,
+        reason: reason || null,
+        evidenceRef: evidencePath,
+        payload: { source: "claude-headless", reviewer: reviewerWorker, late: true, taskState: liveReview.state, verdict: verdict.verdict },
       },
-    });
+      reviewerWorker,
+      { verdict: verdict.verdict, head, source: "claude-headless" }
+    );
   }
   if (
     postHead !== head ||
@@ -1368,13 +1380,6 @@ export async function runHeadlessReview(
     })();
     logEvent(db, { source: "factory", taskId, type: "task.review_assigned", payload: { reviewer: reviewerWorker } });
   }
-
-  const reason = [
-    verdict.summary,
-    ...verdict.findings.map((f) => `[${f.severity}] ${f.file ? `${f.file}${f.line ? `:${f.line}` : ""}: ` : ""}${f.message}`),
-  ]
-    .filter(Boolean)
-    .join("\n");
 
   try {
     const updated = recordReview(db, taskId, reviewerWorker, {
