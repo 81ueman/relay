@@ -61,6 +61,35 @@ Task that records only a branch now gets the instruction.
    (`CODE_CHANGE_GATE: NO_PR`). Relay still does not perform merges; a real merge
    is only *observed and credited* against an explicit PR at the recorded head.
 
+## Which reviews count as verdict candidates (ISH-1283)
+
+Relay reads the reviewer's native reviews back with `listReviews` and considers a
+review only when ALL of these hold (`verifyNativeReview`,
+`src/reviewer-runner.ts:924`):
+
+- authored by the expected `RELAY_REVIEW_AUTHOR` login;
+- state `COMMENTED` (PENDING/APPROVED/CHANGES_REQUESTED/DISMISSED never count);
+- pinned to the exact reviewed head (`commit_id` matches the task head);
+- posted after any base-changed invalidation;
+- **body non-empty after trimming** (`isVerdictCandidate`,
+  `src/reviewer-runner.ts:909`, applied in the filter at `:956`).
+
+The body check is the ISH-1283 rule. GitHub can record a separate review object
+with an empty body when the reviewer submits inline comments after its verdict
+review; T407 had the NG marker review at `2026-10-27T08:28:37Z` and an empty-body
+review with one inline comment at `08:28:38Z`. An empty body cannot carry the
+`ishiul-review` marker, so it is not a verdict candidate and cannot shadow the
+verdict. Non-empty prose without a marker **is** a candidate and still fails
+closed as `REVIEW_NATIVE_CONTRADICTED`; only a body-less
+(inline-comment-only) review is skipped.
+
+The NEWEST candidate is the reviewer's current word at the head. Relay accepts it
+only when `reviewBodyHasMarker` (`src/reviewer-runner.ts:976`) matches the
+structured verdict and the reviewed head; a later candidate with a different
+marker, or a marker naming another head, is `REVIEW_NATIVE_CONTRADICTED` — Relay
+never falls back to an older matching review. Reviews pinned to another commit
+are still excluded by the unchanged head-pinning rule.
+
 ## Provenance rule
 
 The native review / `ishiul-review` marker is posted **only by the reviewer Run**,

@@ -550,6 +550,10 @@ export function buildReviewBrief(
       "   If there are none, write `No findings.` — do NOT leave it out.",
       `3. the one-line summary (so the attempt-${task.attempt} verdict is readable on GitHub).`,
       "",
+      "Relay counts only a review with a NON-EMPTY body as a verdict candidate: an",
+      "empty-body review that carries only inline comments is ignored. Keep the",
+      "marker, findings and summary in the ONE body-bearing review.",
+      "",
       "GitHub readers cannot open Relay's local `.relay/` evidence files. Do NOT point at a",
       "local path: put the finding text in the review body (or a public URL).",
       `Post ONE review for THIS review attempt (attempt=${task.attempt}). If a review by`,
@@ -893,14 +897,29 @@ export interface NativeReviewOutcome {
 }
 
 /**
+ * ISH-1283: a review is a VERDICT CANDIDATE only when its body is non-empty.
+ * GitHub can record a separate review object with an EMPTY body when inline
+ * comments are submitted after the verdict review (T407: the marker NG review at
+ * 08:28:37Z, then an empty-body review with one inline comment at 08:28:38Z). An
+ * empty body cannot carry the head-pinned marker, so treating it as the newest
+ * "word" would shadow the genuine verdict. Non-empty prose without a marker
+ * remains a candidate and still fails closed as CONTRADICTED; only a review that
+ * says nothing in its body (inline comments only) is skipped.
+ */
+function isVerdictCandidate(r: ReviewView): boolean {
+  return (r.body ?? "").trim().length > 0;
+}
+
+/**
  * Read the reviewer's native PR review BACK from GitHub and accept it only when
- * the reviewer's CURRENT word at the HEAD — the newest fresh `COMMENTED` review
- * authored by the expected GitHub identity, pinned to the EXACT reviewed HEAD,
- * posted AFTER any base-changed invalidation — carries the marker matching the
- * structured verdict, and the PR's CURRENT head is still that commit. A
- * missing/foreign/PENDING/DISMISSED/stale/moved-HEAD review, a newer review whose
- * verdict contradicts the structured one, or a failed read is `ok:false` — the
- * caller records NOTHING. Relay never trusts the reviewer's own URL/JSON.
+ * the reviewer's CURRENT word at the HEAD — the newest fresh body-bearing
+ * `COMMENTED` review authored by the expected GitHub identity, pinned to the
+ * EXACT reviewed HEAD, posted AFTER any base-changed invalidation — carries the
+ * marker matching the structured verdict, and the PR's CURRENT head is still that
+ * commit. A missing/foreign/PENDING/DISMISSED/stale/moved-HEAD review, a newer
+ * review whose verdict contradicts the structured one, or a failed read is
+ * `ok:false` — the caller records NOTHING. Relay never trusts the reviewer's own
+ * URL/JSON.
  */
 export async function verifyNativeReview(
   db: Database,
@@ -922,17 +941,19 @@ export async function verifyNativeReview(
   // review posted before that invalidation judged the OLD base's diff, so it must
   // not be re-accepted (the same rule the marker path uses).
   const invalidatedAt = latestReviewInvalidationAt(db, task.id, head);
-  // The reviewer's CURRENT word at this HEAD: the NEWEST fresh `COMMENTED` review
-  // by the expected author, whatever its verdict. Only then is its marker checked
-  // against the structured verdict — so a newer contradicting review is never
-  // shadowed by an older matching one. A PENDING (never submitted) or
-  // DISMISSED/APPROVED/CHANGES_REQUESTED review is never a valid verdict; the
-  // brief allows a COMMENT only.
+  // The reviewer's CURRENT word at this HEAD: the NEWEST fresh body-bearing
+  // `COMMENTED` review by the expected author, whatever its verdict. Only then is
+  // its marker checked against the structured verdict — so a newer contradicting
+  // review is never shadowed by an older matching one. A PENDING (never submitted)
+  // or DISMISSED/APPROVED/CHANGES_REQUESTED review is never a valid verdict; the
+  // brief allows a COMMENT only. ISH-1283: an empty-body review (inline comments
+  // only) is not a verdict candidate and cannot shadow the marker review.
   const candidates = reviews.filter(
     (r) =>
       (r.author ?? "").toLowerCase() === native.author.toLowerCase() &&
       (r.state ?? "").toUpperCase() === "COMMENTED" &&
       headsMatch(r.headSha, head) &&
+      isVerdictCandidate(r) &&
       markerAfterInvalidation({ createdAt: r.createdAt } as ReviewMarker, invalidatedAt)
   );
   // Prefer the NEWEST review. Unparseable timestamps sort last.

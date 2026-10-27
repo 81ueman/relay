@@ -216,6 +216,7 @@ describe("ISH-1087: the native review body carries the attempt-N findings", () =
     expect(brief).toContain("No findings.");
     expect(brief).toContain("self-contained");
     expect(brief).toContain("cannot open Relay's local `.relay/` evidence files");
+    expect(brief).toContain("NON-EMPTY body as a verdict candidate");
     expect(brief).toContain(`<!-- ishiul-review head=${head} verdict=OK|NG|HOLD reviewer=ishiul-reviewer -->`);
   });
 });
@@ -437,6 +438,99 @@ describe("runHeadlessReview verifies the reviewer's native GitHub review (ISH-88
     expect(r.outcome).toBe("pass");
     expect(r.nativeReview).toBeNull();
     expect(getTask(db, id)!.phase).toBe("integration");
+  });
+});
+
+describe("ISH-1283: only body-bearing reviews are verdict candidates", () => {
+  test("accepts the marker verdict when an empty-body inline review follows at the same HEAD (T407)", async () => {
+    const head = HEAD();
+    const id = driveToReview(head);
+    const gh = new FakeNativeGitHub(prView(head));
+    const verdictReview = gh.record({
+      headSha: head,
+      createdAt: "2026-10-27T08:28:37Z",
+      body:
+        `<!-- ishiul-review head=${head} verdict=NG reviewer=${gh.author} -->\n\n` +
+        "## Findings — attempt 1\n\n[blocker] src/x.ts:4: missing guard",
+    });
+    // T407: a second review object one second later, same author and HEAD, with
+    // an EMPTY body carrying only an inline comment. It has no marker and no
+    // prose, so it must not shadow the verdict review's NG.
+    const inlineOnly = gh.record({
+      headSha: head,
+      createdAt: "2026-10-27T08:28:38Z",
+      body: "",
+    });
+
+    const r = await runHeadlessReview(db, id, {
+      spawner: reviewer(gh, {
+        verdict: "fix",
+        post: "missing",
+        findings: [{ severity: "blocker", file: "src/x.ts", line: 4, message: "missing guard" }],
+      }).spawner,
+      nativeReview: nativeDeps(gh),
+    });
+
+    expect(inlineOnly.body).toBe("");
+    expect(r.outcome).toBe("fix");
+    expect(r.nativeReview?.id).toBe(verdictReview.id);
+    expect(r.nativeReview?.id).not.toBe(inlineOnly.id);
+    expect(getTask(db, id)!.phase).toBe("implement");
+  });
+
+  test("still refuses when a later review carries a different marker (NG then OK, structured fix)", async () => {
+    const head = HEAD();
+    const id = driveToReview(head);
+    const gh = new FakeNativeGitHub(prView(head));
+    gh.record({
+      headSha: head,
+      createdAt: "2026-01-01T00:00:00Z",
+      body: `<!-- ishiul-review head=${head} verdict=NG reviewer=${gh.author} -->\n\nNG`,
+    });
+    gh.record({
+      headSha: head,
+      createdAt: "2026-02-01T00:00:00Z",
+      body: `<!-- ishiul-review head=${head} verdict=OK reviewer=${gh.author} -->\n\nOK`,
+    });
+
+    // The structured verdict is fix, but the reviewer's newest word is OK.
+    const r = await runHeadlessReview(db, id, {
+      spawner: reviewer(gh, { verdict: "fix", post: "missing" }).spawner,
+      nativeReview: nativeDeps(gh),
+    });
+
+    expect(r.outcome).toBe("refused");
+    expect(r.error).toContain(REVIEW_NATIVE_CONTRADICTED);
+    expect(getTask(db, id)!.phase).toBe("review");
+  });
+
+  test("still refuses when the newest body-bearing review carries a marker for another head", async () => {
+    const head = HEAD();
+    const otherHead = "f".repeat(40);
+    const id = driveToReview(head);
+    const gh = new FakeNativeGitHub(prView(head));
+    gh.record({
+      headSha: head,
+      createdAt: "2026-01-01T00:00:00Z",
+      body: `<!-- ishiul-review head=${head} verdict=OK reviewer=${gh.author} -->\n\nOK`,
+    });
+    // Newest at the reviewed HEAD, but its marker names a different head: no
+    // fallback to the older OK is allowed.
+    const otherHeadReview = gh.record({
+      headSha: head,
+      createdAt: "2026-02-01T00:00:00Z",
+      body: `<!-- ishiul-review head=${otherHead} verdict=OK reviewer=${gh.author} -->\n\nother head`,
+    });
+
+    const r = await runHeadlessReview(db, id, {
+      spawner: reviewer(gh, { verdict: "pass", post: "missing" }).spawner,
+      nativeReview: nativeDeps(gh),
+    });
+
+    expect(r.outcome).toBe("refused");
+    expect(r.error).toContain(REVIEW_NATIVE_CONTRADICTED);
+    expect(r.error).toContain(`id ${otherHeadReview.id}`);
+    expect(getTask(db, id)!.phase).toBe("review");
   });
 });
 
